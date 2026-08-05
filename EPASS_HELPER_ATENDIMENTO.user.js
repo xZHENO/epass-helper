@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         EPass Helper 5.1 - Atendimento
+// @name         
 // @namespace    https://github.com/epass-helper
 // @version      5.11.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
