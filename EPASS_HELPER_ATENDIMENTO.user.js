@@ -5,7 +5,7 @@
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
-// @author       EPass Helper
+// @author       
 // @match        http://www.epass.com.br/*
 // @match        https://www.epass.com.br/*
 // @match        http://epass.com.br/*
