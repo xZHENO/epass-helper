@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.18.0
+// @version      5.19.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -28,7 +28,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.18.0',
+        VERSION: '5.19.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -1748,143 +1748,81 @@
             });
         },
 
-        inlineTicketStyles(sourceRoot, targetRoot) {
-            if (!sourceRoot || !targetRoot) return;
-            const textProps = [
-                'font', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight',
-                'letterSpacing', 'wordSpacing', 'color', 'textTransform', 'textAlign',
-                'whiteSpace', 'wordBreak', 'overflowWrap', 'textRendering',
-                'fontKerning', 'fontFeatureSettings', 'fontVariantLigatures'
-            ];
-            const boxProps = [
-                'display', 'backgroundColor', 'border', 'borderTop', 'borderRight', 'borderBottom', 'borderLeft',
-                'borderRadius', 'padding', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
-                'margin', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft'
-            ];
-            const allProps = [...textProps, ...boxProps];
-            const walk = (src, dst) => {
-                if (!(src instanceof Element) || !(dst instanceof Element)) return;
-                const cs = window.getComputedStyle(src);
-                allProps.forEach(prop => {
-                    const value = cs[prop];
-                    if (value) dst.style[prop] = value;
-                });
-                dst.style.boxSizing = cs.boxSizing;
-                dst.style.textDecoration = cs.textDecoration;
-                dst.style.verticalAlign = cs.verticalAlign;
-                const srcChildren = Array.from(src.children || []);
-                const dstChildren = Array.from(dst.children || []);
-                for (let i = 0; i < Math.min(srcChildren.length, dstChildren.length); i += 1) {
-                    walk(srcChildren[i], dstChildren[i]);
-                }
-            };
-            walk(sourceRoot, targetRoot);
-        },
-
-        prepareCapture(card) {
+        extractTicketData(card) {
             if (!card || !document.contains(card)) {
                 throw new Error('A passagem selecionada não está mais disponível na tela.');
             }
 
-            const summary = this.summary(card);
-            const { shell, stage } = EH.Capture.createShell();
-            const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 446));
-            stage.classList.add('eh-ticket-capture-stage');
-            stage.style.width = `${width}px`;
-            stage.style.maxWidth = `${width}px`;
-            stage.style.minWidth = `${width}px`;
-
-            const clone = card.cloneNode(true);
-            clone.querySelectorAll('.eh-ticket-pick-btn').forEach(button => button.remove());
-            clone.classList.remove('eh-ticket-choice');
-            clone.style.position = 'static';
-            clone.style.width = '100%';
-            clone.style.maxWidth = '100%';
-            clone.style.minWidth = '0';
-            clone.style.margin = '0';
-            clone.style.padding = '0';
-            clone.style.transform = 'none';
-            clone.style.border = '1px solid #d8d8d8';
-            clone.style.borderRadius = '2px';
-            clone.style.boxShadow = 'none';
-            clone.style.background = '#fff';
-            clone.style.overflow = 'hidden';
-            clone.style.fontFamily = 'Arial, "Segoe UI", sans-serif';
-            clone.style.fontSize = '14px';
-            clone.style.lineHeight = '1.4';
-            clone.style.letterSpacing = 'normal';
-            clone.style.wordSpacing = 'normal';
-
-            this.inlineTicketStyles(card, clone);
-
-            clone.querySelectorAll('.row').forEach(element => {
-                element.style.marginLeft = '0';
-                element.style.marginRight = '0';
-                element.style.width = '100%';
-            });
-            clone.querySelectorAll('[class*="col-"]').forEach(element => {
-                element.style.width = '100%';
-                element.style.maxWidth = '100%';
-                element.style.flex = '0 0 100%';
-                element.style.paddingLeft = '0';
-                element.style.paddingRight = '0';
-            });
-
-            const bodies = clone.querySelectorAll('.body, .card-body');
-            if (bodies.length) {
-                bodies.forEach(element => {
-                    element.style.padding = '18px 18px';
-                    element.style.margin = '0';
-                    element.style.fontSize = '14px';
-                    element.style.lineHeight = '1.4';
-                });
-            } else {
-                clone.style.padding = '18px 18px';
+            const headerElement = card.querySelector('.dados-passagem .col-12 h6')
+                || card.querySelector('.dados-passagem h6');
+            if (!headerElement) {
+                throw new Error('Não foi possível localizar os dados principais da passagem.');
             }
 
-            clone.querySelectorAll('.dados-passagem').forEach(element => {
-                element.style.display = 'block';
-                element.style.width = '100%';
-                element.style.margin = '0 0 14px';
-                element.style.fontSize = '14px';
-                element.style.lineHeight = '1.4';
-                element.style.whiteSpace = 'normal';
-                element.style.overflowWrap = 'break-word';
-                element.style.wordBreak = 'normal';
-            });
+            const headerClone = headerElement.cloneNode(true);
+            const badgeClone = headerClone.querySelector('.badge');
+            const status = EH.Utils.clean(badgeClone?.textContent || '');
+            badgeClone?.remove();
+            const header = EH.Utils.clean(headerClone.textContent)
+                .replace(/\s*-\s*$/, '')
+                .trim();
 
-            clone.querySelectorAll('.card').forEach(element => {
-                if (element === clone) return;
-                element.style.margin = '0';
-                element.style.border = '1px solid #dddddd';
-                element.style.borderRadius = '2px';
-                element.style.boxShadow = 'none';
-                element.style.background = '#fff';
-            });
+            const infoLines = Array.from(card.querySelectorAll('.dados-passagem .col-10 h6'))
+                .map(element => EH.Utils.clean(element.textContent))
+                .filter(Boolean);
+            const seller = infoLines.find(line => /Venda\s+realizada\s+por\s*:/i.test(line)) || '';
+            const soldAt = infoLines.find(line => /Venda\s+realizada\s+em\s*:/i.test(line)) || '';
 
-            clone.querySelectorAll('table').forEach(element => {
-                element.style.width = '100%';
-                element.style.tableLayout = 'auto';
-                element.style.borderCollapse = 'collapse';
-            });
-            clone.querySelectorAll('td, th').forEach(element => {
-                element.style.padding = '14px 16px';
-                element.style.fontSize = '14px';
-                element.style.lineHeight = '1.4';
-                element.style.whiteSpace = 'normal';
-                element.style.wordBreak = 'normal';
-                element.style.overflowWrap = 'break-word';
-            });
-            clone.querySelectorAll('img').forEach(element => {
-                element.style.maxWidth = '100%';
-                element.style.height = 'auto';
-            });
+            const tickets = Array.from(card.querySelectorAll('ul.list-group > li.list-group-item'))
+                .map(item => {
+                    const leadingText = Array.from(item.childNodes)
+                        .filter(node => node.nodeType === Node.TEXT_NODE)
+                        .map(node => node.nodeValue || '')
+                        .join(' ');
+                    const firstLine = EH.Utils.clean(leadingText);
+                    const route = EH.Utils.clean(item.querySelector('.viagem')?.textContent || '');
+                    const headMatch = firstLine.match(/N[º°O]?\s*:\s*(\d+)\s*-\s*Data\s*de\s*Embarque\s*:\s*(.+)$/i);
+                    const routeMatch = route.match(/Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*(.*)$/i);
+                    return {
+                        number: EH.Utils.clean(headMatch?.[1] || ''),
+                        date: EH.Utils.clean(headMatch?.[2] || ''),
+                        origin: EH.Utils.clean(routeMatch?.[1] || ''),
+                        destination: EH.Utils.clean(routeMatch?.[2] || ''),
+                        firstLine,
+                        route
+                    };
+                })
+                .filter(ticket => ticket.number || ticket.firstLine || ticket.route);
 
+            if (!tickets.length) {
+                throw new Error('Os bilhetes não foram encontrados dentro da passagem selecionada.');
+            }
 
-            stage.appendChild(clone);
-            const filename = `bilhete-${summary.ticket || Date.now()}.png`;
-            const text = summary.raw.replace(/\s*📸\s*CAPTURAR ESTA\s*\d*/gi, '').trim();
-            return { shell, stage, filename, text, width };
+            const summary = this.summary(card);
+            return {
+                header,
+                status: status || summary.status || 'PASSAGEM',
+                seller,
+                soldAt,
+                tickets,
+                filename: `bilhete-${tickets[0]?.number || summary.ticket || Date.now()}.png`,
+                text: EH.Utils.clean(card.innerText || card.textContent || '')
+                    .replace(/\s*📸\s*CAPTURAR ESTA\s*\d*/gi, '')
+                    .trim()
+            };
+        },
+
+        prepareCapture(card) {
+            const data = this.extractTicketData(card);
+            const { shell } = EH.Capture.createShell();
+            const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
+            return {
+                shell,
+                data,
+                width,
+                filename: data.filename,
+                text: data.text
+            };
         }
 
     };
@@ -2750,45 +2688,183 @@
             }
         },
 
-        async renderTicket(prepared) {
-            const library = this.getLibrary();
-            const { shell, stage, width } = prepared;
-            try {
-                if (document.fonts?.ready) await document.fonts.ready;
-                await EH.Utils.waitForImages(stage);
-                await EH.Utils.sleep(260);
+        ticketStatusStyle(status) {
+            const normalized = EH.Utils.normalize(status);
+            if (normalized.includes('VALIDA')) return { fill: '#22ad43', text: '#ffffff' };
+            if (normalized.includes('EMBARCADA')) return { fill: '#1aa6c8', text: '#ffffff' };
+            if (normalized.includes('NAO EMBARCADA')) return { fill: '#e5b522', text: '#252525' };
+            if (normalized.includes('SUBSTITUIDA')) return { fill: '#e4a719', text: '#252525' };
+            return { fill: '#6c757d', text: '#ffffff' };
+        },
 
-                const captureWidth = Math.max(stage.scrollWidth, stage.offsetWidth, width || 430, 1);
-                const captureHeight = Math.max(stage.scrollHeight, stage.offsetHeight, 1);
-                // O comprovante deve manter proporção real de tela de celular.
-                // Escala 1 evita que o texto fique artificialmente ampliado ou comprimido.
-                const safeScale = Math.max(1, Math.min(2, Math.sqrt(EH.Config.MAX_CAPTURE_PIXELS / (captureWidth * captureHeight))));
+        renderTicketCanvas(data, requestedWidth) {
+            const width = Math.min(520, Math.max(360, Number(requestedWidth) || 430));
+            const scale = Math.max(1.5, Math.min(2.5, Number(EH.Config.CAPTURE_SCALE) || 2));
+            const padding = 22;
+            const innerWidth = width - padding * 2;
+            const borderColor = '#d8d8d8';
+            const mainColor = '#272727';
+            const mutedColor = '#4a4a4a';
+            const lineHeight = 20;
 
-                const canvas = await library(stage, {
-                    backgroundColor: '#ffffff',
-                    scale: safeScale,
-                    foreignObjectRendering: true,
-                    useCORS: true,
-                    allowTaint: false,
-                    logging: EH.Config.DEBUG,
-                    imageTimeout: 15000,
-                    removeContainer: true,
-                    scrollX: 0,
-                    scrollY: 0,
-                    windowWidth: captureWidth,
-                    windowHeight: Math.max(680, captureHeight + 20),
-                    onclone(clonedDocument) {
-                        clonedDocument.querySelector('#eh-root')?.remove();
-                        clonedDocument.querySelector('#eh-toast-area')?.remove();
-                        clonedDocument.querySelectorAll('.eh-capture-message, .eh-ticket-pick-btn')
-                            .forEach(element => element.remove());
-                    }
-                });
+            const measureCanvas = document.createElement('canvas');
+            const measure = measureCanvas.getContext('2d');
+            const linesFor = (text, font, maxWidth = innerWidth) => {
+                measure.font = font;
+                return this.wrapCanvasText(measure, EH.Utils.clean(text), maxWidth);
+            };
 
-                if (!canvas.width || !canvas.height) {
-                    throw new Error('A captura da passagem foi criada sem largura ou altura.');
+            const headerFont = '600 14px Arial';
+            const bodyFont = '400 14px Arial';
+            const labelFont = '700 16px Arial';
+            const itemFont = '400 14px Arial';
+            const statusFont = '700 13px Arial';
+
+            const headerText = `${data.header}${data.header ? ' -' : ''}`;
+            const headerLines = linesFor(headerText, headerFont);
+            measure.font = statusFont;
+            const badgePadX = 9;
+            const badgeHeight = 24;
+            const badgeWidth = Math.ceil(measure.measureText(data.status).width) + badgePadX * 2;
+            measure.font = headerFont;
+            const headerLastWidth = headerLines.length ? measure.measureText(headerLines[headerLines.length - 1]).width : 0;
+            const badgeInline = headerLines.length > 0 && headerLastWidth + 8 + badgeWidth <= innerWidth;
+            const headerHeight = headerLines.length * lineHeight + (badgeInline ? 0 : badgeHeight + 4);
+
+            const sellerLines = linesFor(data.seller, bodyFont);
+            const soldAtLines = linesFor(data.soldAt, bodyFont);
+
+            const ticketLayouts = data.tickets.map(ticket => {
+                const line1 = ticket.number
+                    ? `Nº: ${ticket.number} - Data de Embarque:`
+                    : ticket.firstLine;
+                const line1Lines = linesFor(line1, itemFont, innerWidth - 32);
+                const dateLines = linesFor(ticket.date, itemFont, innerWidth - 32);
+                const routeText = ticket.origin || ticket.destination
+                    ? `Origem: ${ticket.origin} - Destino: ${ticket.destination}`
+                    : ticket.route;
+                const routeLines = linesFor(routeText, itemFont, innerWidth - 32);
+                const contentHeight = line1Lines.length * lineHeight
+                    + (dateLines.length ? dateLines.length * lineHeight + 2 : 0)
+                    + (routeLines.length ? routeLines.length * lineHeight + 2 : 0);
+                return {
+                    line1Lines,
+                    dateLines,
+                    routeLines,
+                    height: Math.max(78, contentHeight + 26)
+                };
+            });
+
+            let height = padding;
+            height += headerHeight;
+            height += 14;
+            height += sellerLines.length * lineHeight;
+            height += 10;
+            height += soldAtLines.length * lineHeight;
+            height += 20;
+            height += 24; // Bilhete(s)
+            height += 10;
+            height += ticketLayouts.reduce((sum, item) => sum + item.height, 0);
+            height += padding;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.round(width * scale);
+            canvas.height = Math.round(height * scale);
+            const ctx = canvas.getContext('2d');
+            ctx.scale(scale, scale);
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, width, height);
+            ctx.strokeStyle = borderColor;
+            ctx.lineWidth = 1;
+            this.drawRoundRect(ctx, 0.5, 0.5, width - 1, height - 1, 4);
+            ctx.stroke();
+
+            let y = padding;
+            ctx.textBaseline = 'top';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = mainColor;
+            ctx.font = headerFont;
+            headerLines.forEach(line => {
+                ctx.fillText(line, padding, y);
+                y += lineHeight;
+            });
+
+            const badgeStyle = this.ticketStatusStyle(data.status);
+            const badgeY = badgeInline ? (y - lineHeight - 2) : (y + 2);
+            const badgeX = badgeInline ? (padding + headerLastWidth + 8) : padding;
+            this.drawRoundRect(ctx, badgeX, badgeY, badgeWidth, badgeHeight, 5);
+            ctx.fillStyle = badgeStyle.fill;
+            ctx.fill();
+            ctx.fillStyle = badgeStyle.text;
+            ctx.font = statusFont;
+            ctx.textBaseline = 'middle';
+            ctx.fillText(data.status, badgeX + badgePadX, badgeY + badgeHeight / 2 + 0.5);
+            ctx.textBaseline = 'top';
+            if (!badgeInline) y = badgeY + badgeHeight;
+
+            y += 14;
+            ctx.fillStyle = mainColor;
+            ctx.font = bodyFont;
+            sellerLines.forEach(line => {
+                ctx.fillText(line, padding, y);
+                y += lineHeight;
+            });
+            y += 10;
+            soldAtLines.forEach(line => {
+                ctx.fillText(line, padding, y);
+                y += lineHeight;
+            });
+
+            y += 20;
+            ctx.fillStyle = mainColor;
+            ctx.font = labelFont;
+            ctx.fillText('Bilhete(s):', padding, y);
+            y += 34;
+
+            const listX = padding;
+            const listW = innerWidth;
+            const listTop = y;
+            const listH = ticketLayouts.reduce((sum, item) => sum + item.height, 0);
+            ctx.strokeStyle = borderColor;
+            this.drawRoundRect(ctx, listX, listTop, listW, listH, 2);
+            ctx.stroke();
+
+            ctx.font = itemFont;
+            ctx.fillStyle = mutedColor;
+            data.tickets.forEach((ticket, index) => {
+                const layout = ticketLayouts[index];
+                if (index > 0) {
+                    ctx.strokeStyle = borderColor;
+                    ctx.beginPath();
+                    ctx.moveTo(listX, y);
+                    ctx.lineTo(listX + listW, y);
+                    ctx.stroke();
                 }
-                return canvas;
+                let itemY = y + 13;
+                layout.line1Lines.forEach(line => {
+                    ctx.fillText(line, listX + 16, itemY);
+                    itemY += lineHeight;
+                });
+                if (layout.dateLines.length) itemY += 2;
+                layout.dateLines.forEach(line => {
+                    ctx.fillText(line, listX + 16, itemY);
+                    itemY += lineHeight;
+                });
+                if (layout.routeLines.length) itemY += 2;
+                layout.routeLines.forEach(line => {
+                    ctx.fillText(line, listX + 16, itemY);
+                    itemY += lineHeight;
+                });
+                y += layout.height;
+            });
+
+            return canvas;
+        },
+
+        async renderTicket(prepared) {
+            const { shell, data, width } = prepared;
+            try {
+                return this.renderTicketCanvas(data, width);
             } finally {
                 this.destroyShell(shell);
             }
