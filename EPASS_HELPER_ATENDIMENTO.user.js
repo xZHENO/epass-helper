@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.17.0
+// @version      5.18.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -28,7 +28,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.17.0',
+        VERSION: '5.18.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -1748,6 +1748,39 @@
             });
         },
 
+        inlineTicketStyles(sourceRoot, targetRoot) {
+            if (!sourceRoot || !targetRoot) return;
+            const textProps = [
+                'font', 'fontFamily', 'fontSize', 'fontWeight', 'fontStyle', 'lineHeight',
+                'letterSpacing', 'wordSpacing', 'color', 'textTransform', 'textAlign',
+                'whiteSpace', 'wordBreak', 'overflowWrap', 'textRendering',
+                'fontKerning', 'fontFeatureSettings', 'fontVariantLigatures'
+            ];
+            const boxProps = [
+                'display', 'backgroundColor', 'border', 'borderTop', 'borderRight', 'borderBottom', 'borderLeft',
+                'borderRadius', 'padding', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+                'margin', 'marginTop', 'marginRight', 'marginBottom', 'marginLeft'
+            ];
+            const allProps = [...textProps, ...boxProps];
+            const walk = (src, dst) => {
+                if (!(src instanceof Element) || !(dst instanceof Element)) return;
+                const cs = window.getComputedStyle(src);
+                allProps.forEach(prop => {
+                    const value = cs[prop];
+                    if (value) dst.style[prop] = value;
+                });
+                dst.style.boxSizing = cs.boxSizing;
+                dst.style.textDecoration = cs.textDecoration;
+                dst.style.verticalAlign = cs.verticalAlign;
+                const srcChildren = Array.from(src.children || []);
+                const dstChildren = Array.from(dst.children || []);
+                for (let i = 0; i < Math.min(srcChildren.length, dstChildren.length); i += 1) {
+                    walk(srcChildren[i], dstChildren[i]);
+                }
+            };
+            walk(sourceRoot, targetRoot);
+        },
+
         prepareCapture(card) {
             if (!card || !document.contains(card)) {
                 throw new Error('A passagem selecionada não está mais disponível na tela.');
@@ -1755,7 +1788,7 @@
 
             const summary = this.summary(card);
             const { shell, stage } = EH.Capture.createShell();
-            const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
+            const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 446));
             stage.classList.add('eh-ticket-capture-stage');
             stage.style.width = `${width}px`;
             stage.style.maxWidth = `${width}px`;
@@ -1763,8 +1796,6 @@
 
             const clone = card.cloneNode(true);
             clone.querySelectorAll('.eh-ticket-pick-btn').forEach(button => button.remove());
-            clone.querySelectorAll('.acoes').forEach(element => element.remove());
-            clone.querySelectorAll('button, [role="button"]').forEach(element => element.remove());
             clone.classList.remove('eh-ticket-choice');
             clone.style.position = 'static';
             clone.style.width = '100%';
@@ -1781,6 +1812,10 @@
             clone.style.fontFamily = 'Arial, "Segoe UI", sans-serif';
             clone.style.fontSize = '14px';
             clone.style.lineHeight = '1.4';
+            clone.style.letterSpacing = 'normal';
+            clone.style.wordSpacing = 'normal';
+
+            this.inlineTicketStyles(card, clone);
 
             clone.querySelectorAll('.row').forEach(element => {
                 element.style.marginLeft = '0';
