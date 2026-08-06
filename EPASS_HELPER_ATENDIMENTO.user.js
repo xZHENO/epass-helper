@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.15.0
+// @version      5.16.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -28,7 +28,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.15.0',
+        VERSION: '5.16.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -1731,38 +1731,195 @@
             );
         },
 
-        stabilizeCaptureText(root) {
-            if (!root) return;
-            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-            const nodes = [];
-            let node;
-            while ((node = walker.nextNode())) {
-                const parent = node.parentElement;
-                if (!parent) continue;
-                if (/^(SCRIPT|STYLE|TEXTAREA|INPUT|SELECT|OPTION|SVG|PATH)$/i.test(parent.tagName)) continue;
-                if (!node.nodeValue || !/\S/.test(node.nodeValue)) continue;
-                nodes.push(node);
+        fixDisplayText(value) {
+            return String(value || '')
+                .replace(/ /g, ' ')
+                .replace(/\s+/g, ' ')
+                .replace(/\s*-\s*/g, ' - ')
+                .replace(/\s*:\s*/g, ': ')
+                .replace(/([A-ZÁÀÃÂÉÊÍÓÔÕÚÇ])x([A-ZÁÀÃÂÉÊÍÓÔÕÚÇ])/g, '$1 x $2')
+                .replace(/([a-záàãâéêíóôõúç])([A-ZÁÀÃÂÉÊÍÓÔÕÚÇ])/g, '$1 $2')
+                .replace(/(\d)([A-ZÁÀÃÂÉÊÍÓÔÕÚÇ])/g, '$1 $2')
+                .replace(/([A-ZÁÀÃÂÉÊÍÓÔÕÚÇ])(R\$)/g, '$1 $2')
+                .replace(/Datade/gi, 'Data de')
+                .replace(/Vendarealizada/gi, 'Venda realizada')
+                .replace(/ValorPago/gi, 'Valor Pago')
+                .replace(/N[º°O]?\s*:/gi, 'Nº:')
+                .replace(/\s+/g, ' ')
+                .trim();
+        },
+
+        parseCardData(card) {
+            const rawText = String(card?.innerText || card?.textContent || '');
+            const lines = rawText
+                .split(/\n+/)
+                .map(line => this.fixDisplayText(line))
+                .filter(Boolean)
+                .filter(line => !/^📸\s*CAPTURAR ESTA/i.test(line));
+
+            const vendorIndex = lines.findIndex(line => /^Venda realizada por\s*:/i.test(line));
+            const saleIndex = lines.findIndex(line => /^Venda realizada em\s*:/i.test(line));
+            const bilheteIndex = lines.findIndex(line => /^Bilhete\(s\)\s*:/i.test(line));
+
+            const headerLines = lines.slice(0, vendorIndex >= 0 ? vendorIndex : (saleIndex >= 0 ? saleIndex : lines.length));
+            let header = this.fixDisplayText(headerLines.join(' '));
+            const vendorLine = vendorIndex >= 0 ? lines[vendorIndex] : '';
+            const saleLine = saleIndex >= 0 ? lines[saleIndex] : '';
+
+            const statusCandidates = ['VÁLIDA', 'VALIDA', 'SUBSTITUÍDA', 'SUBSTITUIDA', 'NÃO EMBARCADA', 'NAO EMBARCADA', 'EMBARCADA'];
+            let status = statusCandidates.find(value => EH.Utils.normalize(header).includes(EH.Utils.normalize(value))) || '';
+            if (!status) {
+                status = statusCandidates.find(value => lines.some(line => EH.Utils.normalize(line).includes(EH.Utils.normalize(value)))) || '';
+            }
+            if (status) {
+                const escaped = status.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                header = header.replace(new RegExp(`\\s*-?\\s*${escaped}\\s*$`, 'i'), '').trim();
             }
 
-            nodes.forEach(textNode => {
-                const value = String(textNode.nodeValue || '');
-                const parts = value.split(/(\s+)/).filter(Boolean);
-                if (parts.length < 2) return;
+            const service = (header.match(/Servi[cç]o\s*:\s*([\w-]+)/i) || [])[1] || '';
+            const value = (header.match(/Valor\s*Pago\s*:\s*(R\$\s*[\d.,]+)/i) || [])[1] || '';
+            const seat = (header.match(/Poltrona\s*:\s*([\w-]+)/i) || [])[1] || '';
+            const ticket = (rawText.match(/N[º°O]?\s*:\s*(\d+)/i) || [])[1] || '';
 
-                const fragment = document.createDocumentFragment();
-                parts.forEach(part => {
-                    if (/^\s+$/.test(part)) {
-                        const spacer = document.createElement('span');
-                        spacer.className = 'eh-ticket-space';
-                        spacer.setAttribute('aria-hidden', 'true');
-                        spacer.textContent = '\u00A0';
-                        fragment.appendChild(spacer);
-                    } else {
-                        fragment.appendChild(document.createTextNode(part));
+            const bilhetesSource = (bilheteIndex >= 0 ? lines.slice(bilheteIndex + 1) : []).join('\n');
+            const bilhetes = [];
+            const regex = /N[º°O]?\s*:\s*(\d+)\s*-\s*Data\s*de\s*Embarque\s*:?\s*([0-9/: ]+)\s*Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*(.*?)(?=(?:\s*N[º°O]?\s*:\s*\d+)|$)/gsi;
+            let match;
+            while ((match = regex.exec(bilhetesSource))) {
+                bilhetes.push({
+                    numero: this.fixDisplayText(match[1]),
+                    data: this.fixDisplayText(match[2]),
+                    origem: this.fixDisplayText(match[3]),
+                    destino: this.fixDisplayText(match[4])
+                });
+            }
+
+            if (!bilhetes.length) {
+                const blocks = bilhetesSource.split(/\n(?=N[º°O]?\s*:)/i).map(v => v.trim()).filter(Boolean);
+                blocks.forEach(block => {
+                    const joined = this.fixDisplayText(block.replace(/\n+/g, ' '));
+                    const m = joined.match(/N[º°O]?\s*:\s*(\d+)\s*-\s*Data\s*de\s*Embarque\s*:?\s*([0-9/: ]+)\s*Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*(.*)$/i);
+                    if (m) {
+                        bilhetes.push({
+                            numero: this.fixDisplayText(m[1]),
+                            data: this.fixDisplayText(m[2]),
+                            origem: this.fixDisplayText(m[3]),
+                            destino: this.fixDisplayText(m[4])
+                        });
                     }
                 });
-                textNode.replaceWith(fragment);
+            }
+
+            return {
+                raw: lines.join('\n'),
+                header,
+                vendorLine: this.fixDisplayText(vendorLine),
+                saleLine: this.fixDisplayText(saleLine),
+                status: this.fixDisplayText(status || 'PASSAGEM'),
+                value: this.fixDisplayText(value),
+                seat: this.fixDisplayText(seat),
+                service: this.fixDisplayText(service),
+                ticket: this.fixDisplayText(ticket),
+                bilhetes
+            };
+        },
+
+        buildCaptureCard(data) {
+            const wrapper = document.createElement('div');
+            wrapper.style.width = '100%';
+            wrapper.style.boxSizing = 'border-box';
+            wrapper.style.background = '#ffffff';
+            wrapper.style.border = '1px solid #d8d8d8';
+            wrapper.style.borderRadius = '4px';
+            wrapper.style.padding = '18px 18px 14px';
+            wrapper.style.fontFamily = 'Arial, "Segoe UI", sans-serif';
+            wrapper.style.color = '#2f2f2f';
+            wrapper.style.fontSize = '14px';
+            wrapper.style.lineHeight = '1.35';
+
+            const title = document.createElement('div');
+            title.style.fontSize = '14px';
+            title.style.fontWeight = '600';
+            title.style.lineHeight = '1.35';
+            title.style.marginBottom = '10px';
+            title.style.whiteSpace = 'normal';
+            title.style.wordBreak = 'break-word';
+            title.textContent = data.header || 'Passagem emitida';
+            if (data.status) {
+                const badge = document.createElement('span');
+                const statusNorm = EH.Utils.normalize(data.status);
+                badge.textContent = statusNorm === 'VALIDA' ? 'VÁLIDA' : data.status;
+                badge.style.display = 'inline-block';
+                badge.style.marginLeft = '8px';
+                badge.style.padding = '2px 8px';
+                badge.style.borderRadius = '4px';
+                badge.style.fontSize = '12px';
+                badge.style.fontWeight = '700';
+                badge.style.color = '#ffffff';
+                badge.style.verticalAlign = 'middle';
+                badge.style.background = statusNorm.includes('VALIDA') ? '#2cad43'
+                    : statusNorm.includes('EMBARCADA') ? '#1caad2'
+                    : statusNorm.includes('NAO EMBARCADA') ? '#e5b321'
+                    : '#888888';
+                title.appendChild(badge);
+            }
+            wrapper.appendChild(title);
+
+            const vendor = document.createElement('div');
+            vendor.style.marginBottom = '8px';
+            vendor.style.whiteSpace = 'normal';
+            vendor.textContent = data.vendorLine;
+            wrapper.appendChild(vendor);
+
+            const sale = document.createElement('div');
+            sale.style.marginBottom = '14px';
+            sale.style.whiteSpace = 'normal';
+            sale.textContent = data.saleLine;
+            wrapper.appendChild(sale);
+
+            const bilLabel = document.createElement('div');
+            bilLabel.style.fontSize = '14px';
+            bilLabel.style.fontWeight = '700';
+            bilLabel.style.marginBottom = '10px';
+            bilLabel.textContent = 'Bilhete(s):';
+            wrapper.appendChild(bilLabel);
+
+            const list = document.createElement('div');
+            list.style.border = '1px solid #dddddd';
+            list.style.borderRadius = '2px';
+            list.style.overflow = 'hidden';
+            list.style.background = '#ffffff';
+
+            const bilhetes = Array.isArray(data.bilhetes) ? data.bilhetes : [];
+            bilhetes.forEach((bilhete, index) => {
+                const item = document.createElement('div');
+                item.style.padding = '14px 16px';
+                item.style.borderTop = index ? '1px solid #e2e2e2' : '0';
+                item.style.whiteSpace = 'normal';
+                item.style.wordBreak = 'break-word';
+                item.style.lineHeight = '1.42';
+
+                const line1 = document.createElement('div');
+                line1.style.marginBottom = '4px';
+                line1.textContent = `Nº: ${bilhete.numero} - Data de Embarque:`;
+                const line2 = document.createElement('div');
+                line2.style.marginBottom = '4px';
+                line2.textContent = bilhete.data;
+                const line3 = document.createElement('div');
+                line3.textContent = `Origem: ${bilhete.origem} - Destino: ${bilhete.destino}`;
+                item.append(line1, line2, line3);
+                list.appendChild(item);
             });
+
+            if (!bilhetes.length) {
+                const fallback = document.createElement('div');
+                fallback.style.padding = '14px 16px';
+                fallback.textContent = 'Não foi possível identificar os bilhetes nesta captura.';
+                list.appendChild(fallback);
+            }
+
+            wrapper.appendChild(list);
+            return wrapper;
         },
 
         prepareCapture(card) {
@@ -1770,106 +1927,22 @@
                 throw new Error('A passagem selecionada não está mais disponível na tela.');
             }
 
-            const summary = this.summary(card);
+            const parsed = this.parseCardData(card);
             const { shell, stage } = EH.Capture.createShell();
             const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
             stage.classList.add('eh-ticket-capture-stage');
             stage.style.width = `${width}px`;
             stage.style.maxWidth = `${width}px`;
             stage.style.minWidth = `${width}px`;
+            stage.style.padding = '0';
+            stage.style.background = '#ffffff';
 
-            const clone = card.cloneNode(true);
-            clone.querySelectorAll('.eh-ticket-pick-btn').forEach(button => button.remove());
-            clone.querySelectorAll('.acoes').forEach(element => element.remove());
-            clone.querySelectorAll('button, [role="button"]').forEach(element => element.remove());
-            clone.classList.remove('eh-ticket-choice');
-            clone.style.position = 'static';
-            clone.style.width = '100%';
-            clone.style.maxWidth = '100%';
-            clone.style.minWidth = '0';
-            clone.style.margin = '0';
-            clone.style.padding = '0';
-            clone.style.transform = 'none';
-            clone.style.border = '1px solid #d8d8d8';
-            clone.style.borderRadius = '2px';
-            clone.style.boxShadow = 'none';
-            clone.style.background = '#fff';
-            clone.style.overflow = 'hidden';
-            clone.style.fontFamily = 'Arial, "Segoe UI", sans-serif';
-            clone.style.fontSize = '16px';
-            clone.style.lineHeight = '1.34';
-
-            clone.querySelectorAll('.row').forEach(element => {
-                element.style.marginLeft = '0';
-                element.style.marginRight = '0';
-                element.style.width = '100%';
-            });
-            clone.querySelectorAll('[class*="col-"]').forEach(element => {
-                element.style.width = '100%';
-                element.style.maxWidth = '100%';
-                element.style.flex = '0 0 100%';
-                element.style.paddingLeft = '0';
-                element.style.paddingRight = '0';
-            });
-
-            const bodies = clone.querySelectorAll('.body, .card-body');
-            if (bodies.length) {
-                bodies.forEach(element => {
-                    element.style.padding = '20px 22px';
-                    element.style.margin = '0';
-                    element.style.fontSize = '16px';
-                    element.style.lineHeight = '1.34';
-                });
-            } else {
-                clone.style.padding = '20px 22px';
-            }
-
-            clone.querySelectorAll('.dados-passagem').forEach(element => {
-                element.style.display = 'block';
-                element.style.width = '100%';
-                element.style.margin = '0 0 16px';
-                element.style.fontSize = '16px';
-                element.style.lineHeight = '1.34';
-                element.style.whiteSpace = 'normal';
-                element.style.overflowWrap = 'break-word';
-                element.style.wordBreak = 'normal';
-            });
-
-            clone.querySelectorAll('.card').forEach(element => {
-                if (element === clone) return;
-                element.style.margin = '0';
-                element.style.border = '1px solid #dddddd';
-                element.style.borderRadius = '2px';
-                element.style.boxShadow = 'none';
-                element.style.background = '#fff';
-            });
-
-            clone.querySelectorAll('table').forEach(element => {
-                element.style.width = '100%';
-                element.style.tableLayout = 'auto';
-                element.style.borderCollapse = 'collapse';
-            });
-            clone.querySelectorAll('td, th').forEach(element => {
-                element.style.padding = '16px 22px';
-                element.style.fontSize = '16px';
-                element.style.lineHeight = '1.45';
-                element.style.whiteSpace = 'normal';
-                element.style.wordBreak = 'normal';
-                element.style.overflowWrap = 'break-word';
-            });
-            clone.querySelectorAll('img').forEach(element => {
-                element.style.maxWidth = '100%';
-                element.style.height = 'auto';
-            });
-
-            // Preserva visualmente os espaços que o html2canvas costuma comprimir.
-            this.stabilizeCaptureText(clone);
-
-            stage.appendChild(clone);
-            const filename = `bilhete-${summary.ticket || Date.now()}.png`;
-            const text = summary.raw.replace(/\s*📸\s*CAPTURAR ESTA\s*\d*/gi, '').trim();
+            stage.appendChild(this.buildCaptureCard(parsed));
+            const filename = `bilhete-${parsed.ticket || Date.now()}.png`;
+            const text = parsed.raw.trim();
             return { shell, stage, filename, text, width };
         }
+
 
     };
 
@@ -2745,7 +2818,7 @@
                 const captureHeight = Math.max(stage.scrollHeight, stage.offsetHeight, 1);
                 // O comprovante deve manter proporção real de tela de celular.
                 // Escala 1 evita que o texto fique artificialmente ampliado ou comprimido.
-                const safeScale = 1;
+                const safeScale = Math.max(1, Math.min(2, Math.sqrt(EH.Config.MAX_CAPTURE_PIXELS / (captureWidth * captureHeight))));
 
                 const canvas = await library(stage, {
                     backgroundColor: '#ffffff',
