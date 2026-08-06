@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.14.0
+// @version      5.15.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -28,7 +28,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.14.0',
+        VERSION: '5.15.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -1100,17 +1100,38 @@
 
                 .eh-ticket-capture-stage {
                     min-width: 0 !important;
-                    padding: 10px !important;
+                    padding: 0 !important;
                     border-radius: 0 !important;
                     background: #fff !important;
                     box-shadow: none !important;
+                    color: #242424 !important;
                     font-family: Arial, "Segoe UI", sans-serif !important;
+                    font-size: 16px !important;
+                    line-height: 1.34 !important;
+                    letter-spacing: 0 !important;
+                    word-spacing: 0 !important;
+                    text-rendering: geometricPrecision;
+                    font-kerning: none;
+                    font-feature-settings: "liga" 0, "kern" 0;
                 }
 
                 .eh-ticket-capture-stage *,
                 .eh-ticket-capture-stage *::before,
                 .eh-ticket-capture-stage *::after {
                     box-sizing: border-box !important;
+                    letter-spacing: 0 !important;
+                    word-spacing: 0 !important;
+                    font-kerning: none !important;
+                    font-feature-settings: "liga" 0, "kern" 0 !important;
+                }
+
+                .eh-ticket-capture-stage .eh-ticket-space {
+                    display: inline-block !important;
+                    width: .28em !important;
+                    min-width: .28em !important;
+                    height: 1px !important;
+                    overflow: hidden !important;
+                    vertical-align: baseline !important;
                 }
 
                 @media (max-width: 700px) {
@@ -1710,6 +1731,40 @@
             );
         },
 
+        stabilizeCaptureText(root) {
+            if (!root) return;
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const nodes = [];
+            let node;
+            while ((node = walker.nextNode())) {
+                const parent = node.parentElement;
+                if (!parent) continue;
+                if (/^(SCRIPT|STYLE|TEXTAREA|INPUT|SELECT|OPTION|SVG|PATH)$/i.test(parent.tagName)) continue;
+                if (!node.nodeValue || !/\S/.test(node.nodeValue)) continue;
+                nodes.push(node);
+            }
+
+            nodes.forEach(textNode => {
+                const value = String(textNode.nodeValue || '');
+                const parts = value.split(/(\s+)/).filter(Boolean);
+                if (parts.length < 2) return;
+
+                const fragment = document.createDocumentFragment();
+                parts.forEach(part => {
+                    if (/^\s+$/.test(part)) {
+                        const spacer = document.createElement('span');
+                        spacer.className = 'eh-ticket-space';
+                        spacer.setAttribute('aria-hidden', 'true');
+                        spacer.textContent = '\u00A0';
+                        fragment.appendChild(spacer);
+                    } else {
+                        fragment.appendChild(document.createTextNode(part));
+                    }
+                });
+                textNode.replaceWith(fragment);
+            });
+        },
+
         prepareCapture(card) {
             if (!card || !document.contains(card)) {
                 throw new Error('A passagem selecionada não está mais disponível na tela.');
@@ -1721,19 +1776,33 @@
             stage.classList.add('eh-ticket-capture-stage');
             stage.style.width = `${width}px`;
             stage.style.maxWidth = `${width}px`;
+            stage.style.minWidth = `${width}px`;
 
             const clone = card.cloneNode(true);
             clone.querySelectorAll('.eh-ticket-pick-btn').forEach(button => button.remove());
+            clone.querySelectorAll('.acoes').forEach(element => element.remove());
+            clone.querySelectorAll('button, [role="button"]').forEach(element => element.remove());
             clone.classList.remove('eh-ticket-choice');
             clone.style.position = 'static';
             clone.style.width = '100%';
             clone.style.maxWidth = '100%';
+            clone.style.minWidth = '0';
             clone.style.margin = '0';
+            clone.style.padding = '0';
             clone.style.transform = 'none';
+            clone.style.border = '1px solid #d8d8d8';
+            clone.style.borderRadius = '2px';
+            clone.style.boxShadow = 'none';
+            clone.style.background = '#fff';
+            clone.style.overflow = 'hidden';
+            clone.style.fontFamily = 'Arial, "Segoe UI", sans-serif';
+            clone.style.fontSize = '16px';
+            clone.style.lineHeight = '1.34';
 
             clone.querySelectorAll('.row').forEach(element => {
                 element.style.marginLeft = '0';
                 element.style.marginRight = '0';
+                element.style.width = '100%';
             });
             clone.querySelectorAll('[class*="col-"]').forEach(element => {
                 element.style.width = '100%';
@@ -1742,33 +1811,66 @@
                 element.style.paddingLeft = '0';
                 element.style.paddingRight = '0';
             });
+
+            const bodies = clone.querySelectorAll('.body, .card-body');
+            if (bodies.length) {
+                bodies.forEach(element => {
+                    element.style.padding = '20px 22px';
+                    element.style.margin = '0';
+                    element.style.fontSize = '16px';
+                    element.style.lineHeight = '1.34';
+                });
+            } else {
+                clone.style.padding = '20px 22px';
+            }
+
             clone.querySelectorAll('.dados-passagem').forEach(element => {
-                element.style.display = 'flex';
-                element.style.flexDirection = 'column';
-                element.style.alignItems = 'stretch';
-                element.style.gap = '8px';
+                element.style.display = 'block';
+                element.style.width = '100%';
+                element.style.margin = '0 0 16px';
+                element.style.fontSize = '16px';
+                element.style.lineHeight = '1.34';
+                element.style.whiteSpace = 'normal';
+                element.style.overflowWrap = 'break-word';
+                element.style.wordBreak = 'normal';
             });
-            clone.querySelectorAll('.acoes').forEach(element => {
-                element.style.marginLeft = '0';
-                element.style.marginTop = '10px';
-                element.style.display = 'flex';
-                element.style.flexWrap = 'wrap';
-                element.style.gap = '5px';
+
+            clone.querySelectorAll('.card').forEach(element => {
+                if (element === clone) return;
+                element.style.margin = '0';
+                element.style.border = '1px solid #dddddd';
+                element.style.borderRadius = '2px';
+                element.style.boxShadow = 'none';
+                element.style.background = '#fff';
             });
+
             clone.querySelectorAll('table').forEach(element => {
                 element.style.width = '100%';
-                element.style.tableLayout = 'fixed';
+                element.style.tableLayout = 'auto';
+                element.style.borderCollapse = 'collapse';
+            });
+            clone.querySelectorAll('td, th').forEach(element => {
+                element.style.padding = '16px 22px';
+                element.style.fontSize = '16px';
+                element.style.lineHeight = '1.45';
+                element.style.whiteSpace = 'normal';
+                element.style.wordBreak = 'normal';
+                element.style.overflowWrap = 'break-word';
             });
             clone.querySelectorAll('img').forEach(element => {
                 element.style.maxWidth = '100%';
                 element.style.height = 'auto';
             });
 
+            // Preserva visualmente os espaços que o html2canvas costuma comprimir.
+            this.stabilizeCaptureText(clone);
+
             stage.appendChild(clone);
             const filename = `bilhete-${summary.ticket || Date.now()}.png`;
             const text = summary.raw.replace(/\s*📸\s*CAPTURAR ESTA\s*\d*/gi, '').trim();
             return { shell, stage, filename, text, width };
         }
+
     };
 
     // ============================================================
@@ -2641,13 +2743,9 @@
 
                 const captureWidth = Math.max(stage.scrollWidth, stage.offsetWidth, width || 430, 1);
                 const captureHeight = Math.max(stage.scrollHeight, stage.offsetHeight, 1);
-                const safeScale = Math.max(
-                    1,
-                    Math.min(
-                        EH.Config.CAPTURE_SCALE,
-                        Math.sqrt(EH.Config.MAX_CAPTURE_PIXELS / (captureWidth * captureHeight))
-                    )
-                );
+                // O comprovante deve manter proporção real de tela de celular.
+                // Escala 1 evita que o texto fique artificialmente ampliado ou comprimido.
+                const safeScale = 1;
 
                 const canvas = await library(stage, {
                     backgroundColor: '#ffffff',
@@ -2659,8 +2757,8 @@
                     removeContainer: true,
                     scrollX: 0,
                     scrollY: 0,
-                    windowWidth: captureWidth + 40,
-                    windowHeight: Math.max(780, captureHeight + 60),
+                    windowWidth: captureWidth,
+                    windowHeight: Math.max(680, captureHeight + 20),
                     onclone(clonedDocument) {
                         clonedDocument.querySelector('#eh-root')?.remove();
                         clonedDocument.querySelector('#eh-toast-area')?.remove();
