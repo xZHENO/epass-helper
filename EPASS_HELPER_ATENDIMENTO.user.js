@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.13.0
+// @version      5.14.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -28,11 +28,12 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.13.0',
+        VERSION: '5.14.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
+        TICKET_CAPTURE_WIDTH: 430,
         MAX_CAPTURE_PIXELS: 26000000,
         TAXAS_ORIGEM: {
             IPORA: 3.83,
@@ -98,6 +99,13 @@
         VALOR_PARCIAL: [
             '.valor-parcial h3',
             '.valor_parcial h3'
+        ],
+        PASSAGENS_ROOT: [
+            'app-passagens'
+        ],
+        PASSAGENS_CPF_INPUT: [
+            'input[formcontrolname="cpf_passageiro"]',
+            'input[placeholder*="CPF DO PASSAGEIRO"]'
         ]
     };
 
@@ -158,6 +166,9 @@
             EH.Config.CAPTURE_SCALE = Number(
                 this.get('captureScale', EH.Config.CAPTURE_SCALE)
             ) || 2;
+            EH.Config.TICKET_CAPTURE_WIDTH = Math.min(520, Math.max(360, Number(
+                this.get('ticketCaptureWidth', EH.Config.TICKET_CAPTURE_WIDTH)
+            ) || 430));
         }
     };
 
@@ -1059,6 +1070,49 @@
                     gap: 8px 12px;
                 }
 
+                .eh-ticket-choice {
+                    position: relative !important;
+                    outline: 3px solid rgba(61, 139, 253, .86) !important;
+                    outline-offset: -3px;
+                    box-shadow: 0 0 0 6px rgba(61, 139, 253, .12) !important;
+                }
+
+                .eh-ticket-pick-btn {
+                    position: absolute;
+                    z-index: 2147483200;
+                    top: 10px;
+                    right: 10px;
+                    min-height: 36px;
+                    padding: 8px 12px;
+                    border: 1px solid #1f66c2;
+                    border-radius: 9px;
+                    background: #2878df;
+                    color: #fff;
+                    box-shadow: 0 8px 24px rgba(21, 62, 117, .28);
+                    cursor: pointer;
+                    font: 800 11px Arial, sans-serif;
+                    letter-spacing: .2px;
+                }
+
+                .eh-ticket-pick-btn:hover {
+                    background: #1f69c9;
+                }
+
+                .eh-ticket-capture-stage {
+                    min-width: 0 !important;
+                    padding: 10px !important;
+                    border-radius: 0 !important;
+                    background: #fff !important;
+                    box-shadow: none !important;
+                    font-family: Arial, "Segoe UI", sans-serif !important;
+                }
+
+                .eh-ticket-capture-stage *,
+                .eh-ticket-capture-stage *::before,
+                .eh-ticket-capture-stage *::after {
+                    box-sizing: border-box !important;
+                }
+
                 @media (max-width: 700px) {
                     #eh-root { width: 172px; }
                     .eh-settings-grid { grid-template-columns: 1fr; }
@@ -1114,6 +1168,7 @@
     EH.Pages = {
         current: 'desconhecida',
         detect() {
+            if (EH.Tickets?.isPassagensPage()) return 'passagens';
             if (EH.Utils.first(EH.Selectors.TABLE_HORARIOS)) return 'pesquisa';
             if (EH.Utils.first(EH.Selectors.MAPA_POLTRONAS) || EH.Utils.first(EH.Selectors.DADOS_RESERVA)) {
                 return 'reserva';
@@ -1506,6 +1561,213 @@
                     ? 'O navegador bloqueou a cópia. Use “Baixar PNG” ou clique com o botão direito na imagem.'
                     : 'O E-Pass está aberto em HTTP. Use “Baixar PNG” ou tente abrir o sistema em HTTPS.'
             );
+        }
+    };
+
+    // ============================================================
+    // PASSAGENS EMITIDAS — SELEÇÃO E CAPTURA DO CARTÃO ORIGINAL
+    // ============================================================
+    EH.Tickets = {
+        active: false,
+        cards: [],
+
+        isPassagensPage() {
+            return location.pathname.includes('/vendas/passagens') || Boolean(
+                EH.Utils.first(EH.Selectors.PASSAGENS_ROOT) &&
+                EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT)
+            );
+        },
+
+        countTicketLabels(element) {
+            const text = EH.Utils.normalize(element?.innerText || element?.textContent || '');
+            return (text.match(/BILHETE\(S\)\s*:/g) || []).length;
+        },
+
+        qualifiesAsTicketCard(element) {
+            if (!element || element === document.body || element === document.documentElement) return false;
+            const text = EH.Utils.normalize(element.innerText || element.textContent || '');
+            if (!text.includes('BILHETE(S):')) return false;
+            if (!text.includes('VALOR PAGO')) return false;
+            if (!text.includes('VENDA REALIZADA')) return false;
+            if (!/N[º°O]?\s*:\s*\d+/i.test(element.innerText || element.textContent || '')) return false;
+            return this.countTicketLabels(element) === 1;
+        },
+
+        findByDadosPassagem(root) {
+            return EH.Utils.all('.dados-passagem', root)
+                .map(element => element.closest('.card') || element.parentElement)
+                .filter(element => this.qualifiesAsTicketCard(element));
+        },
+
+        findByTextMarkers(root) {
+            const results = [];
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            let node;
+            while ((node = walker.nextNode())) {
+                if (!EH.Utils.normalize(node.nodeValue).includes('BILHETE(S):')) continue;
+                let current = node.parentElement;
+                while (current && current !== root.parentElement) {
+                    if (this.qualifiesAsTicketCard(current)) {
+                        results.push(current);
+                        break;
+                    }
+                    current = current.parentElement;
+                }
+            }
+            return results;
+        },
+
+        findCards() {
+            const root = EH.Utils.first(EH.Selectors.PASSAGENS_ROOT) || document.body;
+            const candidates = [
+                ...this.findByDadosPassagem(root),
+                ...this.findByTextMarkers(root)
+            ];
+            const unique = [];
+            const seen = new Set();
+            candidates.forEach(card => {
+                if (!card || seen.has(card)) return;
+                seen.add(card);
+                unique.push(card);
+            });
+            unique.sort((a, b) => {
+                if (a === b) return 0;
+                const position = a.compareDocumentPosition(b);
+                return position & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+            });
+            return unique;
+        },
+
+        summary(card) {
+            const raw = EH.Utils.clean(card?.innerText || card?.textContent || '');
+            const normalized = EH.Utils.normalize(raw);
+            const status = ['VALIDA', 'SUBSTITUIDA', 'NAO EMBARCADA', 'EMBARCADA']
+                .find(value => normalized.includes(value)) || 'PASSAGEM';
+            const value = raw.match(/Valor\s*Pago\s*:\s*(R\$\s*[\d.,]+)/i)?.[1] || '';
+            const seat = raw.match(/Poltrona\s*:\s*([\w-]+)/i)?.[1] || '';
+            const service = raw.match(/Servi[cç]o\s*:\s*([\w-]+)/i)?.[1] || '';
+            const ticket = raw.match(/N[º°O]?\s*:\s*(\d+)/i)?.[1] || '';
+            return { raw, status, value, seat, service, ticket };
+        },
+
+        clearSelection() {
+            this.active = false;
+            document.querySelectorAll('.eh-ticket-pick-btn').forEach(button => button.remove());
+            document.querySelectorAll('.eh-ticket-choice').forEach(card => {
+                card.classList.remove('eh-ticket-choice');
+                if (card.dataset.ehTicketOldPosition !== undefined) {
+                    card.style.position = card.dataset.ehTicketOldPosition;
+                    delete card.dataset.ehTicketOldPosition;
+                }
+            });
+            this.cards = [];
+        },
+
+        activateSelection() {
+            if (this.active) {
+                this.clearSelection();
+                EH.Toast.info('Seleção de passagem cancelada.');
+                return;
+            }
+
+            const cards = this.findCards();
+            if (!cards.length) {
+                EH.Toast.warning('Digite o CPF, faça a busca e aguarde aparecerem as passagens.');
+                return;
+            }
+
+            this.clearSelection();
+            this.active = true;
+            this.cards = cards;
+
+            cards.forEach((card, index) => {
+                const computed = getComputedStyle(card).position;
+                card.dataset.ehTicketOldPosition = card.style.position || '';
+                if (computed === 'static') card.style.position = 'relative';
+                card.classList.add('eh-ticket-choice');
+
+                const summary = this.summary(card);
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'eh-ticket-pick-btn';
+                button.title = [summary.status, summary.value, summary.seat ? `Poltrona ${summary.seat}` : '']
+                    .filter(Boolean).join(' • ');
+                button.textContent = `📸 CAPTURAR ESTA ${index + 1}`;
+                button.addEventListener('click', event => {
+                    event.preventDefault();
+                    event.stopPropagation();
+                    EH.UI.captureTicketCard(card);
+                });
+                card.appendChild(button);
+            });
+
+            cards[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+            EH.Toast.info(
+                cards.length === 1
+                    ? 'Uma passagem encontrada. Clique em “CAPTURAR ESTA”.'
+                    : `${cards.length} passagens encontradas. Clique em “CAPTURAR ESTA” na passagem correta.`,
+                6000
+            );
+        },
+
+        prepareCapture(card) {
+            if (!card || !document.contains(card)) {
+                throw new Error('A passagem selecionada não está mais disponível na tela.');
+            }
+
+            const summary = this.summary(card);
+            const { shell, stage } = EH.Capture.createShell();
+            const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
+            stage.classList.add('eh-ticket-capture-stage');
+            stage.style.width = `${width}px`;
+            stage.style.maxWidth = `${width}px`;
+
+            const clone = card.cloneNode(true);
+            clone.querySelectorAll('.eh-ticket-pick-btn').forEach(button => button.remove());
+            clone.classList.remove('eh-ticket-choice');
+            clone.style.position = 'static';
+            clone.style.width = '100%';
+            clone.style.maxWidth = '100%';
+            clone.style.margin = '0';
+            clone.style.transform = 'none';
+
+            clone.querySelectorAll('.row').forEach(element => {
+                element.style.marginLeft = '0';
+                element.style.marginRight = '0';
+            });
+            clone.querySelectorAll('[class*="col-"]').forEach(element => {
+                element.style.width = '100%';
+                element.style.maxWidth = '100%';
+                element.style.flex = '0 0 100%';
+                element.style.paddingLeft = '0';
+                element.style.paddingRight = '0';
+            });
+            clone.querySelectorAll('.dados-passagem').forEach(element => {
+                element.style.display = 'flex';
+                element.style.flexDirection = 'column';
+                element.style.alignItems = 'stretch';
+                element.style.gap = '8px';
+            });
+            clone.querySelectorAll('.acoes').forEach(element => {
+                element.style.marginLeft = '0';
+                element.style.marginTop = '10px';
+                element.style.display = 'flex';
+                element.style.flexWrap = 'wrap';
+                element.style.gap = '5px';
+            });
+            clone.querySelectorAll('table').forEach(element => {
+                element.style.width = '100%';
+                element.style.tableLayout = 'fixed';
+            });
+            clone.querySelectorAll('img').forEach(element => {
+                element.style.maxWidth = '100%';
+                element.style.height = 'auto';
+            });
+
+            stage.appendChild(clone);
+            const filename = `bilhete-${summary.ticket || Date.now()}.png`;
+            const text = summary.raw.replace(/\s*📸\s*CAPTURAR ESTA\s*\d*/gi, '').trim();
+            return { shell, stage, filename, text, width };
         }
     };
 
@@ -2369,6 +2631,53 @@
             }
         },
 
+        async renderTicket(prepared) {
+            const library = this.getLibrary();
+            const { shell, stage, width } = prepared;
+            try {
+                if (document.fonts?.ready) await document.fonts.ready;
+                await EH.Utils.waitForImages(stage);
+                await EH.Utils.sleep(220);
+
+                const captureWidth = Math.max(stage.scrollWidth, stage.offsetWidth, width || 430, 1);
+                const captureHeight = Math.max(stage.scrollHeight, stage.offsetHeight, 1);
+                const safeScale = Math.max(
+                    1,
+                    Math.min(
+                        EH.Config.CAPTURE_SCALE,
+                        Math.sqrt(EH.Config.MAX_CAPTURE_PIXELS / (captureWidth * captureHeight))
+                    )
+                );
+
+                const canvas = await library(stage, {
+                    backgroundColor: '#ffffff',
+                    scale: safeScale,
+                    useCORS: true,
+                    allowTaint: false,
+                    logging: EH.Config.DEBUG,
+                    imageTimeout: 15000,
+                    removeContainer: true,
+                    scrollX: 0,
+                    scrollY: 0,
+                    windowWidth: captureWidth + 40,
+                    windowHeight: Math.max(780, captureHeight + 60),
+                    onclone(clonedDocument) {
+                        clonedDocument.querySelector('#eh-root')?.remove();
+                        clonedDocument.querySelector('#eh-toast-area')?.remove();
+                        clonedDocument.querySelectorAll('.eh-capture-message, .eh-ticket-pick-btn')
+                            .forEach(element => element.remove());
+                    }
+                });
+
+                if (!canvas.width || !canvas.height) {
+                    throw new Error('A captura da passagem foi criada sem largura ou altura.');
+                }
+                return canvas;
+            } finally {
+                this.destroyShell(shell);
+            }
+        },
+
         start(page, data) {
             if (page === 'pesquisa') {
                 const route = [data.origem, data.destino].filter(Boolean).join(' → ') || 'horarios';
@@ -2503,12 +2812,14 @@
 
             const horarios = this.createButton('🗓️', 'HORÁRIOS', 'eh-primary', () => this.captureAction('pesquisa'));
             const reserva = this.createButton('💺', 'RESERVA', 'eh-success', () => this.captureAction('reserva'));
+            const bilhete = this.createButton('🎫', 'BILHETE', 'eh-primary', () => EH.Tickets.activateSelection());
             const copiar = this.createButton('📋', 'COPIAR TEXTO', '', () => this.copyCurrentText());
 
             horarios.id = 'eh-btn-horarios';
             reserva.id = 'eh-btn-reserva';
+            bilhete.id = 'eh-btn-bilhete';
             copiar.id = 'eh-btn-copiar';
-            actions.append(horarios, reserva, copiar);
+            actions.append(horarios, reserva, bilhete, copiar);
 
             const status = document.createElement('div');
             status.className = 'eh-status';
@@ -2527,7 +2838,7 @@
             this.body = body;
             this.statusText = statusText;
             this.statusDot = dot;
-            this.buttons = { horarios, reserva, copiar };
+            this.buttons = { horarios, reserva, bilhete, copiar };
 
             toggle.addEventListener('click', event => {
                 event.stopPropagation();
@@ -2608,17 +2919,21 @@
             if (!this.root) return;
             const isPesquisa = page === 'pesquisa';
             const isReserva = page === 'reserva';
+            const isPassagens = page === 'passagens';
 
             this.buttons.horarios.disabled = !isPesquisa || this.busy;
             this.buttons.reserva.disabled = !isReserva || this.busy;
+            this.buttons.bilhete.disabled = !isPassagens || this.busy;
             this.buttons.copiar.disabled = (!isPesquisa && !isReserva) || this.busy;
 
-            this.statusDot.classList.toggle('active', isPesquisa || isReserva);
+            this.statusDot.classList.toggle('active', isPesquisa || isReserva || isPassagens);
             this.statusText.textContent = isPesquisa
                 ? 'Tela de horários'
                 : isReserva
                     ? 'Mapa de poltronas'
-                    : 'Aguardando pesquisa';
+                    : isPassagens
+                        ? 'Pesquisa de passagens'
+                        : 'Aguardando pesquisa';
         },
 
         setBusy(value, message) {
@@ -2650,6 +2965,43 @@
             } catch (error) {
                 EH.Logger.error(error);
                 EH.Toast.error(error.message || 'Não foi possível copiar o texto.');
+            } finally {
+                this.setBusy(false);
+            }
+        },
+
+        async captureTicketCard(card) {
+            let prepared;
+            try {
+                this.setBusy(true, 'Capturando passagem…');
+                prepared = EH.Tickets.prepareCapture(card);
+                EH.Tickets.clearSelection();
+
+                const canvasPromise = EH.Capture.renderTicket(prepared);
+                const blobPromise = canvasPromise.then(canvas => EH.Clipboard.canvasToBlob(canvas));
+                const autoCopyPromise = EH.Clipboard.tryAutoCopyImage(blobPromise);
+                const [canvas, autoCopy] = await Promise.all([canvasPromise, autoCopyPromise]);
+                const blob = await blobPromise;
+                const dataUrl = canvas.toDataURL('image/png', 1);
+
+                this.showPreview({
+                    blob,
+                    dataUrl,
+                    text: prepared.text,
+                    filename: prepared.filename,
+                    copied: autoCopy.copied,
+                    reason: autoCopy.reason || ''
+                });
+
+                if (autoCopy.copied) {
+                    EH.Toast.success('Passagem copiada. Cole no WhatsApp com Ctrl + V.');
+                } else {
+                    EH.Toast.warning('Passagem capturada. Use “Copiar imagem” na prévia.', 4600);
+                }
+            } catch (error) {
+                if (prepared?.shell) EH.Capture.destroyShell(prepared.shell);
+                EH.Logger.error('Falha na captura da passagem:', error);
+                EH.Toast.error(error.message || 'Não foi possível capturar a passagem.', 5200);
             } finally {
                 this.setBusy(false);
             }
@@ -2866,7 +3218,19 @@
             scaleInput.value = String(EH.Config.CAPTURE_SCALE);
             scaleField.append(scaleLabel, scaleInput);
 
-            grid.append(feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField);
+            const ticketWidthField = document.createElement('div');
+            ticketWidthField.className = 'eh-field';
+            const ticketWidthLabel = document.createElement('label');
+            ticketWidthLabel.textContent = 'Largura do print da passagem (360 a 520 px)';
+            const ticketWidthInput = document.createElement('input');
+            ticketWidthInput.type = 'number';
+            ticketWidthInput.min = '360';
+            ticketWidthInput.max = '520';
+            ticketWidthInput.step = '10';
+            ticketWidthInput.value = String(EH.Config.TICKET_CAPTURE_WIDTH);
+            ticketWidthField.append(ticketWidthLabel, ticketWidthInput);
+
+            grid.append(feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, ticketWidthField);
 
             const checkWrap = document.createElement('label');
             checkWrap.className = 'eh-check';
@@ -2902,19 +3266,23 @@
                     'SAO LUIS DE MONTES BELOS': Math.max(0, Number(taxaFields['SAO LUIS DE MONTES BELOS'].value) || 0)
                 };
                 const scale = Math.min(3, Math.max(1, Number(scaleInput.value) || 2));
+                const ticketWidth = Math.min(520, Math.max(360, Number(ticketWidthInput.value) || 430));
                 EH.Config.TAXAS_ORIGEM = taxas;
                 EH.Config.CAPTURE_SCALE = scale;
+                EH.Config.TICKET_CAPTURE_WIDTH = ticketWidth;
                 EH.Config.APLICAR_TAXAS_ORIGEM = check.checked;
                 EH.Storage.set('taxasOrigem', taxas);
                 EH.Storage.set('taxaIpora', taxas.IPORA);
                 EH.Storage.set('captureScale', scale);
+                EH.Storage.set('ticketCaptureWidth', ticketWidth);
                 EH.Storage.set('aplicarTaxasOrigem', check.checked);
                 EH.Storage.set('aplicarTaxaIpora', check.checked);
 
                 const savedScale = Number(EH.Storage.get('captureScale', 0));
+                const savedTicketWidth = Number(EH.Storage.get('ticketCaptureWidth', 0));
                 const savedTaxes = EH.Storage.get('taxasOrigem', null);
                 const savedAutoTax = Boolean(EH.Storage.get('aplicarTaxasOrigem', false));
-                const savedCorrectly = savedTaxes && savedScale === scale && savedAutoTax === check.checked;
+                const savedCorrectly = savedTaxes && savedScale === scale && savedTicketWidth === ticketWidth && savedAutoTax === check.checked;
 
                 if (!savedCorrectly) {
                     EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
@@ -2988,7 +3356,10 @@
         observer: null,
         start() {
             if (this.observer || !document.body) return;
-            const update = EH.Utils.debounce(() => EH.Pages.update(), 250);
+            const update = EH.Utils.debounce(() => {
+                const page = EH.Pages.update();
+                if (page !== 'passagens' && EH.Tickets.active) EH.Tickets.clearSelection();
+            }, 250);
             this.observer = new MutationObserver(update);
             this.observer.observe(document.body, { childList: true, subtree: true });
             window.addEventListener('popstate', update);
@@ -3011,6 +3382,12 @@
             EH.UI.init();
             EH.Observer.start();
             EH.Pages.update();
+            document.addEventListener('keydown', event => {
+                if (event.key === 'Escape' && EH.Tickets.active) {
+                    EH.Tickets.clearSelection();
+                    EH.Toast.info('Seleção de passagem cancelada.');
+                }
+            });
 
             if (EH.Config.DEBUG) window.EPassHelper = EH;
             EH.Logger.info(`EPass Helper ${EH.Config.VERSION} iniciado.`);
