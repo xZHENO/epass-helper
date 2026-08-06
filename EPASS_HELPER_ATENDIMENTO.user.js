@@ -1,11 +1,11 @@
 // ==UserScript==
-// @name         
+// @name         -
 // @namespace    https://github.com/epass-helper
 // @version      0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
-// @author       
+// @author       -
 // @match        http://www.epass.com.br/*
 // @match        https://www.epass.com.br/*
 // @match        http://epass.com.br/*
