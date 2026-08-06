@@ -1,11 +1,11 @@
 // ==UserScript==
-// @name         -
+// @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      0
+// @version      5.12.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
+// @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
-// @author       -
 // @match        http://www.epass.com.br/*
 // @match        https://www.epass.com.br/*
 // @match        http://epass.com.br/*
@@ -28,7 +28,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '0',
+        VERSION: '5.12.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -409,6 +409,10 @@
                     user-select: none;
                 }
 
+                #eh-root.eh-collapsed {
+                    width: auto;
+                }
+
                 .eh-panel {
                     overflow: hidden;
                     border: 1px solid var(--eh-border);
@@ -420,48 +424,50 @@
                 .eh-header {
                     display: flex;
                     align-items: center;
-                    gap: 8px;
-                    min-height: 42px;
-                    padding: 8px 9px 8px 11px;
+                    justify-content: flex-end;
+                    gap: 4px;
+                    min-height: 36px;
+                    padding: 4px;
                     border-bottom: 1px solid var(--eh-border);
                     cursor: grab;
                     touch-action: none;
                 }
 
+                #eh-root.eh-collapsed .eh-header {
+                    border-bottom: 0;
+                }
+
                 .eh-header:active { cursor: grabbing; }
 
                 .eh-title {
-                    min-width: 0;
-                    flex: 1;
-                    font-size: 13px;
-                    font-weight: 700;
-                    letter-spacing: .1px;
-                    white-space: nowrap;
+                    display: none !important;
                 }
 
                 .eh-version {
-                    display: block;
-                    margin-top: 1px;
-                    color: var(--eh-muted);
-                    font-size: 9px;
-                    font-weight: 500;
+                    display: none !important;
                 }
 
                 .eh-icon-btn {
-                    width: 27px;
-                    height: 27px;
+                    width: 28px;
+                    height: 28px;
+                    display: inline-flex;
+                    align-items: center;
+                    justify-content: center;
+                    padding: 0;
                     border: 0;
                     border-radius: 7px;
                     background: transparent;
                     color: var(--eh-muted);
                     cursor: pointer;
                     font-size: 14px;
+                    line-height: 1;
                 }
 
                 .eh-icon-btn:hover { background: var(--eh-bg-2); color: var(--eh-text); }
 
                 .eh-body { padding: 9px; }
                 .eh-body[hidden] { display: none !important; }
+                #eh-root.eh-collapsed .eh-panel { border-radius: 10px; }
 
                 .eh-actions {
                     display: grid;
@@ -2453,10 +2459,11 @@
             if (document.querySelector('#eh-root')) return;
 
             const savedPosition = EH.Storage.get('panelPosition', EH.Config.PANEL_POSITION);
-            const minimized = Boolean(EH.Storage.get('minimized', false));
+            const collapsed = Boolean(EH.Storage.get('collapsed', true));
 
             const root = document.createElement('div');
             root.id = 'eh-root';
+            root.classList.toggle('eh-collapsed', collapsed);
             root.style.left = `${Number(savedPosition.x) || 18}px`;
             root.style.top = `${Number(savedPosition.y) || 18}px`;
 
@@ -2465,32 +2472,31 @@
 
             const header = document.createElement('div');
             header.className = 'eh-header';
+            header.title = 'Arraste para mover';
 
-            const title = document.createElement('div');
-            title.className = 'eh-title';
-            title.innerHTML = `<span class="eh-version">versão ${EH.Config.VERSION}</span>`;
+            const toggle = document.createElement('button');
+            toggle.type = 'button';
+            toggle.className = 'eh-icon-btn';
+            toggle.title = collapsed ? 'Expandir' : 'Recolher';
+            toggle.setAttribute('aria-label', toggle.title);
+            toggle.textContent = collapsed ? '▾' : '▴';
 
             const settings = document.createElement('button');
             settings.type = 'button';
             settings.className = 'eh-icon-btn';
-            settings.title = 'Configurações e diagnóstico';
+            settings.title = 'Configurações';
+            settings.setAttribute('aria-label', settings.title);
             settings.textContent = '⚙';
             settings.addEventListener('click', event => {
                 event.stopPropagation();
                 this.showSettings();
             });
 
-            const minimize = document.createElement('button');
-            minimize.type = 'button';
-            minimize.className = 'eh-icon-btn';
-            minimize.title = 'Minimizar';
-            minimize.textContent = minimized ? '+' : '−';
-
-            header.append(title, settings, minimize);
+            header.append(toggle, settings);
 
             const body = document.createElement('div');
             body.className = 'eh-body';
-            body.hidden = minimized;
+            body.hidden = collapsed;
 
             const actions = document.createElement('div');
             actions.className = 'eh-actions';
@@ -2523,12 +2529,17 @@
             this.statusDot = dot;
             this.buttons = { horarios, reserva, copiar };
 
-            minimize.addEventListener('click', event => {
+            toggle.addEventListener('click', event => {
                 event.stopPropagation();
-                body.hidden = !body.hidden;
-                minimize.textContent = body.hidden ? '+' : '−';
-                EH.Storage.set('minimized', body.hidden);
-                this.clampPosition();
+                const isCollapsed = !body.hidden;
+                body.hidden = isCollapsed;
+                root.classList.toggle('eh-collapsed', isCollapsed);
+                toggle.textContent = isCollapsed ? '▾' : '▴';
+                toggle.title = isCollapsed ? 'Expandir' : 'Recolher';
+                toggle.setAttribute('aria-label', toggle.title);
+                EH.Storage.set('collapsed', isCollapsed);
+                EH.Storage.set('minimized', isCollapsed);
+                requestAnimationFrame(() => this.clampPosition(true));
             });
 
             this.enableDrag(header);
@@ -2870,8 +2881,8 @@
             const help = document.createElement('div');
             help.className = 'eh-help-box';
             help.textContent = window.isSecureContext
-                ? 'O sistema está em HTTPS. A cópia direta de imagens deve funcionar, desde que o navegador permita acesso à área de transferência.'
-                : 'O sistema está em HTTP. O navegador pode bloquear a cópia direta de imagens. A prévia e o botão “Baixar PNG” continuarão funcionando.';
+                ? 'As configurações, a posição e o estado recolhido ficam salvos neste navegador, mesmo depois de fechá-lo. A cópia direta de imagens depende da permissão da área de transferência.'
+                : 'As configurações, a posição e o estado recolhido ficam salvos neste navegador, mesmo depois de fechá-lo. Em HTTP, a cópia direta pode ser bloqueada; a prévia e o botão “Baixar PNG” continuam funcionando.';
 
             content.append(grid, checkWrap, help);
 
@@ -2899,7 +2910,19 @@
                 EH.Storage.set('captureScale', scale);
                 EH.Storage.set('aplicarTaxasOrigem', check.checked);
                 EH.Storage.set('aplicarTaxaIpora', check.checked);
-                EH.Toast.success('Configurações salvas.');
+
+                const savedScale = Number(EH.Storage.get('captureScale', 0));
+                const savedTaxes = EH.Storage.get('taxasOrigem', null);
+                const savedAutoTax = Boolean(EH.Storage.get('aplicarTaxasOrigem', false));
+                const savedCorrectly = savedTaxes && savedScale === scale && savedAutoTax === check.checked;
+
+                if (!savedCorrectly) {
+                    EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
+                    return;
+                }
+
+                EH.Toast.success('Configurações salvas neste navegador.');
+                close();
             });
 
             const diagnostic = document.createElement('button');
