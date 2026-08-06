@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.12.0
+// @version      5.13.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -28,7 +28,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.12.0',
+        VERSION: '5.13.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
