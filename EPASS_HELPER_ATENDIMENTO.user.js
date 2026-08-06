@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         
 // @namespace    https://github.com/epass-helper
-// @version      5.11.0
+// @version      0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -28,7 +28,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.11.0',
+        VERSION: '0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -2468,7 +2468,7 @@
 
             const title = document.createElement('div');
             title.className = 'eh-title';
-            title.innerHTML = `🚍 EPass Helper<span class="eh-version">versão ${EH.Config.VERSION}</span>`;
+            title.innerHTML = `<span class="eh-version">versão ${EH.Config.VERSION}</span>`;
 
             const settings = document.createElement('button');
             settings.type = 'button';
