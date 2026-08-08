@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.20.0
+// @version      5.21.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -29,7 +29,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.20.0',
+        VERSION: '5.21.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -41,7 +41,9 @@
         MESSAGES: {
             pesquisa: 'Escolha o horário desejado. Após isso, vou encaminhar as poltronas disponíveis.',
             reserva: 'Estas são as poltronas disponíveis. Informe o número da poltrona desejada.',
-            bilhete: 'Passagem emitida com sucesso. Confira os dados da viagem no comprovante.'
+            bilhete: 'Passagem emitida com sucesso. Confira os dados da viagem no comprovante.',
+            resumo: 'Confira os dados da sua viagem abaixo. Se estiver tudo correto, responda *SIM* para eu gerar o pagamento via PIX.',
+            pix: 'PIX gerado. Confira o valor, o vencimento e use o código copia e cola ou o QR Code para realizar o pagamento.'
         },
         TAXAS_ORIGEM: {
             IPORA: 3.83,
@@ -122,7 +124,14 @@
         PASSAGENS_CPF_INPUT: [
             'input[formcontrolname="cpf_passageiro"]',
             'input[placeholder*="CPF DO PASSAGEIRO"]'
-        ]
+        ],
+        PAGAMENTO_ROOT: ['app-pagamento'],
+        RESUMO_COMPRA: ['.resumo-reserva .card .body'],
+        PIX_MODAL: ['ngx-smart-modal[identifier="modalPixQrCode"] .nsm-dialog-open', '.modalPixQrCode.nsm-dialog-open'],
+        PIX_QR: ['ngx-smart-modal[identifier="modalPixQrCode"] .qrCodeImg', '.modalPixQrCode.nsm-dialog-open .qrCodeImg'],
+        PIX_VALOR: ['ngx-smart-modal[identifier="modalPixQrCode"] .pixValor strong', '.modalPixQrCode.nsm-dialog-open .pixValor strong'],
+        PIX_EXPIRA: ['ngx-smart-modal[identifier="modalPixQrCode"] .pixExpiraEm strong', '.modalPixQrCode.nsm-dialog-open .pixExpiraEm strong'],
+        PIX_CODIGO: ['#pixCopiaEColaContent']
     };
 
     // ============================================================
@@ -328,9 +337,48 @@
                 || Boolean(EH.Utils.first(EH.Selectors.ORIGEM_SELECT) && EH.Utils.first(EH.Selectors.DESTINO_SELECT));
         },
 
-        async apply(route) {
+        findSearchButton() {
+            const origem = EH.Utils.first(EH.Selectors.ORIGEM_SELECT);
+            const destino = EH.Utils.first(EH.Selectors.DESTINO_SELECT);
+            const form = origem?.closest('form') || destino?.closest('form') || document.querySelector('app-pesquisa form');
+            if (!form) return null;
+            return Array.from(form.querySelectorAll('button, input[type="submit"]')).find(element => {
+                if (element.disabled) return false;
+                const type = String(element.getAttribute('type') || '').toLowerCase();
+                const label = EH.Utils.normalize(element.textContent || element.value || element.title || '');
+                return type === 'submit' || /PESQUISAR|BUSCAR|CONSULTAR/.test(label);
+            }) || null;
+        },
+
+        async searchAndCapture(route) {
+            const oldTable = EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
+            const oldFingerprint = oldTable ? EH.Utils.clean(oldTable.innerText).slice(0, 1200) : '';
+            const button = this.findSearchButton();
+            if (!button) throw new Error('Não encontrei o botão Pesquisar da consulta.');
+            EH.Toast.info('Rota preenchida. Pesquisando horários…');
+            button.click();
+            await EH.Utils.sleep(700);
+            const table = await EH.Utils.waitFor(() => {
+                const current = EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
+                if (!current) return null;
+                const rows = current.querySelectorAll('tbody tr');
+                if (!rows.length) return null;
+                const fp = EH.Utils.clean(current.innerText).slice(0, 1200);
+                if (!oldFingerprint || fp !== oldFingerprint) return current;
+                return null;
+            }, 14000, 250) || EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
+            if (!table || !table.querySelectorAll('tbody tr').length) {
+                throw new Error('A pesquisa foi feita, mas não encontrei horários para capturar.');
+            }
+            EH.Workflow?.setStage('horarios');
+            await EH.Utils.sleep(350);
+            await EH.UI.captureAction('pesquisa');
+        },
+
+        async apply(route, options = {}) {
             if (!route) return;
-            EH.Storage.set('pendingRoute', route);
+            const opts = { autoSearch: false, autoCapture: false, ...options };
+            EH.Storage.set('pendingRoute', { route, options: opts });
             if (!this.isSearchPage()) {
                 location.href = `${location.origin}/epass/vendas/pesquisa`;
                 return;
@@ -341,17 +389,26 @@
             EH.Storage.remove('pendingRoute');
             EH.Toast.success(`${route.origem} → ${route.destino} preenchido.`);
             if (route.observacao) EH.Storage.set('lastRouteObservation', route.observacao);
+            EH.Workflow?.setRoute(route);
+
+            if (opts.autoSearch) {
+                await this.searchAndCapture(route);
+            }
         },
 
         async applyPending() {
             if (!this.isSearchPage()) return;
             const pending = EH.Storage.get('pendingRoute', null);
-            if (!pending?.origem || !pending?.destino) return;
+            const route = pending?.route || pending;
+            const options = pending?.options || {};
+            if (!route?.origem || !route?.destino) return;
             try {
                 await EH.Utils.sleep(450);
-                await this.apply(pending);
+                await this.apply(route, options);
             } catch (error) {
+                EH.Storage.remove('pendingRoute');
                 EH.Logger.warn('Não foi possível aplicar a rota pendente:', error);
+                EH.Toast.error(error.message || 'Não foi possível usar a rota automática.');
             }
         }
     };
@@ -623,6 +680,21 @@
                     setTimeout(finish, 4000);
                 });
             }));
+        },
+        async waitFor(predicate, timeout = 12000, interval = 180) {
+            const started = Date.now();
+            let lastError = null;
+            while (Date.now() - started < timeout) {
+                try {
+                    const value = predicate();
+                    if (value) return value;
+                } catch (error) {
+                    lastError = error;
+                }
+                await this.sleep(interval);
+            }
+            if (lastError) EH.Logger.debug('waitFor:', lastError);
+            return null;
         },
         debounce(fn, wait = 250) {
             let timer = null;
@@ -1448,10 +1520,53 @@
                 }
 
                 @media (max-width: 700px) {
-                    #eh-root { width: 172px; }
                     .eh-settings-grid { grid-template-columns: 1fr; }
                     .eh-modal-actions { flex-direction: column; }
                     .eh-modal-btn { width: 100%; }
+                }
+
+                /* Painel fixo de atendimento */
+                #eh-root {
+                    position: fixed !important;
+                    left: auto !important;
+                    right: 0 !important;
+                    top: 0 !important;
+                    width: 294px !important;
+                    height: 100vh !important;
+                    z-index: 2147483000;
+                }
+                #eh-root.eh-collapsed { width: 44px !important; }
+                #eh-root .eh-panel {
+                    height: 100%;
+                    border-radius: 0;
+                    display: flex;
+                    flex-direction: column;
+                    box-shadow: -8px 0 28px rgba(0,0,0,.20);
+                }
+                #eh-root .eh-header { cursor: default; flex: 0 0 auto; }
+                #eh-root .eh-body { flex: 1 1 auto; overflow-y: auto; min-height: 0; }
+                html.eh-dock-open body { padding-right: 294px !important; }
+                .eh-dock-title { margin: 2px 0 8px; font-size: 10px; font-weight: 900; color: #d8deea; letter-spacing:.4px; text-transform:uppercase; }
+                .eh-steps { display:grid; grid-template-columns:repeat(5,1fr); gap:4px; margin-bottom:10px; }
+                .eh-step { padding:5px 2px; border:1px solid #343946; border-radius:7px; text-align:center; color:#8f98a8; font-size:8px; line-height:1.2; }
+                .eh-step strong { display:block; font-size:11px; }
+                .eh-step.active { color:#fff; border-color:#3d8bfd; background:rgba(61,139,253,.18); }
+                .eh-dock-phone { width:100%; padding:8px 9px; border:1px solid #3b4350; border-radius:8px; background:#11141a; color:#fff; font:inherit; font-size:11px; margin-bottom:8px; }
+                .eh-quick-routes { display:grid; gap:5px; margin-bottom:10px; }
+                .eh-route-quick { width:100%; padding:7px 8px; border:1px solid #394251; border-radius:8px; background:#20252e; color:#eef2f8; cursor:pointer; font-size:10px; font-weight:750; text-align:left; }
+                .eh-route-quick:hover { border-color:#3d8bfd; background:#252c38; }
+                .eh-context-card { padding:9px; margin-bottom:9px; border:1px solid #343946; border-radius:9px; background:#11141a; color:#dce2ec; font-size:10px; line-height:1.45; }
+                .eh-context-card strong { color:#fff; }
+                .eh-context-actions { display:grid; gap:6px; margin-top:8px; }
+                .eh-context-btn { width:100%; min-height:34px; padding:7px 9px; border:1px solid #435066; border-radius:8px; background:#252b35; color:#fff; cursor:pointer; font-size:10px; font-weight:800; text-align:left; }
+                .eh-context-btn.primary { border-color:#3d8bfd; background:#263b5d; }
+                .eh-context-btn.success { border-color:#35b879; background:#173c2c; }
+                .eh-pix-mini { display:block; width:150px; max-width:100%; margin:8px auto; border:5px solid #fff; border-radius:8px; background:#fff; }
+                .eh-tools-divider { height:1px; background:#343946; margin:10px 0; }
+                @media (max-width: 1100px) {
+                    #eh-root { width: 258px !important; }
+                    html.eh-dock-open body { padding-right: 0 !important; }
+                    #eh-root.eh-collapsed { width:44px !important; }
                 }
             `);
         }
@@ -1502,6 +1617,7 @@
     EH.Pages = {
         current: 'desconhecida',
         detect() {
+            if (EH.Payment?.isPage()) return 'pagamento';
             if (EH.Tickets?.isPassagensPage()) return 'passagens';
             if (EH.Utils.first(EH.Selectors.TABLE_HORARIOS)) return 'pesquisa';
             if (EH.Utils.first(EH.Selectors.MAPA_POLTRONAS) || EH.Utils.first(EH.Selectors.DADOS_RESERVA)) {
@@ -3300,6 +3416,156 @@
     };
 
     // ============================================================
+    // FLUXO DE ATENDIMENTO + PAGAMENTO
+    // ============================================================
+    EH.Workflow = {
+        stage: EH.Storage.get('workflowStage', 'consulta'),
+        route: EH.Storage.get('workflowRoute', null),
+        setStage(stage) {
+            this.stage = stage || 'consulta';
+            EH.Storage.set('workflowStage', this.stage);
+            EH.UI?.renderAutomation?.(EH.Pages?.detect?.() || 'desconhecida');
+        },
+        setRoute(route) {
+            this.route = route || null;
+            EH.Storage.set('workflowRoute', this.route);
+            this.setStage('consulta');
+        },
+        stages: [
+            ['consulta', '1', 'Horários'],
+            ['poltronas', '2', 'Poltronas'],
+            ['confirmacao', '3', 'Confirmar'],
+            ['pix', '4', 'PIX'],
+            ['bilhete', '5', 'Bilhete']
+        ],
+        infer(page) {
+            if (page === 'pesquisa') return 'consulta';
+            if (page === 'reserva') return 'poltronas';
+            if (page === 'pagamento') return EH.Payment?.parsePix?.() ? 'pix' : 'confirmacao';
+            if (page === 'passagens') return 'bilhete';
+            return this.stage || 'consulta';
+        }
+    };
+
+    EH.Payment = {
+        lastPixCode: '',
+        clean(text) { return EH.Utils.clean(String(text || '').replace(/\u00a0/g, ' ')); },
+        isPage() {
+            return location.pathname.includes('/vendas/pagamento') || Boolean(EH.Utils.first(EH.Selectors.PAGAMENTO_ROOT));
+        },
+        parseSummary() {
+            const bodies = EH.Utils.all('.resumo-reserva .card .body');
+            if (!bodies.length) return null;
+            const cards = bodies.map(body => {
+                const badges = Array.from(body.querySelectorAll('.badge')).map(el => this.clean(el.textContent)).filter(Boolean);
+                const routeDate = this.clean(body.querySelector('.badge-primary')?.textContent || badges[0] || '');
+                const vehicle = this.clean(body.querySelector('.badge-info')?.textContent || badges[1] || '');
+                const lines = Array.from(body.querySelectorAll('.col-12')).map(el => this.clean(el.textContent)).filter(Boolean);
+                const byPrefix = prefix => lines.find(line => EH.Utils.normalize(line).startsWith(EH.Utils.normalize(prefix))) || '';
+                const valueLines = Array.from(body.querySelectorAll('.valores .col-12')).map(el => this.clean(el.textContent)).filter(Boolean);
+                const findValue = prefix => valueLines.find(line => EH.Utils.normalize(line).startsWith(EH.Utils.normalize(prefix))) || '';
+                return {
+                    routeDate,
+                    vehicle,
+                    passenger: byPrefix('PASSAGEIRO:').replace(/^PASSAGEIRO\s*:\s*/i, '').trim(),
+                    seat: this.clean(body.querySelector('.numero_poltrona')?.textContent || byPrefix('NÚMERO DA POLTRONA:')).replace(/^N[ÚU]MERO DA POLTRONA\s*:\s*/i, '').trim(),
+                    tarifa: findValue('TARIFA:'),
+                    taxa: findValue('TAXA DE EMBARQUE:'),
+                    pedagio: findValue('PEDAGIO:'),
+                    beneficio: findValue('BENEFÍCIO:') || findValue('BENEFICIO:'),
+                    credito: findValue('CRÉDITO:') || findValue('CREDITO:'),
+                    total: this.clean(body.querySelector('.valores b')?.textContent || findValue('TOTAL:'))
+                };
+            });
+            return { cards };
+        },
+        formatSummary(summary) {
+            if (!summary?.cards?.length) return '';
+            const parts = ['*CONFIRMAÇÃO DA VIAGEM*', ''];
+            summary.cards.forEach((card, index) => {
+                if (summary.cards.length > 1) parts.push(`*Passageiro ${index + 1}*`);
+                if (card.routeDate) parts.push(`🚌 ${card.routeDate}`);
+                if (card.vehicle) parts.push(`🪑 ${card.vehicle}`);
+                if (card.passenger) parts.push(`👤 Passageiro: ${card.passenger}`);
+                if (card.seat) parts.push(`💺 Poltrona: ${card.seat}`);
+                if (card.tarifa) parts.push(`💰 ${card.tarifa}`);
+                if (card.taxa) parts.push(card.taxa);
+                if (card.pedagio) parts.push(card.pedagio);
+                if (card.beneficio && !/R\$\s*0[,.]00/.test(card.beneficio)) parts.push(card.beneficio);
+                if (card.credito && !/R\$\s*0[,.]00/.test(card.credito)) parts.push(card.credito);
+                if (card.total) parts.push(`*${card.total}*`);
+                parts.push('');
+            });
+            parts.push(EH.Messages.get('resumo'));
+            return parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        },
+        parsePix() {
+            const modal = EH.Utils.first(EH.Selectors.PIX_MODAL);
+            if (!modal) return null;
+            const code = this.clean(EH.Utils.first(EH.Selectors.PIX_CODIGO, modal)?.textContent || document.querySelector('#pixCopiaEColaContent')?.textContent || '');
+            if (!code) return null;
+            const value = this.clean(EH.Utils.first(EH.Selectors.PIX_VALOR)?.textContent || modal.querySelector('.pixValor strong')?.textContent || '');
+            const expires = this.clean(EH.Utils.first(EH.Selectors.PIX_EXPIRA)?.textContent || modal.querySelector('.pixExpiraEm strong')?.textContent || '');
+            const qr = EH.Utils.first(EH.Selectors.PIX_QR)?.getAttribute('src') || modal.querySelector('.qrCodeImg')?.getAttribute('src') || '';
+            return { code, value, expires, qr };
+        },
+        formatPix(pix) {
+            if (!pix?.code) return '';
+            return [
+                '*PAGAMENTO VIA PIX*',
+                '',
+                pix.value ? `💰 Valor: ${pix.value}` : '',
+                pix.expires ? `⏳ Expira em: ${pix.expires}` : '',
+                '',
+                '🏦 Banco: Bradesco',
+                '🏢 Recebedor: EXPRESSO MAIA LTDA',
+                'CNPJ: 01.526.219/0001-91',
+                '',
+                '*PIX copia e cola:*',
+                pix.code,
+                '',
+                EH.Messages.get('pix')
+            ].filter((line, i, arr) => line !== '' || (i > 0 && arr[i - 1] !== '')).join('\n').trim();
+        },
+        findGeneratePixButton() {
+            return Array.from(document.querySelectorAll('button, .click-cartao, span.badge')).find(el => /GERAR\s+QR\s*CODE/i.test(EH.Utils.normalize(el.textContent)));
+        },
+        async clientConfirmed() {
+            const trigger = this.findGeneratePixButton();
+            if (!trigger) {
+                EH.Toast.warning('Não encontrei “Gerar QR Code”. Escolha PIX como forma de pagamento e tente novamente.');
+                return;
+            }
+            EH.Workflow.setStage('pix');
+            trigger.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+            EH.Toast.info('Gerando PIX…');
+            const pix = await EH.Utils.waitFor(() => this.parsePix(), 12000, 250);
+            if (!pix) EH.Toast.warning('O QR Code ainda não apareceu.');
+            else await this.handlePixReady(pix, true);
+        },
+        async handlePixReady(pix = this.parsePix(), force = false) {
+            if (!pix?.code) return;
+            if (!force && pix.code === this.lastPixCode) return;
+            this.lastPixCode = pix.code;
+            EH.Workflow.setStage('pix');
+            const message = this.formatPix(pix);
+            try {
+                await EH.Clipboard.copyText(message);
+                EH.Toast.success('PIX pronto: informações e código copia e cola foram copiados.');
+            } catch (error) {
+                EH.Logger.warn('Não foi possível copiar o PIX automaticamente:', error);
+            }
+            EH.Storage.set('lastPixPackage', { ...pix, message, savedAt: new Date().toISOString() });
+            EH.UI?.renderAutomation?.('pagamento');
+        },
+        openQr(pix = this.parsePix()) {
+            if (!pix?.qr) return EH.Toast.warning('QR Code não encontrado.');
+            const win = window.open(pix.qr, '_blank');
+            if (!win) EH.Toast.warning('O navegador bloqueou a abertura do QR Code.');
+        }
+    };
+
+    // ============================================================
     // INTERFACE
     // ============================================================
     EH.UI = {
@@ -3314,20 +3580,18 @@
             if (document.querySelector('#eh-root')) return;
 
             const savedPosition = EH.Storage.get('panelPosition', EH.Config.PANEL_POSITION);
-            const collapsed = Boolean(EH.Storage.get('collapsed', true));
+            const collapsed = Boolean(EH.Storage.get('collapsed', false));
 
             const root = document.createElement('div');
             root.id = 'eh-root';
             root.classList.toggle('eh-collapsed', collapsed);
-            root.style.left = `${Number(savedPosition.x) || 18}px`;
-            root.style.top = `${Number(savedPosition.y) || 18}px`;
 
             const panel = document.createElement('div');
             panel.className = 'eh-panel';
 
             const header = document.createElement('div');
             header.className = 'eh-header';
-            header.title = 'Arraste para mover';
+            header.title = 'Painel fixo de atendimento';
 
             const toggle = document.createElement('button');
             toggle.type = 'button';
@@ -3352,6 +3616,35 @@
             const body = document.createElement('div');
             body.className = 'eh-body';
             body.hidden = collapsed;
+
+            const workflowTitle = document.createElement('div');
+            workflowTitle.className = 'eh-dock-title';
+            workflowTitle.textContent = 'Fluxo do atendimento';
+
+            const steps = document.createElement('div');
+            steps.className = 'eh-steps';
+
+            const phone = document.createElement('input');
+            phone.type = 'tel';
+            phone.className = 'eh-dock-phone';
+            phone.placeholder = 'WhatsApp do cliente (DDD + número)';
+            phone.value = String(EH.Storage.get('currentPhone', '') || '');
+            phone.addEventListener('input', EH.Utils.debounce(() => EH.Storage.set('currentPhone', phone.value), 250));
+
+            const quickTitle = document.createElement('div');
+            quickTitle.className = 'eh-dock-title';
+            quickTitle.textContent = 'Rotas rápidas';
+            const quickRoutes = document.createElement('div');
+            quickRoutes.className = 'eh-quick-routes';
+
+            const context = document.createElement('div');
+            context.className = 'eh-context-card';
+
+            const divider = document.createElement('div');
+            divider.className = 'eh-tools-divider';
+            const toolsTitle = document.createElement('div');
+            toolsTitle.className = 'eh-dock-title';
+            toolsTitle.textContent = 'Ferramentas';
 
             const actions = document.createElement('div');
             actions.className = 'eh-actions';
@@ -3381,7 +3674,7 @@
             statusText.textContent = 'Aguardando tela';
             status.append(dot, statusText);
 
-            body.append(actions, status);
+            body.append(workflowTitle, steps, phone, quickTitle, quickRoutes, context, divider, toolsTitle, actions, status);
             panel.append(header, body);
             root.appendChild(panel);
             document.body.appendChild(root);
@@ -3391,6 +3684,11 @@
             this.statusText = statusText;
             this.statusDot = dot;
             this.buttons = { horarios, reserva, bilhete, rotas, historico, enviar, copiar };
+            this.steps = steps;
+            this.phoneInput = phone;
+            this.quickRoutes = quickRoutes;
+            this.contextBox = context;
+            this.renderQuickRoutes();
 
             toggle.addEventListener('click', event => {
                 event.stopPropagation();
@@ -3402,12 +3700,140 @@
                 toggle.setAttribute('aria-label', toggle.title);
                 EH.Storage.set('collapsed', isCollapsed);
                 EH.Storage.set('minimized', isCollapsed);
-                requestAnimationFrame(() => this.clampPosition(true));
+                requestAnimationFrame(() => this.applyDockLayout(!isCollapsed));
             });
 
-            this.enableDrag(header);
-            window.addEventListener('resize', EH.Utils.debounce(() => this.clampPosition(), 100));
-            this.clampPosition();
+            this.applyDockLayout(!collapsed);
+        },
+
+        applyDockLayout(open) {
+            document.documentElement.classList.toggle('eh-dock-open', Boolean(open));
+        },
+
+        renderQuickRoutes() {
+            if (!this.quickRoutes) return;
+            this.quickRoutes.innerHTML = '';
+            EH.Routes.getAll().slice(0, 6).forEach(route => {
+                const btn = document.createElement('button');
+                btn.type = 'button';
+                btn.className = 'eh-route-quick';
+                btn.textContent = `${route.origem.replace(/\s*-\s*[A-Z]{2}$/i, '')} → ${route.destino.replace(/\s*-\s*[A-Z]{2}$/i, '')}`;
+                btn.title = route.observacao || `${route.origem} → ${route.destino}`;
+                btn.addEventListener('click', async () => {
+                    if (this.busy) return;
+                    try {
+                        this.setBusy(true, 'Abrindo rota…');
+                        await EH.Routes.apply(route, { autoSearch: true, autoCapture: true });
+                    } catch (error) {
+                        EH.Logger.error(error);
+                        EH.Toast.error(error.message || 'Falha na automação da rota.');
+                    } finally {
+                        if (EH.Routes.isSearchPage()) this.setBusy(false);
+                    }
+                });
+                this.quickRoutes.appendChild(btn);
+            });
+        },
+
+        getPhone() {
+            return String(this.phoneInput?.value || EH.Storage.get('currentPhone', '') || '').replace(/\D/g, '');
+        },
+
+        openWhatsApp(message = '') {
+            let phone = this.getPhone();
+            if (phone && !phone.startsWith('55')) phone = `55${phone}`;
+            const base = phone ? `https://web.whatsapp.com/send?phone=${phone}` : 'https://web.whatsapp.com/';
+            const url = message ? `${base}${phone ? '&' : '?'}text=${encodeURIComponent(message)}` : base;
+            const width = Math.min(520, Math.max(420, Math.floor(screen.availWidth * .36)));
+            const height = Math.max(700, screen.availHeight - 70);
+            const left = Math.max(0, screen.availWidth - width - 10);
+            const win = window.open(url, 'epass-whatsapp', `popup=yes,width=${width},height=${height},left=${left},top=20,resizable=yes,scrollbars=yes`);
+            if (!win) window.open(url, '_blank');
+        },
+
+        contextButton(label, cls, handler) {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = `eh-context-btn ${cls || ''}`.trim();
+            btn.textContent = label;
+            btn.addEventListener('click', handler);
+            return btn;
+        },
+
+        renderAutomation(page) {
+            if (!this.steps || !this.contextBox) return;
+            const active = EH.Workflow.infer(page);
+            this.steps.innerHTML = '';
+            EH.Workflow.stages.forEach(([key, num, label]) => {
+                const item = document.createElement('div');
+                item.className = `eh-step ${key === active ? 'active' : ''}`;
+                item.innerHTML = `<strong>${num}</strong>${label}`;
+                this.steps.appendChild(item);
+            });
+
+            this.contextBox.innerHTML = '';
+            const title = document.createElement('strong');
+            const info = document.createElement('div');
+            const actions = document.createElement('div');
+            actions.className = 'eh-context-actions';
+
+            if (page === 'pesquisa') {
+                title.textContent = '1. Horários';
+                info.textContent = 'Use uma rota rápida acima ou faça a pesquisa normalmente. A imagem de horários fica pronta para envio.';
+                actions.append(
+                    this.contextButton('🗓️ Gerar horários agora', 'primary', () => this.captureAction('pesquisa')),
+                    this.contextButton('💬 Abrir WhatsApp ao lado', '', () => this.openWhatsApp(EH.Messages.get('pesquisa')))
+                );
+            } else if (page === 'reserva') {
+                title.textContent = '2. Poltronas';
+                info.textContent = 'Envie o mapa de poltronas e aguarde o cliente escolher quantidade e números.';
+                actions.append(
+                    this.contextButton('💺 Gerar poltronas', 'primary', () => this.captureAction('reserva')),
+                    this.contextButton('💬 Abrir WhatsApp ao lado', '', () => this.openWhatsApp(EH.Messages.get('reserva')))
+                );
+            } else if (page === 'pagamento') {
+                const summary = EH.Payment.parseSummary();
+                const pix = EH.Payment.parsePix();
+                if (pix) {
+                    title.textContent = '4. PIX pronto';
+                    info.textContent = `${pix.value ? `Valor ${pix.value}` : 'Pagamento PIX'}${pix.expires ? ` • expira ${pix.expires}` : ''}`;
+                    if (pix.qr) {
+                        const img = document.createElement('img');
+                        img.className = 'eh-pix-mini';
+                        img.src = pix.qr;
+                        img.alt = 'QR Code PIX';
+                        this.contextBox.append(title, info, img);
+                    } else this.contextBox.append(title, info);
+                    const msg = EH.Payment.formatPix(pix);
+                    actions.append(
+                        this.contextButton('📋 Copiar PIX + código', 'success', async () => { await EH.Clipboard.copyText(msg); EH.Toast.success('PIX copiado.'); }),
+                        this.contextButton('💬 Abrir WhatsApp com PIX', 'primary', () => this.openWhatsApp(msg)),
+                        this.contextButton('🖼️ Abrir QR Code', '', () => EH.Payment.openQr(pix))
+                    );
+                    this.contextBox.append(actions);
+                    return;
+                }
+                title.textContent = '3. Confirmar compra';
+                info.textContent = summary?.cards?.length ? `${summary.cards[0].passenger || 'Passageiro'} • ${summary.cards[0].seat ? `poltrona ${summary.cards[0].seat}` : 'confira os dados'}` : 'Resumo da compra ainda não encontrado.';
+                const msg = EH.Payment.formatSummary(summary);
+                actions.append(
+                    this.contextButton('📋 Copiar confirmação', 'primary', async () => { if (!msg) return EH.Toast.warning('Resumo não encontrado.'); await EH.Clipboard.copyText(msg); EH.Toast.success('Confirmação copiada.'); }),
+                    this.contextButton('💬 Enviar confirmação no WhatsApp', '', () => msg ? this.openWhatsApp(msg) : EH.Toast.warning('Resumo não encontrado.')),
+                    this.contextButton('✅ Cliente confirmou → Gerar PIX', 'success', () => EH.Payment.clientConfirmed())
+                );
+            } else if (page === 'passagens') {
+                title.textContent = '5. Bilhete';
+                info.textContent = 'Pesquise o CPF, escolha a passagem correta e envie o comprovante ao cliente.';
+                actions.append(
+                    this.contextButton('🎫 Escolher bilhete', 'primary', () => EH.Tickets.activateSelection()),
+                    this.contextButton('💬 Abrir WhatsApp ao lado', '', () => this.openWhatsApp(EH.Messages.get('bilhete')))
+                );
+            } else {
+                title.textContent = 'Atendimento';
+                info.textContent = 'Use uma rota rápida para iniciar ou abra o WhatsApp ao lado.';
+                actions.append(this.contextButton('💬 Abrir WhatsApp ao lado', 'primary', () => this.openWhatsApp('')));
+            }
+            this.contextBox.append(title, info, actions);
         },
 
         createButton(icon, label, extraClass, action) {
@@ -3472,6 +3898,7 @@
             const isPesquisa = page === 'pesquisa';
             const isReserva = page === 'reserva';
             const isPassagens = page === 'passagens';
+            const isPagamento = page === 'pagamento';
 
             this.buttons.horarios.disabled = !isPesquisa || this.busy;
             this.buttons.reserva.disabled = !isReserva || this.busy;
@@ -3482,14 +3909,18 @@
             this.buttons.enviar.disabled = !hasHistory || this.busy;
             this.buttons.copiar.disabled = (!isPesquisa && !isReserva) || this.busy;
 
-            this.statusDot.classList.toggle('active', isPesquisa || isReserva || isPassagens);
+            this.statusDot.classList.toggle('active', isPesquisa || isReserva || isPassagens || isPagamento);
             this.statusText.textContent = isPesquisa
                 ? 'Tela de horários'
                 : isReserva
                     ? 'Mapa de poltronas'
-                    : isPassagens
-                        ? 'Pesquisa de passagens'
-                        : 'Aguardando pesquisa';
+                    : isPagamento
+                        ? (EH.Payment.parsePix() ? 'PIX pronto' : 'Confirmar pagamento')
+                        : isPassagens
+                            ? 'Pesquisa de passagens'
+                            : 'Aguardando pesquisa';
+            this.renderAutomation(page);
+            if (isPagamento) EH.Payment.handlePixReady().catch(() => {});
         },
 
         setBusy(value, message) {
@@ -3687,7 +4118,7 @@
                         close();
                         try {
                             this.setBusy(true, 'Preenchendo rota…');
-                            await EH.Routes.apply(route);
+                            await EH.Routes.apply(route, { autoSearch: true, autoCapture: true });
                         } catch (error) {
                             EH.Toast.error(error.message || 'Não foi possível preencher a rota.', 5200);
                         } finally {
@@ -4330,6 +4761,8 @@
             const msgHorarios = createMessageField('pesquisa', 'Mensagem após gerar Horários');
             const msgReserva = createMessageField('reserva', 'Mensagem após gerar Reserva');
             const msgBilhete = createMessageField('bilhete', 'Mensagem após gerar Bilhete');
+            const msgResumo = createMessageField('resumo', 'Mensagem de confirmação antes do pagamento');
+            const msgPix = createMessageField('pix', 'Mensagem enviada junto com o PIX');
 
             const help = document.createElement('div');
             help.className = 'eh-help-box';
@@ -4337,7 +4770,7 @@
                 ? 'As configurações, a posição e o estado recolhido ficam salvos neste navegador, mesmo depois de fechá-lo. A cópia direta de imagens depende da permissão da área de transferência.'
                 : 'As configurações ficam salvas neste navegador. Como o E-Pass está em HTTP, o navegador bloqueia a cópia programática de PNG real. O script usa “Abrir imagem para copiar” como alternativa segura e mantém o botão de baixar PNG.';
 
-            content.append(grid, checkWrap, messageSection, msgHorarios, msgReserva, msgBilhete, help);
+            content.append(grid, checkWrap, messageSection, msgHorarios, msgReserva, msgBilhete, msgResumo, msgPix, help);
 
             const actions = document.createElement('div');
             actions.className = 'eh-modal-actions';
@@ -4363,7 +4796,9 @@
                 EH.Messages.setAll({
                     pesquisa: messageFields.pesquisa.value.trim(),
                     reserva: messageFields.reserva.value.trim(),
-                    bilhete: messageFields.bilhete.value.trim()
+                    bilhete: messageFields.bilhete.value.trim(),
+                    resumo: messageFields.resumo.value.trim(),
+                    pix: messageFields.pix.value.trim()
                 });
                 EH.Storage.set('taxasOrigem', taxas);
                 EH.Storage.set('taxaIpora', taxas.IPORA);
@@ -4417,12 +4852,13 @@
             const resetPosition = document.createElement('button');
             resetPosition.type = 'button';
             resetPosition.className = 'eh-modal-btn';
-            resetPosition.textContent = 'Restaurar posição';
+            resetPosition.textContent = 'Restaurar painel lateral';
             resetPosition.addEventListener('click', () => {
-                this.root.style.left = `${EH.Config.PANEL_POSITION.x}px`;
-                this.root.style.top = `${EH.Config.PANEL_POSITION.y}px`;
-                this.clampPosition(true);
-                EH.Toast.success('Posição restaurada.');
+                EH.Storage.set('collapsed', false);
+                this.body.hidden = false;
+                this.root.classList.remove('eh-collapsed');
+                this.applyDockLayout(true);
+                EH.Toast.success('Painel lateral restaurado.');
             });
 
             const closeBottom = document.createElement('button');
