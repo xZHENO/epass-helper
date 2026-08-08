@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.25.0
+// @version      5.25.1
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.25.0',
+        VERSION: '5.25.1',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -887,9 +887,14 @@
                 const pre = node.querySelector?.('[data-pre-plain-text]')?.getAttribute('data-pre-plain-text') || '';
                 const tm = pre.match(/\[(.*?)\]/);
                 const out = node.classList?.contains('message-out') || Boolean(node.closest?.('.message-out'));
+                const senderMatch = pre.match(/\]\s*([^:]+):\s*$/);
+                const sender = out
+                    ? 'Você'
+                    : (this.cleanText(senderMatch?.[1] || '') || title || 'Cliente');
                 messages.push({
                     id: id || `${out ? 'o' : 'i'}-${messages.length}-${body.slice(0, 20)}`,
                     direction: out ? 'out' : 'in',
+                    sender,
                     text: body.slice(0, 4000),
                     time: tm ? this.cleanText(tm[1]) : ''
                 });
@@ -1379,9 +1384,12 @@
             for (const msg of messages) {
                 const bubble = document.createElement('div');
                 bubble.className = `eh-wa-msg ${msg.direction === 'out' ? 'out' : 'in'}`;
+                const sender = document.createElement('div');
+                sender.className = 'eh-wa-msg-sender';
+                sender.textContent = msg.sender || (msg.direction === 'out' ? 'Você' : (this.currentState?.active?.title || 'Cliente'));
                 const body = document.createElement('div');
                 body.textContent = msg.text || '';
-                bubble.appendChild(body);
+                bubble.append(sender, body);
                 if (msg.time) {
                     const time = document.createElement('time');
                     time.textContent = msg.time;
@@ -2413,6 +2421,8 @@
                 .eh-wa-msg { max-width:86%; padding:6px 7px 5px; border-radius:7px; box-shadow:0 1px 1px rgba(0,0,0,.08); font-size:10px; line-height:1.35; white-space:pre-wrap; overflow-wrap:anywhere; }
                 .eh-wa-msg.in { align-self:flex-start; background:#fff; border-top-left-radius:2px; }
                 .eh-wa-msg.out { align-self:flex-end; background:#d9fdd3; border-top-right-radius:2px; }
+                .eh-wa-msg-sender { margin-bottom:2px; color:#008069; font-size:8px; font-weight:700; line-height:1.2; }
+                .eh-wa-msg.out .eh-wa-msg-sender { color:#49724a; text-align:right; }
                 .eh-wa-msg time { display:block; margin-top:3px; color:#667781; font-size:7px; text-align:right; }
                 .eh-wa-compose { display:grid; grid-template-columns:minmax(0,1fr) 34px; gap:6px; align-items:end; padding:7px 8px; border-top:1px solid #d8dedf; background:#f0f2f5; }
                 .eh-wa-compose textarea { width:100%; max-height:88px; min-height:32px; resize:none; padding:8px 10px; border:0; border-radius:9px; outline:none; background:#fff; color:#111b21; font:10px/1.4 "Segoe UI",Arial,sans-serif; }
