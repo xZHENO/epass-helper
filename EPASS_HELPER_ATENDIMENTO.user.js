@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Helper 5.1 - Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.19.0
+// @version      5.20.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -12,6 +12,7 @@
 // @match        https://epass.com.br/*
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_deleteValue
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
@@ -28,13 +29,20 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.19.0',
+        VERSION: '5.20.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
         MAX_CAPTURE_PIXELS: 26000000,
+        HISTORY_LIMIT: 10,
+        HISTORY_MAX_CHARS: 45000000,
+        MESSAGES: {
+            pesquisa: 'Escolha o horário desejado. Após isso, vou encaminhar as poltronas disponíveis.',
+            reserva: 'Estas são as poltronas disponíveis. Informe o número da poltrona desejada.',
+            bilhete: 'Passagem emitida com sucesso. Confira os dados da viagem no comprovante.'
+        },
         TAXAS_ORIGEM: {
             IPORA: 3.83,
             GOIANIA: 0,
@@ -68,9 +76,17 @@
             '.ng-select[formcontrolname="id_localidade_origem"] .ng-value-label',
             '[formcontrolname="id_localidade_origem"] .ng-value-label'
         ],
+        ORIGEM_SELECT: [
+            'ng-select[formcontrolname="id_localidade_origem"]',
+            '[formcontrolname="id_localidade_origem"]'
+        ],
         DESTINO: [
             '.ng-select[formcontrolname="id_localidade_destino"] .ng-value-label',
             '[formcontrolname="id_localidade_destino"] .ng-value-label'
+        ],
+        DESTINO_SELECT: [
+            'ng-select[formcontrolname="id_localidade_destino"]',
+            '[formcontrolname="id_localidade_destino"]'
         ],
         DATA: [
             'input[formcontrolname="data"]',
@@ -151,6 +167,14 @@
                 EH.Logger.warn('Não foi possível salvar a configuração:', name, error);
             }
         },
+        remove(name) {
+            try {
+                if (typeof GM_deleteValue === 'function') GM_deleteValue(this.key(name));
+                else GM_setValue(this.key(name), '');
+            } catch (error) {
+                EH.Logger.warn('Não foi possível remover o valor:', name, error);
+            }
+        },
         loadSettings() {
             const taxasPadrao = { ...EH.Config.TAXAS_ORIGEM };
             const taxasSalvas = this.get('taxasOrigem', null);
@@ -169,6 +193,226 @@
             EH.Config.TICKET_CAPTURE_WIDTH = Math.min(520, Math.max(360, Number(
                 this.get('ticketCaptureWidth', EH.Config.TICKET_CAPTURE_WIDTH)
             ) || 430));
+            const savedMessages = this.get('messages', null);
+            if (savedMessages && typeof savedMessages === 'object') {
+                EH.Config.MESSAGES = { ...EH.Config.MESSAGES, ...savedMessages };
+            }
+        }
+    };
+
+    // ============================================================
+    // MENSAGENS AUTOMÁTICAS
+    // ============================================================
+    EH.Messages = {
+        get(type) {
+            return String(EH.Config.MESSAGES?.[type] || '').trim();
+        },
+        setAll(messages) {
+            EH.Config.MESSAGES = { ...EH.Config.MESSAGES, ...messages };
+            EH.Storage.set('messages', EH.Config.MESSAGES);
+        }
+    };
+
+    // ============================================================
+    // ROTAS FAVORITAS
+    // ============================================================
+    EH.Routes = {
+        defaults: [
+            {
+                id: 'arenopolis-goiania',
+                origem: 'ARENOPOLIS - GO',
+                destino: 'GOIANIA - GO',
+                observacao: 'Passa por Iporá, Israelândia, São Luís de Montes Belos e Firminópolis. Viagem da madrugada deve ser comprada antecipadamente. Compra na agência até as 18:00.'
+            },
+            {
+                id: 'arenopolis-barra',
+                origem: 'ARENOPOLIS - GO',
+                destino: 'BARRA DO GARCAS - MT',
+                observacao: 'Passa por Piranhas, Bom Jardim e Aragarças. Viagem da madrugada deve ser comprada antecipadamente. Compra na agência até as 18:00.'
+            },
+            {
+                id: 'goiania-ipora',
+                origem: 'GOIANIA - GO',
+                destino: 'IPORA - GO',
+                observacao: ''
+            },
+            {
+                id: 'goiania-brasilia',
+                origem: 'GOIANIA - GO',
+                destino: 'BRASILIA - DF',
+                observacao: ''
+            }
+        ],
+
+        getAll() {
+            const saved = EH.Storage.get('favoriteRoutes', null);
+            if (Array.isArray(saved) && saved.length) return saved;
+            EH.Storage.set('favoriteRoutes', this.defaults);
+            return this.defaults.map(item => ({ ...item }));
+        },
+
+        saveAll(routes) {
+            const clean = (Array.isArray(routes) ? routes : [])
+                .filter(route => route && route.origem && route.destino)
+                .map((route, index) => ({
+                    id: route.id || `rota-${Date.now()}-${index}`,
+                    origem: String(route.origem).trim(),
+                    destino: String(route.destino).trim(),
+                    observacao: String(route.observacao || '').trim()
+                }));
+            EH.Storage.set('favoriteRoutes', clean);
+            return clean;
+        },
+
+        async selectNgValue(selectors, wantedText) {
+            const host = EH.Utils.first(selectors);
+            if (!host) throw new Error('Não encontrei o campo de origem/destino nesta tela.');
+
+            host.scrollIntoView({ block: 'center', behavior: 'smooth' });
+            const clear = host.querySelector('.ng-clear-wrapper');
+            if (clear) {
+                clear.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                await EH.Utils.sleep(120);
+            }
+
+            host.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            host.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            await EH.Utils.sleep(150);
+
+            const input = host.querySelector('input[role="combobox"], input[type="text"]')
+                || document.querySelector('.ng-dropdown-panel input[role="combobox"], .ng-dropdown-panel input[type="text"]');
+            if (!input) throw new Error('Não encontrei o campo de busca da cidade.');
+
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            if (setter) setter.call(input, wantedText);
+            else input.value = wantedText;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.focus();
+
+            let options = [];
+            for (let attempt = 0; attempt < 12; attempt += 1) {
+                await EH.Utils.sleep(120);
+                options = Array.from(document.querySelectorAll('.ng-dropdown-panel .ng-option:not(.disabled)'));
+                if (options.length) break;
+            }
+
+            const target = EH.Utils.normalize(wantedText);
+            const baseCity = target.replace(/\s*-\s*[A-Z]{2}\s*$/, '').trim();
+            let option = options.find(item => EH.Utils.normalize(item.textContent) === target)
+                || options.find(item => EH.Utils.normalize(item.textContent).includes(target))
+                || options.find(item => EH.Utils.normalize(item.textContent).includes(baseCity));
+
+            if (!option && baseCity && baseCity !== target) {
+                if (setter) setter.call(input, baseCity);
+                else input.value = baseCity;
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                await EH.Utils.sleep(300);
+                options = Array.from(document.querySelectorAll('.ng-dropdown-panel .ng-option:not(.disabled)'));
+                option = options.find(item => EH.Utils.normalize(item.textContent).includes(target))
+                    || options.find(item => EH.Utils.normalize(item.textContent).includes(baseCity));
+            }
+
+            if (!option) {
+                throw new Error(`Não encontrei “${wantedText}” na lista do E-Pass.`);
+            }
+
+            option.scrollIntoView({ block: 'nearest' });
+            option.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+            option.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            await EH.Utils.sleep(160);
+        },
+
+        isSearchPage() {
+            return location.pathname.includes('/vendas/pesquisa')
+                || Boolean(EH.Utils.first(EH.Selectors.ORIGEM_SELECT) && EH.Utils.first(EH.Selectors.DESTINO_SELECT));
+        },
+
+        async apply(route) {
+            if (!route) return;
+            EH.Storage.set('pendingRoute', route);
+            if (!this.isSearchPage()) {
+                location.href = `${location.origin}/epass/vendas/pesquisa`;
+                return;
+            }
+
+            await this.selectNgValue(EH.Selectors.ORIGEM_SELECT, route.origem);
+            await this.selectNgValue(EH.Selectors.DESTINO_SELECT, route.destino);
+            EH.Storage.remove('pendingRoute');
+            EH.Toast.success(`${route.origem} → ${route.destino} preenchido.`);
+            if (route.observacao) EH.Storage.set('lastRouteObservation', route.observacao);
+        },
+
+        async applyPending() {
+            if (!this.isSearchPage()) return;
+            const pending = EH.Storage.get('pendingRoute', null);
+            if (!pending?.origem || !pending?.destino) return;
+            try {
+                await EH.Utils.sleep(450);
+                await this.apply(pending);
+            } catch (error) {
+                EH.Logger.warn('Não foi possível aplicar a rota pendente:', error);
+            }
+        }
+    };
+
+    // ============================================================
+    // HISTÓRICO LOCAL DAS CAPTURAS
+    // ============================================================
+    EH.History = {
+        indexKey: 'captureHistoryIndex',
+
+        list() {
+            const index = EH.Storage.get(this.indexKey, []);
+            return Array.isArray(index) ? index : [];
+        },
+
+        get(id) {
+            const meta = this.list().find(item => item.id === id);
+            if (!meta) return null;
+            const dataUrl = EH.Storage.get(`captureImage.${id}`, '');
+            return dataUrl ? { ...meta, dataUrl } : null;
+        },
+
+        add(entry) {
+            if (!entry?.dataUrl) return null;
+            const id = `cap-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+            const meta = {
+                id,
+                type: entry.type || 'imagem',
+                filename: entry.filename || 'epass.png',
+                message: String(entry.message || ''),
+                text: String(entry.text || ''),
+                summary: String(entry.summary || entry.filename || 'Captura do E-Pass'),
+                createdAt: new Date().toISOString(),
+                size: entry.dataUrl.length
+            };
+
+            let index = [meta, ...this.list().filter(item => item.id !== id)];
+            EH.Storage.set(`captureImage.${id}`, entry.dataUrl);
+
+            while (index.length > EH.Config.HISTORY_LIMIT || index.reduce((sum, item) => sum + (Number(item.size) || 0), 0) > EH.Config.HISTORY_MAX_CHARS) {
+                const removed = index.pop();
+                if (removed) EH.Storage.remove(`captureImage.${removed.id}`);
+            }
+            EH.Storage.set(this.indexKey, index);
+            return meta;
+        },
+
+        remove(id) {
+            const index = this.list().filter(item => item.id !== id);
+            EH.Storage.set(this.indexKey, index);
+            EH.Storage.remove(`captureImage.${id}`);
+        },
+
+        clear() {
+            this.list().forEach(item => EH.Storage.remove(`captureImage.${item.id}`));
+            EH.Storage.set(this.indexKey, []);
+        },
+
+        latest() {
+            const first = this.list()[0];
+            return first ? this.get(first.id) : null;
         }
     };
 
@@ -1117,6 +1361,92 @@
                     box-sizing: border-box !important;
                 }
 
+                .eh-message-box {
+                    margin-top: 12px;
+                    padding: 11px 12px;
+                    border: 1px solid #dfe4eb;
+                    border-radius: 9px;
+                    background: #f7f9fc;
+                    color: #293346;
+                    font-size: 12px;
+                    line-height: 1.5;
+                    white-space: pre-wrap;
+                    user-select: text;
+                }
+
+                .eh-field textarea,
+                .eh-field input[type="text"],
+                .eh-field input[type="tel"] {
+                    width: 100%;
+                    min-height: 38px;
+                    padding: 9px 10px;
+                    border: 1px solid #cfd5df;
+                    border-radius: 8px;
+                    background: #fff;
+                    color: #1f2430;
+                    font: inherit;
+                    resize: vertical;
+                }
+
+                .eh-route-list,
+                .eh-history-list {
+                    display: grid;
+                    gap: 9px;
+                }
+
+                .eh-route-card,
+                .eh-history-card {
+                    padding: 11px 12px;
+                    border: 1px solid #dfe4eb;
+                    border-radius: 10px;
+                    background: #f7f9fc;
+                }
+
+                .eh-route-title,
+                .eh-history-title {
+                    color: #253047;
+                    font-size: 12px;
+                    font-weight: 850;
+                }
+
+                .eh-route-note,
+                .eh-history-note {
+                    margin-top: 5px;
+                    color: #687386;
+                    font-size: 10px;
+                    line-height: 1.45;
+                }
+
+                .eh-inline-actions {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 7px;
+                    margin-top: 9px;
+                }
+
+                .eh-mini-btn {
+                    min-height: 30px;
+                    padding: 6px 9px;
+                    border: 1px solid #ccd3dd;
+                    border-radius: 7px;
+                    background: #fff;
+                    color: #273142;
+                    cursor: pointer;
+                    font: 700 10px Arial, sans-serif;
+                }
+
+                .eh-mini-btn.primary { background:#3d8bfd; border-color:#2f77df; color:#fff; }
+                .eh-mini-btn.danger { color:#a7303b; border-color:#e0b5ba; }
+
+                .eh-section-label {
+                    margin: 14px 0 8px;
+                    color: #475266;
+                    font-size: 11px;
+                    font-weight: 900;
+                    text-transform: uppercase;
+                    letter-spacing: .3px;
+                }
+
                 @media (max-width: 700px) {
                     #eh-root { width: 172px; }
                     .eh-settings-grid { grid-template-columns: 1fr; }
@@ -1549,22 +1879,46 @@
             return copied;
         },
 
-        async copyImageBlob(blob, previewImage) {
+        async copyImageBlob(blob) {
+            if (!window.isSecureContext) {
+                throw new Error('O E-Pass está aberto em HTTP. O navegador não permite copiar um PNG real para a área de transferência nessa página.');
+            }
+            if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
+                throw new Error('Este navegador não liberou a cópia direta de imagens.');
+            }
             try {
-                if (window.isSecureContext && navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
-                    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
-                    return 'clipboard';
-                }
+                await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })]);
+                return 'clipboard';
             } catch (error) {
                 EH.Logger.debug('Clipboard moderno de imagem bloqueado:', error);
+                throw new Error('O navegador bloqueou a cópia da imagem. Verifique a permissão da área de transferência.');
             }
+        },
 
-            if (this.legacyCopyImageElement(previewImage)) return 'legacy';
-            throw new Error(
-                window.isSecureContext
-                    ? 'O navegador bloqueou a cópia. Use “Baixar PNG” ou clique com o botão direito na imagem.'
-                    : 'O E-Pass está aberto em HTTP. Use “Baixar PNG” ou tente abrir o sistema em HTTPS.'
-            );
+        dataUrlToBlob(dataUrl) {
+            const [header, body] = String(dataUrl || '').split(',');
+            const mime = header.match(/data:([^;]+)/)?.[1] || 'image/png';
+            const binary = atob(body || '');
+            const bytes = new Uint8Array(binary.length);
+            for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+            return new Blob([bytes], { type: mime });
+        },
+
+        openImageForNativeCopy(dataUrl) {
+            const popup = window.open('', '_blank');
+            if (!popup) throw new Error('O navegador bloqueou a nova aba. Libere pop-ups para o E-Pass.');
+            popup.document.title = 'Imagem do E-Pass';
+            popup.document.body.style.cssText = 'margin:0;padding:22px;background:#eef1f5;font-family:Arial,sans-serif;text-align:center;';
+            const note = popup.document.createElement('div');
+            note.textContent = 'Clique com o botão direito na imagem e escolha “Copiar imagem”. Depois cole no WhatsApp com Ctrl + V.';
+            note.style.cssText = 'max-width:760px;margin:0 auto 14px;padding:10px 12px;background:#fff;border-radius:8px;color:#263349;font-size:14px;';
+            const image = popup.document.createElement('img');
+            image.src = dataUrl;
+            image.alt = 'Captura do E-Pass';
+            image.style.cssText = 'display:block;max-width:100%;height:auto;margin:0 auto;background:#fff;box-shadow:0 8px 28px rgba(0,0,0,.12);';
+            popup.document.body.append(note, image);
+            popup.focus();
+            return popup;
         }
     };
 
@@ -3005,13 +3359,19 @@
             const horarios = this.createButton('🗓️', 'HORÁRIOS', 'eh-primary', () => this.captureAction('pesquisa'));
             const reserva = this.createButton('💺', 'RESERVA', 'eh-success', () => this.captureAction('reserva'));
             const bilhete = this.createButton('🎫', 'BILHETE', 'eh-primary', () => EH.Tickets.activateSelection());
+            const rotas = this.createButton('🧭', 'ROTAS', '', () => this.showRoutes());
+            const historico = this.createButton('🕘', 'HISTÓRICO', '', () => this.showHistory());
+            const enviar = this.createButton('📤', 'ENVIAR', 'eh-success', () => this.showSend());
             const copiar = this.createButton('📋', 'COPIAR TEXTO', '', () => this.copyCurrentText());
 
             horarios.id = 'eh-btn-horarios';
             reserva.id = 'eh-btn-reserva';
             bilhete.id = 'eh-btn-bilhete';
+            rotas.id = 'eh-btn-rotas';
+            historico.id = 'eh-btn-historico';
+            enviar.id = 'eh-btn-enviar';
             copiar.id = 'eh-btn-copiar';
-            actions.append(horarios, reserva, bilhete, copiar);
+            actions.append(horarios, reserva, bilhete, rotas, historico, enviar, copiar);
 
             const status = document.createElement('div');
             status.className = 'eh-status';
@@ -3030,7 +3390,7 @@
             this.body = body;
             this.statusText = statusText;
             this.statusDot = dot;
-            this.buttons = { horarios, reserva, bilhete, copiar };
+            this.buttons = { horarios, reserva, bilhete, rotas, historico, enviar, copiar };
 
             toggle.addEventListener('click', event => {
                 event.stopPropagation();
@@ -3116,6 +3476,10 @@
             this.buttons.horarios.disabled = !isPesquisa || this.busy;
             this.buttons.reserva.disabled = !isReserva || this.busy;
             this.buttons.bilhete.disabled = !isPassagens || this.busy;
+            this.buttons.rotas.disabled = this.busy;
+            const hasHistory = EH.History.list().length > 0;
+            this.buttons.historico.disabled = !hasHistory || this.busy;
+            this.buttons.enviar.disabled = !hasHistory || this.busy;
             this.buttons.copiar.disabled = (!isPesquisa && !isReserva) || this.busy;
 
             this.statusDot.classList.toggle('active', isPesquisa || isReserva || isPassagens);
@@ -3175,12 +3539,21 @@
                 const [canvas, autoCopy] = await Promise.all([canvasPromise, autoCopyPromise]);
                 const blob = await blobPromise;
                 const dataUrl = canvas.toDataURL('image/png', 1);
+                const message = EH.Messages.get('bilhete');
+                const ticketNumber = prepared.data?.tickets?.[0]?.number || prepared.data?.summary?.ticket || '';
+                const summary = `Bilhete${ticketNumber ? ` ${ticketNumber}` : ''}${prepared.data?.status ? ` • ${prepared.data.status}` : ''}`;
+                const history = EH.History.add({
+                    type: 'bilhete', dataUrl, message, text: prepared.text, filename: prepared.filename, summary
+                });
 
                 this.showPreview({
                     blob,
                     dataUrl,
                     text: prepared.text,
+                    message,
                     filename: prepared.filename,
+                    captureType: 'bilhete',
+                    historyId: history?.id || '',
                     copied: autoCopy.copied,
                     reason: autoCopy.reason || ''
                 });
@@ -3188,7 +3561,7 @@
                 if (autoCopy.copied) {
                     EH.Toast.success('Passagem copiada. Cole no WhatsApp com Ctrl + V.');
                 } else {
-                    EH.Toast.warning('Passagem capturada. Use “Copiar imagem” na prévia.', 4600);
+                    EH.Toast.warning(window.isSecureContext ? 'Passagem capturada. Use “Copiar imagem” na prévia.' : 'Passagem capturada. Use “Abrir imagem para copiar” na prévia.', 5200);
                 }
             } catch (error) {
                 if (prepared?.shell) EH.Capture.destroyShell(prepared.shell);
@@ -3227,12 +3600,22 @@
                 ]);
                 const blob = await blobPromise;
                 const dataUrl = canvas.toDataURL('image/png', 1);
+                const message = EH.Messages.get(page);
+                const summary = page === 'pesquisa'
+                    ? `Horários • ${[data.origem, data.destino].filter(Boolean).join(' → ')}${data.data ? ` • ${data.data}` : ''}`
+                    : `Reserva • ${data.origemDestino || 'Mapa de poltronas'}${data.horaSaida ? ` • ${data.horaSaida}` : ''}`;
+                const history = EH.History.add({
+                    type: page, dataUrl, message, text, filename: capture.prepared.filename, summary
+                });
 
                 this.showPreview({
                     blob,
                     dataUrl,
                     text,
+                    message,
                     filename: capture.prepared.filename,
+                    captureType: page,
+                    historyId: history?.id || '',
                     copied: autoCopy.copied,
                     reason: autoCopy.reason || ''
                 });
@@ -3240,7 +3623,7 @@
                 if (autoCopy.copied) {
                     EH.Toast.success('Imagem copiada. Agora cole no WhatsApp com Ctrl + V.');
                 } else if (!window.isSecureContext) {
-                    EH.Toast.warning('Imagem criada. Em HTTP, use a prévia ou “Baixar PNG”.', 5200);
+                    EH.Toast.warning('Imagem criada. Em HTTP, use “Abrir imagem para copiar” na prévia.', 5200);
                 } else {
                     EH.Toast.warning('Imagem criada. Clique em “Copiar imagem” na prévia.', 4600);
                 }
@@ -3252,7 +3635,454 @@
             }
         },
 
-        showPreview({ blob, dataUrl, text, filename, copied, reason }) {
+        showRoutes() {
+            document.querySelector('#eh-routes-overlay')?.remove();
+            const overlay = document.createElement('div');
+            overlay.className = 'eh-overlay';
+            overlay.id = 'eh-routes-overlay';
+
+            const modal = document.createElement('div');
+            modal.className = 'eh-modal';
+            modal.style.width = 'min(720px, 96vw)';
+
+            const head = document.createElement('div');
+            head.className = 'eh-modal-head';
+            const title = document.createElement('div');
+            title.className = 'eh-modal-title';
+            title.textContent = 'Rotas favoritas';
+            const closeTop = document.createElement('button');
+            closeTop.type = 'button';
+            closeTop.className = 'eh-modal-close';
+            closeTop.textContent = '✕';
+            head.append(title, closeTop);
+
+            const content = document.createElement('div');
+            content.className = 'eh-modal-content';
+            const list = document.createElement('div');
+            list.className = 'eh-route-list';
+
+            const refresh = () => {
+                list.innerHTML = '';
+                const routes = EH.Routes.getAll();
+                routes.forEach(route => {
+                    const card = document.createElement('div');
+                    card.className = 'eh-route-card';
+                    const titleEl = document.createElement('div');
+                    titleEl.className = 'eh-route-title';
+                    titleEl.textContent = `${route.origem} → ${route.destino}`;
+                    card.appendChild(titleEl);
+                    if (route.observacao) {
+                        const note = document.createElement('div');
+                        note.className = 'eh-route-note';
+                        note.textContent = route.observacao;
+                        card.appendChild(note);
+                    }
+                    const actions = document.createElement('div');
+                    actions.className = 'eh-inline-actions';
+                    const use = document.createElement('button');
+                    use.type = 'button';
+                    use.className = 'eh-mini-btn primary';
+                    use.textContent = 'Usar rota';
+                    use.addEventListener('click', async () => {
+                        close();
+                        try {
+                            this.setBusy(true, 'Preenchendo rota…');
+                            await EH.Routes.apply(route);
+                        } catch (error) {
+                            EH.Toast.error(error.message || 'Não foi possível preencher a rota.', 5200);
+                        } finally {
+                            this.setBusy(false);
+                        }
+                    });
+                    actions.appendChild(use);
+
+                    if (route.observacao) {
+                        const copyObs = document.createElement('button');
+                        copyObs.type = 'button';
+                        copyObs.className = 'eh-mini-btn';
+                        copyObs.textContent = 'Copiar observação';
+                        copyObs.addEventListener('click', async () => {
+                            try {
+                                await EH.Clipboard.copyText(route.observacao);
+                                EH.Toast.success('Observação copiada.');
+                            } catch (error) {
+                                EH.Toast.error(error.message || 'Não foi possível copiar.');
+                            }
+                        });
+                        actions.appendChild(copyObs);
+                    }
+
+                    const remove = document.createElement('button');
+                    remove.type = 'button';
+                    remove.className = 'eh-mini-btn danger';
+                    remove.textContent = 'Excluir';
+                    remove.addEventListener('click', () => {
+                        EH.Routes.saveAll(EH.Routes.getAll().filter(item => item.id !== route.id));
+                        refresh();
+                    });
+                    actions.appendChild(remove);
+                    card.appendChild(actions);
+                    list.appendChild(card);
+                });
+            };
+            refresh();
+
+            const section = document.createElement('div');
+            section.className = 'eh-section-label';
+            section.textContent = 'Adicionar outra rota';
+
+            const formGrid = document.createElement('div');
+            formGrid.className = 'eh-settings-grid';
+            const makeField = (labelText, placeholder = '') => {
+                const field = document.createElement('div');
+                field.className = 'eh-field';
+                const label = document.createElement('label');
+                label.textContent = labelText;
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.placeholder = placeholder;
+                field.append(label, input);
+                return { field, input };
+            };
+            const origin = makeField('Origem', 'Ex.: ARENOPOLIS - GO');
+            const destination = makeField('Destino', 'Ex.: GOIANIA - GO');
+            formGrid.append(origin.field, destination.field);
+
+            const obsField = document.createElement('div');
+            obsField.className = 'eh-field';
+            obsField.style.marginTop = '10px';
+            const obsLabel = document.createElement('label');
+            obsLabel.textContent = 'Observação da rota (opcional)';
+            const obsInput = document.createElement('textarea');
+            obsInput.rows = 3;
+            obsInput.placeholder = 'Ex.: compra antecipada, cidades por onde passa...';
+            obsField.append(obsLabel, obsInput);
+
+            const addActions = document.createElement('div');
+            addActions.className = 'eh-inline-actions';
+            const add = document.createElement('button');
+            add.type = 'button';
+            add.className = 'eh-mini-btn primary';
+            add.textContent = 'Adicionar rota';
+            add.addEventListener('click', () => {
+                const origem = origin.input.value.trim();
+                const destino = destination.input.value.trim();
+                if (!origem || !destino) {
+                    EH.Toast.warning('Informe origem e destino.');
+                    return;
+                }
+                const routes = EH.Routes.getAll();
+                routes.push({
+                    id: `rota-${Date.now()}`,
+                    origem,
+                    destino,
+                    observacao: obsInput.value.trim()
+                });
+                EH.Routes.saveAll(routes);
+                origin.input.value = '';
+                destination.input.value = '';
+                obsInput.value = '';
+                refresh();
+                EH.Toast.success('Rota adicionada.');
+            });
+            const restore = document.createElement('button');
+            restore.type = 'button';
+            restore.className = 'eh-mini-btn';
+            restore.textContent = 'Restaurar rotas padrão';
+            restore.addEventListener('click', () => {
+                EH.Routes.saveAll(EH.Routes.defaults.map(item => ({ ...item })));
+                refresh();
+                EH.Toast.success('Rotas padrão restauradas.');
+            });
+            addActions.append(add, restore);
+
+            content.append(list, section, formGrid, obsField, addActions);
+
+            const actions = document.createElement('div');
+            actions.className = 'eh-modal-actions';
+            const closeBottom = document.createElement('button');
+            closeBottom.type = 'button';
+            closeBottom.className = 'eh-modal-btn';
+            closeBottom.textContent = 'Fechar';
+            actions.appendChild(closeBottom);
+
+            const close = () => overlay.remove();
+            closeTop.addEventListener('click', close);
+            closeBottom.addEventListener('click', close);
+            overlay.addEventListener('click', event => { if (event.target === overlay) close(); });
+
+            modal.append(head, content, actions);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+        },
+
+        showHistory() {
+            document.querySelector('#eh-history-overlay')?.remove();
+            const entries = EH.History.list();
+            if (!entries.length) {
+                EH.Toast.info('Ainda não há capturas no histórico.');
+                return;
+            }
+
+            const overlay = document.createElement('div');
+            overlay.className = 'eh-overlay';
+            overlay.id = 'eh-history-overlay';
+            const modal = document.createElement('div');
+            modal.className = 'eh-modal';
+            modal.style.width = 'min(760px, 96vw)';
+            const head = document.createElement('div');
+            head.className = 'eh-modal-head';
+            const title = document.createElement('div');
+            title.className = 'eh-modal-title';
+            title.textContent = `Histórico das últimas capturas (${entries.length})`;
+            const closeTop = document.createElement('button');
+            closeTop.type = 'button';
+            closeTop.className = 'eh-modal-close';
+            closeTop.textContent = '✕';
+            head.append(title, closeTop);
+            const content = document.createElement('div');
+            content.className = 'eh-modal-content';
+            const list = document.createElement('div');
+            list.className = 'eh-history-list';
+
+            entries.forEach(meta => {
+                const card = document.createElement('div');
+                card.className = 'eh-history-card';
+                const titleEl = document.createElement('div');
+                titleEl.className = 'eh-history-title';
+                titleEl.textContent = meta.summary || meta.filename;
+                const note = document.createElement('div');
+                note.className = 'eh-history-note';
+                const date = new Date(meta.createdAt);
+                note.textContent = `${Number.isNaN(date.getTime()) ? '' : date.toLocaleString('pt-BR')} • ${meta.filename || ''}`;
+                card.append(titleEl, note);
+                const row = document.createElement('div');
+                row.className = 'eh-inline-actions';
+                const open = document.createElement('button');
+                open.type = 'button';
+                open.className = 'eh-mini-btn primary';
+                open.textContent = 'Abrir';
+                open.addEventListener('click', () => {
+                    const entry = EH.History.get(meta.id);
+                    if (!entry) return EH.Toast.error('A imagem não está mais disponível no histórico.');
+                    close();
+                    const blob = EH.Clipboard.dataUrlToBlob(entry.dataUrl);
+                    this.showPreview({
+                        blob,
+                        dataUrl: entry.dataUrl,
+                        text: entry.text || '',
+                        message: entry.message || EH.Messages.get(entry.type),
+                        filename: entry.filename,
+                        captureType: entry.type,
+                        historyId: entry.id,
+                        copied: false,
+                        reason: window.isSecureContext ? '' : 'O E-Pass está em HTTP; para copiar a imagem, use “Abrir imagem para copiar”.'
+                    });
+                });
+                const send = document.createElement('button');
+                send.type = 'button';
+                send.className = 'eh-mini-btn';
+                send.textContent = 'Enviar';
+                send.addEventListener('click', () => {
+                    close();
+                    this.showSend(meta.id);
+                });
+                const remove = document.createElement('button');
+                remove.type = 'button';
+                remove.className = 'eh-mini-btn danger';
+                remove.textContent = 'Excluir';
+                remove.addEventListener('click', () => {
+                    EH.History.remove(meta.id);
+                    card.remove();
+                    EH.Pages.update();
+                    if (!EH.History.list().length) close();
+                });
+                row.append(open, send, remove);
+                card.appendChild(row);
+                list.appendChild(card);
+            });
+            content.appendChild(list);
+
+            const actions = document.createElement('div');
+            actions.className = 'eh-modal-actions';
+            const clear = document.createElement('button');
+            clear.type = 'button';
+            clear.className = 'eh-modal-btn danger';
+            clear.textContent = 'Limpar histórico';
+            clear.addEventListener('click', () => {
+                EH.History.clear();
+                EH.Pages.update();
+                close();
+                EH.Toast.success('Histórico limpo.');
+            });
+            const closeBottom = document.createElement('button');
+            closeBottom.type = 'button';
+            closeBottom.className = 'eh-modal-btn';
+            closeBottom.textContent = 'Fechar';
+            actions.append(clear, closeBottom);
+            const close = () => overlay.remove();
+            closeTop.addEventListener('click', close);
+            closeBottom.addEventListener('click', close);
+            overlay.addEventListener('click', event => { if (event.target === overlay) close(); });
+            modal.append(head, content, actions);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+        },
+
+        showSend(historyId = '') {
+            document.querySelector('#eh-send-overlay')?.remove();
+            const entry = historyId ? EH.History.get(historyId) : EH.History.latest();
+            if (!entry) {
+                EH.Toast.info('Gere uma imagem antes de usar “Enviar”.');
+                return;
+            }
+
+            const overlay = document.createElement('div');
+            overlay.className = 'eh-overlay';
+            overlay.id = 'eh-send-overlay';
+            const modal = document.createElement('div');
+            modal.className = 'eh-modal';
+            modal.style.width = 'min(620px, 96vw)';
+            const head = document.createElement('div');
+            head.className = 'eh-modal-head';
+            const title = document.createElement('div');
+            title.className = 'eh-modal-title';
+            title.textContent = 'Enviar atendimento';
+            const closeTop = document.createElement('button');
+            closeTop.type = 'button';
+            closeTop.className = 'eh-modal-close';
+            closeTop.textContent = '✕';
+            head.append(title, closeTop);
+
+            const content = document.createElement('div');
+            content.className = 'eh-modal-content';
+            const summary = document.createElement('div');
+            summary.className = 'eh-help-box';
+            summary.style.marginTop = '0';
+            summary.innerHTML = `<strong>Resumo:</strong> ${entry.summary || entry.filename}`;
+
+            const phoneField = document.createElement('div');
+            phoneField.className = 'eh-field';
+            phoneField.style.marginTop = '12px';
+            const phoneLabel = document.createElement('label');
+            phoneLabel.textContent = 'Telefone/WhatsApp do cliente';
+            const phone = document.createElement('input');
+            phone.type = 'tel';
+            phone.placeholder = 'Ex.: (64) 99999-9999';
+            phoneField.append(phoneLabel, phone);
+
+            const msgField = document.createElement('div');
+            msgField.className = 'eh-field';
+            msgField.style.marginTop = '12px';
+            const msgLabel = document.createElement('label');
+            msgLabel.textContent = 'Mensagem';
+            const msg = document.createElement('textarea');
+            msg.rows = 4;
+            msg.value = entry.message || EH.Messages.get(entry.type);
+            msgField.append(msgLabel, msg);
+
+            const includeSummary = document.createElement('label');
+            includeSummary.className = 'eh-check';
+            includeSummary.style.marginTop = '10px';
+            const includeCheck = document.createElement('input');
+            includeCheck.type = 'checkbox';
+            const includeText = document.createElement('span');
+            includeText.textContent = 'Incluir o resumo do atendimento na mensagem';
+            includeSummary.append(includeCheck, includeText);
+
+            const clipboardInfo = document.createElement('div');
+            clipboardInfo.className = 'eh-help-box';
+            clipboardInfo.textContent = window.isSecureContext
+                ? 'Ao abrir o WhatsApp, o script tentará deixar a imagem copiada para você colar com Ctrl + V.'
+                : 'O E-Pass está em HTTP. Por segurança do navegador, um script não consegue colocar um PNG real na área de transferência. Use “Abrir imagem para copiar” e escolha “Copiar imagem” no menu do navegador.';
+
+            content.append(summary, phoneField, msgField, includeSummary, clipboardInfo);
+
+            const finalMessage = () => {
+                const base = msg.value.trim();
+                return includeCheck.checked && entry.summary
+                    ? `${base}${base ? '\n\n' : ''}${entry.summary}`
+                    : base;
+            };
+
+            const actions = document.createElement('div');
+            actions.className = 'eh-modal-actions';
+            const openWhats = document.createElement('button');
+            openWhats.type = 'button';
+            openWhats.className = 'eh-modal-btn success';
+            openWhats.textContent = '📤 Abrir WhatsApp';
+            openWhats.addEventListener('click', async () => {
+                let digits = phone.value.replace(/\D/g, '');
+                if (digits.length === 10 || digits.length === 11) digits = `55${digits}`;
+                if (digits.length < 12) {
+                    EH.Toast.warning('Informe o telefone com DDD.');
+                    phone.focus();
+                    return;
+                }
+                const target = window.open('about:blank', '_blank');
+                if (!target) {
+                    EH.Toast.error('O navegador bloqueou a nova aba do WhatsApp.');
+                    return;
+                }
+                const message = finalMessage();
+                if (window.isSecureContext) {
+                    try {
+                        const blob = EH.Clipboard.dataUrlToBlob(entry.dataUrl);
+                        await EH.Clipboard.copyImageBlob(blob);
+                        EH.Toast.success('Imagem copiada. Cole no WhatsApp com Ctrl + V.');
+                    } catch (error) {
+                        EH.Toast.warning(error.message || 'Não foi possível copiar a imagem.', 5200);
+                    }
+                }
+                target.location.href = `https://wa.me/${digits}?text=${encodeURIComponent(message)}`;
+                target.focus();
+            });
+
+            const imageButton = document.createElement('button');
+            imageButton.type = 'button';
+            imageButton.className = 'eh-modal-btn primary';
+            imageButton.textContent = window.isSecureContext ? '📋 Copiar imagem' : '🖼️ Abrir imagem para copiar';
+            imageButton.addEventListener('click', async () => {
+                try {
+                    if (window.isSecureContext) {
+                        await EH.Clipboard.copyImageBlob(EH.Clipboard.dataUrlToBlob(entry.dataUrl));
+                        EH.Toast.success('Imagem copiada.');
+                    } else {
+                        EH.Clipboard.openImageForNativeCopy(entry.dataUrl);
+                    }
+                } catch (error) {
+                    EH.Toast.error(error.message || 'Não foi possível preparar a imagem.', 6000);
+                }
+            });
+
+            const copyMessage = document.createElement('button');
+            copyMessage.type = 'button';
+            copyMessage.className = 'eh-modal-btn';
+            copyMessage.textContent = '💬 Copiar mensagem';
+            copyMessage.addEventListener('click', async () => {
+                try {
+                    await EH.Clipboard.copyText(finalMessage());
+                    EH.Toast.success('Mensagem copiada.');
+                } catch (error) {
+                    EH.Toast.error(error.message || 'Não foi possível copiar a mensagem.');
+                }
+            });
+
+            const closeBottom = document.createElement('button');
+            closeBottom.type = 'button';
+            closeBottom.className = 'eh-modal-btn';
+            closeBottom.textContent = 'Fechar';
+            actions.append(openWhats, imageButton, copyMessage, closeBottom);
+            const close = () => overlay.remove();
+            closeTop.addEventListener('click', close);
+            closeBottom.addEventListener('click', close);
+            overlay.addEventListener('click', event => { if (event.target === overlay) close(); });
+            modal.append(head, content, actions);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+        },
+
+        showPreview({ blob, dataUrl, text, message, filename, captureType, historyId, copied, reason }) {
             document.querySelector('#eh-preview-overlay')?.remove();
 
             const overlay = document.createElement('div');
@@ -3271,9 +4101,13 @@
             title.textContent = copied ? 'Imagem copiada com sucesso' : 'Prévia da imagem';
             const note = document.createElement('div');
             note.className = 'eh-modal-note';
-            note.textContent = copied
-                ? 'Cole no WhatsApp com Ctrl + V. Você também pode baixar o PNG.'
-                : (reason || 'Clique em “Copiar imagem” para tentar novamente.');
+            if (copied) {
+                note.textContent = 'Cole no WhatsApp com Ctrl + V.';
+            } else if (!window.isSecureContext) {
+                note.textContent = 'O E-Pass está em HTTP. Use “Abrir imagem para copiar” para obter uma cópia real da imagem pelo navegador.';
+            } else {
+                note.textContent = reason || 'Clique em “Copiar imagem” para tentar novamente.';
+            }
             headText.append(title, note);
 
             const closeTop = document.createElement('button');
@@ -3290,19 +4124,35 @@
             image.src = dataUrl;
             content.appendChild(image);
 
+            const automaticMessage = String(message || EH.Messages.get(captureType) || '').trim();
+            if (automaticMessage) {
+                const messageTitle = document.createElement('div');
+                messageTitle.className = 'eh-section-label';
+                messageTitle.textContent = 'Mensagem para o cliente';
+                const messageBox = document.createElement('div');
+                messageBox.className = 'eh-message-box';
+                messageBox.textContent = automaticMessage;
+                content.append(messageTitle, messageBox);
+            }
+
             const actions = document.createElement('div');
             actions.className = 'eh-modal-actions';
 
             const copyImage = document.createElement('button');
             copyImage.type = 'button';
             copyImage.className = 'eh-modal-btn primary';
-            copyImage.textContent = '📋 Copiar imagem';
+            copyImage.textContent = window.isSecureContext ? '📋 Copiar imagem' : '🖼️ Abrir imagem para copiar';
             copyImage.addEventListener('click', async () => {
                 try {
-                    await EH.Clipboard.copyImageBlob(blob, image);
-                    title.textContent = 'Imagem copiada com sucesso';
-                    note.textContent = 'Cole no WhatsApp com Ctrl + V.';
-                    EH.Toast.success('Imagem copiada.');
+                    if (window.isSecureContext) {
+                        await EH.Clipboard.copyImageBlob(blob);
+                        title.textContent = 'Imagem copiada com sucesso';
+                        note.textContent = 'Cole no WhatsApp com Ctrl + V.';
+                        EH.Toast.success('Imagem copiada.');
+                    } else {
+                        EH.Clipboard.openImageForNativeCopy(dataUrl);
+                        note.textContent = 'Na nova aba, clique com o botão direito na imagem e escolha “Copiar imagem”.';
+                    }
                 } catch (error) {
                     EH.Toast.error(error.message || 'A cópia foi bloqueada.', 6000);
                 }
@@ -3317,14 +4167,39 @@
             download.style.display = 'inline-flex';
             download.style.alignItems = 'center';
 
+            const copyMessage = document.createElement('button');
+            copyMessage.type = 'button';
+            copyMessage.className = 'eh-modal-btn';
+            copyMessage.textContent = '💬 Copiar mensagem';
+            copyMessage.disabled = !automaticMessage;
+            copyMessage.addEventListener('click', async () => {
+                try {
+                    await EH.Clipboard.copyText(automaticMessage);
+                    EH.Toast.success('Mensagem copiada.');
+                } catch (error) {
+                    EH.Toast.error(error.message || 'Não foi possível copiar a mensagem.');
+                }
+            });
+
+            const send = document.createElement('button');
+            send.type = 'button';
+            send.className = 'eh-modal-btn success';
+            send.textContent = '📤 Enviar atendimento';
+            send.disabled = !historyId;
+            send.addEventListener('click', () => {
+                close();
+                this.showSend(historyId);
+            });
+
             const copyText = document.createElement('button');
             copyText.type = 'button';
             copyText.className = 'eh-modal-btn';
-            copyText.textContent = '📝 Copiar texto';
+            copyText.textContent = '📝 Copiar detalhes';
+            copyText.disabled = !String(text || '').trim();
             copyText.addEventListener('click', async () => {
                 try {
                     await EH.Clipboard.copyText(text);
-                    EH.Toast.success('Texto copiado.');
+                    EH.Toast.success('Detalhes copiados.');
                 } catch (error) {
                     EH.Toast.error(error.message || 'Não foi possível copiar o texto.');
                 }
@@ -3342,7 +4217,7 @@
                 if (event.target === overlay) close();
             });
 
-            actions.append(copyImage, download, copyText, closeBottom);
+            actions.append(copyImage, download, copyMessage, send, copyText, closeBottom);
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
@@ -3357,7 +4232,7 @@
 
             const modal = document.createElement('div');
             modal.className = 'eh-modal';
-            modal.style.width = 'min(580px, 96vw)';
+            modal.style.width = 'min(760px, 96vw)';
 
             const head = document.createElement('div');
             head.className = 'eh-modal-head';
@@ -3434,13 +4309,35 @@
             checkText.textContent = 'Adicionar automaticamente a taxa conforme a origem configurada';
             checkWrap.append(check, checkText);
 
+            const messageSection = document.createElement('div');
+            messageSection.className = 'eh-section-label';
+            messageSection.textContent = 'Mensagens automáticas';
+
+            const messageFields = {};
+            const createMessageField = (key, labelText) => {
+                const field = document.createElement('div');
+                field.className = 'eh-field';
+                field.style.marginTop = '9px';
+                const label = document.createElement('label');
+                label.textContent = labelText;
+                const textarea = document.createElement('textarea');
+                textarea.rows = 3;
+                textarea.value = EH.Messages.get(key);
+                field.append(label, textarea);
+                messageFields[key] = textarea;
+                return field;
+            };
+            const msgHorarios = createMessageField('pesquisa', 'Mensagem após gerar Horários');
+            const msgReserva = createMessageField('reserva', 'Mensagem após gerar Reserva');
+            const msgBilhete = createMessageField('bilhete', 'Mensagem após gerar Bilhete');
+
             const help = document.createElement('div');
             help.className = 'eh-help-box';
             help.textContent = window.isSecureContext
                 ? 'As configurações, a posição e o estado recolhido ficam salvos neste navegador, mesmo depois de fechá-lo. A cópia direta de imagens depende da permissão da área de transferência.'
-                : 'As configurações, a posição e o estado recolhido ficam salvos neste navegador, mesmo depois de fechá-lo. Em HTTP, a cópia direta pode ser bloqueada; a prévia e o botão “Baixar PNG” continuam funcionando.';
+                : 'As configurações ficam salvas neste navegador. Como o E-Pass está em HTTP, o navegador bloqueia a cópia programática de PNG real. O script usa “Abrir imagem para copiar” como alternativa segura e mantém o botão de baixar PNG.';
 
-            content.append(grid, checkWrap, help);
+            content.append(grid, checkWrap, messageSection, msgHorarios, msgReserva, msgBilhete, help);
 
             const actions = document.createElement('div');
             actions.className = 'eh-modal-actions';
@@ -3463,6 +4360,11 @@
                 EH.Config.CAPTURE_SCALE = scale;
                 EH.Config.TICKET_CAPTURE_WIDTH = ticketWidth;
                 EH.Config.APLICAR_TAXAS_ORIGEM = check.checked;
+                EH.Messages.setAll({
+                    pesquisa: messageFields.pesquisa.value.trim(),
+                    reserva: messageFields.reserva.value.trim(),
+                    bilhete: messageFields.bilhete.value.trim()
+                });
                 EH.Storage.set('taxasOrigem', taxas);
                 EH.Storage.set('taxaIpora', taxas.IPORA);
                 EH.Storage.set('captureScale', scale);
@@ -3474,7 +4376,8 @@
                 const savedTicketWidth = Number(EH.Storage.get('ticketCaptureWidth', 0));
                 const savedTaxes = EH.Storage.get('taxasOrigem', null);
                 const savedAutoTax = Boolean(EH.Storage.get('aplicarTaxasOrigem', false));
-                const savedCorrectly = savedTaxes && savedScale === scale && savedTicketWidth === ticketWidth && savedAutoTax === check.checked;
+                const savedMessages = EH.Storage.get('messages', null);
+                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && savedAutoTax === check.checked;
 
                 if (!savedCorrectly) {
                     EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
@@ -3574,6 +4477,7 @@
             EH.UI.init();
             EH.Observer.start();
             EH.Pages.update();
+            setTimeout(() => EH.Routes.applyPending(), 800);
             document.addEventListener('keydown', event => {
                 if (event.key === 'Escape' && EH.Tickets.active) {
                     EH.Tickets.clearSelection();
