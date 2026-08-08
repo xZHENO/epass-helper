@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.23.0
+// @version      5.24.0
 // @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.23.0',
+        VERSION: '5.24.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -43,7 +43,8 @@
         AUTO_COPY_IMAGES: true,
         AUTO_ROUTE_CAPTURE: true,
         WHATSAPP_MODE: 'web',
-        PANEL_WIDTH: 252,
+        PANEL_WIDTH: 228,
+        WHATSAPP_POPUP_WIDTH: 430,
         MESSAGES: {
             pesquisa: 'Escolha o horário desejado. Após isso, vou encaminhar as poltronas disponíveis.',
             reserva: 'Estas são as poltronas disponíveis. Informe o número da poltrona desejada.',
@@ -735,30 +736,48 @@
     EH.WhatsAppBridge = {
         COMMAND_TTL: 2 * 60 * 1000,
         HEARTBEAT_TTL: 45 * 1000,
+        COMPACT_WINDOW_NAME: 'EPassWhatsAppCompact',
         heartbeatTimer: null,
         listenerId: null,
+        compactObserver: null,
+        compactStyleInjected: false,
 
         isWhatsAppHost() {
             return String(location.hostname || '').toLowerCase() === 'web.whatsapp.com';
         },
 
+        isCompactWindow() {
+            return this.isWhatsAppHost() && String(window.name || '') === this.COMPACT_WINDOW_NAME;
+        },
+
         heartbeat(online = true) {
-            EH.Storage.set('waHeartbeat', {
+            const compact = this.isCompactWindow();
+            const payload = {
                 online: Boolean(online),
+                compact,
                 at: online ? Date.now() : 0,
-                href: online ? location.href : ''
-            });
+                href: online ? location.href : '',
+                windowName: String(window.name || '')
+            };
+            EH.Storage.set(compact ? 'waCompactHeartbeat' : 'waHeartbeat', payload);
         },
 
+        isCompactOnline() {
+            const hb = EH.Storage.get('waCompactHeartbeat', null);
+            return Boolean(hb?.online && hb?.compact && hb?.at && (Date.now() - Number(hb.at)) < this.HEARTBEAT_TTL);
+        },
+
+        // Mantém compatibilidade com o restante do código: no modo WEB,
+        // "online" agora significa a janela compacta dedicada ao atendimento.
         isOnline() {
-            const hb = EH.Storage.get('waHeartbeat', null);
-            return Boolean(hb?.online && hb?.at && (Date.now() - Number(hb.at)) < this.HEARTBEAT_TTL);
+            return this.isCompactOnline();
         },
 
-        makeCommand({ phone = '', message = '', imageDataUrl = '', filename = '' } = {}) {
+        makeCommand({ phone = '', message = '', imageDataUrl = '', filename = '', target = 'compact' } = {}) {
             return {
                 id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
                 createdAt: Date.now(),
+                target,
                 phone: String(phone || '').replace(/\D/g, ''),
                 message: String(message || ''),
                 imageDataUrl: String(imageDataUrl || ''),
@@ -778,6 +797,96 @@
             } catch (error) {
                 return null;
             }
+        },
+
+        injectCompactStyle() {
+            if (this.compactStyleInjected || !this.isCompactWindow()) return;
+            this.compactStyleInjected = true;
+            GM_addStyle(`
+                html.eh-wa-compact,
+                html.eh-wa-compact body {
+                    margin: 0 !important;
+                    padding: 0 !important;
+                    overflow: hidden !important;
+                    background: #0b141a !important;
+                }
+                html.eh-wa-compact #side,
+                html.eh-wa-compact [data-eh-wa-hidden="1"] {
+                    display: none !important;
+                    visibility: hidden !important;
+                    width: 0 !important;
+                    min-width: 0 !important;
+                    max-width: 0 !important;
+                }
+                html.eh-wa-compact #main,
+                html.eh-wa-compact [data-eh-wa-main="1"] {
+                    display: flex !important;
+                    flex: 1 1 100% !important;
+                    width: 100vw !important;
+                    min-width: 0 !important;
+                    max-width: 100vw !important;
+                    height: 100vh !important;
+                    margin: 0 !important;
+                    border-left: 0 !important;
+                }
+                html.eh-wa-compact #app,
+                html.eh-wa-compact #app > div {
+                    width: 100vw !important;
+                    max-width: 100vw !important;
+                    height: 100vh !important;
+                    margin: 0 !important;
+                }
+            `);
+        },
+
+        findConversationMain() {
+            return document.querySelector('#main, [data-testid="conversation-panel-wrapper"], [data-testid="conversation-panel-body"]') || null;
+        },
+
+        compactConversationLayout() {
+            if (!this.isCompactWindow()) return false;
+            this.injectCompactStyle();
+            document.documentElement.classList.add('eh-wa-compact');
+            document.body?.classList.add('eh-wa-compact');
+
+            const main = this.findConversationMain();
+            if (!main) return false;
+            main.setAttribute('data-eh-wa-main', '1');
+
+            // Remove a lista de conversas e qualquer coluna lateral que esteja
+            // ao lado esquerdo da conversa. Fazemos isso pela geometria da tela
+            // para não depender apenas dos nomes internos do WhatsApp Web.
+            const explicitSide = document.querySelector('#side');
+            if (explicitSide) explicitSide.setAttribute('data-eh-wa-hidden', '1');
+
+            let child = main;
+            for (let depth = 0; depth < 6 && child?.parentElement; depth += 1) {
+                const parent = child.parentElement;
+                const childRect = child.getBoundingClientRect();
+                Array.from(parent.children).forEach(sibling => {
+                    if (sibling === child || !(sibling instanceof HTMLElement)) return;
+                    const rect = sibling.getBoundingClientRect();
+                    const substantial = rect.width > 48 && rect.height > 120;
+                    const isLeftColumn = rect.right <= childRect.left + 28 || (rect.left < childRect.left && rect.width < childRect.width);
+                    if (substantial && isLeftColumn) sibling.setAttribute('data-eh-wa-hidden', '1');
+                });
+                child = parent;
+            }
+
+            main.style.setProperty('width', '100vw', 'important');
+            main.style.setProperty('max-width', '100vw', 'important');
+            main.style.setProperty('flex', '1 1 100%', 'important');
+            main.style.setProperty('min-width', '0', 'important');
+            return true;
+        },
+
+        startCompactObserver() {
+            if (!this.isCompactWindow() || this.compactObserver || !document.body) return;
+            const refresh = EH.Utils.debounce(() => this.compactConversationLayout(), 120);
+            this.compactObserver = new MutationObserver(refresh);
+            this.compactObserver.observe(document.body, { childList: true, subtree: true, attributes: false });
+            refresh();
+            window.addEventListener('resize', refresh);
         },
 
         async waitForComposer(timeout = 15000) {
@@ -835,7 +944,6 @@
             const file = this.dataUrlToFile(dataUrl, filename);
             if (!file) return false;
 
-            // Primeiro tenta simular uma colagem no campo da conversa.
             const composer = await this.waitForComposer(12000);
             if (composer && typeof DataTransfer !== 'undefined') {
                 try {
@@ -856,7 +964,6 @@
                 }
             }
 
-            // Fallback: usa o input de arquivo do próprio WhatsApp, quando disponível.
             let input = Array.from(document.querySelectorAll('input[type="file"]')).find(el => /image|video/i.test(el.accept || '')) || null;
             if (!input) {
                 const attach = document.querySelector('[data-icon="plus-rounded"], [data-icon="attach-menu-plus"], button[aria-label*="Anexar" i], button[title*="Anexar" i]');
@@ -879,6 +986,7 @@
         async handleCommand(command) {
             if (!command?.id || !command.createdAt) return;
             if ((Date.now() - Number(command.createdAt)) > this.COMMAND_TTL) return;
+            if ((command.target || 'compact') === 'compact' && !this.isCompactWindow()) return;
 
             const doneKey = 'ehWaDoneCommand';
             const pendingKey = 'ehWaPendingCommand';
@@ -895,16 +1003,16 @@
                 return;
             }
 
-            // Se o comando não tem número, usa a conversa já aberta.
             if (!phone && command.message) {
                 await this.insertTextIntoCurrentChat(command.message);
             }
 
-            // Após navegar para a conversa, o texto da URL já é preenchido pelo WhatsApp.
-            // Se houver imagem, tenta anexá-la automaticamente à conversa sem enviá-la.
+            await EH.Utils.sleep(450);
+            this.compactConversationLayout();
+
             let imageAttached = false;
             if (command.imageDataUrl) {
-                await EH.Utils.sleep(1200);
+                await EH.Utils.sleep(900);
                 imageAttached = await this.attachImage(command.imageDataUrl, command.filename || 'epass-atendimento.png');
             }
 
@@ -913,17 +1021,26 @@
             EH.Storage.set('waAck', {
                 id: command.id,
                 at: Date.now(),
+                compact: this.isCompactWindow(),
                 imageAttached,
                 ok: true
             });
+            this.compactConversationLayout();
             try { window.focus(); } catch (error) {}
         },
 
         initReceiver() {
             if (!this.isWhatsAppHost()) return;
+            if (this.isCompactWindow()) {
+                this.injectCompactStyle();
+                this.startCompactObserver();
+            }
             this.heartbeat(true);
             clearInterval(this.heartbeatTimer);
-            this.heartbeatTimer = setInterval(() => this.heartbeat(true), 5000);
+            this.heartbeatTimer = setInterval(() => {
+                this.heartbeat(true);
+                if (this.isCompactWindow()) this.compactConversationLayout();
+            }, 4000);
             window.addEventListener('focus', () => this.heartbeat(true));
             document.addEventListener('visibilitychange', () => {
                 if (!document.hidden) this.heartbeat(true);
@@ -938,11 +1055,11 @@
                 });
             }
 
-            // Processa um comando que já estava aguardando quando a aba abriu/recarregou.
             setTimeout(() => {
                 const command = EH.Storage.get('waCommand', null);
                 if (command) this.handleCommand(command);
-            }, 900);
+                if (this.isCompactWindow()) this.compactConversationLayout();
+            }, 700);
         }
     };
 
@@ -1766,13 +1883,13 @@
                     .eh-modal-btn { width: 100%; }
                 }
 
-                /* Gaveta lateral discreta: fica escondida e aparece sob demanda */
+                /* Gaveta lateral discreta: script à esquerda, E-Pass no centro */
                 #eh-root {
                     position: fixed !important;
-                    left: auto !important;
-                    right: 0 !important;
+                    left: 0 !important;
+                    right: auto !important;
                     top: 0 !important;
-                    width: 252px !important;
+                    width: 228px !important;
                     height: 100vh !important;
                     z-index: 2147483000;
                     font-family: Inter, "Segoe UI", Arial, sans-serif !important;
@@ -1781,20 +1898,20 @@
                     will-change: transform;
                 }
                 #eh-root.eh-collapsed {
-                    width: 252px !important;
-                    transform: translateX(calc(100% + 8px));
+                    width: 228px !important;
+                    transform: translateX(calc(-100% - 8px));
                     opacity: 0;
                     pointer-events: none;
                 }
                 #eh-root .eh-panel {
                     height: 100%;
                     border: 0;
-                    border-left: 1px solid #2f3540;
+                    border-right: 1px solid #2f3540;
                     border-radius: 0;
                     display: flex;
                     flex-direction: column;
                     background: rgba(18, 21, 27, .985);
-                    box-shadow: -10px 0 28px rgba(0,0,0,.18);
+                    box-shadow: 10px 0 28px rgba(0,0,0,.18);
                 }
                 #eh-root .eh-header {
                     min-height: 38px;
@@ -1813,23 +1930,24 @@
                     padding: 8px;
                     scrollbar-width: thin;
                 }
-                html.eh-dock-open body { padding-right: 0 !important; }
+                html.eh-dock-open body { padding-left: 228px !important; transition: padding-left .18s ease; }
                 html.eh-dock-open .container-agente { max-width: 100% !important; }
 
                 #eh-launcher {
                     position: fixed;
                     z-index: 2147482999;
-                    right: 0;
+                    left: 0;
+                    right: auto;
                     top: 46%;
                     width: 16px;
                     height: 54px;
                     padding: 0;
                     border: 1px solid rgba(70,79,94,.55);
-                    border-right: 0;
-                    border-radius: 8px 0 0 8px;
+                    border-left: 0;
+                    border-radius: 0 8px 8px 0;
                     background: rgba(18,21,27,.30);
                     color: rgba(255,255,255,.62);
-                    box-shadow: -3px 0 10px rgba(0,0,0,.08);
+                    box-shadow: 3px 0 10px rgba(0,0,0,.08);
                     cursor: pointer;
                     opacity: .28;
                     transition: width .16s ease, opacity .16s ease, background .16s ease;
@@ -1871,12 +1989,14 @@
                 #eh-root .eh-btn-icon { width:16px; font-size:13px; }
                 #eh-root .eh-status { margin-top:7px; padding-top:7px; font-size:9px; }
                 @media (max-width: 1180px) {
-                    #eh-root { width: 240px !important; }
-                    #eh-root.eh-collapsed { width:240px !important; }
+                    #eh-root { width: 220px !important; }
+                    #eh-root.eh-collapsed { width:220px !important; }
+                    html.eh-dock-open body { padding-left:220px !important; }
                 }
                 @media (max-width: 720px) {
-                    #eh-root { width:min(236px, 86vw) !important; }
-                    #eh-root.eh-collapsed { width:min(236px, 86vw) !important; }
+                    #eh-root { width:min(220px, 84vw) !important; }
+                    #eh-root.eh-collapsed { width:min(220px, 84vw) !important; }
+                    html.eh-dock-open body { padding-left:0 !important; }
                     .eh-quick-routes { grid-template-columns:1fr; }
                     #eh-launcher { top:auto; bottom:22%; }
                 }
@@ -3987,9 +4107,16 @@
             const waOpen = document.createElement('button');
             waOpen.type = 'button';
             waOpen.className = 'eh-wa-open';
-            waOpen.title = 'Usar a aba já aberta do WhatsApp';
+            waOpen.title = 'Abrir WhatsApp compacto na lateral';
             waOpen.textContent = '💬';
-            waOpen.addEventListener('click', () => this.openWhatsApp(''));
+            waOpen.addEventListener('click', () => {
+                if (!this.getPhone()) {
+                    EH.Toast.warning('Informe o número do cliente para abrir diretamente a conversa específica.');
+                    phone.focus();
+                    return;
+                }
+                this.openWhatsApp('');
+            });
 
             const whatsRow = document.createElement('div');
             whatsRow.className = 'eh-whatsapp-row';
@@ -4118,7 +4245,7 @@
             this.waModeButton.classList.toggle('connected', connected);
             this.waModeButton.textContent = isWeb ? (connected ? 'WEB✓' : 'WEB') : 'APP';
             this.waModeButton.title = isWeb
-                ? (connected ? 'WhatsApp Web conectado nesta sessão.' : 'WhatsApp Web ainda não detectado. Abra uma aba do WhatsApp Web uma vez.')
+                ? (connected ? 'WhatsApp compacto conectado e pronto para receber conversas.' : 'WhatsApp compacto ainda não aberto. Use o botão 💬.')
                 : 'Usando o aplicativo do WhatsApp no Windows.';
         },
 
@@ -4133,6 +4260,9 @@
                 btn.title = route.observacao || `${route.origem} → ${route.destino}`;
                 btn.addEventListener('click', async () => {
                     if (this.busy) return;
+                    if (EH.Config.WHATSAPP_MODE === 'web' && this.getPhone() && !EH.WhatsAppBridge.isCompactOnline()) {
+                        this.openWhatsAppCompactWindow(this.getPhone(), { silent: true });
+                    }
                     try {
                         btn.classList.add('eh-route-running');
                         this.setBusy(true, 'Rota automática…');
@@ -4153,11 +4283,62 @@
             return String(this.phoneInput?.value || EH.Storage.get('currentPhone', '') || '').replace(/\D/g, '');
         },
 
+        openWhatsAppCompactWindow(phone = '', options = {}) {
+            const digits = String(phone || '').replace(/\D/g, '');
+            const normalizedPhone = digits && !digits.startsWith('55') ? `55${digits}` : digits;
+            const availWidth = Number(screen?.availWidth || window.screen?.width || 1366);
+            const availHeight = Number(screen?.availHeight || window.screen?.height || 768);
+            const availLeft = Number(screen?.availLeft || 0);
+            const availTop = Number(screen?.availTop || 0);
+            const width = Math.max(360, Math.min(520, Number(EH.Config.WHATSAPP_POPUP_WIDTH) || Math.round(availWidth * 0.30)));
+            const height = Math.max(560, Math.min(availHeight, availHeight - 12));
+            const left = Math.max(availLeft, availLeft + availWidth - width);
+            const top = Math.max(availTop, availTop + 2);
+            const url = normalizedPhone
+                ? `https://web.whatsapp.com/send?phone=${encodeURIComponent(normalizedPhone)}`
+                : 'https://web.whatsapp.com/';
+            const features = [
+                'popup=yes',
+                `width=${Math.round(width)}`,
+                `height=${Math.round(height)}`,
+                `left=${Math.round(left)}`,
+                `top=${Math.round(top)}`,
+                'resizable=yes',
+                'scrollbars=no',
+                'menubar=no',
+                'toolbar=no',
+                'location=no',
+                'status=no'
+            ].join(',');
+
+            let win = null;
+            try {
+                win = window.open(url, EH.WhatsAppBridge.COMPACT_WINDOW_NAME, features);
+                if (win) {
+                    try { win.resizeTo(Math.round(width), Math.round(height)); } catch (error) {}
+                    try { win.moveTo(Math.round(left), Math.round(top)); } catch (error) {}
+                    try { win.focus(); } catch (error) {}
+                    if (!options.silent) EH.Toast.info('WhatsApp compacto aberto na lateral.');
+                    return win;
+                }
+            } catch (error) {
+                EH.Logger.warn('Não foi possível abrir a janela compacta do WhatsApp:', error);
+            }
+            if (!options.silent) EH.Toast.warning('O navegador bloqueou o popup. Libere pop-ups para o E-Pass e tente novamente.');
+            return null;
+        },
+
         async openWhatsApp(message = '', options = {}) {
             let phone = this.getPhone();
             if (phone && !phone.startsWith('55')) phone = `55${phone}`;
             const imageDataUrl = String(options.imageDataUrl || '');
             const filename = String(options.filename || 'epass-atendimento.png');
+
+            if (EH.Config.WHATSAPP_MODE === 'web' && !phone && !options.allowCurrentChat) {
+                EH.Toast.warning('Informe o WhatsApp do cliente para abrir a conversa específica no painel compacto.');
+                try { this.phoneInput?.focus(); } catch (error) {}
+                return { mode: 'web', connected: false, missingPhone: true };
+            }
 
             if (EH.Config.WHATSAPP_MODE === 'app') {
                 if (imageDataUrl) {
@@ -4183,30 +4364,31 @@
                 return { mode: 'app', connected: true };
             }
 
-            const command = EH.WhatsAppBridge.makeCommand({ phone, message, imageDataUrl, filename });
-            const connected = EH.WhatsAppBridge.isOnline();
+            const command = EH.WhatsAppBridge.makeCommand({ phone, message, imageDataUrl, filename, target: 'compact' });
+            const connected = EH.WhatsAppBridge.isCompactOnline();
             EH.WhatsAppBridge.send(command);
             this.lastWaCommandId = command.id;
             this.lastWaCommandHasImage = Boolean(imageDataUrl);
 
             if (connected) {
                 EH.Toast.success(imageDataUrl
-                    ? 'WhatsApp Web atualizado na aba já aberta. A imagem está sendo preparada na conversa.'
-                    : 'WhatsApp Web atualizado na aba já aberta.');
+                    ? 'WhatsApp compacto atualizado. A imagem está sendo preparada na conversa.'
+                    : 'WhatsApp compacto atualizado na conversa do cliente.');
                 return { mode: 'web', connected: true, commandId: command.id };
             }
 
             if (options.bridgeOnly) {
-                EH.Toast.warning('A aba do WhatsApp Web não está conectada ao script. Abra o WhatsApp Web uma vez e tente novamente.');
+                EH.Toast.warning('A janela compacta do WhatsApp não está conectada. Abra pelo botão 💬 e tente novamente.');
                 return { mode: 'web', connected: false, commandId: command.id };
             }
 
-            // Só abre uma aba nova quando não existe uma aba do WhatsApp Web conectada.
-            const win = window.open('https://web.whatsapp.com/', '_blank');
+            // Abre/reutiliza uma janela nomeada. Por ser sempre a mesma janela,
+            // não cria várias abas e o próprio userscript esconde a lista de chats.
+            const win = this.openWhatsAppCompactWindow(phone, { silent: true });
             if (win) {
-                EH.Toast.info('WhatsApp Web aberto. Depois de carregar, esta aba ficará conectada ao E-Pass automaticamente.');
+                EH.Toast.info('WhatsApp compacto aberto. A conversa específica será carregada automaticamente.');
             } else {
-                EH.Toast.warning('O navegador bloqueou a abertura do WhatsApp Web. Abra web.whatsapp.com manualmente uma vez.');
+                EH.Toast.warning('Libere pop-ups para o E-Pass. O WhatsApp compacto precisa de uma janela própria para ficar só com a conversa.');
             }
             return { mode: 'web', connected: false, commandId: command.id };
         },
@@ -4486,7 +4668,7 @@
 
                 // Em uma rota automática, se já houver número informado e uma aba do WhatsApp Web
                 // conectada, prepara a conversa e anexa a imagem sem abrir outra aba.
-                if (opts.automatic && page === 'pesquisa' && EH.Config.WHATSAPP_MODE === 'web' && this.getPhone() && EH.WhatsAppBridge.isOnline()) {
+                if (opts.automatic && page === 'pesquisa' && EH.Config.WHATSAPP_MODE === 'web' && this.getPhone() && EH.WhatsAppBridge.isCompactOnline()) {
                     this.openWhatsApp(message, {
                         imageDataUrl: dataUrl,
                         filename: capture.prepared.filename || 'horarios-epass.png',
@@ -4886,7 +5068,7 @@
 
             const clipboardInfo = document.createElement('div');
             clipboardInfo.className = 'eh-help-box';
-            clipboardInfo.textContent = `Modo deste computador: ${EH.Config.WHATSAPP_MODE === 'app' ? 'WhatsApp do Windows' : 'WhatsApp Web'}. No modo Web, a aba já aberta recebe a conversa e tenta anexar a imagem diretamente; no modo App, o script usa a área de transferência antes de abrir o aplicativo.`;
+            clipboardInfo.textContent = `Modo deste computador: ${EH.Config.WHATSAPP_MODE === 'app' ? 'WhatsApp do Windows' : 'WhatsApp Web'}. No modo Web, uma janela compacta dedicada mostra somente a conversa do cliente e tenta anexar a imagem diretamente; no modo App, o script usa a área de transferência antes de abrir o aplicativo.`;
 
             content.append(summary, phoneField, msgField, includeSummary, clipboardInfo);
 
