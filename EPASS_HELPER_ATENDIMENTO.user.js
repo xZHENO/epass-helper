@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.30.0
-// @description  Atendimento integrado E-Pass + WhatsApp, com estado unificado e interface minimalista
+// @version      5.31.0
+// @description  Atendimento integrado E-Pass + WhatsApp, previsão de viagem e lembretes de embarque
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.30.0',
+        VERSION: '5.31.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -59,6 +59,15 @@
         WA_HEARTBEAT_TTL_MS: 150000,
         WA_UI_CACHE_TTL_MS: 10 * 60 * 1000,
         WA_VERIFY_TIMEOUT_MS: 3600,
+        WA_HISTORY_LIMIT: 260,
+        WA_HISTORY_SCROLLS: 10,
+        TRAVEL_HISTORY_LIMIT: 2400,
+        TRAVEL_MAX_DURATION_MIN: 18 * 60,
+        TRAVEL_TRIP_GAP_MIN: 8 * 60,
+        BOARDING_DEFAULT_REMIND_MINUTES: 120,
+        BOARDING_DEFAULT_ALERTS: [120],
+        BOARDING_CHECK_MS: 30000,
+        BOARDING_BROWSER_NOTIFICATIONS: false,
         MESSAGES: {
             pesquisa: 'Escolha o horário desejado. Após isso, vou encaminhar as poltronas disponíveis.',
             reserva: 'Estas são as poltronas disponíveis. Informe o número da poltrona desejada.',
@@ -232,6 +241,17 @@
             EH.Config.WHATSAPP_MODE = ['web', 'app'].includes(waMode) ? waMode : 'web';
             EH.Config.PANEL_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('panelZoom', EH.Config.PANEL_ZOOM)) || 1.5));
             EH.Config.WHATSAPP_DOCK_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('whatsappDockZoom', EH.Config.WHATSAPP_DOCK_ZOOM)) || 1.1));
+            EH.Config.BOARDING_DEFAULT_REMIND_MINUTES = Math.min(1440, Math.max(5, Number(
+                this.get('boardingDefaultRemindMinutes', EH.Config.BOARDING_DEFAULT_REMIND_MINUTES)
+            ) || 120));
+            const savedBoardingAlerts = this.get('boardingDefaultAlerts', EH.Config.BOARDING_DEFAULT_ALERTS);
+            EH.Config.BOARDING_DEFAULT_ALERTS = Array.isArray(savedBoardingAlerts)
+                ? savedBoardingAlerts.map(Number).filter(value => Number.isFinite(value) && value >= 5 && value <= 1440).sort((a, b) => b - a)
+                : [EH.Config.BOARDING_DEFAULT_REMIND_MINUTES];
+            if (!EH.Config.BOARDING_DEFAULT_ALERTS.length) EH.Config.BOARDING_DEFAULT_ALERTS = [EH.Config.BOARDING_DEFAULT_REMIND_MINUTES];
+            EH.Config.BOARDING_BROWSER_NOTIFICATIONS = Boolean(
+                this.get('boardingBrowserNotifications', EH.Config.BOARDING_BROWSER_NOTIFICATIONS)
+            );
         }
     };
 
@@ -1189,7 +1209,7 @@
             return chats;
         },
 
-        collectActiveConversation() {
+        collectActiveConversation(limit = 45) {
             const main = this.findConversationMain();
             if (!main) return { active: null, messages: [] };
             const header = main.querySelector('header') || main;
@@ -1205,7 +1225,8 @@
             }
             const messages = [];
             const seen = new Set();
-            for (const node of nodes.slice(-70)) {
+            const safeLimit = Math.min(500, Math.max(1, Number(limit) || 45));
+            for (const node of nodes.slice(-Math.max(70, safeLimit + 12))) {
                 const id = String(node.getAttribute?.('data-id') || '');
                 if (id && seen.has(id)) continue;
                 if (id) seen.add(id);
@@ -1228,13 +1249,94 @@
                     direction: out ? 'out' : 'in',
                     sender,
                     text: body.slice(0, 4000),
-                    time: tm ? this.cleanText(tm[1]) : ''
+                    time: tm ? this.cleanText(tm[1]) : '',
+                    meta: this.cleanText(pre),
+                    dataId: id
                 });
             }
             return {
                 active: title ? { title } : null,
-                messages: messages.slice(-45)
+                messages: messages.slice(-safeLimit)
             };
+        },
+
+        findMessageScroller() {
+            const main = this.findConversationMain();
+            if (!main) return null;
+            const sample = main.querySelector('div.message-in, div.message-out, [data-id]');
+            let node = sample;
+            for (let i = 0; i < 9 && node; i += 1, node = node.parentElement) {
+                if (!(node instanceof HTMLElement)) continue;
+                const style = getComputedStyle(node);
+                if (node.scrollHeight > node.clientHeight + 120 && /(auto|scroll)/i.test(style.overflowY || '')) return node;
+            }
+            return Array.from(main.querySelectorAll('div')).find(el => {
+                if (!(el instanceof HTMLElement)) return false;
+                const rect = el.getBoundingClientRect?.();
+                if (!rect || rect.height < 180) return false;
+                const style = getComputedStyle(el);
+                return el.scrollHeight > el.clientHeight + 240 && /(auto|scroll)/i.test(style.overflowY || '');
+            }) || null;
+        },
+
+        async readChatHistory(title, { limit = EH.Config.WA_HISTORY_LIMIT, scrolls = EH.Config.WA_HISTORY_SCROLLS } = {}) {
+            const wanted = this.cleanText(title);
+            if (!wanted) return { ok: false, chatTitle: '', messages: [], reason: 'Grupo não informado.' };
+            const selected = await this.selectChatByTitle(wanted);
+            if (!selected) return { ok: false, chatTitle: wanted, messages: [], reason: 'Conversa não encontrada na lista atual.' };
+            await EH.Utils.sleep(500);
+
+            const scroller = this.findMessageScroller();
+            if (scroller) {
+                let stagnant = 0;
+                let previousHeight = scroller.scrollHeight;
+                const maxScrolls = Math.min(18, Math.max(0, Number(scrolls) || 0));
+                for (let i = 0; i < maxScrolls; i += 1) {
+                    scroller.scrollTop = 0;
+                    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    await EH.Utils.sleep(420);
+                    const nextHeight = scroller.scrollHeight;
+                    if (nextHeight <= previousHeight + 4) stagnant += 1;
+                    else stagnant = 0;
+                    previousHeight = nextHeight;
+                    if (stagnant >= 2) break;
+                }
+            }
+
+            const convo = this.collectActiveConversation(Math.min(500, Math.max(30, Number(limit) || EH.Config.WA_HISTORY_LIMIT)));
+            if (scroller) {
+                try { scroller.scrollTop = scroller.scrollHeight; } catch (error) { EH.Logger.debug('Não foi possível restaurar a rolagem do WhatsApp:', error); }
+            }
+            this.publishUiState(true);
+            return {
+                ok: Boolean(convo.active?.title && convo.messages.length),
+                chatTitle: convo.active?.title || wanted,
+                messages: convo.messages,
+                count: convo.messages.length,
+                at: Date.now()
+            };
+        },
+
+        async requestChatHistory(chatTitle, { timeout = 18000 } = {}) {
+            const title = this.cleanText(chatTitle);
+            if (!title) return { ok: false, messages: [], reason: 'Selecione o grupo de referência.' };
+            const state = await this.ensureReady({ requireConversation: false, verifyStale: true, context: 'historico-grupo' });
+            if (!state.connected) return { ok: false, messages: [], reason: 'WhatsApp desconectado.', state };
+            const command = this.makeCommand({
+                action: 'read_history',
+                target: 'web',
+                chatTitle: title,
+                historyLimit: EH.Config.WA_HISTORY_LIMIT,
+                historyScrolls: EH.Config.WA_HISTORY_SCROLLS
+            });
+            this.send(command);
+            const started = Date.now();
+            while (Date.now() - started < Math.max(4000, Number(timeout) || 18000)) {
+                const result = EH.Storage.get('waHistoryResult', null);
+                if (result?.id === command.id) return result;
+                await EH.Utils.sleep(160);
+            }
+            return { ok: false, messages: [], reason: 'O WhatsApp não respondeu a tempo.' };
         },
 
         publishUiState(force = false) {
@@ -1471,6 +1573,18 @@
                 return;
             }
 
+            if (action === 'read_history') {
+                const result = await this.readChatHistory(command.chatTitle || '', {
+                    limit: command.historyLimit,
+                    scrolls: command.historyScrolls
+                });
+                const stored = { ...result, id: command.id, action, at: Date.now() };
+                EH.Storage.set('waHistoryResult', stored);
+                sessionStorage.setItem(doneKey, command.id);
+                EH.Storage.set('waAck', { id: command.id, at: Date.now(), action, ok: Boolean(result.ok), count: result.count || 0 });
+                return;
+            }
+
             if (phone && !pending) {
                 sessionStorage.setItem(pendingKey, command.id);
                 location.assign(`https://web.whatsapp.com/send?phone=${encodeURIComponent(phone)}`);
@@ -1561,6 +1675,1113 @@
     };
 
     // ============================================================
+    // OPERAÇÃO DE VIAGEM — HISTÓRICO, PREVISÃO E EMBARQUES
+    // Módulos isolados para permitir evolução sem acoplar a venda/PIX.
+    // ============================================================
+    EH.TravelHistory = {
+        KEY: 'travelHistoryV1',
+        DELETED_KEY: 'travelHistoryDeletedV1',
+
+        normalizePlace(value) {
+            return EH.Utils.normalize(value).replace(/\s+-\s+[A-Z]{2}$/i, '').trim();
+        },
+
+        displayPlace(value) {
+            return EH.Utils.prettifyWords(EH.Utils.clean(value)).replace(/\s+-\s+[A-Z]{2}$/i, '').trim();
+        },
+
+        load() {
+            const rows = EH.Storage.get(this.KEY, []);
+            return Array.isArray(rows) ? rows.filter(row => row && Number(row.durationMinutes) > 0) : [];
+        },
+
+        save(rows) {
+            const safe = (Array.isArray(rows) ? rows : []).slice(-EH.Config.TRAVEL_HISTORY_LIMIT);
+            EH.Storage.set(this.KEY, safe);
+            return safe;
+        },
+
+        idFor(record) {
+            const raw = [
+                record.source || 'manual', record.whatsappGroup || '', record.originKey || '', record.destinationKey || '',
+                record.departureDateTime || '', record.arrivalDateTime || '', Math.round(Number(record.durationMinutes) || 0)
+            ].join('|');
+            let hash = 2166136261;
+            for (let i = 0; i < raw.length; i += 1) {
+                hash ^= raw.charCodeAt(i);
+                hash = Math.imul(hash, 16777619);
+            }
+            return `tr-${(hash >>> 0).toString(36)}`;
+        },
+
+        addRecords(records) {
+            const current = this.load();
+            const byId = new Map(current.map(row => [row.id, row]));
+            const deleted = new Set(EH.Storage.get(this.DELETED_KEY, []));
+            let added = 0;
+            for (const input of Array.isArray(records) ? records : []) {
+                const duration = Math.round(Number(input.durationMinutes) || 0);
+                const origin = this.displayPlace(input.origin);
+                const destination = this.displayPlace(input.destination);
+                if (!origin || !destination || origin === destination || duration < 3 || duration > EH.Config.TRAVEL_MAX_DURATION_MIN) continue;
+                const record = {
+                    ...input,
+                    origin,
+                    destination,
+                    originKey: this.normalizePlace(origin),
+                    destinationKey: this.normalizePlace(destination),
+                    durationMinutes: duration,
+                    source: input.source === 'whatsapp' ? 'whatsapp' : 'manual',
+                    whatsappGroup: EH.Utils.clean(input.whatsappGroup || ''),
+                    createdAt: Number(input.createdAt) || Date.now()
+                };
+                record.id = input.id || this.idFor(record);
+                if (deleted.has(record.id)) continue;
+                const existing = byId.get(record.id);
+                if (!existing) added += 1;
+                if (existing?.editedAt) {
+                    byId.set(record.id, { ...record, durationMinutes: existing.durationMinutes, editedAt: existing.editedAt });
+                } else {
+                    byId.set(record.id, record);
+                }
+            }
+            this.save(Array.from(byId.values()).sort((a, b) => Number(a.departureDateTime || 0) - Number(b.departureDateTime || 0)));
+            return added;
+        },
+
+        addTrip(points, meta = {}) {
+            const ordered = (Array.isArray(points) ? points : [])
+                .map(point => ({
+                    city: this.displayPlace(point.city),
+                    at: point.at instanceof Date ? point.at.getTime() : Number(point.at)
+                }))
+                .filter(point => point.city && Number.isFinite(point.at))
+                .sort((a, b) => a.at - b.at);
+            const records = [];
+            for (let i = 0; i < ordered.length - 1; i += 1) {
+                for (let j = i + 1; j < ordered.length; j += 1) {
+                    const minutes = Math.round((ordered[j].at - ordered[i].at) / 60000);
+                    if (minutes < 3 || minutes > EH.Config.TRAVEL_MAX_DURATION_MIN) continue;
+                    records.push({
+                        routeId: meta.routeId || meta.whatsappGroup || '',
+                        direction: `${this.normalizePlace(ordered[i].city)}>${this.normalizePlace(ordered[j].city)}`,
+                        origin: ordered[i].city,
+                        destination: ordered[j].city,
+                        departureDateTime: ordered[i].at,
+                        arrivalDateTime: ordered[j].at,
+                        durationMinutes: minutes,
+                        source: meta.source || 'manual',
+                        whatsappGroup: meta.whatsappGroup || ''
+                    });
+                }
+            }
+            return { records, added: this.addRecords(records) };
+        },
+
+        median(values) {
+            const sorted = [...values].sort((a, b) => a - b);
+            if (!sorted.length) return 0;
+            const mid = Math.floor(sorted.length / 2);
+            return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+        },
+
+        percentile(values, q) {
+            const sorted = [...values].sort((a, b) => a - b);
+            if (!sorted.length) return 0;
+            const pos = (sorted.length - 1) * Math.min(1, Math.max(0, q));
+            const lo = Math.floor(pos), hi = Math.ceil(pos);
+            if (lo === hi) return sorted[lo];
+            return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+        },
+
+        stats(origin, destination, whatsappGroup = '') {
+            const o = this.normalizePlace(origin);
+            const d = this.normalizePlace(destination);
+            const group = EH.Utils.clean(whatsappGroup);
+            if (!o || !d) return null;
+            let rows = this.load().filter(row => row.originKey === o && row.destinationKey === d);
+            if (group) {
+                const exactOrGeneric = rows.filter(row => !row.whatsappGroup || row.whatsappGroup === group);
+                if (exactOrGeneric.length) rows = exactOrGeneric;
+            }
+            if (!rows.length) return null;
+
+            const raw = rows.map(row => Number(row.durationMinutes)).filter(v => v > 0 && v <= EH.Config.TRAVEL_MAX_DURATION_MIN);
+            if (!raw.length) return null;
+            const median = this.median(raw);
+            const deviations = raw.map(value => Math.abs(value - median));
+            const mad = this.median(deviations);
+            const threshold = raw.length >= 5 ? Math.max(20, mad * 3.5) : Number.POSITIVE_INFINITY;
+            let filteredRows = rows.filter(row => Math.abs(Number(row.durationMinutes) - median) <= threshold);
+            if (filteredRows.length < Math.min(3, rows.length)) filteredRows = rows;
+            let filtered = filteredRows.map(row => Number(row.durationMinutes)).sort((a, b) => a - b);
+            if (filtered.length >= 10) {
+                const trim = Math.max(1, Math.floor(filtered.length * 0.1));
+                filtered = filtered.slice(trim, filtered.length - trim);
+            }
+            const mean = filtered.reduce((sum, value) => sum + value, 0) / filtered.length;
+            const low = filtered.length >= 4 ? Math.min(this.percentile(filtered, .2), mean - 10) : Math.max(1, mean - 20);
+            const high = filtered.length >= 4 ? Math.max(this.percentile(filtered, .8), mean + 10) : mean + 20;
+            const confidence = raw.length >= 10 ? 'good' : raw.length >= 4 ? 'medium' : 'low';
+            return {
+                origin: this.displayPlace(origin),
+                destination: this.displayPlace(destination),
+                averageMinutes: Math.round(mean),
+                medianMinutes: Math.round(median),
+                lowMinutes: Math.round(low),
+                highMinutes: Math.round(high),
+                count: raw.length,
+                usedCount: filtered.length,
+                ignoredCount: raw.length - filtered.length,
+                confidence,
+                records: filteredRows.sort((a, b) => Number(b.departureDateTime || 0) - Number(a.departureDateTime || 0))
+            };
+        },
+
+        routeSummaries() {
+            const map = new Map();
+            for (const row of this.load()) {
+                const key = `${row.originKey}>${row.destinationKey}`;
+                if (!map.has(key)) map.set(key, { origin: row.origin, destination: row.destination });
+            }
+            return Array.from(map.values()).map(item => this.stats(item.origin, item.destination)).filter(Boolean)
+                .sort((a, b) => b.count - a.count || a.origin.localeCompare(b.origin));
+        },
+
+        updateDuration(id, minutes) {
+            const value = Math.round(Number(minutes) || 0);
+            if (value < 3 || value > EH.Config.TRAVEL_MAX_DURATION_MIN) return false;
+            const rows = this.load();
+            const row = rows.find(item => item.id === id);
+            if (!row) return false;
+            row.durationMinutes = value;
+            row.editedAt = Date.now();
+            this.save(rows);
+            return true;
+        },
+
+        remove(id) {
+            const rows = this.load();
+            const next = rows.filter(row => row.id !== id);
+            if (next.length === rows.length) return false;
+            this.save(next);
+            const deleted = new Set(EH.Storage.get(this.DELETED_KEY, []));
+            deleted.add(id);
+            EH.Storage.set(this.DELETED_KEY, Array.from(deleted).slice(-2000));
+            return true;
+        },
+
+        clear() {
+            this.save([]);
+            EH.Storage.set(this.DELETED_KEY, []);
+        },
+
+        knownPlaces() {
+            const values = [];
+            for (const row of this.load()) values.push(row.origin, row.destination);
+            for (const route of EH.Routes.getAll()) values.push(route.origem, route.destino);
+            const map = new Map();
+            values.filter(Boolean).forEach(value => {
+                const display = this.displayPlace(value);
+                const key = this.normalizePlace(display);
+                if (key && !map.has(key)) map.set(key, display);
+            });
+            return Array.from(map.values()).sort((a, b) => a.localeCompare(b, 'pt-BR'));
+        }
+    };
+
+    EH.WhatsAppRouteParser = {
+        extractTime(text) {
+            const match = String(text || '').match(/\b([01]?\d|2[0-3])\s*(?::|h)\s*([0-5]\d)\b/i);
+            if (!match) return '';
+            return `${String(Number(match[1])).padStart(2, '0')}:${match[2]}`;
+        },
+
+        cleanPlace(value) {
+            return EH.Utils.prettifyWords(String(value || '')
+                .replace(/^\s*(?:da|do|de)\s+/i, '')
+                .replace(/^\s*rodovi[aá]ria\s+(?:de|da|do)\s+/i, '')
+                .replace(/^\s*(?:o\s+)?[oô]nibus\s+/i, '')
+                .replace(/\s+(?:da|do)\s+central\s*$/i, '')
+                .replace(/\b(?:agora|neste momento|já)\s*$/i, '')
+                .replace(/[,.!?;:]+$/g, '')
+                .trim());
+        },
+
+        extractPlace(text) {
+            const raw = String(text || '').replace(/[–—|]+/g, ' ').replace(/\s+/g, ' ').trim();
+            if (!raw) return '';
+            const withoutTime = raw
+                .replace(/\b([01]?\d|2[0-3])\s*(?::|h)\s*[0-5]\d\b/ig, ' ')
+                .replace(/(?:^|\s)(?:as|às)(?=\s|$)/ig, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            const patterns = [
+                /(?:^|\s)(?:saiu|saindo|saída|saida|partiu|passou|passando)\s+(?:de\s+|da\s+|do\s+)?(.+)$/i,
+                /^(.+?)\s+(?:saiu|partiu|passou|saindo|saída|saida)$/i
+            ];
+            for (const pattern of patterns) {
+                const match = withoutTime.match(pattern);
+                if (match?.[1]) {
+                    const candidate = this.cleanPlace(match[1]);
+                    if (candidate.length >= 2 && candidate.length <= 70) return candidate;
+                }
+            }
+            const fallback = this.cleanPlace(withoutTime
+                .replace(/^.*?\b(?:ônibus|onibus)\b\s*/i, '')
+                .replace(/\b(?:saiu|saindo|saída|saida|partiu|passou|passando)\b/ig, ' ')
+                .replace(/\s+/g, ' '));
+            if (fallback && fallback.length <= 42 && fallback.split(/\s+/).length <= 6 && !/\b(?:hor[aá]rio|passagem|valor|cliente|embarque|chegada|previs[aã]o)\b/i.test(fallback)) return fallback;
+            return '';
+        },
+
+        dateFromMeta(message, eventTime) {
+            const meta = `${message?.meta || ''} ${message?.time || ''}`;
+            const dateMatch = meta.match(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b/);
+            const now = new Date();
+            let year = now.getFullYear(), month = now.getMonth(), day = now.getDate();
+            if (dateMatch) {
+                day = Number(dateMatch[1]);
+                month = Number(dateMatch[2]) - 1;
+                year = Number(dateMatch[3]);
+                if (year < 100) year += 2000;
+            }
+            const time = eventTime || this.extractTime(message?.time || '') || this.extractTime(meta);
+            if (!time) return null;
+            const [hour, minute] = time.split(':').map(Number);
+            const date = new Date(year, month, day, hour, minute, 0, 0);
+            return Number.isNaN(date.getTime()) ? null : date;
+        },
+
+        parseMessage(message) {
+            const text = EH.Utils.clean(message?.text || '');
+            const time = this.extractTime(text);
+            if (!time) return null;
+            const city = this.extractPlace(text);
+            if (!city) return null;
+            const date = this.dateFromMeta(message, time);
+            if (!date) return null;
+            return {
+                city,
+                cityKey: EH.TravelHistory.normalizePlace(city),
+                time,
+                at: date.getTime(),
+                text,
+                messageTime: message?.time || '',
+                sender: message?.sender || ''
+            };
+        },
+
+        clusterTrips(events) {
+            const sorted = [...events].sort((a, b) => a.at - b.at);
+            const trips = [];
+            let current = [];
+            const flush = () => { if (current.length >= 2) trips.push(current); current = []; };
+            for (const event of sorted) {
+                const prev = current[current.length - 1];
+                if (prev) {
+                    const gap = (event.at - prev.at) / 60000;
+                    const totalSpan = current.length ? (event.at - current[0].at) / 60000 : 0;
+                    const repeatedEarlier = current.slice(0, -1).some(item => item.cityKey === event.cityKey);
+                    const routeRestart = current.length >= 2 && event.cityKey === current[0].cityKey && gap > 60;
+                    if (gap > EH.Config.TRAVEL_TRIP_GAP_MIN || gap < -5 || totalSpan > EH.Config.TRAVEL_MAX_DURATION_MIN || routeRestart || (repeatedEarlier && gap > 90)) flush();
+                }
+                const last = current[current.length - 1];
+                if (last && last.cityKey === event.cityKey && (event.at - last.at) <= 45 * 60000) current[current.length - 1] = event;
+                else current.push(event);
+            }
+            flush();
+            return trips;
+        },
+
+        ingest(whatsappGroup, messages) {
+            const events = (Array.isArray(messages) ? messages : []).map(message => this.parseMessage(message)).filter(Boolean);
+            const trips = this.clusterTrips(events);
+            let added = 0;
+            for (const trip of trips) {
+                added += EH.TravelHistory.addTrip(trip.map(event => ({ city: event.city, at: event.at })), {
+                    source: 'whatsapp',
+                    whatsappGroup,
+                    routeId: whatsappGroup
+                }).added;
+            }
+            return { events, trips, added };
+        }
+    };
+
+    EH.TravelEstimator = {
+        formatDuration(minutes) {
+            const total = Math.max(0, Math.round(Number(minutes) || 0));
+            const h = Math.floor(total / 60), m = total % 60;
+            if (!h) return `${m} min`;
+            if (!m) return `${h}h`;
+            return `${h}h${String(m).padStart(2, '0')}`;
+        },
+
+        formatClock(timestamp) {
+            const date = new Date(Number(timestamp));
+            if (Number.isNaN(date.getTime())) return '';
+            return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+        },
+
+        formatDateTime(timestamp) {
+            const date = new Date(Number(timestamp));
+            if (Number.isNaN(date.getTime())) return '';
+            return date.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+        },
+
+        localDateInput(timestamp = Date.now()) {
+            const date = new Date(Number(timestamp));
+            if (Number.isNaN(date.getTime())) return '';
+            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+        },
+
+        confidenceLabel(stats) {
+            if (!stats) return '⚠️ Sem histórico suficiente';
+            if (stats.confidence === 'good') return `🟢 Boa estimativa • ${stats.count} viagens`;
+            if (stats.confidence === 'medium') return `🟡 Estimativa aproximada • ${stats.count} viagens`;
+            return `⚠️ Pouco histórico • ${stats.count} ${stats.count === 1 ? 'viagem' : 'viagens'}`;
+        },
+
+        predict({ origin, destination, whatsappGroup = '', departureAt }) {
+            const start = departureAt instanceof Date ? departureAt.getTime() : Number(departureAt);
+            if (!Number.isFinite(start)) return { ok: false, reason: 'Informe uma saída real para calcular a previsão.' };
+            const stats = EH.TravelHistory.stats(origin, destination, whatsappGroup);
+            if (!stats) return { ok: false, reason: `Ainda não há histórico de ${origin} para ${destination}.` };
+            const eta = start + stats.averageMinutes * 60000;
+            const low = start + stats.lowMinutes * 60000;
+            const high = start + stats.highMinutes * 60000;
+            return { ok: true, origin, destination, whatsappGroup, departureAt: start, eta, low, high, stats };
+        },
+
+        formatPrediction(result) {
+            if (!result?.ok) return '';
+            return `Previsão de chegada em ${EH.TravelHistory.displayPlace(result.destination)}: aproximadamente *${this.formatClock(result.eta)}*.\n\nO ônibus saiu de ${EH.TravelHistory.displayPlace(result.origin)} às ${this.formatClock(result.departureAt)}.\n\nPode haver pequena variação no horário.`;
+        },
+
+        manualPoints(baseDate, rows) {
+            const dateMatch = String(baseDate || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (!dateMatch) throw new Error('Informe a data da viagem.');
+            const points = [];
+            let dayOffset = 0;
+            let previousMinutes = null;
+            for (const row of rows) {
+                const city = EH.TravelHistory.displayPlace(row.city);
+                const tm = String(row.time || '').match(/^(\d{1,2}):(\d{2})$/);
+                if (!city || !tm) continue;
+                const minutes = Number(tm[1]) * 60 + Number(tm[2]);
+                if (previousMinutes !== null && minutes < previousMinutes - 240) dayOffset += 1;
+                previousMinutes = minutes;
+                const at = new Date(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3]) + dayOffset, Number(tm[1]), Number(tm[2]), 0, 0).getTime();
+                points.push({ city, at, time: `${String(Number(tm[1])).padStart(2, '0')}:${tm[2]}` });
+            }
+            if (points.length < 2) throw new Error('Informe pelo menos duas cidades com horário.');
+            return points;
+        }
+    };
+
+    EH.BoardingStorage = {
+        KEY: 'boardingRemindersV1',
+        load() {
+            const rows = EH.Storage.get(this.KEY, []);
+            return Array.isArray(rows) ? rows : [];
+        },
+        save(rows) {
+            EH.Storage.set(this.KEY, Array.isArray(rows) ? rows : []);
+            return rows;
+        }
+    };
+
+    EH.NotificationManager = {
+        supported() {
+            return typeof Notification !== 'undefined';
+        },
+        async request() {
+            if (!this.supported()) return { ok: false, reason: 'Notificações não estão disponíveis neste navegador.' };
+            try {
+                const permission = await Notification.requestPermission();
+                const enabled = permission === 'granted';
+                EH.Config.BOARDING_BROWSER_NOTIFICATIONS = enabled;
+                EH.Storage.set('boardingBrowserNotifications', enabled);
+                return { ok: enabled, permission };
+            } catch (error) {
+                EH.Logger.warn('Permissão de notificação:', error);
+                return { ok: false, reason: 'O navegador não permitiu ativar notificações.' };
+            }
+        },
+        notify(title, body) {
+            if (!EH.Config.BOARDING_BROWSER_NOTIFICATIONS || !this.supported() || Notification.permission !== 'granted') return false;
+            try {
+                new Notification(title, { body, tag: `epass-boarding-${title}`, renotify: false });
+                return true;
+            } catch (error) {
+                EH.Logger.debug('Notificação de embarque não disponível:', error);
+                return false;
+            }
+        }
+    };
+
+    EH.BoardingReminders = {
+        lastTicketCandidate: null,
+        started: false,
+
+        parseOffsets(value) {
+            const source = Array.isArray(value) ? value : String(value || '').split(/[,;\s]+/);
+            const values = [...new Set(source.map(Number).filter(item => Number.isFinite(item) && item >= 5 && item <= 1440).map(item => Math.round(item)))];
+            return values.sort((a, b) => b - a);
+        },
+
+        parseDateTime(dateValue, timeValue) {
+            const dateText = EH.Utils.clean(dateValue);
+            const time = String(timeValue || '').match(/(\d{1,2}):(\d{2})/);
+            if (!time) return null;
+            let match = dateText.match(/^(\d{4})-(\d{2})-(\d{2})/);
+            if (!match) {
+                const br = dateText.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
+                if (br) match = [br[0], br[3].length === 2 ? `20${br[3]}` : br[3], br[2], br[1]];
+            }
+            if (!match) return null;
+            const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(time[1]), Number(time[2]), 0, 0);
+            return Number.isNaN(date.getTime()) ? null : date;
+        },
+
+        splitTicketDate(value) {
+            const text = EH.Utils.clean(value);
+            const d = text.match(/(\d{1,2}\/\d{1,2}\/\d{2,4})/);
+            const t = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+            let date = '';
+            if (d) {
+                const [day, month, yearRaw] = d[1].split('/');
+                const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
+                date = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
+            }
+            const time = t ? `${String(Number(t[1])).padStart(2, '0')}:${t[2]}` : '';
+            return { date, time };
+        },
+
+        reminderKey(item) {
+            const ticket = EH.Utils.clean(item.ticketNumber || '');
+            if (ticket) return `ticket:${ticket}:${item.departureAt}`;
+            return [EH.Utils.normalize(item.passenger), EH.TravelHistory.normalizePlace(item.origin), EH.TravelHistory.normalizePlace(item.destination), item.departureAt].join('|');
+        },
+
+        list({ includeCompleted = true } = {}) {
+            return EH.BoardingStorage.load()
+                .filter(item => includeCompleted || item.status !== 'completed')
+                .sort((a, b) => Number(a.departureAt || 0) - Number(b.departureAt || 0));
+        },
+
+        upsert(input) {
+            const departureAt = input.departureAt instanceof Date ? input.departureAt.getTime() : Number(input.departureAt);
+            if (!Number.isFinite(departureAt)) return { ok: false, reason: 'Informe data e horário do embarque.' };
+            const item = {
+                id: input.id || `brd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
+                passenger: EH.Utils.clean(input.passenger || ''),
+                chatTitle: EH.Utils.clean(input.chatTitle || ''),
+                phone: String(input.phone || '').replace(/\D/g, ''),
+                origin: EH.TravelHistory.displayPlace(input.origin),
+                destination: EH.TravelHistory.displayPlace(input.destination),
+                departureAt,
+                company: EH.Utils.clean(input.company || ''),
+                ticketNumber: EH.Utils.clean(input.ticketNumber || ''),
+                status: ['pending', 'notified', 'completed'].includes(input.status) ? input.status : 'pending',
+                remindMinutes: Math.min(1440, Math.max(5, Number(input.remindMinutes) || EH.Config.BOARDING_DEFAULT_REMIND_MINUTES)),
+                alertOffsets: this.parseOffsets(input.alertOffsets || input.remindOffsets || input.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS),
+                firedOffsets: Array.isArray(input.firedOffsets) ? input.firedOffsets.map(Number).filter(Number.isFinite) : [],
+                snoozeUntil: Number(input.snoozeUntil) || 0,
+                snoozeAlertedAt: Number(input.snoozeAlertedAt) || 0,
+                alertedAt: Number(input.alertedAt) || 0,
+                overdueAlertedAt: Number(input.overdueAlertedAt) || 0,
+                createdAt: Number(input.createdAt) || Date.now(),
+                updatedAt: Date.now()
+            };
+            if (!item.alertOffsets.length) item.alertOffsets = [item.remindMinutes];
+            item.remindMinutes = Math.max(...item.alertOffsets);
+            if (!item.passenger) item.passenger = item.chatTitle || 'Passageiro';
+            if (!item.origin || !item.destination) return { ok: false, reason: 'Informe origem e destino.' };
+            const rows = EH.BoardingStorage.load();
+            const key = this.reminderKey(item);
+            const duplicate = rows.find(row => row.id !== item.id && this.reminderKey(row) === key && row.status !== 'completed');
+            if (duplicate) return { ok: false, duplicate: true, existing: duplicate, reason: 'Este embarque já está na lista.' };
+            const index = rows.findIndex(row => row.id === item.id);
+            if (index >= 0) rows[index] = { ...rows[index], ...item };
+            else rows.push(item);
+            EH.BoardingStorage.save(rows);
+            EH.OperationPanel?.refreshBadge?.();
+            return { ok: true, item };
+        },
+
+        setStatus(id, status) {
+            const rows = EH.BoardingStorage.load();
+            const item = rows.find(row => row.id === id);
+            if (!item) return false;
+            item.status = status;
+            item.updatedAt = Date.now();
+            EH.BoardingStorage.save(rows);
+            EH.OperationPanel?.refreshBadge?.();
+            return true;
+        },
+
+        snooze(id, minutes = 30) {
+            const rows = EH.BoardingStorage.load();
+            const item = rows.find(row => row.id === id);
+            if (!item) return false;
+            item.snoozeUntil = Date.now() + Math.max(5, Number(minutes) || 30) * 60000;
+            item.snoozeAlertedAt = 0;
+            item.alertedAt = 0;
+            item.updatedAt = Date.now();
+            EH.BoardingStorage.save(rows);
+            EH.OperationPanel?.refreshBadge?.();
+            return true;
+        },
+
+        remove(id) {
+            const rows = EH.BoardingStorage.load();
+            const next = rows.filter(row => row.id !== id);
+            EH.BoardingStorage.save(next);
+            EH.OperationPanel?.refreshBadge?.();
+        },
+
+        setTicketCandidate(data) {
+            if (!data?.tickets?.length) return;
+            this.lastTicketCandidate = {
+                passenger: data.passenger || data.header || '',
+                seat: data.seat || '',
+                service: data.service || '',
+                tickets: data.tickets.map(ticket => ({ ...ticket })),
+                chatTitle: EH.WhatsAppBridge.getState().activeTitle || EH.WhatsAppDock?.currentState?.active?.title || '',
+                phone: EH.UI?.getPhone?.() || ''
+            };
+            EH.OperationPanel?.refreshBadge?.();
+        },
+
+        ticketPrefill(ticketIndex = 0) {
+            const candidate = this.lastTicketCandidate;
+            if (!candidate?.tickets?.length) return null;
+            const ticket = candidate.tickets[Math.max(0, Math.min(candidate.tickets.length - 1, ticketIndex))];
+            const dt = this.splitTicketDate(ticket.date || '');
+            return {
+                passenger: candidate.passenger,
+                chatTitle: candidate.chatTitle,
+                phone: candidate.phone || '',
+                origin: ticket.origin,
+                destination: ticket.destination,
+                date: dt.date,
+                time: dt.time,
+                company: candidate.service,
+                ticketNumber: ticket.number,
+                ticketOptions: candidate.tickets
+            };
+        },
+
+        dueItems(now = Date.now()) {
+            return this.list({ includeCompleted: false }).filter(item => {
+                if (item.departureAt <= now) return true;
+                if (item.snoozeUntil && now >= item.snoozeUntil) return true;
+                const offsets = this.parseOffsets(item.alertOffsets || item.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS);
+                const earliest = offsets.length ? item.departureAt - Math.max(...offsets) * 60000 : item.departureAt - EH.Config.BOARDING_DEFAULT_REMIND_MINUTES * 60000;
+                return now >= earliest;
+            });
+        },
+
+        checkDue() {
+            const now = Date.now();
+            const rows = EH.BoardingStorage.load();
+            let changed = false;
+            for (const item of rows) {
+                if (item.status === 'completed') continue;
+                const time = EH.TravelEstimator.formatClock(item.departureAt);
+                const body = `${time} — ${item.passenger}\n${item.origin} → ${item.destination}`;
+
+                if (now > item.departureAt) {
+                    if (!item.overdueAlertedAt) {
+                        item.overdueAlertedAt = now;
+                        changed = true;
+                        EH.Toast.warning(`⚠️ Embarque vencido — verificar: ${time} — ${item.passenger}`, 7000);
+                        EH.NotificationManager.notify('⚠️ Embarque vencido — verificar', body);
+                    }
+                    continue;
+                }
+
+                if (item.snoozeUntil && now >= item.snoozeUntil && !item.snoozeAlertedAt) {
+                    item.snoozeAlertedAt = now;
+                    item.snoozeUntil = 0;
+                    changed = true;
+                    EH.Toast.warning(`⏰ Embarque próximo: ${time} — ${item.passenger}`, 5200);
+                    EH.NotificationManager.notify('⏰ Embarque próximo', body);
+                    continue;
+                }
+
+                const offsets = this.parseOffsets(item.alertOffsets || item.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS);
+                const fired = new Set((item.firedOffsets || []).map(Number));
+                const eligible = offsets.filter(offset => now >= item.departureAt - offset * 60000 && !fired.has(offset));
+                if (!eligible.length) continue;
+                // Se o navegador ficou fechado e vários alertas venceram, registra todos,
+                // mas mostra uma única notificação (a mais próxima do embarque) para não gerar spam.
+                eligible.forEach(offset => fired.add(offset));
+                item.firedOffsets = Array.from(fired);
+                item.alertedAt = now;
+                changed = true;
+                const nearest = Math.min(...eligible);
+                EH.Toast.warning(`⏰ Embarque em ~${nearest} min: ${time} — ${item.passenger}`, 5200);
+                EH.NotificationManager.notify(`⏰ Embarque às ${time}`, `${item.passenger} — ${item.origin} → ${item.destination}`);
+            }
+            if (changed) EH.BoardingStorage.save(rows);
+            EH.OperationPanel?.refreshBadge?.();
+        },
+
+        scheduleNext() {
+            if (!this.started) return;
+            EH.Runtime.timeout('boarding-check', () => {
+                this.checkDue();
+                this.scheduleNext();
+            }, EH.Config.BOARDING_CHECK_MS);
+        },
+
+        init() {
+            if (this.started || EH.WhatsAppBridge.isWhatsAppHost()) return;
+            this.started = true;
+            this.checkDue();
+            this.scheduleNext();
+            EH.Runtime.on('boarding-focus', window, 'focus', () => this.checkDue());
+            EH.Runtime.on('boarding-visibility', document, 'visibilitychange', () => { if (!document.hidden) this.checkDue(); });
+        }
+    };
+
+    EH.OperationPanel = {
+        overlay: null,
+        launcher: null,
+        badge: null,
+        activeTab: 'travel',
+        lastAnalysis: null,
+        lastPrediction: null,
+
+        attachLauncher(button) {
+            this.launcher = button;
+            this.refreshBadge();
+        },
+
+        refreshBadge() {
+            if (!this.launcher) return;
+            const active = EH.BoardingReminders.list({ includeCompleted: false });
+            const due = EH.BoardingReminders.dueItems();
+            let badge = this.badge;
+            if (!badge) {
+                badge = document.createElement('span');
+                badge.className = 'eh-operation-badge';
+                this.badge = badge;
+                this.launcher.appendChild(badge);
+            }
+            badge.textContent = String(due.length || active.length || '');
+            badge.hidden = !active.length;
+            badge.classList.toggle('due', Boolean(due.length));
+            this.launcher.title = due.length
+                ? `${due.length} embarque(s) precisam de atenção`
+                : active.length ? `${active.length} embarque(s) pendente(s)` : 'Previsão de viagem e embarques';
+        },
+
+        chatOptions() {
+            const state = EH.WhatsAppDock?.currentState || EH.WhatsAppBridge.getUiState();
+            return Array.isArray(state?.chats) ? state.chats : [];
+        },
+
+        open(tab = 'travel', prefill = null) {
+            document.querySelector('#eh-operation-overlay')?.remove();
+            this.activeTab = tab === 'boarding' ? 'boarding' : 'travel';
+            const overlay = document.createElement('div');
+            overlay.className = 'eh-overlay';
+            overlay.id = 'eh-operation-overlay';
+            const modal = document.createElement('div');
+            modal.className = 'eh-modal eh-operation-modal';
+
+            const head = document.createElement('div');
+            head.className = 'eh-modal-head';
+            const title = document.createElement('div');
+            title.className = 'eh-modal-title';
+            title.textContent = 'Viagem / Embarques';
+            const close = document.createElement('button');
+            close.type = 'button'; close.className = 'eh-modal-close'; close.textContent = '✕';
+            head.append(title, close);
+
+            const tabs = document.createElement('div');
+            tabs.className = 'eh-operation-tabs';
+            const travelTab = document.createElement('button');
+            travelTab.type = 'button'; travelTab.textContent = 'Previsão';
+            const boardingTab = document.createElement('button');
+            boardingTab.type = 'button'; boardingTab.textContent = 'Embarques';
+            tabs.append(travelTab, boardingTab);
+
+            const content = document.createElement('div');
+            content.className = 'eh-modal-content eh-operation-content';
+            const travelPane = document.createElement('section');
+            travelPane.className = 'eh-operation-pane';
+            const boardingPane = document.createElement('section');
+            boardingPane.className = 'eh-operation-pane';
+            content.append(travelPane, boardingPane);
+
+            const switchTab = tabName => {
+                this.activeTab = tabName;
+                travelTab.classList.toggle('active', tabName === 'travel');
+                boardingTab.classList.toggle('active', tabName === 'boarding');
+                travelPane.hidden = tabName !== 'travel';
+                boardingPane.hidden = tabName !== 'boarding';
+            };
+            travelTab.addEventListener('click', () => switchTab('travel'));
+            boardingTab.addEventListener('click', () => switchTab('boarding'));
+            close.addEventListener('click', () => overlay.remove());
+            overlay.addEventListener('click', event => { if (event.target === overlay) overlay.remove(); });
+
+            this.renderTravel(travelPane);
+            this.renderBoarding(boardingPane, prefill);
+            switchTab(this.activeTab);
+            modal.append(head, tabs, content);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+            this.overlay = overlay;
+        },
+
+        createField(labelText, type = 'text', value = '') {
+            const wrap = document.createElement('label');
+            wrap.className = 'eh-op-field';
+            const label = document.createElement('span');
+            label.textContent = labelText;
+            const input = document.createElement('input');
+            input.type = type;
+            input.value = value || '';
+            wrap.append(label, input);
+            return { wrap, input };
+        },
+
+        fillSelect(select, values, placeholder = 'Selecione…') {
+            select.innerHTML = '';
+            const empty = document.createElement('option');
+            empty.value = ''; empty.textContent = placeholder;
+            select.appendChild(empty);
+            values.forEach(value => {
+                const option = document.createElement('option');
+                option.value = value; option.textContent = value;
+                select.appendChild(option);
+            });
+        },
+
+        renderTravel(container) {
+            container.innerHTML = '';
+            const form = document.createElement('div');
+            form.className = 'eh-op-grid';
+            const groupWrap = document.createElement('label');
+            groupWrap.className = 'eh-op-field eh-op-span-2';
+            const groupLabel = document.createElement('span');
+            groupLabel.textContent = 'Grupo de referência';
+            const group = document.createElement('select');
+            this.fillSelect(group, this.chatOptions().map(chat => chat.title), 'Selecione o grupo…');
+            const activeTitle = EH.WhatsAppDock?.currentState?.active?.title || '';
+            if (activeTitle && Array.from(group.options).some(option => option.value === activeTitle)) group.value = activeTitle;
+            groupWrap.append(groupLabel, group);
+
+            const origin = this.createField('Origem');
+            const destination = this.createField('Destino');
+            const departure = this.createField('Saída manual (opcional)', 'datetime-local');
+            departure.wrap.classList.add('eh-op-span-2');
+            form.append(groupWrap, origin.wrap, destination.wrap, departure.wrap);
+
+            const listId = `eh-op-places-${Date.now()}`;
+            const datalist = document.createElement('datalist');
+            datalist.id = listId;
+            EH.TravelHistory.knownPlaces().forEach(place => {
+                const option = document.createElement('option'); option.value = place; datalist.appendChild(option);
+            });
+            origin.input.setAttribute('list', listId);
+            destination.input.setAttribute('list', listId);
+
+            const calculate = document.createElement('button');
+            calculate.type = 'button'; calculate.className = 'eh-op-primary'; calculate.textContent = 'Calcular previsão';
+            const result = document.createElement('div');
+            result.className = 'eh-op-result'; result.hidden = true;
+            const status = document.createElement('div');
+            status.className = 'eh-op-status';
+
+            calculate.addEventListener('click', async () => {
+                const from = EH.TravelHistory.displayPlace(origin.input.value);
+                const to = EH.TravelHistory.displayPlace(destination.input.value);
+                if (!from || !to) return EH.Toast.warning('Informe origem e destino.');
+                calculate.disabled = true;
+                status.textContent = '';
+                let departureAt = departure.input.value ? new Date(departure.input.value).getTime() : NaN;
+                let latest = null;
+                try {
+                    if (group.value) {
+                        status.textContent = 'Lendo somente o grupo selecionado…';
+                        const history = await EH.WhatsAppBridge.requestChatHistory(group.value);
+                        if (!history.ok) throw new Error(history.reason || 'Não foi possível ler o grupo.');
+                        const parsed = EH.WhatsAppRouteParser.ingest(group.value, history.messages || []);
+                        this.lastAnalysis = { group: group.value, ...parsed, at: Date.now() };
+                        const originKey = EH.TravelHistory.normalizePlace(from);
+                        latest = [...parsed.events].reverse().find(event => event.cityKey === originKey) || null;
+                        if (!Number.isFinite(departureAt) && latest) departureAt = latest.at;
+                        status.textContent = `${parsed.events.length} saída(s) reconhecida(s) • ${parsed.added} novo(s) tempo(s) aprendido(s)`;
+                    }
+                    if (!Number.isFinite(departureAt)) throw new Error(`Não encontrei uma saída recente de ${from}. Informe a saída manual.`);
+                    const prediction = EH.TravelEstimator.predict({ origin: from, destination: to, whatsappGroup: group.value, departureAt });
+                    if (!prediction.ok) throw new Error(prediction.reason);
+                    this.lastPrediction = prediction;
+                    result.hidden = false;
+                    result.innerHTML = '';
+                    const heading = document.createElement('strong');
+                    heading.textContent = `${EH.TravelHistory.displayPlace(to)} • ${EH.TravelEstimator.formatClock(prediction.eta)}`;
+                    const detail = document.createElement('div');
+                    detail.textContent = `Última saída: ${from} ${EH.TravelEstimator.formatClock(prediction.departureAt)} • médio ${EH.TravelEstimator.formatDuration(prediction.stats.averageMinutes)}`;
+                    const range = document.createElement('div');
+                    range.textContent = `Faixa provável: ${EH.TravelEstimator.formatClock(prediction.low)} às ${EH.TravelEstimator.formatClock(prediction.high)}`;
+                    const confidence = document.createElement('small');
+                    confidence.textContent = EH.TravelEstimator.confidenceLabel(prediction.stats);
+                    const copy = document.createElement('button');
+                    copy.type = 'button'; copy.className = 'eh-op-secondary'; copy.textContent = 'Copiar previsão';
+                    copy.addEventListener('click', async () => {
+                        await EH.Clipboard.copyText(EH.TravelEstimator.formatPrediction(prediction));
+                        EH.Toast.success('✓ Previsão copiada');
+                    });
+                    result.append(heading, detail, range, confidence, copy);
+                } catch (error) {
+                    result.hidden = false;
+                    result.textContent = error.message || 'Não foi possível calcular a previsão.';
+                } finally {
+                    calculate.disabled = false;
+                }
+            });
+
+            const manual = document.createElement('details');
+            manual.className = 'eh-op-details';
+            const manualSummary = document.createElement('summary');
+            manualSummary.textContent = 'Calculadora manual';
+            const manualBody = document.createElement('div');
+            manualBody.className = 'eh-op-details-body';
+            const dateField = this.createField('Data da viagem', 'date', EH.TravelEstimator.localDateInput());
+            const manualGroup = document.createElement('select');
+            this.fillSelect(manualGroup, this.chatOptions().map(chat => chat.title), 'Sem grupo / manual');
+            manualGroup.value = group.value || '';
+            const rowsWrap = document.createElement('div'); rowsWrap.className = 'eh-manual-rows';
+            const addRow = (city = '', time = '') => {
+                const row = document.createElement('div'); row.className = 'eh-manual-row';
+                const cityInput = document.createElement('input'); cityInput.placeholder = 'Cidade'; cityInput.value = city;
+                cityInput.setAttribute('list', listId);
+                const timeInput = document.createElement('input'); timeInput.type = 'time'; timeInput.value = time;
+                const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = '×'; remove.title = 'Remover';
+                remove.addEventListener('click', () => row.remove());
+                row.append(cityInput, timeInput, remove); rowsWrap.appendChild(row);
+            };
+            addRow(); addRow(); addRow();
+            const manualActions = document.createElement('div'); manualActions.className = 'eh-op-inline';
+            const add = document.createElement('button'); add.type = 'button'; add.className = 'eh-op-secondary'; add.textContent = '+ Cidade';
+            add.addEventListener('click', () => addRow());
+            const save = document.createElement('button'); save.type = 'button'; save.className = 'eh-op-primary'; save.textContent = 'Salvar viagem';
+            const manualResult = document.createElement('div'); manualResult.className = 'eh-op-status';
+            save.addEventListener('click', () => {
+                try {
+                    const rows = Array.from(rowsWrap.querySelectorAll('.eh-manual-row')).map(row => ({
+                        city: row.querySelector('input:not([type="time"])')?.value || '',
+                        time: row.querySelector('input[type="time"]')?.value || ''
+                    }));
+                    const points = EH.TravelEstimator.manualPoints(dateField.input.value, rows);
+                    const stored = EH.TravelHistory.addTrip(points, { source: 'manual', whatsappGroup: manualGroup.value || '', routeId: manualGroup.value || 'manual' });
+                    const intervals = [];
+                    for (let i = 0; i < points.length - 1; i += 1) {
+                        intervals.push(`${points[i].city} → ${points[i + 1].city}: ${EH.TravelEstimator.formatDuration((points[i + 1].at - points[i].at) / 60000)}`);
+                    }
+                    const total = (points[points.length - 1].at - points[0].at) / 60000;
+                    manualResult.textContent = `${intervals.join(' • ')} • Total ${EH.TravelEstimator.formatDuration(total)} • ${stored.added} tempo(s) salvo(s)`;
+                    EH.Toast.success('✓ Tempos da viagem salvos');
+                } catch (error) {
+                    manualResult.textContent = error.message || 'Não foi possível salvar a viagem.';
+                }
+            });
+            manualActions.append(add, save);
+            manualBody.append(dateField.wrap, manualGroup, rowsWrap, manualActions, manualResult);
+            manual.append(manualSummary, manualBody);
+
+            const history = document.createElement('details');
+            history.className = 'eh-op-details';
+            const historySummary = document.createElement('summary'); historySummary.textContent = 'Histórico de tempos';
+            const historyBody = document.createElement('div'); historyBody.className = 'eh-op-details-body';
+            const renderHistory = () => {
+                historyBody.innerHTML = '';
+                const summaries = EH.TravelHistory.routeSummaries().slice(0, 40);
+                if (!summaries.length) { historyBody.textContent = 'Nenhum tempo histórico salvo ainda.'; return; }
+                summaries.forEach(summaryItem => {
+                    const details = document.createElement('details'); details.className = 'eh-history-route';
+                    const s = document.createElement('summary');
+                    s.textContent = `${summaryItem.origin} → ${summaryItem.destination} • ${EH.TravelEstimator.formatDuration(summaryItem.averageMinutes)} • ${summaryItem.count}`;
+                    const records = document.createElement('div'); records.className = 'eh-history-records';
+                    summaryItem.records.slice(0, 25).forEach(record => {
+                        const row = document.createElement('div'); row.className = 'eh-history-record';
+                        const label = document.createElement('span');
+                        label.textContent = `${EH.TravelEstimator.formatDateTime(record.departureDateTime)} • ${record.source === 'whatsapp' ? 'WhatsApp' : 'manual'}${record.whatsappGroup ? ` • ${record.whatsappGroup}` : ''}`;
+                        const minutes = document.createElement('input'); minutes.type = 'number'; minutes.min = '3'; minutes.max = String(EH.Config.TRAVEL_MAX_DURATION_MIN); minutes.value = String(record.durationMinutes); minutes.title = 'Minutos';
+                        const saveBtn = document.createElement('button'); saveBtn.type = 'button'; saveBtn.textContent = '✓'; saveBtn.title = 'Corrigir tempo';
+                        saveBtn.addEventListener('click', () => { if (EH.TravelHistory.updateDuration(record.id, minutes.value)) { EH.Toast.success('Tempo corrigido.'); renderHistory(); } });
+                        const del = document.createElement('button'); del.type = 'button'; del.textContent = '×'; del.title = 'Excluir registro';
+                        del.addEventListener('click', () => { EH.TravelHistory.remove(record.id); renderHistory(); });
+                        row.append(label, minutes, saveBtn, del); records.appendChild(row);
+                    });
+                    details.append(s, records); historyBody.appendChild(details);
+                });
+            };
+            history.addEventListener('toggle', () => { if (history.open) renderHistory(); });
+            history.append(historySummary, historyBody);
+
+            container.append(form, calculate, status, result, manual, history, datalist);
+        },
+
+        renderBoarding(container, prefill = null) {
+            container.innerHTML = '';
+            const top = document.createElement('div'); top.className = 'eh-op-inline';
+            const add = document.createElement('button'); add.type = 'button'; add.className = 'eh-op-primary'; add.textContent = 'Novo lembrete';
+            const ticketPrefill = prefill || EH.BoardingReminders.ticketPrefill();
+            const useTicket = document.createElement('button'); useTicket.type = 'button'; useTicket.className = 'eh-op-secondary'; useTicket.textContent = 'Usar último bilhete'; useTicket.disabled = !ticketPrefill;
+            top.append(add, useTicket);
+            const editor = document.createElement('div'); editor.className = 'eh-boarding-editor'; editor.hidden = true;
+            const list = document.createElement('div'); list.className = 'eh-boarding-list';
+            const completed = document.createElement('details'); completed.className = 'eh-op-details';
+            const completedSummary = document.createElement('summary'); completedSummary.textContent = 'Concluídos';
+            const completedBody = document.createElement('div'); completedBody.className = 'eh-op-details-body'; completed.append(completedSummary, completedBody);
+
+            const openEditor = data => this.renderReminderEditor(editor, data || {} , () => { editor.hidden = true; renderLists(); });
+            add.addEventListener('click', () => openEditor({ chatTitle: EH.WhatsAppBridge.getState().activeTitle || '' }));
+            useTicket.addEventListener('click', () => openEditor(ticketPrefill));
+
+            const renderCard = (item, target) => {
+                const card = document.createElement('div'); card.className = `eh-boarding-card ${item.status}`;
+                const now = Date.now();
+                if (item.departureAt < now && item.status !== 'completed') card.classList.add('overdue');
+                const head = document.createElement('div'); head.className = 'eh-boarding-head';
+                const title = document.createElement('strong');
+                const critical = new Date(item.departureAt).getHours() < 5;
+                title.textContent = `${critical ? '🌙 ' : ''}${EH.TravelEstimator.formatClock(item.departureAt)} — ${item.passenger}`;
+                const state = document.createElement('span'); state.textContent = item.status === 'notified' ? 'Avisado' : item.status === 'completed' ? 'Concluído' : (item.departureAt < now ? 'Vencido' : 'Pendente');
+                head.append(title, state);
+                const route = document.createElement('div'); route.textContent = `${item.origin} → ${item.destination} • ${EH.TravelEstimator.formatDateTime(item.departureAt)}`;
+                const actions = document.createElement('div'); actions.className = 'eh-op-inline compact';
+                const wa = document.createElement('button'); wa.type = 'button'; wa.textContent = 'WhatsApp'; wa.disabled = !item.chatTitle;
+                wa.addEventListener('click', async () => {
+                    if (!item.chatTitle) return;
+                    const stateNow = await EH.WhatsAppBridge.ensureReady({ requireConversation: false, verifyStale: true, context: 'embarque-conversa' });
+                    if (!stateNow.connected) return EH.WhatsAppBridge.notifyUnavailable(stateNow);
+                    EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: item.chatTitle }));
+                    EH.Toast.info('Abrindo conversa do passageiro…');
+                });
+                const notified = document.createElement('button'); notified.type = 'button'; notified.textContent = 'Avisado'; notified.disabled = item.status === 'completed';
+                notified.addEventListener('click', () => { EH.BoardingReminders.setStatus(item.id, 'notified'); renderLists(); });
+                const done = document.createElement('button'); done.type = 'button'; done.textContent = 'Concluir'; done.disabled = item.status === 'completed';
+                done.addEventListener('click', () => { EH.BoardingReminders.setStatus(item.id, 'completed'); renderLists(); });
+                const more = document.createElement('button'); more.type = 'button'; more.textContent = '⋯'; more.title = 'Mais ações';
+                more.addEventListener('click', () => {
+                    const action = prompt('Digite: adiar 30, editar ou excluir', 'adiar 30');
+                    if (!action) return;
+                    const delay = action.match(/adiar\s+(\d+)/i);
+                    if (delay) EH.BoardingReminders.snooze(item.id, Number(delay[1]));
+                    else if (/editar/i.test(action)) openEditor(item);
+                    else if (/excluir/i.test(action)) EH.BoardingReminders.remove(item.id);
+                    renderLists();
+                });
+                actions.append(wa, notified, done, more);
+                card.append(head, route, actions); target.appendChild(card);
+            };
+
+            const renderLists = () => {
+                list.innerHTML = ''; completedBody.innerHTML = '';
+                const rows = EH.BoardingReminders.list();
+                const active = rows.filter(item => item.status !== 'completed');
+                const doneRows = rows.filter(item => item.status === 'completed').slice(-20).reverse();
+                if (!active.length) {
+                    const empty = document.createElement('div'); empty.className = 'eh-op-empty'; empty.textContent = 'Nenhum embarque pendente.'; list.appendChild(empty);
+                } else active.forEach(item => renderCard(item, list));
+                if (!doneRows.length) completedBody.textContent = 'Nenhum embarque concluído.';
+                else doneRows.forEach(item => renderCard(item, completedBody));
+                this.refreshBadge();
+            };
+
+            const settings = document.createElement('details'); settings.className = 'eh-op-details';
+            const settingsSummary = document.createElement('summary'); settingsSummary.textContent = 'Configurações dos alertas';
+            const settingsBody = document.createElement('div'); settingsBody.className = 'eh-op-details-body';
+            const remind = this.createField('Alertas padrão em minutos (ex.: 180,120,60)', 'text', EH.Config.BOARDING_DEFAULT_ALERTS.join(','));
+            const notifications = document.createElement('button'); notifications.type = 'button'; notifications.className = 'eh-op-secondary'; notifications.textContent = 'Ativar notificações do navegador';
+            notifications.addEventListener('click', async () => {
+                const result = await EH.NotificationManager.request();
+                if (result.ok) EH.Toast.success('Notificações de embarque ativadas.');
+                else EH.Toast.warning(result.reason || 'Permissão de notificação não concedida.');
+            });
+            remind.input.addEventListener('change', () => {
+                const offsets = EH.BoardingReminders.parseOffsets(remind.input.value);
+                EH.Config.BOARDING_DEFAULT_ALERTS = offsets.length ? offsets : [120];
+                EH.Config.BOARDING_DEFAULT_REMIND_MINUTES = Math.max(...EH.Config.BOARDING_DEFAULT_ALERTS);
+                remind.input.value = EH.Config.BOARDING_DEFAULT_ALERTS.join(',');
+                EH.Storage.set('boardingDefaultAlerts', EH.Config.BOARDING_DEFAULT_ALERTS);
+                EH.Storage.set('boardingDefaultRemindMinutes', EH.Config.BOARDING_DEFAULT_REMIND_MINUTES);
+            });
+            settingsBody.append(remind.wrap, notifications); settings.append(settingsSummary, settingsBody);
+
+            container.append(top, editor, list, completed, settings);
+            renderLists();
+            if (prefill) openEditor(prefill);
+        },
+
+        renderReminderEditor(container, prefill, onSaved) {
+            container.innerHTML = ''; container.hidden = false;
+            const title = document.createElement('strong'); title.textContent = prefill?.id ? 'Editar embarque' : 'Novo embarque';
+            let data = { ...prefill };
+            if (Array.isArray(prefill?.ticketOptions) && prefill.ticketOptions.length > 1) {
+                const select = document.createElement('select');
+                prefill.ticketOptions.forEach((ticket, index) => {
+                    const option = document.createElement('option'); option.value = String(index); option.textContent = `${ticket.number || index + 1} • ${ticket.origin} → ${ticket.destination} • ${ticket.date}`; select.appendChild(option);
+                });
+                select.addEventListener('change', () => {
+                    const selected = EH.BoardingReminders.ticketPrefill(Number(select.value));
+                    if (selected) this.renderReminderEditor(container, selected, onSaved);
+                });
+                container.append(title, select);
+            } else container.appendChild(title);
+
+            const grid = document.createElement('div'); grid.className = 'eh-op-grid';
+            const passenger = this.createField('Passageiro', 'text', data.passenger || '');
+            const chat = this.createField('Conversa', 'text', data.chatTitle || EH.WhatsAppBridge.getState().activeTitle || '');
+            const origin = this.createField('Origem', 'text', data.origin || '');
+            const destination = this.createField('Destino', 'text', data.destination || '');
+            let dateValue = data.date || '', timeValue = data.time || '';
+            if (data.departureAt) {
+                const dt = new Date(data.departureAt);
+                dateValue = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+                timeValue = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`;
+            }
+            const date = this.createField('Data', 'date', dateValue);
+            const time = this.createField('Horário', 'time', timeValue);
+            const remind = this.createField('Alertas antes (min; ex. 180,120,60)', 'text', EH.BoardingReminders.parseOffsets(data.alertOffsets || data.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS).join(','));
+            const ticket = this.createField('Bilhete / reserva', 'text', data.ticketNumber || '');
+            grid.append(passenger.wrap, chat.wrap, origin.wrap, destination.wrap, date.wrap, time.wrap, remind.wrap, ticket.wrap);
+            const actions = document.createElement('div'); actions.className = 'eh-op-inline';
+            const save = document.createElement('button'); save.type = 'button'; save.className = 'eh-op-primary'; save.textContent = 'Salvar lembrete';
+            const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'eh-op-secondary'; cancel.textContent = 'Cancelar';
+            save.addEventListener('click', () => {
+                const departure = EH.BoardingReminders.parseDateTime(date.input.value, time.input.value);
+                const result = EH.BoardingReminders.upsert({
+                    ...data,
+                    passenger: passenger.input.value,
+                    chatTitle: chat.input.value,
+                    origin: origin.input.value,
+                    destination: destination.input.value,
+                    departureAt: departure?.getTime(),
+                    remindMinutes: Math.max(...(EH.BoardingReminders.parseOffsets(remind.input.value).length ? EH.BoardingReminders.parseOffsets(remind.input.value) : [EH.Config.BOARDING_DEFAULT_REMIND_MINUTES])),
+                    alertOffsets: EH.BoardingReminders.parseOffsets(remind.input.value),
+                    ticketNumber: ticket.input.value
+                });
+                if (!result.ok) return EH.Toast.warning(result.reason || 'Não foi possível criar o lembrete.');
+                EH.Toast.success('✓ Lembrete de embarque salvo');
+                onSaved?.(result.item);
+            });
+            cancel.addEventListener('click', () => { container.hidden = true; });
+            actions.append(save, cancel); container.append(grid, actions);
+        }
+    };
+
+    // ============================================================
     // WHATSAPP INTEGRADO AO E-PASS
     // A aba já aberta do WhatsApp Web funciona como motor. Esta interface
     // lateral reproduz as conversas e envia comandos sem abrir nova aba/janela.
@@ -1611,6 +2832,12 @@
 
             const chats = document.createElement('section');
             chats.className = 'eh-wa-chats';
+            const operation = document.createElement('button');
+            operation.type = 'button';
+            operation.className = 'eh-wa-operation';
+            operation.innerHTML = '<span>⏱</span><strong>Viagem / Embarques</strong>';
+            operation.addEventListener('click', () => EH.OperationPanel.open('travel'));
+            EH.OperationPanel.attachLauncher(operation);
             const search = document.createElement('input');
             search.type = 'search';
             search.className = 'eh-wa-search';
@@ -1619,7 +2846,7 @@
             search.addEventListener('input', () => this.renderChats());
             const list = document.createElement('div');
             list.className = 'eh-wa-chat-list';
-            chats.append(search, list);
+            chats.append(operation, search, list);
 
             const conversation = document.createElement('section');
             conversation.className = 'eh-wa-conversation';
@@ -3066,7 +4293,7 @@
                 .eh-wa-status-text { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#667781; font-size:9px; text-align:right; }
                 .eh-wa-collapse { width:28px; height:28px; border:0; border-radius:7px; background:transparent; color:#54656f; cursor:pointer; font-size:20px; line-height:1; }
                 .eh-wa-collapse:hover { background:#e3e7e9; }
-                .eh-wa-chats { min-height:0; display:grid; grid-template-rows:42px minmax(0,1fr); border-bottom:1px solid #d8dedf; background:#fff; }
+                .eh-wa-chats { min-height:0; display:grid; grid-template-rows:34px 42px minmax(0,1fr); border-bottom:1px solid #d8dedf; background:#fff; }
                 .eh-wa-search { width:calc(100% - 16px); height:30px; margin:6px 8px; padding:0 11px; border:0; border-radius:8px; outline:none; background:#f0f2f5; color:#111b21; font:11px "Segoe UI",Arial,sans-serif; }
                 .eh-wa-chat-list { min-height:0; overflow:auto; scrollbar-width:thin; }
                 .eh-wa-chat { width:100%; min-height:50px; display:grid; grid-template-columns:34px minmax(0,1fr) auto; align-items:center; gap:8px; padding:6px 9px; border:0; border-bottom:1px solid #f1f3f4; background:#fff; color:#111b21; cursor:pointer; text-align:left; }
@@ -3102,6 +4329,70 @@
                 .eh-wa-empty-conversation { margin:auto; }
                 #eh-wa-handle { position:fixed; z-index:2147482499; right:0; top:46%; width:22px; height:54px; border:1px solid #cfd6d8; border-right:0; border-radius:8px 0 0 8px; background:#f0f2f5; color:#008069; cursor:pointer; font:800 20px Arial,sans-serif; box-shadow:-4px 0 12px rgba(0,0,0,.08); }
                 #eh-wa-handle[hidden] { display:none !important; }
+                .eh-wa-operation { position:relative; width:calc(100% - 16px); height:28px; margin:4px 8px 2px; display:flex; align-items:center; justify-content:center; gap:6px; border:1px solid #d8dedf; border-radius:7px; background:#fff; color:#34444d; cursor:pointer; font:600 10px "Segoe UI",Arial,sans-serif; }
+                .eh-wa-operation:hover { background:#f5f7f8; border-color:#b8c3c8; }
+                .eh-operation-badge { min-width:16px; height:16px; display:grid; place-items:center; padding:0 4px; border-radius:9px; background:#d9a321; color:#fff; font-size:8px; font-weight:800; }
+                .eh-operation-badge[hidden] { display:none !important; }
+                .eh-operation-badge.due { background:#d94b55; }
+
+                .eh-operation-modal { width:min(720px,96vw); max-height:min(820px,94vh); }
+                .eh-operation-tabs { display:flex; gap:4px; padding:8px 12px 0; border-bottom:1px solid #e2e6ec; background:#fafbfc; }
+                .eh-operation-tabs button { padding:7px 11px; border:0; border-bottom:2px solid transparent; background:transparent; color:#667085; cursor:pointer; font-size:11px; font-weight:750; }
+                .eh-operation-tabs button.active { color:#2f6fed; border-bottom-color:#2f6fed; }
+                .eh-operation-content { max-height:calc(92vh - 104px); overflow:auto; }
+                .eh-operation-pane { display:grid; gap:10px; }
+                .eh-operation-pane[hidden] { display:none !important; }
+                .eh-op-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+                .eh-op-span-2 { grid-column:1 / -1; }
+                .eh-op-field { min-width:0; display:grid; gap:4px; color:#667085; font-size:9px; font-weight:700; }
+                .eh-op-field input, .eh-op-field select, .eh-op-details-body select, .eh-boarding-editor select { width:100%; min-width:0; height:32px; padding:5px 8px; border:1px solid #dce1e8; border-radius:6px; background:#fff; color:#273142; font:10.5px "Segoe UI",Arial,sans-serif; outline:none; }
+                .eh-op-field input:focus, .eh-op-field select:focus { border-color:#8fb0ea; box-shadow:0 0 0 2px rgba(47,111,237,.08); }
+                .eh-op-primary, .eh-op-secondary { min-height:32px; padding:6px 10px; border:1px solid #d5dce5; border-radius:6px; background:#fff; color:#344054; cursor:pointer; font-size:10px; font-weight:750; }
+                .eh-op-primary { border-color:#2f6fed; background:#2f6fed; color:#fff; }
+                .eh-op-primary:disabled, .eh-op-secondary:disabled { opacity:.45; cursor:not-allowed; }
+                .eh-op-status { min-height:16px; color:#667085; font-size:9.5px; line-height:1.4; }
+                .eh-op-result { display:grid; gap:4px; padding:10px; border:1px solid #dbe3ee; border-radius:7px; background:#f8fafc; color:#344054; font-size:10px; line-height:1.4; }
+                .eh-op-result[hidden] { display:none !important; }
+                .eh-op-result strong { color:#1f2937; font-size:13px; }
+                .eh-op-result small { color:#667085; }
+                .eh-op-result button { justify-self:start; margin-top:4px; }
+                .eh-op-details { border:1px solid #e1e5eb; border-radius:7px; background:#fff; overflow:hidden; }
+                .eh-op-details > summary { padding:8px 10px; cursor:pointer; list-style:none; color:#475467; font-size:10px; font-weight:750; }
+                .eh-op-details > summary::-webkit-details-marker { display:none; }
+                .eh-op-details > summary::after { content:'＋'; float:right; color:#98a2b3; }
+                .eh-op-details[open] > summary::after { content:'−'; }
+                .eh-op-details-body { display:grid; gap:8px; padding:9px 10px 10px; border-top:1px solid #edf0f4; color:#667085; font-size:9.5px; }
+                .eh-op-inline { display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
+                .eh-op-inline.compact button { min-height:26px; padding:4px 7px; border:1px solid #dce1e8; border-radius:5px; background:#fff; color:#475467; cursor:pointer; font-size:8.5px; }
+                .eh-manual-rows { display:grid; gap:5px; }
+                .eh-manual-row { display:grid; grid-template-columns:minmax(0,1fr) 100px 28px; gap:5px; }
+                .eh-manual-row input { min-width:0; height:30px; padding:4px 7px; border:1px solid #dce1e8; border-radius:6px; font-size:10px; }
+                .eh-manual-row button { border:0; background:#f1f3f5; border-radius:5px; color:#667085; cursor:pointer; }
+                .eh-history-route { border-top:1px solid #eef1f4; }
+                .eh-history-route:first-child { border-top:0; }
+                .eh-history-route > summary { padding:6px 0; cursor:pointer; color:#475467; font-size:9px; }
+                .eh-history-records { display:grid; gap:4px; padding-bottom:6px; }
+                .eh-history-record { display:grid; grid-template-columns:minmax(0,1fr) 58px 26px 26px; align-items:center; gap:4px; }
+                .eh-history-record span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+                .eh-history-record input { width:58px; height:26px; border:1px solid #dce1e8; border-radius:5px; font-size:9px; }
+                .eh-history-record button { height:26px; border:1px solid #dce1e8; border-radius:5px; background:#fff; cursor:pointer; }
+                .eh-boarding-editor { display:grid; gap:8px; padding:9px; border:1px solid #dbe3ee; border-radius:7px; background:#f8fafc; }
+                .eh-boarding-editor[hidden] { display:none !important; }
+                .eh-boarding-list { display:grid; gap:6px; }
+                .eh-boarding-card { display:grid; gap:4px; padding:8px 9px; border:1px solid #e0e5eb; border-left:3px solid #d7a62a; border-radius:7px; background:#fff; color:#475467; font-size:9px; }
+                .eh-boarding-card.pending { border-left-color:#d94b55; }
+                .eh-boarding-card.notified { border-left-color:#d7a62a; }
+                .eh-boarding-card.completed { border-left-color:#4da574; opacity:.72; }
+                .eh-boarding-card.overdue { border-left-color:#d94b55; background:#fff8f8; }
+                .eh-boarding-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
+                .eh-boarding-head strong { color:#273142; font-size:10px; }
+                .eh-boarding-head span { color:#667085; font-size:8px; }
+                .eh-op-empty { padding:14px; text-align:center; color:#98a2b3; font-size:10px; }
+                @media (max-width:680px) {
+                    .eh-op-grid { grid-template-columns:1fr; }
+                    .eh-op-span-2 { grid-column:auto; }
+                    .eh-operation-modal { width:98vw; }
+                }
 
 
             `);
@@ -5072,6 +6363,71 @@
             );
         },
 
+        extractTicketData(card) {
+            if (!card || !document.contains(card)) {
+                throw new Error('A passagem selecionada não está mais disponível na tela.');
+            }
+
+            const headerElement = card.querySelector('.dados-passagem .col-12 h6')
+                || card.querySelector('.dados-passagem h6');
+            if (!headerElement) throw new Error('Não foi possível localizar os dados principais da passagem.');
+
+            const headerClone = headerElement.cloneNode(true);
+            const badgeClone = headerClone.querySelector('.badge');
+            const status = EH.Utils.clean(badgeClone?.textContent || '');
+            badgeClone?.remove();
+            const header = EH.Utils.clean(headerClone.textContent).replace(/\s*-\s*$/, '').trim();
+
+            const infoLines = Array.from(card.querySelectorAll('.dados-passagem .col-10 h6'))
+                .map(element => EH.Utils.clean(element.textContent))
+                .filter(Boolean);
+            const seller = infoLines.find(line => /Venda\s+realizada\s+por\s*:/i.test(line)) || '';
+            const soldAt = infoLines.find(line => /Venda\s+realizada\s+em\s*:/i.test(line)) || '';
+
+            const tickets = Array.from(card.querySelectorAll('ul.list-group > li.list-group-item'))
+                .map(item => {
+                    const leadingText = Array.from(item.childNodes)
+                        .filter(node => node.nodeType === Node.TEXT_NODE)
+                        .map(node => node.nodeValue || '')
+                        .join(' ');
+                    const firstLine = EH.Utils.clean(leadingText);
+                    const route = EH.Utils.clean(item.querySelector('.viagem')?.textContent || '');
+                    const headMatch = firstLine.match(/N[º°O]?\s*:\s*(\d+)\s*-\s*Data\s*de\s*Embarque\s*:\s*(.+)$/i);
+                    const routeMatch = route.match(/Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*(.*)$/i);
+                    return {
+                        number: EH.Utils.clean(headMatch?.[1] || ''),
+                        date: EH.Utils.clean(headMatch?.[2] || ''),
+                        origin: EH.Utils.clean(routeMatch?.[1] || ''),
+                        destination: EH.Utils.clean(routeMatch?.[2] || ''),
+                        firstLine,
+                        route
+                    };
+                })
+                .filter(ticket => ticket.number || ticket.firstLine || ticket.route);
+
+            if (!tickets.length) throw new Error('Os bilhetes não foram encontrados dentro da passagem selecionada.');
+
+            const summary = this.summary(card);
+            const passenger = header
+                .replace(/\s+-\s+[A-Z]{2}\s+X\s+.*$/i, '')
+                .replace(/\s+-\s+[^-]+\s+X\s+[^-]+$/i, '')
+                .trim();
+            return {
+                header,
+                passenger,
+                status: status || summary.status || 'PASSAGEM',
+                seller,
+                soldAt,
+                seat: summary.seat || '',
+                service: summary.service || '',
+                tickets,
+                filename: `bilhete-${tickets[0]?.number || summary.ticket || Date.now()}.png`,
+                text: EH.Utils.clean(card.innerText || card.textContent || '')
+                    .replace(/\s*📸\s*CAPTURAR ESTA\s*\d*/gi, '')
+                    .trim()
+            };
+        },
+
         prepareCapture(card) {
             const data = this.extractTicketData(card);
             const { shell } = EH.Capture.createShell();
@@ -6920,6 +8276,7 @@
                     summary,
                     createdAt: Date.now()
                 };
+                EH.BoardingReminders.setTicketCandidate(prepared.data);
 
                 let waPrepared = false;
                 if (EH.WhatsAppBridge.getState().readyToSend) {
@@ -7625,6 +8982,16 @@
                 }
             });
 
+            const reminder = document.createElement('button');
+            reminder.type = 'button';
+            reminder.className = 'eh-modal-btn';
+            reminder.textContent = '⏰ Lembrar embarque';
+            reminder.hidden = captureType !== 'bilhete' || !EH.BoardingReminders.lastTicketCandidate;
+            reminder.addEventListener('click', () => {
+                close();
+                EH.OperationPanel.open('boarding', EH.BoardingReminders.ticketPrefill());
+            });
+
             const closeBottom = document.createElement('button');
             closeBottom.type = 'button';
             closeBottom.className = 'eh-modal-btn';
@@ -7637,7 +9004,7 @@
                 if (event.target === overlay) close();
             });
 
-            actions.append(copySummary, copyImage, sendWhatsApp, download, send, copyText, closeBottom);
+            actions.append(copySummary, copyImage, sendWhatsApp, download, send, copyText, reminder, closeBottom);
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
@@ -7987,6 +9354,7 @@
             EH.Style.inject();
             EH.Toast.init();
             EH.UI.init();
+            EH.BoardingReminders.init();
             EH.WhatsAppDock.init();
             EH.Layout.sync();
             EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => EH.Layout.sync(), 140));
