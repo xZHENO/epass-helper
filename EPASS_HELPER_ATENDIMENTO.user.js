@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.29.0
-// @description  Atendimento integrado E-Pass + WhatsApp, com fluxo modular e interface otimizada
+// @version      5.30.0
+// @description  Atendimento integrado E-Pass + WhatsApp, com estado unificado e interface minimalista
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.29.0',
+        VERSION: '5.30.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -53,9 +53,12 @@
         LAYOUT_TRANSITION_MS: 180,
         APP_OBSERVER_DEBOUNCE_MS: 420,
         WA_OBSERVER_DEBOUNCE_MS: 650,
-        WA_UI_FALLBACK_MS: 6500,
-        WA_HEARTBEAT_MS: 4500,
-        WA_STATUS_REFRESH_MS: 5000,
+        WA_UI_FALLBACK_MS: 12000,
+        WA_HEARTBEAT_MS: 15000,
+        WA_STATUS_REFRESH_MS: 4000,
+        WA_HEARTBEAT_TTL_MS: 150000,
+        WA_UI_CACHE_TTL_MS: 10 * 60 * 1000,
+        WA_VERIFY_TIMEOUT_MS: 3600,
         MESSAGES: {
             pesquisa: 'Escolha o horário desejado. Após isso, vou encaminhar as poltronas disponíveis.',
             reserva: 'Estas são as poltronas disponíveis. Informe o número da poltrona desejada.',
@@ -252,7 +255,7 @@
         off(key) {
             const item = this.listeners.get(key);
             if (!item) return;
-            try { item.target.removeEventListener(item.type, item.handler, item.options); } catch (error) {}
+            try { item.target.removeEventListener(item.type, item.handler, item.options); } catch (error) { EH.Logger.debug('Listener já removido:', key, error); }
             this.listeners.delete(key);
         },
 
@@ -487,7 +490,7 @@
             let changed = false;
             const observerTarget = oldTable?.parentElement || document.querySelector('app-pesquisa') || document.body;
             const localObserver = new MutationObserver(() => { changed = true; });
-            try { localObserver.observe(observerTarget, { childList: true, subtree: true, characterData: true }); } catch (error) {}
+            try { localObserver.observe(observerTarget, { childList: true, subtree: true, characterData: true }); } catch (error) { EH.Logger.debug('Observer local indisponível:', error); }
 
             const button = this.findSearchButton();
             if (!button) throw new Error('Não encontrei o botão Pesquisar da consulta.');
@@ -777,23 +780,6 @@
                 .replace(/\s+/g, ' ')
                 .trim();
         },
-        formatVehicleTypeLines(value) {
-            const text = this.extractVehicleType(value, value);
-            if (!text) return [];
-            if (text.includes(' - DOIS ANDARES')) {
-                const parts = text.split(/\s*-\s*DOIS ANDARES\s*/i);
-                const first = parts[0]?.trim();
-                const secondTail = text.match(/DOIS ANDARES.*$/i)?.[0]?.trim();
-                return [first, secondTail].filter(Boolean).map(line => this.stabilizeDisplayText(line));
-            }
-            return [this.stabilizeDisplayText(text)];
-        },
-        stabilizeDisplayText(value) {
-            return String(value || '')
-                .replace(/\s+/g, ' ')
-                .trim()
-                .replace(/ /g, ' ');
-        },
         unique(values) {
             return [...new Set(values.filter(Boolean))];
         },
@@ -856,7 +842,10 @@
     // ============================================================
     EH.WhatsAppBridge = {
         COMMAND_TTL: 2 * 60 * 1000,
-        HEARTBEAT_TTL: 18 * 1000,
+        HEARTBEAT_TTL: EH.Config.WA_HEARTBEAT_TTL_MS,
+        UI_CACHE_TTL: EH.Config.WA_UI_CACHE_TTL_MS,
+        VERIFY_TIMEOUT: EH.Config.WA_VERIFY_TIMEOUT_MS,
+        statusBootAt: Date.now(),
         heartbeatTimer: null,
         listenerId: null,
         uiObserver: null,
@@ -900,7 +889,7 @@
             const probe = online ? this.probeConnection() : { state: 'disconnected', ready: false, reason: 'page-hidden' };
             EH.Storage.set('waHeartbeat', {
                 online: Boolean(online),
-                at: online ? Date.now() : 0,
+                at: Date.now(),
                 href: online ? location.href : '',
                 phase: probe.state,
                 ready: Boolean(probe.ready),
@@ -908,28 +897,197 @@
             });
         },
 
-        getConnectionStatus() {
+        getState() {
+            const now = Date.now();
             const hb = EH.Storage.get('waHeartbeat', null);
-            const fresh = Boolean(hb?.online && hb?.at && (Date.now() - Number(hb.at)) < this.HEARTBEAT_TTL);
-            if (!fresh) {
-                return { state: 'disconnected', connected: false, readyToSend: false, label: '🔴 WhatsApp desconectado' };
+            const ui = this.getUiState();
+            const uiProbe = ui?.connection && typeof ui.connection === 'object' ? ui.connection : null;
+            const hbAt = Number(hb?.at || 0);
+            const uiAt = Number(ui?.at || 0);
+            const hbAge = hbAt ? Math.max(0, now - hbAt) : Number.POSITIVE_INFINITY;
+            const uiAge = uiAt ? Math.max(0, now - uiAt) : Number.POSITIVE_INFINITY;
+            const hbPhase = String(hb?.phase || (hb?.ready ? 'connected' : 'loading'));
+            const uiPhase = String(uiProbe?.state || '');
+            const explicitOffline = Boolean(hb && hb.online === false);
+            const heartbeatFresh = Boolean(hb?.online && hbAt && hbAge <= this.HEARTBEAT_TTL);
+            const uiFresh = Boolean(uiAt && uiAge <= this.HEARTBEAT_TTL);
+            const cachedPositive = Boolean(
+                !explicitOffline &&
+                (
+                    (hb?.online && hbPhase === 'connected' && hbAge <= this.UI_CACHE_TTL) ||
+                    (uiPhase === 'connected' && uiAge <= this.UI_CACHE_TTL)
+                )
+            );
+
+            let state = 'loading';
+            let connected = false;
+            let loaded = false;
+            let source = 'initializing';
+
+            if (explicitOffline) {
+                state = 'disconnected';
+                loaded = true;
+                source = 'explicit-offline';
+            } else if (heartbeatFresh) {
+                loaded = hbPhase !== 'loading';
+                if (hbPhase === 'connected') {
+                    connected = true;
+                    state = 'connected';
+                    loaded = true;
+                    source = 'heartbeat';
+                } else if (hbPhase === 'loading') {
+                    state = 'loading';
+                    source = 'heartbeat-loading';
+                } else {
+                    state = 'disconnected';
+                    loaded = true;
+                    source = 'heartbeat-disconnected';
+                }
+            } else if (uiFresh && uiPhase === 'connected') {
+                connected = true;
+                loaded = true;
+                state = 'connected';
+                source = 'ui-state';
+            } else if (cachedPositive) {
+                // Abas em segundo plano podem ter timers fortemente desacelerados pelo
+                // navegador. Um último estado positivo permanece utilizável até prova
+                // contrária; antes de ações sensíveis fazemos um ping/ACK real.
+                connected = true;
+                loaded = true;
+                state = 'connected';
+                source = 'cached-positive';
+            } else if ((uiFresh && uiPhase === 'loading') || (hb?.online && hbPhase === 'loading' && hbAge <= this.UI_CACHE_TTL)) {
+                state = 'loading';
+                source = 'loading';
+            } else if (!hb && !uiAt && (now - this.statusBootAt) < 8000) {
+                state = 'loading';
+                source = 'startup-grace';
+            } else {
+                state = 'disconnected';
+                loaded = Boolean(hb || uiAt);
+                source = 'no-live-signal';
             }
-            const phase = String(hb?.phase || (hb?.ready ? 'connected' : 'loading'));
-            if (phase === 'loading') {
-                return { state: 'loading', connected: false, readyToSend: false, label: '🟡 Conectando…' };
-            }
-            if (phase !== 'connected') {
-                return { state: 'disconnected', connected: false, readyToSend: false, label: '🔴 WhatsApp desconectado' };
-            }
-            const state = this.getUiState();
-            const hasChat = Boolean(String(state?.active?.title || '').trim());
-            return hasChat
-                ? { state: 'ready', connected: true, readyToSend: true, label: '🟢 WhatsApp conectado' }
-                : { state: 'no-chat', connected: true, readyToSend: false, label: '⚠️ Selecione uma conversa' };
+
+            const activeTitle = String(ui?.active?.title || '').trim();
+            const conversationSelected = Boolean(connected && activeTitle);
+            const readyToSend = Boolean(connected && conversationSelected);
+            const stale = Boolean(connected && !heartbeatFresh && !(uiFresh && uiPhase === 'connected'));
+
+            if (connected) state = readyToSend ? 'ready' : 'no-chat';
+
+            const label = state === 'ready'
+                ? 'Conectado'
+                : state === 'no-chat'
+                    ? 'Selecione uma conversa'
+                    : state === 'loading'
+                        ? 'Conectando…'
+                        : 'Desconectado';
+
+            return {
+                state,
+                loaded,
+                connected,
+                conversationSelected,
+                readyToSend,
+                activeTitle,
+                stale,
+                source,
+                heartbeatAge: Number.isFinite(hbAge) ? hbAge : null,
+                uiAge: Number.isFinite(uiAge) ? uiAge : null,
+                label
+            };
         },
 
-        isOnline() {
-            return Boolean(this.getConnectionStatus().connected);
+        getConnectionStatus() {
+            return this.getState();
+        },
+
+
+        logState(context = '') {
+            if (!EH.Config.DEBUG) return this.getState();
+            const state = this.getState();
+            console.debug('[EPass][WhatsApp]', context || 'state', {
+                loaded: state.loaded,
+                connected: state.connected,
+                conversationSelected: state.conversationSelected,
+                readyToSend: state.readyToSend,
+                state: state.state,
+                source: state.source,
+                stale: state.stale,
+                activeTitle: state.activeTitle,
+                heartbeatAge: state.heartbeatAge,
+                uiAge: state.uiAge
+            });
+            return state;
+        },
+
+        async verifyConnection(timeout = this.VERIFY_TIMEOUT) {
+            const command = this.makeCommand({ action: 'sync', target: 'web' });
+            this.send(command);
+            const started = Date.now();
+
+            while ((Date.now() - started) < Math.max(600, Number(timeout) || this.VERIFY_TIMEOUT)) {
+                const ack = EH.Storage.get('waAck', null);
+                if (ack?.id === command.id) {
+                    const state = this.getState();
+                    this.logState('sync-ack');
+                    return { ...state, verified: Boolean(ack.ok), ack };
+                }
+                await EH.Utils.sleep(120);
+            }
+
+            const state = this.getState();
+            this.logState('sync-timeout');
+            return { ...state, verified: false, verifyTimedOut: true };
+        },
+
+        async ensureReady({ requireConversation = true, verifyStale = true, context = 'envio' } = {}) {
+            let state = this.getState();
+            this.logState(`${context}:before`);
+
+            const alreadyUsable = state.connected && (!requireConversation || state.conversationSelected);
+            if (alreadyUsable && (!verifyStale || !state.stale)) return state;
+
+            // Uma tentativa de sincronização é a autoridade final. Isso também permite
+            // recuperar a conexão após reconexão do WhatsApp sem recarregar o E-Pass.
+            if (state.stale || state.state === 'loading' || !state.connected) {
+                const verified = await this.verifyConnection();
+                if (!verified.verified) {
+                    state = verified.state === 'loading'
+                        ? verified
+                        : {
+                            ...verified,
+                            state: 'disconnected',
+                            connected: false,
+                            conversationSelected: false,
+                            readyToSend: false,
+                            source: 'verification-timeout',
+                            label: 'Desconectado'
+                        };
+                } else {
+                    state = verified;
+                }
+            } else {
+                // conectado, mas sem conversa: não há motivo para esperar um ping.
+                state = this.getState();
+            }
+
+            this.logState(`${context}:after`);
+            return state;
+        },
+
+        notifyUnavailable(state) {
+            const current = state || this.getState();
+            if (current.state === 'loading') {
+                EH.Toast.info('🟡 Verificando WhatsApp…');
+            } else if (!current.connected) {
+                EH.Toast.error('🔴 WhatsApp desconectado.');
+            } else if (!current.conversationSelected) {
+                EH.Toast.warning('⚠️ Selecione uma conversa.');
+            } else {
+                EH.Toast.warning('⚠️ WhatsApp ainda não está pronto para envio.');
+            }
+            return false;
         },
 
         getUiState() {
@@ -1239,7 +1397,7 @@
             let input = Array.from(document.querySelectorAll('input[type="file"]')).find(el => /image|video/i.test(el.accept || '')) || null;
             if (!input) {
                 const attach = document.querySelector('[data-icon="plus-rounded"], [data-icon="attach-menu-plus"], button[aria-label*="Anexar" i], button[title*="Anexar" i], button[aria-label*="Attach" i]');
-                try { (attach?.closest('button') || attach)?.click(); } catch (error) {}
+                try { (attach?.closest('button') || attach)?.click(); } catch (error) { EH.Logger.debug('Botão de anexo indisponível:', error); }
                 input = await EH.Utils.waitFor(() => Array.from(document.querySelectorAll('input[type="file"]')).find(el => /image|video/i.test(el.accept || '')) || null, 3500, 180);
             }
             if (!input || typeof DataTransfer === 'undefined') return false;
@@ -1576,40 +1734,30 @@
         },
 
         refreshConnection() {
-            const connection = EH.WhatsAppBridge.getConnectionStatus();
-            const hasChat = Boolean(String(this.currentState?.active?.title || EH.WhatsAppBridge.getUiState()?.active?.title || '').trim());
-            const state = connection.connected ? (hasChat ? 'ready' : 'no-chat') : connection.state;
+            const connection = EH.WhatsAppBridge.getState();
+            const state = connection.state;
             this.root?.classList.remove('eh-wa-online', 'eh-wa-loading', 'eh-wa-disconnected', 'eh-wa-no-chat', 'eh-wa-ready');
             if (state === 'ready') this.root?.classList.add('eh-wa-online', 'eh-wa-ready');
             else if (state === 'no-chat') this.root?.classList.add('eh-wa-online', 'eh-wa-no-chat');
             else if (state === 'loading') this.root?.classList.add('eh-wa-loading');
             else this.root?.classList.add('eh-wa-disconnected');
 
-            if (this.statusEl) {
-                this.statusEl.textContent = state === 'ready'
-                    ? '🟢 WhatsApp conectado'
-                    : state === 'no-chat'
-                        ? '⚠️ Selecione uma conversa'
-                        : state === 'loading'
-                            ? '🟡 Conectando…'
-                            : '🔴 WhatsApp desconectado';
+            if (this.statusEl) this.statusEl.textContent = connection.label;
+
+            // O campo pode receber texto/imagem assim que a sessão Web estiver conectada.
+            // O botão de envio só libera quando existe uma conversa selecionada.
+            if (this.composer) this.composer.disabled = !connection.connected;
+            if (this.sendButton) {
+                this.sendButton.disabled = !connection.readyToSend;
+                this.sendButton.title = this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem';
             }
-            const canCompose = Boolean(connection.connected);
-            const canSend = Boolean(connection.connected && hasChat);
-            // Permite colar/preparar uma imagem antes de escolher a conversa;
-            // o envio continua bloqueado até existir um chat selecionado.
-            if (this.composer) this.composer.disabled = !canCompose;
-            if (this.sendButton) this.sendButton.disabled = !canSend;
-            if (this.sendButton) this.sendButton.title = this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem';
-            return { ...connection, state, canSend };
+            return connection;
         },
 
         requestSync() {
-            if (!EH.WhatsAppBridge.isOnline()) {
-                this.refreshConnection();
-                return;
-            }
-            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'sync' }));
+            // Não bloqueie a própria tentativa de sincronização com base em um estado
+            // possivelmente antigo. O ACK do WhatsApp é que confirma a conexão real.
+            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'sync', target: 'web' }));
         },
 
         render(state) {
@@ -1766,27 +1914,38 @@
             }
         },
 
-        selectChat(title) {
-            if (!EH.WhatsAppBridge.isOnline()) {
-                EH.Toast.warning('O WhatsApp Web não está conectado. Abra a aba que você já usa e mantenha-a aberta.');
+        async selectChat(title) {
+            const state = await EH.WhatsAppBridge.ensureReady({
+                requireConversation: false,
+                verifyStale: true,
+                context: 'selecionar-conversa'
+            });
+            if (!state.connected) {
+                EH.WhatsAppBridge.notifyUnavailable(state);
                 return;
             }
             EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: title }));
             if (this.titleEl) this.titleEl.textContent = title;
         },
 
-        sendCurrentMessage() {
+        async sendCurrentMessage() {
             const message = String(this.composer?.value || '').trim();
-            const title = String(this.currentState?.active?.title || '').trim();
-            const connection = this.refreshConnection();
-            if (!title) {
-                EH.Toast.warning('Selecione uma conversa antes de enviar.');
+            const state = await EH.WhatsAppBridge.ensureReady({
+                requireConversation: true,
+                verifyStale: true,
+                context: this.pendingImage ? 'enviar-imagem' : 'enviar-texto'
+            });
+            const title = String(state.activeTitle || this.currentState?.active?.title || '').trim();
+
+            if (!state.connected || !title) {
+                EH.WhatsAppBridge.notifyUnavailable({
+                    ...state,
+                    conversationSelected: Boolean(title),
+                    activeTitle: title
+                });
                 return;
             }
-            if (!connection?.connected) {
-                EH.Toast.warning(connection?.state === 'loading' ? 'WhatsApp ainda está conectando.' : 'WhatsApp Web desconectado.');
-                return;
-            }
+
             if (this.pendingImage) {
                 const command = EH.WhatsAppBridge.makeCommand({
                     action: 'send_image',
@@ -1801,8 +1960,11 @@
                 return;
             }
             if (!message) return;
-            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'send_text', chatTitle: title, message }));
+            const command = EH.WhatsAppBridge.makeCommand({ action: 'send_text', chatTitle: title, message });
+            this.pendingCommandId = command.id;
+            EH.WhatsAppBridge.send(command);
             this.composer.value = '';
+            EH.Toast.info('Enviando mensagem…');
         }
     };
 
@@ -1918,15 +2080,15 @@
         inject() {
             GM_addStyle(`
                 :root {
-                    --eh-bg: #17191f;
-                    --eh-bg-2: #20232b;
-                    --eh-border: #343946;
-                    --eh-text: #f4f6fa;
-                    --eh-muted: #aeb5c2;
-                    --eh-primary: #3d8bfd;
-                    --eh-success: #35b879;
-                    --eh-warning: #e7a83a;
-                    --eh-danger: #e35d6a;
+                    --eh-bg: #f6f7f9;
+                    --eh-bg-2: #ffffff;
+                    --eh-border: #d9dee7;
+                    --eh-text: #1f2937;
+                    --eh-muted: #6b7280;
+                    --eh-primary: #2f6fed;
+                    --eh-success: #2f9e69;
+                    --eh-warning: #d9941f;
+                    --eh-danger: #d94b55;
                     --eh-wa-base: 360px;
                     --eh-panel-base: 228px;
                     --eh-panel-zoom: 1.5;
@@ -1992,8 +2154,8 @@
                     background: #272b35;
                 }
                 #eh-root .eh-btn:disabled { opacity: .38; cursor: not-allowed; }
-                #eh-root .eh-btn.eh-primary { border-color: rgba(61, 139, 253, .48); }
-                #eh-root .eh-btn.eh-success { border-color: rgba(53, 184, 121, .48); }
+                #eh-root .eh-btn.eh-primary { border-color: #2f6fed; background:#2f6fed; color:#fff; }
+                #eh-root .eh-btn.eh-success { border-color: #d9dee7; }
                 #eh-root .eh-btn-icon { width: 18px; text-align: center; font-size: 13px; }
                 #eh-root .eh-status {
                     display: flex;
@@ -2018,9 +2180,9 @@
                 #eh-toast-area {
                     position: fixed;
                     z-index: 2147483647;
-                    top: 16px;
-                    right: 16px;
-                    width: min(360px, calc(100vw - 32px));
+                    top: 12px;
+                    right: 12px;
+                    width: min(300px, calc(100vw - 24px));
                     display: grid;
                     gap: 8px;
                     pointer-events: none;
@@ -2031,14 +2193,14 @@
                     display: flex;
                     align-items: flex-start;
                     gap: 9px;
-                    padding: 11px 12px;
-                    border: 1px solid #343946;
-                    border-radius: 10px;
-                    background: rgba(23, 25, 31, .97);
-                    color: #f4f6fa;
-                    box-shadow: 0 12px 34px rgba(0, 0, 0, .32);
+                    padding: 8px 10px;
+                    border: 1px solid #d9dee7;
+                    border-radius: 7px;
+                    background: #ffffff;
+                    color: #273142;
+                    box-shadow: 0 6px 20px rgba(16, 24, 40, .12);
                     pointer-events: auto;
-                    font-size: 12px;
+                    font-size: 10px;
                     line-height: 1.4;
                     animation: eh-in .18s ease-out;
                 }
@@ -2048,7 +2210,7 @@
                 .eh-toast.warning { border-left: 4px solid var(--eh-warning); }
                 .eh-toast.info { border-left: 4px solid var(--eh-primary); }
                 .eh-toast-text { flex: 1; user-select: text; }
-                .eh-toast-close { border: 0; background: transparent; color: #aeb5c2; cursor: pointer; }
+                .eh-toast-close { border: 0; background: transparent; color: #8b95a5; cursor: pointer; }
 
                 @keyframes eh-in {
                     from { opacity: 0; transform: translateY(-6px); }
@@ -2706,12 +2868,12 @@
                 #eh-root .eh-panel {
                     height: 100%;
                     border: 0;
-                    border-right: 1px solid #2f3540;
+                    border-right: 1px solid #d9dee7;
                     border-radius: 0;
                     display: flex;
                     flex-direction: column;
-                    background: rgba(18, 21, 27, .985);
-                    box-shadow: 10px 0 28px rgba(0,0,0,.18);
+                    background: #f7f8fa;
+                    box-shadow: none;
                 }
                 #eh-root .eh-header {
                     min-height: 38px;
@@ -2722,34 +2884,44 @@
                     flex: 0 0 auto;
                     justify-content: flex-end;
                     gap: 3px;
-                    background: #101319;
-                    border-bottom: 1px solid #292f39;
+                    background: #ffffff;
+                    border-bottom: 1px solid #e2e6ec;
+                }
+                #eh-root .eh-panel-heading {
+                    flex: 1 1 auto;
+                    min-width: 0;
+                    padding-left: 4px;
+                    color: #273142;
+                    font-size: 10.5px;
+                    font-weight: 750;
+                    letter-spacing: .1px;
                 }
                 #eh-root .eh-body {
                     flex: 1 1 auto;
                     overflow-y: auto;
                     min-height: 0;
-                    padding: 8px;
+                    padding: 7px;
+                    background: #f7f8fa;
                     scrollbar-width: thin;
                 }
                 #eh-root .eh-panel-footer {
                     flex: 0 0 auto;
                     padding: 6px 8px;
-                    border-top: 1px solid #292f39;
-                    background: #101319;
+                    border-top: 1px solid #e2e6ec;
+                    background: #ffffff;
                 }
                 #eh-root .eh-flow-section {
                     margin: 0 0 7px;
-                    border: 1px solid #2d3540;
+                    border: 1px solid #e0e4ea;
                     border-radius: 7px;
-                    background: #151a21;
+                    background: #ffffff;
                     overflow: hidden;
                 }
                 #eh-root .eh-flow-section > summary {
                     padding: 6px 8px;
                     cursor: pointer;
                     list-style: none;
-                    color: #9ba6b7;
+                    color: #667085;
                     font-size: 8.5px;
                     font-weight: 850;
                     letter-spacing: .3px;
@@ -2812,11 +2984,11 @@
                 }
                 #eh-launcher[hidden] { display:none !important; }
 
-                .eh-dock-title { margin: 7px 1px 6px; font-size: 9px; font-weight: 900; color: #9ba6b7; letter-spacing:.45px; text-transform:uppercase; }
+                .eh-dock-title { margin: 8px 2px 5px; font-size: 8px; font-weight: 800; color: #667085; letter-spacing:.35px; text-transform:uppercase; }
                 .eh-steps { display:grid; grid-template-columns:repeat(5,1fr); gap:3px; margin-bottom:8px; }
-                .eh-step { padding:4px 1px; border:1px solid #303743; border-radius:6px; text-align:center; color:#727d8f; font-size:7px; line-height:1.15; background:#181c23; }
+                .eh-step { padding:4px 1px; border:1px solid #e2e6ec; border-radius:6px; text-align:center; color:#7b8494; font-size:7px; line-height:1.15; background:#f7f8fa; }
                 .eh-step strong { display:block; font-size:10px; line-height:1.05; }
-                .eh-step.active { color:#fff; border-color:#3d8bfd; background:#223654; }
+                .eh-step.active { color:#245ab8; border-color:#9dbcf2; background:#eef4ff; }
                 .eh-whatsapp-row { display:grid; grid-template-columns:minmax(0,1fr) 48px 34px; gap:5px; margin-bottom:8px; }
                 .eh-dock-phone { width:100%; min-width:0; height:34px; padding:6px 8px; border:1px solid #343c48; border-radius:7px; background:#0e1116; color:#fff; font:inherit; font-size:10px; margin:0; }
                 .eh-wa-mode, .eh-wa-open { height:34px; border:1px solid #3b4655; border-radius:7px; background:#202630; color:#eef3fa; cursor:pointer; font:800 9px Arial,sans-serif; }
@@ -2824,24 +2996,24 @@
                 .eh-wa-mode:hover, .eh-wa-open:hover { border-color:#35b879; background:#25352e; }
                 .eh-wa-open { font-size:15px; }
                 .eh-quick-routes { display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:8px; }
-                .eh-route-quick { width:100%; min-height:35px; padding:6px 7px; border:1px solid #323a46; border-radius:7px; background:#1c222b; color:#eef2f8; cursor:pointer; font-size:9px; font-weight:800; line-height:1.25; text-align:left; }
-                .eh-route-quick:hover { border-color:#3d8bfd; background:#222d3b; }
-                .eh-route-quick.eh-route-running { border-color:#35b879; background:#183329; }
-                .eh-context-card { padding:8px; margin-bottom:8px; border:1px solid #303743; border-radius:8px; background:#0f1217; color:#cfd6e2; font-size:9.5px; line-height:1.42; }
-                .eh-context-card strong { display:block; margin-bottom:3px; color:#fff; font-size:10.5px; }
+                .eh-route-quick { width:100%; min-height:33px; padding:6px 7px; border:1px solid #dce1e8; border-radius:7px; background:#fff; color:#273142; cursor:pointer; font-size:9px; font-weight:700; line-height:1.25; text-align:left; }
+                .eh-route-quick:hover { border-color:#9dbcf2; background:#f5f8ff; }
+                .eh-route-quick.eh-route-running { border-color:#9bd4b7; background:#f0faf5; }
+                .eh-context-card { padding:8px; margin-bottom:8px; border:1px solid #dfe4ea; border-radius:8px; background:#fff; color:#5f6978; font-size:9.5px; line-height:1.42; }
+                .eh-context-card strong { display:block; margin-bottom:3px; color:#273142; font-size:10.5px; }
                 .eh-context-actions { display:grid; gap:5px; margin-top:7px; }
-                .eh-context-btn { width:100%; min-height:31px; padding:6px 8px; border:1px solid #3b4554; border-radius:7px; background:#20262f; color:#fff; cursor:pointer; font-size:9.5px; font-weight:800; text-align:left; }
+                .eh-context-btn { width:100%; min-height:31px; padding:6px 8px; border:1px solid #dce1e8; border-radius:7px; background:#fff; color:#273142; cursor:pointer; font-size:9.5px; font-weight:750; text-align:left; }
                 .eh-context-more { margin-top:7px; border-top:1px solid #2c323c; padding-top:6px; }
                 .eh-context-more > summary { list-style:none; cursor:pointer; color:#98a3b3; font-size:8.5px; font-weight:800; }
                 .eh-context-more > summary::-webkit-details-marker { display:none; }
                 .eh-context-more > summary::after { content:'＋'; float:right; color:#738093; }
                 .eh-context-more[open] > summary::after { content:'−'; }
                 .eh-context-actions-secondary { margin-top:6px; }
-                .eh-context-btn.primary { border-color:#397bdd; background:#223957; }
-                .eh-context-btn.success { border-color:#2f9e69; background:#16382a; }
+                .eh-context-btn.primary { border-color:#2f6fed; background:#2f6fed; color:#fff; }
+                .eh-context-btn.success { border-color:#cfd6df; background:#fff; color:#273142; }
                 .eh-context-btn:disabled { opacity:.38; cursor:not-allowed; filter:grayscale(.25); }
                 .eh-pix-mini { display:block; width:128px; max-width:100%; margin:7px auto; border:4px solid #fff; border-radius:7px; background:#fff; }
-                .eh-tools-divider { height:1px; background:#2c323c; margin:8px 0 6px; }
+                .eh-tools-divider { height:1px; background:#e2e6ec; margin:8px 0 6px; }
                 #eh-root .eh-actions-primary { grid-template-columns:1fr 1fr; }
                 #eh-root .eh-actions-secondary { grid-template-columns:1fr 1fr; }
                 @media (max-width: 720px) {
@@ -2849,8 +3021,8 @@
                     #eh-launcher { top:auto; bottom:22%; }
                 }
 
-                .eh-more-tools { margin-top:6px; border:1px solid #2d3540; border-radius:7px; overflow:hidden; background:#151a21; }
-                .eh-more-tools > summary { padding:7px 8px; cursor:pointer; color:#aeb8c7; font-size:9px; font-weight:800; list-style:none; }
+                .eh-more-tools { margin-top:6px; border:1px solid #e0e4ea; border-radius:7px; overflow:hidden; background:#fff; }
+                .eh-more-tools > summary { padding:7px 8px; cursor:pointer; color:#667085; font-size:9px; font-weight:800; list-style:none; }
                 .eh-more-tools > summary::-webkit-details-marker { display:none; }
                 .eh-more-tools > summary::after { content:'＋'; float:right; color:#778396; }
                 .eh-more-tools[open] > summary::after { content:'−'; }
@@ -2868,11 +3040,11 @@
                     zoom: var(--eh-wa-zoom, 1);
                     display: grid;
                     grid-template-rows: 42px minmax(135px, 34%) minmax(0, 1fr) auto auto;
-                    border-left: 1px solid #26343a;
+                    border-left: 1px solid #d9dee2;
                     background: #efeae2;
                     color: #111b21;
                     font-family: "Segoe UI", Arial, sans-serif;
-                    box-shadow: -10px 0 30px rgba(0,0,0,.10);
+                    box-shadow: none;
                     overflow: hidden;
                 }
                 #eh-wa-dock.eh-wa-collapsed { display:none !important; }
@@ -2930,6 +3102,7 @@
                 .eh-wa-empty-conversation { margin:auto; }
                 #eh-wa-handle { position:fixed; z-index:2147482499; right:0; top:46%; width:22px; height:54px; border:1px solid #cfd6d8; border-right:0; border-radius:8px 0 0 8px; background:#f0f2f5; color:#008069; cursor:pointer; font:800 20px Arial,sans-serif; box-shadow:-4px 0 12px rgba(0,0,0,.08); }
                 #eh-wa-handle[hidden] { display:none !important; }
+
 
             `);
         }
@@ -3454,9 +3627,6 @@
             return new Blob([bytes], { type: mime });
         },
 
-        openImageForNativeCopy() {
-            throw new Error('A cópia binária foi bloqueada. Use “Enviar ao WhatsApp” ou “Baixar PNG”.');
-        }
     };
 
     // ============================================================
@@ -4902,104 +5072,6 @@
             );
         },
 
-        stabilizeCaptureText(root) {
-            if (!root) return;
-            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-            const nodes = [];
-            let node;
-            while ((node = walker.nextNode())) {
-                const parent = node.parentElement;
-                if (!parent) continue;
-                if (/^(SCRIPT|STYLE|TEXTAREA|INPUT|SELECT|OPTION|SVG|PATH)$/i.test(parent.tagName)) continue;
-                if (!node.nodeValue || !/\S/.test(node.nodeValue)) continue;
-                nodes.push(node);
-            }
-
-            nodes.forEach(textNode => {
-                const value = String(textNode.nodeValue || '');
-                const parts = value.split(/(\s+)/).filter(Boolean);
-                if (parts.length < 2) return;
-
-                const fragment = document.createDocumentFragment();
-                parts.forEach(part => {
-                    if (/^\s+$/.test(part)) {
-                        const spacer = document.createElement('span');
-                        spacer.className = 'eh-ticket-space';
-                        spacer.setAttribute('aria-hidden', 'true');
-                        spacer.textContent = '\u00A0';
-                        fragment.appendChild(spacer);
-                    } else {
-                        fragment.appendChild(document.createTextNode(part));
-                    }
-                });
-                textNode.replaceWith(fragment);
-            });
-        },
-
-        extractTicketData(card) {
-            if (!card || !document.contains(card)) {
-                throw new Error('A passagem selecionada não está mais disponível na tela.');
-            }
-
-            const headerElement = card.querySelector('.dados-passagem .col-12 h6')
-                || card.querySelector('.dados-passagem h6');
-            if (!headerElement) {
-                throw new Error('Não foi possível localizar os dados principais da passagem.');
-            }
-
-            const headerClone = headerElement.cloneNode(true);
-            const badgeClone = headerClone.querySelector('.badge');
-            const status = EH.Utils.clean(badgeClone?.textContent || '');
-            badgeClone?.remove();
-            const header = EH.Utils.clean(headerClone.textContent)
-                .replace(/\s*-\s*$/, '')
-                .trim();
-
-            const infoLines = Array.from(card.querySelectorAll('.dados-passagem .col-10 h6'))
-                .map(element => EH.Utils.clean(element.textContent))
-                .filter(Boolean);
-            const seller = infoLines.find(line => /Venda\s+realizada\s+por\s*:/i.test(line)) || '';
-            const soldAt = infoLines.find(line => /Venda\s+realizada\s+em\s*:/i.test(line)) || '';
-
-            const tickets = Array.from(card.querySelectorAll('ul.list-group > li.list-group-item'))
-                .map(item => {
-                    const leadingText = Array.from(item.childNodes)
-                        .filter(node => node.nodeType === Node.TEXT_NODE)
-                        .map(node => node.nodeValue || '')
-                        .join(' ');
-                    const firstLine = EH.Utils.clean(leadingText);
-                    const route = EH.Utils.clean(item.querySelector('.viagem')?.textContent || '');
-                    const headMatch = firstLine.match(/N[º°O]?\s*:\s*(\d+)\s*-\s*Data\s*de\s*Embarque\s*:\s*(.+)$/i);
-                    const routeMatch = route.match(/Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*(.*)$/i);
-                    return {
-                        number: EH.Utils.clean(headMatch?.[1] || ''),
-                        date: EH.Utils.clean(headMatch?.[2] || ''),
-                        origin: EH.Utils.clean(routeMatch?.[1] || ''),
-                        destination: EH.Utils.clean(routeMatch?.[2] || ''),
-                        firstLine,
-                        route
-                    };
-                })
-                .filter(ticket => ticket.number || ticket.firstLine || ticket.route);
-
-            if (!tickets.length) {
-                throw new Error('Os bilhetes não foram encontrados dentro da passagem selecionada.');
-            }
-
-            const summary = this.summary(card);
-            return {
-                header,
-                status: status || summary.status || 'PASSAGEM',
-                seller,
-                soldAt,
-                tickets,
-                filename: `bilhete-${tickets[0]?.number || summary.ticket || Date.now()}.png`,
-                text: EH.Utils.clean(card.innerText || card.textContent || '')
-                    .replace(/\s*📸\s*CAPTURAR ESTA\s*\d*/gi, '')
-                    .trim()
-            };
-        },
-
         prepareCapture(card) {
             const data = this.extractTicketData(card);
             const { shell } = EH.Capture.createShell();
@@ -5508,19 +5580,6 @@
             return canvas;
         },
 
-        removeActionColumn(tableClone) {
-            EH.Utils.all('button, .btn, [role="button"]', tableClone).forEach(element => element.remove());
-            EH.Utils.all('tr', tableClone).forEach(row => {
-                const cells = Array.from(row.children);
-                if (!cells.length) return;
-                const last = cells[cells.length - 1];
-                const normalized = EH.Utils.normalize(last.textContent);
-                if (!normalized || normalized.includes('ACAO') || normalized.includes('RESERVAR')) {
-                    last.remove();
-                }
-            });
-        },
-
         createShell() {
             EH.UI.root?.setAttribute('hidden', 'hidden');
             const shell = document.createElement('div');
@@ -5541,288 +5600,6 @@
         destroyShell(shell) {
             shell?.remove();
             EH.UI.root?.removeAttribute('hidden');
-        },
-
-        appendTitle(stage, title, subtitle) {
-            const header = document.createElement('div');
-            header.className = 'eh-capture-title';
-
-            const strong = document.createElement('strong');
-            strong.textContent = title;
-            header.appendChild(strong);
-
-            if (subtitle) {
-                const span = document.createElement('span');
-                span.textContent = subtitle;
-                header.appendChild(span);
-            }
-
-            stage.appendChild(header);
-        },
-
-        prepareHorarios(data) {
-            if (!data || !Array.isArray(data.horarios) || !data.horarios.length) {
-                throw new Error('Nenhum horário foi encontrado para montar a imagem.');
-            }
-
-            const { shell, stage } = this.createShell();
-            const route = [data.origem, data.destino].filter(Boolean).join(' → ') || 'Horários disponíveis';
-            const subtitle = data.data || '';
-            this.appendTitle(stage, route, subtitle);
-
-            const card = document.createElement('div');
-            card.className = 'eh-horarios-card';
-
-            const table = document.createElement('table');
-            table.className = 'eh-horarios-table';
-            table.setAttribute('aria-label', 'Horários disponíveis');
-
-            const colgroup = document.createElement('colgroup');
-            for (let index = 0; index < 4; index += 1) {
-                colgroup.appendChild(document.createElement('col'));
-            }
-
-            const thead = document.createElement('thead');
-            const headerRow = document.createElement('tr');
-            ['Linha', 'Horário de saída', 'Horário de chegada', 'Valor'].forEach(label => {
-                const th = document.createElement('th');
-                th.scope = 'col';
-                th.textContent = label;
-                headerRow.appendChild(th);
-            });
-            thead.appendChild(headerRow);
-
-            const tbody = document.createElement('tbody');
-            data.horarios.forEach(item => {
-                const row = document.createElement('tr');
-
-                const departure = document.createElement('td');
-                const departureValue = document.createElement('span');
-                departureValue.className = 'eh-time-value';
-                departureValue.textContent = item.saida || '—';
-                departure.appendChild(departureValue);
-
-                const company = document.createElement('td');
-                const companyName = document.createElement('div');
-                companyName.className = 'eh-company-name';
-                companyName.textContent = EH.Utils.stabilizeDisplayText(item.linha || 'Linha não informada');
-                company.appendChild(companyName);
-                if (item.tipo) {
-                    const vehicleType = document.createElement('div');
-                    vehicleType.className = 'eh-vehicle-type';
-                    const typeLines = EH.Utils.formatVehicleTypeLines(item.tipo);
-                    (typeLines.length ? typeLines : [item.tipo]).forEach(line => {
-                        const lineNode = document.createElement('div');
-                        lineNode.className = 'eh-vehicle-type-line';
-                        lineNode.textContent = line;
-                        vehicleType.appendChild(lineNode);
-                    });
-                    company.appendChild(vehicleType);
-                }
-
-                const arrival = document.createElement('td');
-                const arrivalValue = document.createElement('span');
-                arrivalValue.className = 'eh-time-value';
-                arrivalValue.textContent = item.chegada || '—';
-                arrival.appendChild(arrivalValue);
-
-                const price = document.createElement('td');
-                const priceValue = document.createElement('span');
-                priceValue.className = 'eh-price-value';
-                priceValue.textContent = item.preco || 'Consultar';
-                price.appendChild(priceValue);
-
-                row.append(company, departure, arrival, price);
-                tbody.appendChild(row);
-            });
-
-            table.append(colgroup, thead, tbody);
-            card.appendChild(table);
-            stage.appendChild(card);
-
-            const footer = document.createElement('div');
-            footer.className = 'eh-capture-footer single';
-            const bullet = document.createElement('span');
-            bullet.className = 'eh-footer-bullet';
-            bullet.textContent = '';
-            const note = document.createElement('span');
-            note.className = 'eh-footer-text';
-            note.textContent = EH.Utils.stabilizeDisplayText('- Escolha seu horário após isso vou encaminhar as poltronas disponíveis');
-            footer.append(bullet, note);
-            stage.appendChild(footer);
-
-            return { shell, stage, filename: `horarios-${EH.Utils.safeFilePart(route)}.png` };
-        },
-
-        prepareReserva(data) {
-            const map = EH.Utils.first(EH.Selectors.MAPA_POLTRONAS);
-            if (!map) throw new Error('O mapa de poltronas não foi encontrado.');
-
-            const { shell, stage } = this.createShell();
-            this.appendTitle(
-                stage,
-                data.origemDestino || 'Mapa de poltronas',
-                [data.linha, data.horaSaida ? `Saída: ${data.horaSaida}` : ''].filter(Boolean).join(' • ')
-            );
-
-            const layout = document.createElement('div');
-            layout.className = 'eh-reserva-layout';
-
-            const mapCard = document.createElement('section');
-            mapCard.className = 'eh-reserva-map-card';
-
-            const mapTitle = document.createElement('h3');
-            mapTitle.className = 'eh-reserva-section-title';
-            mapTitle.textContent = 'Mapa de poltronas';
-
-            const mapWrap = document.createElement('div');
-            mapWrap.className = 'eh-reserva-map';
-            const mapClone = map.cloneNode(true);
-            EH.Utils.all('button', mapClone).forEach(button => {
-                button.tabIndex = -1;
-                button.style.pointerEvents = 'none';
-            });
-            mapWrap.appendChild(mapClone);
-            mapCard.append(mapTitle, mapWrap);
-
-            const summary = document.createElement('aside');
-            summary.className = 'eh-reserva-summary';
-
-            const createSection = titleText => {
-                const card = document.createElement('section');
-                card.className = 'eh-summary-card';
-                const title = document.createElement('h3');
-                title.className = 'eh-reserva-section-title';
-                title.textContent = titleText;
-                card.appendChild(title);
-                return card;
-            };
-
-            const appendInfo = (grid, label, value, extraClass = '') => {
-                if (!value) return;
-                const item = document.createElement('div');
-                item.className = 'eh-info-item';
-                const labelNode = document.createElement('span');
-                labelNode.className = 'eh-info-label';
-                labelNode.textContent = label;
-                const valueNode = document.createElement('span');
-                valueNode.className = `eh-info-value ${extraClass}`.trim();
-                valueNode.textContent = value;
-                item.append(labelNode, valueNode);
-                grid.appendChild(item);
-            };
-
-            const tripCard = createSection('Informações da viagem');
-            const infoGrid = document.createElement('div');
-            infoGrid.className = 'eh-info-grid';
-            appendInfo(infoGrid, 'Linha', data.linha || 'Não informada');
-            appendInfo(infoGrid, 'Horário de saída', data.horaSaida || 'Não informado');
-            appendInfo(infoGrid, 'Tipo de veículo', data.tipo || 'Não informado');
-            appendInfo(
-                infoGrid,
-                'Valor total',
-                data.valorTotalNum > 0 ? EH.Utils.formatMoney(data.valorTotalNum) : (data.valorParcial || 'Consultar'),
-                'money'
-            );
-            appendInfo(infoGrid, 'Tarifa', data.tarifa);
-            appendInfo(infoGrid, 'Taxa de embarque', data.taxa);
-            tripCard.appendChild(infoGrid);
-
-            const seatsCard = createSection('Situação das poltronas');
-            const stats = document.createElement('div');
-            stats.className = 'eh-seat-stats';
-
-            [
-                ['free', data.poltronasLivres.length, 'Livres'],
-                ['occupied', data.poltronasOcupadas.length, 'Ocupadas'],
-                ['reserved', data.poltronasReservadas.length, 'Reservadas'],
-                ['selected', data.poltronasSelecionadas.length, 'Selecionadas']
-            ].forEach(([className, amount, label]) => {
-                const stat = document.createElement('div');
-                stat.className = `eh-seat-stat ${className}`;
-                const strong = document.createElement('strong');
-                strong.textContent = String(amount);
-                const span = document.createElement('span');
-                span.textContent = label;
-                stat.append(strong, span);
-                stats.appendChild(stat);
-            });
-            seatsCard.appendChild(stats);
-
-            const formatSeatList = (values, limit = 36) => {
-                if (!Array.isArray(values) || !values.length) return '';
-                const shown = values.slice(0, limit);
-                const remaining = values.length - shown.length;
-                return `${shown.join(', ')}${remaining > 0 ? ` e mais ${remaining}` : ''}`;
-            };
-
-            const groups = document.createElement('div');
-            groups.className = 'eh-seat-groups';
-            [
-                ['Poltronas livres', data.poltronasLivres],
-                ['Poltronas selecionadas', data.poltronasSelecionadas],
-                ['Poltronas ocupadas', data.poltronasOcupadas],
-                ['Poltronas reservadas', data.poltronasReservadas]
-            ].forEach(([label, values]) => {
-                const group = document.createElement('div');
-                group.className = 'eh-seat-group';
-
-                const head = document.createElement('div');
-                head.className = 'eh-seat-group-head';
-                const headLabel = document.createElement('span');
-                headLabel.textContent = label;
-                const count = document.createElement('span');
-                count.textContent = String(values.length);
-                head.append(headLabel, count);
-
-                const list = document.createElement('div');
-                const listText = formatSeatList(values);
-                list.className = `eh-seat-list${listText ? '' : ' empty'}`;
-                list.textContent = listText || 'Nenhuma';
-
-                group.append(head, list);
-                groups.appendChild(group);
-            });
-            seatsCard.appendChild(groups);
-
-            const legendCard = createSection('Legenda do mapa');
-            const legend = document.createElement('div');
-            legend.className = 'eh-legend';
-            [
-                ['livre', 'Livre'],
-                ['ocupada', 'Ocupada'],
-                ['reservada', 'Reservada'],
-                ['selecionada', 'Selecionada']
-            ].forEach(([className, label]) => {
-                const item = document.createElement('div');
-                item.className = 'eh-legend-item';
-                const color = document.createElement('span');
-                color.className = `eh-legend-color ${className}`;
-                const text = document.createElement('span');
-                text.textContent = label;
-                item.append(color, text);
-                legend.appendChild(item);
-            });
-            legendCard.appendChild(legend);
-
-            summary.append(tripCard, seatsCard, legendCard);
-            layout.append(mapCard, summary);
-            stage.appendChild(layout);
-
-            const footer = document.createElement('div');
-            footer.className = 'eh-capture-footer';
-            const total = document.createElement('span');
-            total.innerHTML = `<strong>${data.poltronasLivres.length}</strong> poltronas livres de <strong>${data.totalPoltronas || 0}</strong>`;
-            const warning = document.createElement('span');
-            warning.textContent = 'A disponibilidade pode mudar até a conclusão da reserva.';
-            footer.append(total, warning);
-            stage.appendChild(footer);
-
-            return {
-                shell,
-                stage,
-                filename: `reserva-${EH.Utils.safeFilePart(data.origemDestino)}.png`
-            };
         },
 
         async render(prepared) {
@@ -6367,8 +6144,6 @@
             ].join('\n');
         },
 
-        formatPixInfo() { return this.formatPixInstruction(); },
-        formatPix() { return this.formatPixInstruction(); },
 
         formatPixMonospace(pix = this.parsePix()) {
             const payload = this.payload(pix);
@@ -6492,15 +6267,6 @@
             EH.UI?.renderAutomation?.('pagamento');
         },
 
-        openQr(pix = this.parsePix()) {
-            try {
-                const url = this.getQrDataUrl(pix);
-                const win = window.open(url, '_blank');
-                if (!win) EH.Toast.warning('O navegador bloqueou a abertura do QR Code.');
-            } catch (error) {
-                EH.Toast.error(`Não foi possível gerar o QR Code. ${error.message || ''}`.trim());
-            }
-        }
     };
 
     // ============================================================
@@ -6537,6 +6303,10 @@
             header.className = 'eh-header';
             header.title = 'Atendimento rápido';
 
+            const heading = document.createElement('strong');
+            heading.className = 'eh-panel-heading';
+            heading.textContent = 'Passagens';
+
             const toggle = document.createElement('button');
             toggle.type = 'button';
             toggle.className = 'eh-icon-btn';
@@ -6555,7 +6325,7 @@
                 this.showSettings();
             });
 
-            header.append(toggle, settings);
+            header.append(heading, toggle, settings);
 
             const body = document.createElement('div');
             body.className = 'eh-body';
@@ -6572,7 +6342,7 @@
 
             const quickTitle = document.createElement('div');
             quickTitle.className = 'eh-dock-title';
-            quickTitle.textContent = 'Rotas rápidas';
+            quickTitle.textContent = 'Rotas';
             const quickRoutes = document.createElement('div');
             quickRoutes.className = 'eh-quick-routes';
 
@@ -6583,17 +6353,17 @@
             divider.className = 'eh-tools-divider';
             const toolsTitle = document.createElement('div');
             toolsTitle.className = 'eh-dock-title';
-            toolsTitle.textContent = 'Ferramentas';
+            toolsTitle.textContent = 'Ações';
 
             const actions = document.createElement('div');
             actions.className = 'eh-actions eh-actions-primary';
 
-            const horarios = this.createButton('🗓️', 'HORÁRIOS', 'eh-primary', () => this.captureAction('pesquisa'));
-            const reserva = this.createButton('💺', 'RESERVA', 'eh-success', () => this.captureAction('reserva'));
-            const bilhete = this.createButton('🎫', 'BILHETE', 'eh-primary', () => EH.Tickets.activateSelection());
+            const horarios = this.createButton('🗓️', 'HORÁRIOS', '', () => this.captureAction('pesquisa'));
+            const reserva = this.createButton('💺', 'POLTRONAS', '', () => this.captureAction('reserva'));
+            const bilhete = this.createButton('🎫', 'BILHETE', '', () => EH.Tickets.activateSelection());
             const rotas = this.createButton('🧭', 'ROTAS', '', () => this.showRoutes());
             const historico = this.createButton('🕘', 'HISTÓRICO', '', () => this.showHistory());
-            const enviar = this.createButton('📤', 'ENVIAR', 'eh-success', () => this.showSend());
+            const enviar = this.createButton('📤', 'ENVIAR', '', () => this.showSend());
             const resumo = this.createButton('📋', 'RESUMO', 'eh-primary', () => this.copyCurrentSummary());
             const detalhes = this.createButton('📄', 'DETALHES', '', () => this.copyCurrentDetails());
 
@@ -6611,7 +6381,7 @@
             const more = document.createElement('details');
             more.className = 'eh-more-tools';
             const moreSummary = document.createElement('summary');
-            moreSummary.textContent = 'Mais opções';
+            moreSummary.textContent = 'Mais';
             const secondaryActions = document.createElement('div');
             secondaryActions.className = 'eh-actions eh-actions-secondary';
             secondaryActions.append(rotas, historico, enviar, detalhes);
@@ -6632,7 +6402,7 @@
             const flowSection = document.createElement('details');
             flowSection.className = 'eh-flow-section';
             const flowSummary = document.createElement('summary');
-            flowSummary.textContent = 'Fluxo do atendimento';
+            flowSummary.textContent = 'Fluxo';
             flowSection.append(flowSummary, steps);
 
             body.append(flowSection, quickTitle, quickRoutes, context, divider, toolsTitle, actions, more);
@@ -6738,21 +6508,22 @@
             return String(this.phoneInput?.value || EH.Storage.get('currentPhone', '') || '').replace(/\D/g, '');
         },
 
-        // Mantido por compatibilidade interna. O WhatsApp não abre mais popup.
-        openWhatsAppCompactWindow() {
-            EH.Toast.info('O WhatsApp agora fica integrado na lateral do E-Pass.');
-            return null;
-        },
 
         async openWhatsApp(message = '', options = {}) {
-            let phone = EH.Config.WHATSAPP_MODE === 'app'
+            const imageDataUrl = String(options.imageDataUrl || '');
+            const filename = String(options.filename || 'epass-atendimento.png');
+            const forceWeb = options.bridgeOnly === true;
+            const currentWebState = EH.WhatsAppBridge.getState();
+
+            // O WhatsApp integrado tem prioridade sempre que existir uma sessão Web
+            // ativa. O modo APP continua disponível como fallback no computador de casa.
+            const useApp = !forceWeb && EH.Config.WHATSAPP_MODE === 'app' && !currentWebState.connected;
+            let phone = useApp
                 ? this.getPhone()
                 : String(options.phone || '').replace(/\D/g, '');
             if (phone && !phone.startsWith('55')) phone = `55${phone}`;
-            const imageDataUrl = String(options.imageDataUrl || '');
-            const filename = String(options.filename || 'epass-atendimento.png');
 
-            if (EH.Config.WHATSAPP_MODE === 'app') {
+            if (useApp) {
                 if (imageDataUrl) {
                     try {
                         const blob = EH.Clipboard.dataUrlToBlob(imageDataUrl);
@@ -6771,25 +6542,29 @@
                 document.body.appendChild(link);
                 link.click();
                 link.remove();
-                return { mode: 'app', connected: true };
+                return { mode: 'app', connected: true, readyToSend: true };
             }
 
-            if (!EH.WhatsAppBridge.isOnline()) {
-                EH.Toast.warning('WhatsApp Web desconectado. Mantenha a aba do WhatsApp Web que você já usa aberta.');
-                return { mode: 'web', connected: false };
-            }
-
-            const state = EH.WhatsAppBridge.getUiState();
-            const activeTitle = String(state?.active?.title || '').trim();
-            if (!phone && !activeTitle) {
-                EH.Toast.warning('Selecione primeiro a conversa do cliente no WhatsApp integrado à direita.');
-                return { mode: 'web', connected: false, missingChat: true };
+            const state = await EH.WhatsAppBridge.ensureReady({
+                requireConversation: !phone,
+                verifyStale: true,
+                context: imageDataUrl ? 'preparar-imagem' : 'preparar-mensagem'
+            });
+            if (!state.connected || (!phone && !state.conversationSelected)) {
+                EH.WhatsAppBridge.notifyUnavailable(state);
+                return {
+                    mode: 'web',
+                    connected: Boolean(state.connected),
+                    readyToSend: Boolean(state.readyToSend),
+                    missingChat: Boolean(state.connected && !state.conversationSelected),
+                    state
+                };
             }
 
             const command = EH.WhatsAppBridge.makeCommand({
                 action: 'prepare',
                 phone,
-                chatTitle: phone ? '' : activeTitle,
+                chatTitle: phone ? '' : state.activeTitle,
                 message,
                 imageDataUrl,
                 filename,
@@ -6799,10 +6574,10 @@
             this.lastWaCommandId = command.id;
             this.lastWaCommandHasImage = Boolean(imageDataUrl);
             this.lastWaCommandPurpose = '';
-            return { mode: 'web', connected: true, commandId: command.id };
+            return { mode: 'web', connected: true, readyToSend: true, commandId: command.id, state };
         },
 
-        sendPixPairToWhatsApp(pix) {
+        async sendPixPairToWhatsApp(pix) {
             const payload = EH.Payment.payload(pix);
             if (!payload) {
                 EH.Toast.warning('⚠️ Código PIX não encontrado.');
@@ -6813,18 +6588,20 @@
                 EH.Toast.warning(`⚠️ O código PIX parece incompleto ou inválido. ${validation.reason || ''}`.trim());
                 return null;
             }
-            if (EH.Config.WHATSAPP_MODE !== 'web' || !EH.WhatsAppBridge.isOnline()) {
-                EH.Toast.warning('WhatsApp Web integrado não está conectado.');
+
+            const state = await EH.WhatsAppBridge.ensureReady({
+                requireConversation: true,
+                verifyStale: true,
+                context: 'enviar-pix'
+            });
+            if (!state.readyToSend) {
+                EH.WhatsAppBridge.notifyUnavailable(state);
                 return null;
             }
-            const activeTitle = String(EH.WhatsAppBridge.getUiState()?.active?.title || '').trim();
-            if (!activeTitle) {
-                EH.Toast.warning('Selecione primeiro a conversa do cliente no WhatsApp à direita.');
-                return null;
-            }
+
             const command = EH.WhatsAppBridge.makeCommand({
                 action: 'send_pair',
-                chatTitle: activeTitle,
+                chatTitle: state.activeTitle,
                 message: EH.Payment.formatPixInstruction(pix),
                 // Mensagem 2 contém SOMENTE o payload original, sem prefixos/sufixos.
                 message2: payload,
@@ -6834,7 +6611,7 @@
             this.lastWaCommandId = command.id;
             this.lastWaCommandHasImage = false;
             this.lastWaCommandPurpose = 'pix';
-            EH.Toast.info('Enviando instrução e PIX em mensagens separadas…');
+            EH.Toast.info('Enviando PIX…');
             return command;
         },
 
@@ -6862,25 +6639,25 @@
             return result;
         },
 
-        sendPixMonospaceToWhatsApp(pix) {
+        async sendPixMonospaceToWhatsApp(pix) {
             const payload = EH.Payment.payload(pix);
             const validation = pix?.validation || EH.Payment.validatePix(payload);
             if (!payload || !validation.valid) {
                 EH.Toast.warning('O PIX precisa estar válido antes do envio.');
                 return null;
             }
-            if (EH.Config.WHATSAPP_MODE !== 'web' || !EH.WhatsAppBridge.isOnline()) {
-                EH.Toast.warning('WhatsApp Web integrado não está conectado.');
-                return null;
-            }
-            const activeTitle = String(EH.WhatsAppBridge.getUiState()?.active?.title || '').trim();
-            if (!activeTitle) {
-                EH.Toast.warning('Selecione primeiro a conversa do cliente no WhatsApp à direita.');
+            const state = await EH.WhatsAppBridge.ensureReady({
+                requireConversation: true,
+                verifyStale: true,
+                context: 'enviar-pix-mono'
+            });
+            if (!state.readyToSend) {
+                EH.WhatsAppBridge.notifyUnavailable(state);
                 return null;
             }
             const command = EH.WhatsAppBridge.makeCommand({
                 action: 'send_text',
-                chatTitle: activeTitle,
+                chatTitle: state.activeTitle,
                 message: EH.Payment.formatPixMonospace(pix),
                 target: 'web'
             });
@@ -6919,12 +6696,12 @@
                 title.textContent = '1. Horários';
                 const recent = this.lastCaptureState?.type === 'pesquisa' && (Date.now() - this.lastCaptureState.createdAt) < 90000;
                 info.textContent = recent
-                    ? 'Horários prontos. Use a conversa selecionada no WhatsApp à direita.'
-                    : 'Clique numa rota rápida: o E-Pass preenche, pesquisa e gera a imagem automaticamente.';
+                    ? 'Horários prontos.'
+                    : 'Escolha uma rota ou gere a captura.';
                 actions.append(this.contextButton('🗓️ Gerar horários agora', 'primary', () => this.captureAction('pesquisa')));
             } else if (page === 'reserva') {
                 title.textContent = '2. Poltronas';
-                info.textContent = 'Gere o mapa e use a conversa selecionada no WhatsApp integrado à direita.';
+                info.textContent = 'Gere o mapa de poltronas.';
                 actions.append(this.contextButton('💺 Gerar poltronas', 'primary', () => this.captureAction('reserva')));
             } else if (page === 'pagamento') {
                 const summary = EH.Payment.parseSummary();
@@ -6950,7 +6727,7 @@
                     }
 
                     const sendPix = this.contextButton('💬 ENVIAR PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
-                    const copyPix = this.contextButton('📋 Copiar código PIX', 'success', () => EH.Payment.copyPixCode(pix));
+                    const copyPix = this.contextButton('📋 Copiar código PIX', '', () => EH.Payment.copyPixCode(pix));
                     [sendPix, copyPix].forEach(btn => { btn.disabled = !validation.valid; });
                     actions.append(sendPix, copyPix);
                     this.contextBox.append(title, info, actions);
@@ -6980,7 +6757,7 @@
                     return;
                 }
                 title.textContent = '3. Confirmar compra';
-                info.textContent = summary?.cards?.length ? `${summary.cards[0].passenger || 'Passageiro'} • ${summary.cards[0].seat ? `poltrona ${summary.cards[0].seat}` : 'confira os dados'}` : 'Resumo da compra ainda não encontrado.';
+                info.textContent = summary?.cards?.length ? `${summary.cards[0].passenger || 'Passageiro'} • ${summary.cards[0].seat ? `poltrona ${summary.cards[0].seat}` : 'confira os dados'}` : 'Resumo ainda não encontrado.';
                 const msg = EH.Payment.formatSummary(summary);
                 actions.append(
                     this.contextButton('📋 Copiar confirmação', 'primary', async () => { if (!msg) return EH.Toast.warning('Resumo não encontrado.'); await EH.Clipboard.copyText(msg); EH.Toast.success('✓ Confirmação copiada'); }),
@@ -6993,13 +6770,18 @@
                 );
             } else if (page === 'passagens') {
                 title.textContent = '5. Bilhete';
-                info.textContent = 'Pesquise o CPF e escolha a passagem correta. O WhatsApp permanece ao lado durante todo o atendimento.';
+                info.textContent = 'Escolha o bilhete correto.';
                 actions.append(this.contextButton('🎫 Escolher bilhete', 'primary', () => EH.Tickets.activateSelection()));
             } else {
                 title.textContent = 'Atendimento';
-                info.textContent = EH.WhatsAppBridge.isOnline()
-                    ? 'WhatsApp conectado à direita. Escolha uma conversa e inicie o atendimento.'
-                    : 'Mantenha a aba do WhatsApp Web que você já usa aberta para aparecer aqui na lateral.';
+                const waState = EH.WhatsAppBridge.getState();
+                info.textContent = waState.state === 'ready'
+                    ? 'WhatsApp conectado.'
+                    : waState.state === 'no-chat'
+                        ? 'Selecione uma conversa.'
+                        : waState.state === 'loading'
+                            ? 'Conectando ao WhatsApp…'
+                            : 'WhatsApp desconectado.';
             }
             this.contextBox.append(title, info);
             if (actions.children.length) this.contextBox.append(actions);
@@ -7140,7 +6922,7 @@
                 };
 
                 let waPrepared = false;
-                if (EH.Config.WHATSAPP_MODE === 'web' && EH.WhatsAppBridge.isOnline() && EH.WhatsAppBridge.getUiState()?.active?.title) {
+                if (EH.WhatsAppBridge.getState().readyToSend) {
                     const waResult = await this.openWhatsApp(message, {
                         imageDataUrl: dataUrl,
                         filename: prepared.filename || 'bilhete-epass.png',
@@ -7232,7 +7014,7 @@
                 // pode ser preparada nela. Isso é o fallback principal do E-Pass em HTTP,
                 // onde o navegador bloqueia o PNG binário no clipboard.
                 let waPrepared = false;
-                if (EH.Config.WHATSAPP_MODE === 'web' && EH.WhatsAppBridge.isOnline() && EH.WhatsAppBridge.getUiState()?.active?.title) {
+                if (EH.WhatsAppBridge.getState().readyToSend) {
                     try {
                         const waResult = await this.openWhatsApp(message, {
                             imageDataUrl: dataUrl,
@@ -7812,7 +7594,7 @@
             sendWhatsApp.type = 'button';
             sendWhatsApp.className = 'eh-modal-btn success';
             sendWhatsApp.textContent = '💬 Enviar ao WhatsApp';
-            sendWhatsApp.disabled = !(EH.Config.WHATSAPP_MODE === 'web' && EH.WhatsAppBridge.isOnline() && EH.WhatsAppBridge.getUiState()?.active?.title);
+            sendWhatsApp.disabled = !(EH.WhatsAppBridge.getState().readyToSend);
             sendWhatsApp.addEventListener('click', async () => {
                 const result = await this.openWhatsApp(automaticMessage, { imageDataUrl: dataUrl, filename, allowCurrentChat: true, bridgeOnly: true });
                 if (result?.connected) EH.Toast.success('Imagem preparada no WhatsApp integrado.');
