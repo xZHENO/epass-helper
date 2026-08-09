@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.28.0
-// @description  Atendimento ao cliente, horários organizados, mapa de poltronas e cópia para WhatsApp
+// @version      5.29.0
+// @description  Atendimento integrado E-Pass + WhatsApp, com fluxo modular e interface otimizada
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.28.0',
+        VERSION: '5.29.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -45,8 +45,17 @@
         WHATSAPP_MODE: 'web',
         PANEL_WIDTH: 228,
         PANEL_ZOOM: 1.5,
+        PANEL_MIN_BASE: 112,
         WHATSAPP_DOCK_WIDTH: 360,
         WHATSAPP_DOCK_ZOOM: 1.1,
+        WHATSAPP_MIN_BASE: 160,
+        CENTRAL_MIN_WIDTH: 280,
+        LAYOUT_TRANSITION_MS: 180,
+        APP_OBSERVER_DEBOUNCE_MS: 420,
+        WA_OBSERVER_DEBOUNCE_MS: 650,
+        WA_UI_FALLBACK_MS: 6500,
+        WA_HEARTBEAT_MS: 4500,
+        WA_STATUS_REFRESH_MS: 5000,
         MESSAGES: {
             pesquisa: 'Escolha o horário desejado. Após isso, vou encaminhar as poltronas disponíveis.',
             reserva: 'Estas são as poltronas disponíveis. Informe o número da poltrona desejada.',
@@ -63,7 +72,6 @@
         },
         APLICAR_TAXAS_ORIGEM: true,
         SORT_DAY_START_MINUTES: 5 * 60,
-        PANEL_POSITION: { x: 18, y: 18 },
         LINHAS: {
             MA: 'EXPRESSO MAIA',
             JO: 'JOTAMAR',
@@ -221,6 +229,114 @@
             EH.Config.WHATSAPP_MODE = ['web', 'app'].includes(waMode) ? waMode : 'web';
             EH.Config.PANEL_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('panelZoom', EH.Config.PANEL_ZOOM)) || 1.5));
             EH.Config.WHATSAPP_DOCK_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('whatsappDockZoom', EH.Config.WHATSAPP_DOCK_ZOOM)) || 1.1));
+        }
+    };
+
+    // ============================================================
+    // CICLO DE VIDA / EVENTOS
+    // Centraliza listeners e timers para impedir registros duplicados.
+    // ============================================================
+    EH.Runtime = {
+        listeners: new Map(),
+        intervals: new Map(),
+        timeouts: new Map(),
+
+        on(key, target, type, handler, options) {
+            if (!key || !target?.addEventListener || !type || typeof handler !== 'function') return null;
+            this.off(key);
+            target.addEventListener(type, handler, options);
+            this.listeners.set(key, { target, type, handler, options });
+            return handler;
+        },
+
+        off(key) {
+            const item = this.listeners.get(key);
+            if (!item) return;
+            try { item.target.removeEventListener(item.type, item.handler, item.options); } catch (error) {}
+            this.listeners.delete(key);
+        },
+
+        interval(key, callback, delay) {
+            this.clearInterval(key);
+            const id = setInterval(callback, delay);
+            this.intervals.set(key, id);
+            return id;
+        },
+
+        clearInterval(key) {
+            const id = this.intervals.get(key);
+            if (id !== undefined) clearInterval(id);
+            this.intervals.delete(key);
+        },
+
+        timeout(key, callback, delay) {
+            this.clearTimeout(key);
+            const id = setTimeout(() => {
+                this.timeouts.delete(key);
+                callback();
+            }, delay);
+            this.timeouts.set(key, id);
+            return id;
+        },
+
+        clearTimeout(key) {
+            const id = this.timeouts.get(key);
+            if (id !== undefined) clearTimeout(id);
+            this.timeouts.delete(key);
+        },
+
+        clearAll() {
+            Array.from(this.listeners.keys()).forEach(key => this.off(key));
+            Array.from(this.intervals.keys()).forEach(key => this.clearInterval(key));
+            Array.from(this.timeouts.keys()).forEach(key => this.clearTimeout(key));
+        }
+    };
+
+    // ============================================================
+    // ESTADO GLOBAL DA INTERFACE
+    // Um único estado decide expansão/recolhimento dos dois painéis.
+    // ============================================================
+    EH.State = {
+        loaded: false,
+        panels: {
+            leftOpen: false,
+            rightOpen: true
+        },
+
+        load() {
+            if (this.loaded) return this.panels;
+            this.panels.leftOpen = !Boolean(EH.Storage.get('collapsed', true));
+            this.panels.rightOpen = !Boolean(EH.Storage.get('waDockCollapsed', false));
+            this.loaded = true;
+            return this.panels;
+        },
+
+        isOpen(panel) {
+            this.load();
+            return panel === 'right' ? this.panels.rightOpen : this.panels.leftOpen;
+        },
+
+        setPanel(panel, open, { persist = true } = {}) {
+            this.load();
+            const value = Boolean(open);
+            if (panel === 'left') {
+                this.panels.leftOpen = value;
+                if (persist) {
+                    EH.Storage.set('collapsed', !value);
+                    EH.Storage.set('minimized', !value);
+                }
+            } else if (panel === 'right') {
+                this.panels.rightOpen = value;
+                if (persist) EH.Storage.set('waDockCollapsed', !value);
+            } else {
+                return;
+            }
+            EH.Layout?.sync?.();
+        },
+
+        snapshot() {
+            this.load();
+            return { ...this.panels };
         }
     };
 
@@ -745,6 +861,7 @@
         listenerId: null,
         uiObserver: null,
         uiTimer: null,
+        receiverStarted: false,
         lastUiHash: '',
 
         isWhatsAppHost() {
@@ -987,12 +1104,16 @@
 
         startUiObserver() {
             if (!this.isWhatsAppHost() || this.uiObserver || !document.body) return;
-            const refresh = EH.Utils.debounce(() => this.publishUiState(false), 500);
-            this.uiObserver = new MutationObserver(refresh);
-            this.uiObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
-            clearInterval(this.uiTimer);
-            this.uiTimer = setInterval(() => this.publishUiState(false), 2200);
-            setTimeout(() => this.publishUiState(true), 900);
+            const refresh = EH.Utils.debounce(() => this.publishUiState(false), EH.Config.WA_OBSERVER_DEBOUNCE_MS);
+            const target = document.querySelector('#app') || document.body;
+            this.uiObserver = new MutationObserver(mutations => {
+                // Ignora mudanças triviais fora da aplicação quando possível.
+                if (!mutations?.length) return;
+                refresh();
+            });
+            this.uiObserver.observe(target, { childList: true, subtree: true, characterData: true });
+            this.uiTimer = EH.Runtime.interval('wa-ui-fallback', () => this.publishUiState(false), EH.Config.WA_UI_FALLBACK_MS);
+            EH.Runtime.timeout('wa-ui-first-sync', () => this.publishUiState(true), 900);
         },
 
         findChatRowByTitle(title) {
@@ -1245,34 +1366,35 @@
         },
 
         initReceiver() {
-            if (!this.isWhatsAppHost()) return;
+            if (!this.isWhatsAppHost() || this.receiverStarted) return;
+            this.receiverStarted = true;
             this.heartbeat(true);
             this.startUiObserver();
-            clearInterval(this.heartbeatTimer);
-            this.heartbeatTimer = setInterval(() => {
+            this.heartbeatTimer = EH.Runtime.interval('wa-heartbeat', () => {
                 this.heartbeat(true);
                 this.publishUiState(false);
-            }, 4000);
-            window.addEventListener('focus', () => {
+            }, EH.Config.WA_HEARTBEAT_MS);
+
+            EH.Runtime.on('wa-focus', window, 'focus', () => {
                 this.heartbeat(true);
                 this.publishUiState(true);
             });
-            document.addEventListener('visibilitychange', () => {
+            EH.Runtime.on('wa-visibility', document, 'visibilitychange', () => {
                 if (!document.hidden) {
                     this.heartbeat(true);
                     this.publishUiState(true);
                 }
             });
-            window.addEventListener('pagehide', () => this.heartbeat(false));
+            EH.Runtime.on('wa-pagehide', window, 'pagehide', () => this.heartbeat(false));
 
             const key = EH.Storage.key('waCommand');
-            if (typeof GM_addValueChangeListener === 'function') {
+            if (typeof GM_addValueChangeListener === 'function' && !this.listenerId) {
                 this.listenerId = GM_addValueChangeListener(key, (_name, _oldValue, newValue) => {
                     const command = this.parseStored(newValue);
                     if (command) this.handleCommand(command);
                 });
             }
-            setTimeout(() => {
+            EH.Runtime.timeout('wa-initial-command', () => {
                 const command = EH.Storage.get('waCommand', null);
                 if (command) this.handleCommand(command);
                 this.publishUiState(true);
@@ -1307,7 +1429,7 @@
 
         init() {
             if (this.root || EH.WhatsAppBridge.isWhatsAppHost() || !document.body) return;
-            this.collapsed = Boolean(EH.Storage.get('waDockCollapsed', false));
+            this.collapsed = !EH.State.isOpen('right');
 
             const root = document.createElement('aside');
             root.id = 'eh-wa-dock';
@@ -1442,19 +1564,14 @@
                 });
             }
             this.requestSync();
-            setInterval(() => this.refreshConnection(), 3000);
+            EH.Runtime.interval('wa-dock-status', () => this.refreshConnection(), EH.Config.WA_STATUS_REFRESH_MS);
         },
 
         setCollapsed(value) {
-            this.collapsed = Boolean(value);
-            this.root?.classList.toggle('eh-wa-collapsed', this.collapsed);
-            if (this.handle) this.handle.hidden = !this.collapsed;
-            EH.Storage.set('waDockCollapsed', this.collapsed);
-            this.applyLayout();
+            EH.State.setPanel('right', !Boolean(value));
         },
 
         applyLayout() {
-            document.documentElement.classList.toggle('eh-wa-integrated', !this.collapsed);
             EH.Layout?.sync?.();
         },
 
@@ -1691,38 +1808,106 @@
 
     // ============================================================
     // LAYOUT / ZOOM DOS PAINÉIS
+    // Estado -> classes/CSS variables. Nenhum ajuste cumulativo no E-Pass.
     // ============================================================
     EH.Layout = {
+        lastMetrics: null,
+
+        responsiveBases(viewportWidth, leftZoom, rightZoom, leftOpen, rightOpen) {
+            const vw = Math.max(320, Number(viewportWidth) || 1366);
+            let leftBase = vw <= 820 ? 176 : vw <= 1100 ? 194 : vw <= 1366 ? 214 : EH.Config.PANEL_WIDTH;
+            let rightBase = vw <= 820 ? 235 : vw <= 1100 ? 270 : vw <= 1366 ? 320 : EH.Config.WHATSAPP_DOCK_WIDTH;
+
+            if (leftOpen && rightOpen) {
+                const desiredLeft = leftBase * leftZoom;
+                const desiredRight = rightBase * rightZoom;
+                const centralTarget = vw >= 1440 ? 620 : vw >= 1180 ? 520 : vw >= 980 ? 400 : EH.Config.CENTRAL_MIN_WIDTH;
+                const maxPanels = Math.max(120, vw - centralTarget);
+                const desiredTotal = desiredLeft + desiredRight;
+                if (desiredTotal > maxPanels) {
+                    const ratio = Math.max(0.35, maxPanels / desiredTotal);
+                    leftBase = Math.max(EH.Config.PANEL_MIN_BASE, Math.floor(leftBase * ratio));
+                    rightBase = Math.max(EH.Config.WHATSAPP_MIN_BASE, Math.floor(rightBase * ratio));
+
+                    // Em telas realmente estreitas, preservar o centro é mais importante
+                    // que manter as larguras-base de desktop. O zoom continua inalterado.
+                    const adjustedTotal = leftBase * leftZoom + rightBase * rightZoom;
+                    if (adjustedTotal > maxPanels && maxPanels > 160) {
+                        const secondRatio = maxPanels / adjustedTotal;
+                        leftBase = Math.max(88, Math.floor(leftBase * secondRatio));
+                        rightBase = Math.max(126, Math.floor(rightBase * secondRatio));
+                    }
+                }
+            }
+
+            return { leftBase, rightBase };
+        },
+
         sync() {
-            const vw = Math.max(320, window.innerWidth || 1366);
+            EH.State?.load?.();
+            // clientWidth exclui a barra de rolagem vertical e corresponde ao espaço
+            // real usado por elementos fixed com left/right:0. Evita ~15px de sobreposição.
+            const viewportWidth = Math.max(320, document.documentElement.clientWidth || window.innerWidth || 1366);
             const leftZoom = Math.min(2, Math.max(0.75, Number(EH.Config.PANEL_ZOOM) || 1.5));
-            const waZoom = Math.min(2, Math.max(0.75, Number(EH.Config.WHATSAPP_DOCK_ZOOM) || 1.1));
-
-            // A largura-base muda com a viewport; o zoom continua independente.
-            const leftBase = vw <= 820 ? 176 : vw <= 1100 ? 194 : vw <= 1366 ? 214 : EH.Config.PANEL_WIDTH;
-            const waBase = vw <= 820 ? 235 : vw <= 1100 ? 270 : vw <= 1366 ? 320 : EH.Config.WHATSAPP_DOCK_WIDTH;
-            const leftOpen = Boolean(EH.UI?.root && !EH.UI.root.classList.contains('eh-collapsed'));
-            const rightOpen = Boolean(EH.WhatsAppDock?.root && !EH.WhatsAppDock.root.classList.contains('eh-wa-collapsed'));
+            const rightZoom = Math.min(2, Math.max(0.75, Number(EH.Config.WHATSAPP_DOCK_ZOOM) || 1.1));
+            const leftOpen = Boolean(EH.State?.isOpen?.('left') && EH.UI?.root);
+            const rightOpen = Boolean(EH.State?.isOpen?.('right') && EH.WhatsAppDock?.root);
+            const { leftBase, rightBase } = this.responsiveBases(viewportWidth, leftZoom, rightZoom, leftOpen, rightOpen);
             const leftSpace = leftOpen ? Math.round(leftBase * leftZoom) : 0;
-            const rightSpace = rightOpen ? Math.round(waBase * waZoom) : 0;
-
+            const rightSpace = rightOpen ? Math.round(rightBase * rightZoom) : 0;
             const root = document.documentElement;
-            root.classList.add('eh-layout-managed');
+            const layoutActive = leftOpen || rightOpen;
+
+            root.classList.toggle('eh-layout-managed', layoutActive);
+            root.classList.toggle('eh-app-left-open', leftOpen);
+            root.classList.toggle('eh-app-right-open', rightOpen);
+            root.classList.toggle('eh-app-both-open', leftOpen && rightOpen);
+            root.classList.toggle('eh-app-panels-closed', !leftOpen && !rightOpen);
+            root.classList.toggle('eh-layout-tight', layoutActive && (viewportWidth - leftSpace - rightSpace) < 380);
+
             root.style.setProperty('--eh-panel-base', `${leftBase}px`);
-            root.style.setProperty('--eh-wa-base', `${waBase}px`);
+            root.style.setProperty('--eh-wa-base', `${rightBase}px`);
             root.style.setProperty('--eh-panel-zoom', String(leftZoom));
-            root.style.setProperty('--eh-wa-zoom', String(waZoom));
+            root.style.setProperty('--eh-wa-zoom', String(rightZoom));
+            root.style.setProperty('--eh-left-logical-height', `${100 / leftZoom}vh`);
+            root.style.setProperty('--eh-right-logical-height', `${100 / rightZoom}vh`);
             root.style.setProperty('--eh-left-active-space', `${leftSpace}px`);
             root.style.setProperty('--eh-right-active-space', `${rightSpace}px`);
+            root.style.setProperty('--eh-layout-transition', `${Math.max(0, Number(EH.Config.LAYOUT_TRANSITION_MS) || 180)}ms`);
 
             if (EH.UI?.root) {
-                EH.UI.root.style.zoom = String(leftZoom);
-                EH.UI.root.style.setProperty('height', `${100 / leftZoom}vh`, 'important');
+                EH.UI.root.classList.toggle('eh-collapsed', !leftOpen);
+                if (EH.UI.body) EH.UI.body.hidden = !leftOpen;
+                if (EH.UI.launcher) EH.UI.launcher.hidden = leftOpen;
             }
             if (EH.WhatsAppDock?.root) {
-                EH.WhatsAppDock.root.style.zoom = String(waZoom);
-                EH.WhatsAppDock.root.style.setProperty('height', `${100 / waZoom}vh`, 'important');
+                EH.WhatsAppDock.collapsed = !rightOpen;
+                EH.WhatsAppDock.root.classList.toggle('eh-wa-collapsed', !rightOpen);
+                if (EH.WhatsAppDock.handle) EH.WhatsAppDock.handle.hidden = rightOpen;
             }
+
+            this.lastMetrics = {
+                viewportWidth,
+                leftOpen,
+                rightOpen,
+                leftZoom,
+                rightZoom,
+                leftBase,
+                rightBase,
+                leftSpace,
+                rightSpace,
+                centralSpace: Math.max(0, viewportWidth - leftSpace - rightSpace)
+            };
+            return this.lastMetrics;
+        },
+
+        reset() {
+            const root = document.documentElement;
+            ['eh-layout-managed', 'eh-app-left-open', 'eh-app-right-open', 'eh-app-both-open', 'eh-app-panels-closed', 'eh-layout-tight']
+                .forEach(name => root.classList.remove(name));
+            ['--eh-panel-base', '--eh-wa-base', '--eh-panel-zoom', '--eh-wa-zoom', '--eh-left-logical-height', '--eh-right-logical-height', '--eh-left-active-space', '--eh-right-active-space', '--eh-layout-transition']
+                .forEach(name => root.style.removeProperty(name));
+            this.lastMetrics = null;
         }
     };
 
@@ -1742,60 +1927,28 @@
                     --eh-success: #35b879;
                     --eh-warning: #e7a83a;
                     --eh-danger: #e35d6a;
+                    --eh-wa-base: 360px;
+                    --eh-panel-base: 228px;
+                    --eh-panel-zoom: 1.5;
+                    --eh-wa-zoom: 1.1;
+                    --eh-left-logical-height: 66.6667vh;
+                    --eh-right-logical-height: 90.9091vh;
+                    --eh-left-active-space: 0px;
+                    --eh-right-active-space: 0px;
+                    --eh-layout-transition: 180ms;
                 }
 
                 #eh-root, #eh-root * { box-sizing: border-box; }
 
+                /* Componentes do painel esquerdo. Posicionamento e dimensões ficam
+                   exclusivamente no bloco de layout abaixo. */
                 #eh-root {
-                    position: fixed;
-                    z-index: 2147483000;
-                    left: 18px;
-                    top: 18px;
-                    width: 190px;
                     font-family: Inter, "Segoe UI", Arial, sans-serif;
                     color: var(--eh-text);
                     user-select: none;
                 }
-
-                #eh-root.eh-collapsed {
-                    width: auto;
-                }
-
-                .eh-panel {
-                    overflow: hidden;
-                    border: 1px solid var(--eh-border);
-                    border-radius: 13px;
-                    background: rgba(23, 25, 31, .97);
-                    box-shadow: 0 14px 40px rgba(0, 0, 0, .34);
-                }
-
-                .eh-header {
-                    display: flex;
-                    align-items: center;
-                    justify-content: flex-end;
-                    gap: 4px;
-                    min-height: 36px;
-                    padding: 4px;
-                    border-bottom: 1px solid var(--eh-border);
-                    cursor: grab;
-                    touch-action: none;
-                }
-
-                #eh-root.eh-collapsed .eh-header {
-                    border-bottom: 0;
-                }
-
-                .eh-header:active { cursor: grabbing; }
-
-                .eh-title {
-                    display: none !important;
-                }
-
-                .eh-version {
-                    display: none !important;
-                }
-
-                .eh-icon-btn {
+                #eh-root .eh-title, #eh-root .eh-version { display: none !important; }
+                #eh-root .eh-icon-btn {
                     width: 28px;
                     height: 28px;
                     display: inline-flex;
@@ -1810,71 +1963,54 @@
                     font-size: 14px;
                     line-height: 1;
                 }
-
-                .eh-icon-btn:hover { background: var(--eh-bg-2); color: var(--eh-text); }
-
-                .eh-body { padding: 9px; }
-                .eh-body[hidden] { display: none !important; }
-                #eh-root.eh-collapsed .eh-panel { border-radius: 10px; }
-
-                .eh-actions {
-                    display: grid;
-                    gap: 7px;
-                }
-
-                .eh-btn {
+                #eh-root .eh-icon-btn:hover { background: var(--eh-bg-2); color: var(--eh-text); }
+                #eh-root .eh-body[hidden] { display: none !important; }
+                #eh-root .eh-actions { display: grid; gap: 6px; }
+                #eh-root .eh-btn {
                     width: 100%;
-                    min-height: 38px;
+                    min-height: 34px;
                     display: flex;
                     align-items: center;
                     justify-content: flex-start;
-                    gap: 9px;
-                    padding: 8px 10px;
+                    gap: 7px;
+                    padding: 7px 8px;
                     border: 1px solid var(--eh-border);
-                    border-radius: 9px;
+                    border-radius: 8px;
                     background: var(--eh-bg-2);
                     color: var(--eh-text);
                     cursor: pointer;
                     font: inherit;
-                    font-size: 11px;
-                    font-weight: 700;
-                    letter-spacing: .3px;
+                    font-size: 10px;
+                    font-weight: 750;
+                    letter-spacing: .15px;
                     text-align: left;
-                    transition: transform .15s ease, border-color .15s ease, background .15s ease;
+                    transition: transform .14s ease, border-color .14s ease, background .14s ease;
                 }
-
-                .eh-btn:hover:not(:disabled) {
+                #eh-root .eh-btn:hover:not(:disabled) {
                     transform: translateY(-1px);
                     border-color: #4d5565;
                     background: #272b35;
                 }
-
-                .eh-btn:disabled { opacity: .38; cursor: not-allowed; }
-                .eh-btn.eh-primary { border-color: rgba(61, 139, 253, .48); }
-                .eh-btn.eh-success { border-color: rgba(53, 184, 121, .48); }
-                .eh-btn-icon { width: 20px; text-align: center; font-size: 15px; }
-
-                .eh-status {
+                #eh-root .eh-btn:disabled { opacity: .38; cursor: not-allowed; }
+                #eh-root .eh-btn.eh-primary { border-color: rgba(61, 139, 253, .48); }
+                #eh-root .eh-btn.eh-success { border-color: rgba(53, 184, 121, .48); }
+                #eh-root .eh-btn-icon { width: 18px; text-align: center; font-size: 13px; }
+                #eh-root .eh-status {
                     display: flex;
                     align-items: center;
                     justify-content: center;
                     gap: 6px;
-                    margin-top: 8px;
-                    padding-top: 8px;
-                    border-top: 1px solid var(--eh-border);
                     color: var(--eh-muted);
-                    font-size: 10px;
+                    font-size: 9px;
                 }
-
-                .eh-dot {
+                #eh-root .eh-dot {
                     width: 7px;
                     height: 7px;
                     border-radius: 50%;
                     background: var(--eh-warning);
                     box-shadow: 0 0 0 3px rgba(231, 168, 58, .12);
                 }
-
-                .eh-dot.active {
+                #eh-root .eh-dot.active {
                     background: var(--eh-success);
                     box-shadow: 0 0 0 3px rgba(53, 184, 121, .12);
                 }
@@ -2553,11 +2689,12 @@
                     right: auto !important;
                     top: 0 !important;
                     width: var(--eh-panel-base, 228px) !important;
-                    height: 100vh !important;
+                    height: var(--eh-left-logical-height, 100vh) !important;
+                    zoom: var(--eh-panel-zoom, 1);
                     z-index: 2147483000;
                     font-family: Inter, "Segoe UI", Arial, sans-serif !important;
                     transform: translateX(0);
-                    transition: transform .18s ease, opacity .18s ease;
+                    transition: transform var(--eh-layout-transition, 180ms) ease, opacity var(--eh-layout-transition, 180ms) ease;
                     will-change: transform;
                 }
                 #eh-root.eh-collapsed {
@@ -2578,6 +2715,8 @@
                 }
                 #eh-root .eh-header {
                     min-height: 38px;
+                    display: flex;
+                    align-items: center;
                     padding: 5px 6px;
                     cursor: default;
                     flex: 0 0 auto;
@@ -2593,15 +2732,41 @@
                     padding: 8px;
                     scrollbar-width: thin;
                 }
-                html.eh-layout-managed body { padding-left:0 !important; padding-right:0 !important; }
+                #eh-root .eh-panel-footer {
+                    flex: 0 0 auto;
+                    padding: 6px 8px;
+                    border-top: 1px solid #292f39;
+                    background: #101319;
+                }
+                #eh-root .eh-flow-section {
+                    margin: 0 0 7px;
+                    border: 1px solid #2d3540;
+                    border-radius: 7px;
+                    background: #151a21;
+                    overflow: hidden;
+                }
+                #eh-root .eh-flow-section > summary {
+                    padding: 6px 8px;
+                    cursor: pointer;
+                    list-style: none;
+                    color: #9ba6b7;
+                    font-size: 8.5px;
+                    font-weight: 850;
+                    letter-spacing: .3px;
+                    text-transform: uppercase;
+                }
+                #eh-root .eh-flow-section > summary::-webkit-details-marker { display:none; }
+                #eh-root .eh-flow-section > summary::after { content:'＋'; float:right; color:#778396; }
+                #eh-root .eh-flow-section[open] > summary::after { content:'−'; }
+                #eh-root .eh-flow-section .eh-steps { margin: 0; padding: 0 6px 6px; }
                 html.eh-layout-managed app-root {
                     display:block !important;
-                    width:calc(100vw - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
-                    max-width:calc(100vw - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
+                    width:calc(100% - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
+                    max-width:calc(100% - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
                     min-width:0 !important;
                     margin-left:var(--eh-left-active-space, 0px) !important;
                     margin-right:0 !important;
-                    transition:width .18s ease, margin-left .18s ease;
+                    transition:width var(--eh-layout-transition, 180ms) ease, margin-left var(--eh-layout-transition, 180ms) ease;
                 }
                 html.eh-layout-managed app-root .navbar-fixed-top {
                     left:var(--eh-left-active-space, 0px) !important;
@@ -2666,15 +2831,19 @@
                 .eh-context-card strong { display:block; margin-bottom:3px; color:#fff; font-size:10.5px; }
                 .eh-context-actions { display:grid; gap:5px; margin-top:7px; }
                 .eh-context-btn { width:100%; min-height:31px; padding:6px 8px; border:1px solid #3b4554; border-radius:7px; background:#20262f; color:#fff; cursor:pointer; font-size:9.5px; font-weight:800; text-align:left; }
+                .eh-context-more { margin-top:7px; border-top:1px solid #2c323c; padding-top:6px; }
+                .eh-context-more > summary { list-style:none; cursor:pointer; color:#98a3b3; font-size:8.5px; font-weight:800; }
+                .eh-context-more > summary::-webkit-details-marker { display:none; }
+                .eh-context-more > summary::after { content:'＋'; float:right; color:#738093; }
+                .eh-context-more[open] > summary::after { content:'−'; }
+                .eh-context-actions-secondary { margin-top:6px; }
                 .eh-context-btn.primary { border-color:#397bdd; background:#223957; }
                 .eh-context-btn.success { border-color:#2f9e69; background:#16382a; }
                 .eh-context-btn:disabled { opacity:.38; cursor:not-allowed; filter:grayscale(.25); }
                 .eh-pix-mini { display:block; width:128px; max-width:100%; margin:7px auto; border:4px solid #fff; border-radius:7px; background:#fff; }
                 .eh-tools-divider { height:1px; background:#2c323c; margin:8px 0 6px; }
-                #eh-root .eh-actions { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
-                #eh-root .eh-btn { min-height:32px; padding:6px 7px; border-radius:7px; font-size:9px; gap:5px; }
-                #eh-root .eh-btn-icon { width:16px; font-size:13px; }
-                #eh-root .eh-status { margin-top:7px; padding-top:7px; font-size:9px; }
+                #eh-root .eh-actions-primary { grid-template-columns:1fr 1fr; }
+                #eh-root .eh-actions-secondary { grid-template-columns:1fr 1fr; }
                 @media (max-width: 720px) {
                     .eh-quick-routes { grid-template-columns:1fr; }
                     #eh-launcher { top:auto; bottom:22%; }
@@ -2688,7 +2857,6 @@
                 .eh-actions-secondary { padding:0 6px 6px; }
 
                 /* WhatsApp Web integrado à direita do E-Pass */
-                :root { --eh-wa-base: 360px; --eh-panel-base:228px; --eh-left-active-space:0px; --eh-right-active-space:0px; }
                 #eh-wa-dock, #eh-wa-dock * { box-sizing: border-box; }
                 #eh-wa-dock {
                     position: fixed;
@@ -2696,7 +2864,8 @@
                     top: 0;
                     right: 0;
                     width: var(--eh-wa-base, 360px);
-                    height: 100vh;
+                    height: var(--eh-right-logical-height, 100vh);
+                    zoom: var(--eh-wa-zoom, 1);
                     display: grid;
                     grid-template-rows: 42px minmax(135px, 34%) minmax(0, 1fr) auto auto;
                     border-left: 1px solid #26343a;
@@ -5943,8 +6112,21 @@
                 },
                 settings: {
                     captureScale: EH.Config.CAPTURE_SCALE,
-                    applyIporaFee: EH.Config.APLICAR_TAXA_IPORA,
-                    iporaFee: EH.Config.TAXA_IPORA
+                    applyOriginFees: EH.Config.APLICAR_TAXAS_ORIGEM,
+                    originFees: { ...(EH.Config.TAXAS_ORIGEM || {}) },
+                    panelZoom: EH.Config.PANEL_ZOOM,
+                    whatsappZoom: EH.Config.WHATSAPP_DOCK_ZOOM
+                },
+                interface: {
+                    state: EH.State?.snapshot?.() || null,
+                    layout: EH.Layout?.lastMetrics || null,
+                    whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null
+                },
+                runtime: {
+                    listeners: EH.Runtime?.listeners?.size || 0,
+                    intervals: EH.Runtime?.intervals?.size || 0,
+                    timeouts: EH.Runtime?.timeouts?.size || 0,
+                    observerActive: Boolean(EH.Observer?.observer)
                 }
             };
         },
@@ -6340,7 +6522,9 @@
                 EH.Storage.set('collapsed', true);
                 EH.Storage.set('drawer523Initialized', true);
             }
-            const collapsed = Boolean(EH.Storage.get('collapsed', true));
+            // O estado persistente é lido uma única vez e passa a ser a fonte de verdade.
+            EH.State.loaded = false;
+            const collapsed = !EH.State.isOpen('left');
 
             const root = document.createElement('div');
             root.id = 'eh-root';
@@ -6376,10 +6560,6 @@
             const body = document.createElement('div');
             body.className = 'eh-body';
             body.hidden = collapsed;
-
-            const workflowTitle = document.createElement('div');
-            workflowTitle.className = 'eh-dock-title';
-            workflowTitle.textContent = 'Fluxo do atendimento';
 
             const steps = document.createElement('div');
             steps.className = 'eh-steps';
@@ -6445,8 +6625,18 @@
             statusText.textContent = 'Aguardando tela';
             status.append(dot, statusText);
 
-            body.append(workflowTitle, steps, quickTitle, quickRoutes, context, divider, toolsTitle, actions, more, status);
-            panel.append(header, body);
+            const footer = document.createElement('div');
+            footer.className = 'eh-panel-footer';
+            footer.appendChild(status);
+
+            const flowSection = document.createElement('details');
+            flowSection.className = 'eh-flow-section';
+            const flowSummary = document.createElement('summary');
+            flowSummary.textContent = 'Fluxo do atendimento';
+            flowSection.append(flowSummary, steps);
+
+            body.append(flowSection, quickTitle, quickRoutes, context, divider, toolsTitle, actions, more);
+            panel.append(header, body, footer);
             root.appendChild(panel);
 
             const launcher = document.createElement('button');
@@ -6483,8 +6673,6 @@
 
             this.applyDockLayout(!collapsed);
             this.refreshWhatsAppConnection();
-            clearInterval(this.waStatusTimer);
-            this.waStatusTimer = setInterval(() => this.refreshWhatsAppConnection(), 3000);
             if (typeof GM_addValueChangeListener === 'function' && !this.waAckListener) {
                 this.waAckListener = GM_addValueChangeListener(EH.Storage.key('waAck'), (_name, _oldValue, newValue) => {
                     const ack = EH.WhatsAppBridge.parseStored(newValue);
@@ -6504,22 +6692,14 @@
 
         setPanelOpen(open) {
             if (!this.root || !this.body) return;
-            const isOpen = Boolean(open);
-            this.body.hidden = !isOpen;
-            this.root.classList.toggle('eh-collapsed', !isOpen);
-            if (this.launcher) this.launcher.hidden = isOpen;
-            EH.Storage.set('collapsed', !isOpen);
-            EH.Storage.set('minimized', !isOpen);
-            this.applyDockLayout(isOpen);
+            EH.State.setPanel('left', Boolean(open));
         },
 
         togglePanel() {
-            const open = Boolean(this.body && !this.body.hidden);
-            this.setPanelOpen(!open);
+            this.setPanelOpen(!EH.State.isOpen('left'));
         },
 
-        applyDockLayout(open) {
-            document.documentElement.classList.toggle('eh-dock-open', Boolean(open));
+        applyDockLayout() {
             EH.Layout?.sync?.();
         },
 
@@ -6768,23 +6948,35 @@
                     if (validation.valid) {
                         try { localQr = EH.Payment.getQrDataUrl(pix); } catch (error) { EH.Logger.warn('QR local:', error); }
                     }
+
+                    const sendPix = this.contextButton('💬 ENVIAR PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
+                    const copyPix = this.contextButton('📋 Copiar código PIX', 'success', () => EH.Payment.copyPixCode(pix));
+                    [sendPix, copyPix].forEach(btn => { btn.disabled = !validation.valid; });
+                    actions.append(sendPix, copyPix);
+                    this.contextBox.append(title, info, actions);
+
+                    const secondary = document.createElement('details');
+                    secondary.className = 'eh-context-more';
+                    const secondaryTitle = document.createElement('summary');
+                    secondaryTitle.textContent = 'QR Code e alternativas';
+                    secondary.appendChild(secondaryTitle);
                     if (localQr) {
                         const img = document.createElement('img');
                         img.className = 'eh-pix-mini';
                         img.src = localQr;
                         img.alt = 'QR Code PIX';
-                        this.contextBox.append(title, info, img);
-                    } else this.contextBox.append(title, info);
-
-                    const sendPix = this.contextButton('💬 ENVIAR PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
-                    const copyPix = this.contextButton('📋 Copiar código PIX', 'success', () => EH.Payment.copyPixCode(pix));
+                        secondary.appendChild(img);
+                    }
+                    const extraActions = document.createElement('div');
+                    extraActions.className = 'eh-context-actions eh-context-actions-secondary';
                     const copyQr = this.contextButton('🖼️ Copiar QR Code', '', () => EH.Payment.copyQrCode(pix));
                     const sendQr = this.contextButton('🖼️ Enviar QR Code', '', () => this.sendPixQrToWhatsApp(pix));
                     const txt = this.contextButton('📄 PIX em arquivo', '', () => EH.Payment.downloadPixTxt(pix));
-                    const mono = this.contextButton('` Enviar monoespaçado (opcional)', '', () => this.sendPixMonospaceToWhatsApp(pix));
-                    [sendPix, copyPix, copyQr, sendQr, txt, mono].forEach(btn => { btn.disabled = !validation.valid; });
-                    actions.append(sendPix, copyPix, copyQr, sendQr, txt, mono);
-                    this.contextBox.append(actions);
+                    const mono = this.contextButton('` Monoespaçado (opcional)', '', () => this.sendPixMonospaceToWhatsApp(pix));
+                    [copyQr, sendQr, txt, mono].forEach(btn => { btn.disabled = !validation.valid; });
+                    extraActions.append(copyQr, sendQr, txt, mono);
+                    secondary.appendChild(extraActions);
+                    this.contextBox.appendChild(secondary);
                     return;
                 }
                 title.textContent = '3. Confirmar compra';
@@ -7973,11 +8165,21 @@
             const update = EH.Utils.debounce(() => {
                 const page = EH.Pages.update();
                 if (page !== 'passagens' && EH.Tickets.active) EH.Tickets.clearSelection();
-            }, 360);
-            this.observer = new MutationObserver(update);
-            this.observer.observe(document.body, { childList: true, subtree: true });
-            window.addEventListener('popstate', update);
-            window.addEventListener('hashchange', update);
+            }, EH.Config.APP_OBSERVER_DEBOUNCE_MS);
+
+            const isOwnMutation = mutation => {
+                const target = mutation?.target instanceof Element ? mutation.target : mutation?.target?.parentElement;
+                return Boolean(target?.closest?.('#eh-root, #eh-wa-dock, #eh-toast-area, .eh-overlay, .eh-capture-overlay'));
+            };
+
+            this.observer = new MutationObserver(mutations => {
+                if (mutations?.length && mutations.every(isOwnMutation)) return;
+                update();
+            });
+            const target = document.querySelector('app-root') || document.body;
+            this.observer.observe(target, { childList: true, subtree: true });
+            EH.Runtime.on('app-popstate', window, 'popstate', update);
+            EH.Runtime.on('app-hashchange', window, 'hashchange', update);
         }
     };
 
@@ -8005,11 +8207,11 @@
             EH.UI.init();
             EH.WhatsAppDock.init();
             EH.Layout.sync();
-            window.addEventListener('resize', EH.Utils.debounce(() => EH.Layout.sync(), 120));
+            EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => EH.Layout.sync(), 140));
             EH.Observer.start();
             EH.Pages.update();
-            setTimeout(() => EH.Routes.applyPending(), 800);
-            document.addEventListener('keydown', event => {
+            EH.Runtime.timeout('pending-route', () => EH.Routes.applyPending(), 800);
+            EH.Runtime.on('app-shortcuts', document, 'keydown', event => {
                 if (event.altKey && !event.ctrlKey && !event.shiftKey && String(event.key || '').toLowerCase() === 'a') {
                     event.preventDefault();
                     EH.UI.togglePanel();
@@ -8020,6 +8222,7 @@
                     EH.Toast.info('Seleção de passagem cancelada.');
                 }
             });
+            EH.Runtime.on('app-pagehide', window, 'pagehide', () => EH.Layout.reset());
 
             if (EH.Config.DEBUG) window.EPassHelper = EH;
             EH.Logger.info(`EPass Helper ${EH.Config.VERSION} iniciado.`);
