@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.35.0
-// @description  Atendimento integrado E-Pass + WhatsApp, quebras de linha preservadas, PIX com QR original e operação de viagem
+// @version      5.32.0
+// @description  Atendimento integrado E-Pass + WhatsApp, composer, previsão de viagem e lembretes de embarque
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.35.0',
+        VERSION: '5.32.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -42,6 +42,7 @@
         HISTORY_MAX_CHARS: 45000000,
         AUTO_COPY_IMAGES: true,
         AUTO_ROUTE_CAPTURE: true,
+        WHATSAPP_MODE: 'web',
         PANEL_WIDTH: 228,
         PANEL_ZOOM: 1.5,
         PANEL_MIN_BASE: 112,
@@ -51,7 +52,6 @@
         LAYOUT_TRANSITION_MS: 180,
         INTERFACE_PROFILE: 'auto',
         PANEL_SIZE: 'medium',
-        CONFIRMATION_MODE: 'image',
         PANEL_TOP_FALLBACK: 86,
         PANEL_BOTTOM_GAP: 0,
         APP_OBSERVER_DEBOUNCE_MS: 420,
@@ -240,14 +240,14 @@
             }
             EH.Config.AUTO_COPY_IMAGES = Boolean(this.get('autoCopyImages', EH.Config.AUTO_COPY_IMAGES));
             EH.Config.AUTO_ROUTE_CAPTURE = Boolean(this.get('autoRouteCapture', EH.Config.AUTO_ROUTE_CAPTURE));
+            const waMode = String(this.get('whatsappMode', EH.Config.WHATSAPP_MODE) || 'web').toLowerCase();
+            EH.Config.WHATSAPP_MODE = ['web', 'app'].includes(waMode) ? waMode : 'web';
             EH.Config.PANEL_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('panelZoom', EH.Config.PANEL_ZOOM)) || 1.5));
             EH.Config.WHATSAPP_DOCK_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('whatsappDockZoom', EH.Config.WHATSAPP_DOCK_ZOOM)) || 1.1));
             const interfaceProfile = String(this.get('interfaceProfile', EH.Config.INTERFACE_PROFILE) || 'auto').toLowerCase();
             EH.Config.INTERFACE_PROFILE = ['auto', 'home', 'station'].includes(interfaceProfile) ? interfaceProfile : 'auto';
             const panelSize = String(this.get('panelSize', EH.Config.PANEL_SIZE) || 'medium').toLowerCase();
             EH.Config.PANEL_SIZE = ['small', 'medium', 'large'].includes(panelSize) ? panelSize : 'medium';
-            const confirmationMode = String(this.get('confirmationMode', EH.Config.CONFIRMATION_MODE) || 'image').toLowerCase();
-            EH.Config.CONFIRMATION_MODE = ['text', 'image'].includes(confirmationMode) ? confirmationMode : 'image';
             EH.Config.BOARDING_DEFAULT_REMIND_MINUTES = Math.min(1440, Math.max(5, Number(
                 this.get('boardingDefaultRemindMinutes', EH.Config.BOARDING_DEFAULT_REMIND_MINUTES)
             ) || 120));
@@ -863,39 +863,6 @@
     };
 
     // ============================================================
-    // TEXTO DO WHATSAPP — fonte central de normalização
-    // Preserva quebras reais de linha e Markdown simples do WhatsApp.
-    // Nunca deve ser usado para alterar o payload financeiro PIX.
-    // ============================================================
-    EH.WhatsAppText = {
-        normalize(value) {
-            let text = String(value == null ? '' : value)
-                .replace(/\r\n?/g, '\n')
-                // Corrige strings antigas que chegaram com \n literal entre blocos.
-                .replace(/\\n/g, '\n')
-                // O sistema usa Markdown simples do WhatsApp; não escapar asteriscos.
-                .replace(/\\\*/g, '*');
-
-            const lines = text.split('\n').map(line => line.replace(/[ \t]+$/g, ''));
-            while (lines.length && !lines[0].trim()) lines.shift();
-            while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
-            return lines.join('\n');
-        },
-
-        raw(value) {
-            // Usado para conteúdos que precisam permanecer byte-a-byte iguais, como pixOriginal.
-            return String(value == null ? '' : value);
-        },
-
-        comparable(value) {
-            return this.normalize(value)
-                .replace(/\u00a0/g, ' ')
-                .replace(/\u200b|\u200c|\u200d|\ufeff/g, '')
-                .replace(/[ \t]+$/gm, '');
-        }
-    };
-
-    // ============================================================
     // PONTE COM WHATSAPP WEB
     // O mesmo userscript roda no E-Pass e no WhatsApp Web. A comunicação
     // entre as abas usa o armazenamento compartilhado do Tampermonkey.
@@ -1162,9 +1129,8 @@
                 target,
                 phone: String(phone || '').replace(/\D/g, ''),
                 chatTitle: String(chatTitle || '').trim(),
-                message: EH.WhatsAppText.normalize(message),
-                // message2 é mantida crua: no fluxo PIX ela contém pixOriginal e não pode ser alterada.
-                message2: EH.WhatsAppText.raw(message2),
+                message: String(message || ''),
+                message2: String(message2 || ''),
                 imageDataUrl: String(imageDataUrl || ''),
                 filename: String(filename || 'epass-atendimento.png')
             };
@@ -1323,7 +1289,6 @@
         async readChatHistory(title, { limit = EH.Config.WA_HISTORY_LIMIT, scrolls = EH.Config.WA_HISTORY_SCROLLS } = {}) {
             const wanted = this.cleanText(title);
             if (!wanted) return { ok: false, chatTitle: '', messages: [], reason: 'Grupo não informado.' };
-            const previousTitle = this.collectActiveConversation(1)?.active?.title || '';
             const selected = await this.selectChatByTitle(wanted);
             if (!selected) return { ok: false, chatTitle: wanted, messages: [], reason: 'Conversa não encontrada na lista atual.' };
             await EH.Utils.sleep(500);
@@ -1349,18 +1314,7 @@
             if (scroller) {
                 try { scroller.scrollTop = scroller.scrollHeight; } catch (error) { EH.Logger.debug('Não foi possível restaurar a rolagem do WhatsApp:', error); }
             }
-
-            // A leitura operacional de um grupo não deve roubar a conversa do cliente
-            // que estava sendo atendido no painel integrado.
-            if (
-                previousTitle &&
-                this.cleanText(previousTitle).toLocaleLowerCase('pt-BR') !== wanted.toLocaleLowerCase('pt-BR')
-            ) {
-                await this.selectChatByTitle(previousTitle);
-            } else {
-                this.publishUiState(true);
-            }
-
+            this.publishUiState(true);
             return {
                 ok: Boolean(convo.active?.title && convo.messages.length),
                 chatTitle: convo.active?.title || wanted,
@@ -1443,17 +1397,7 @@
         },
 
         async selectChatByTitle(title) {
-            const wanted = this.cleanText(title);
-            if (!wanted) return false;
-
-            // Se a conversa já é a ativa, não clique novamente na lista e não
-            // provoque mudanças visuais desnecessárias na aba-motor.
-            const current = this.collectActiveConversation(1)?.active?.title || '';
-            if (current && this.cleanText(current).toLocaleLowerCase('pt-BR') === wanted.toLocaleLowerCase('pt-BR')) {
-                return true;
-            }
-
-            const row = this.findChatRowByTitle(wanted);
+            const row = this.findChatRowByTitle(title);
             if (!row) return false;
             try {
                 row.scrollIntoView({ block: 'nearest' });
@@ -1477,139 +1421,38 @@
             }, timeout, 250);
         },
 
-        editableText(element) {
-            if (!element) return '';
-            if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-                return String(element.value || '').replace(/\r\n?/g, '\n');
-            }
-            return String(element.innerText || element.textContent || '').replace(/\r\n?/g, '\n');
-        },
-
-        dispatchTextInput(element, value, inputType = 'insertText') {
+        async insertTextIntoCurrentChat(message, replace = false) {
+            if (!message) return true;
+            const composer = await this.waitForComposer(12000);
+            if (!composer) return false;
             try {
-                element.dispatchEvent(new InputEvent('input', {
-                    bubbles: true,
-                    inputType,
-                    data: inputType === 'insertText' ? value : null
-                }));
-            } catch (error) {
-                element.dispatchEvent(new Event('input', { bubbles: true }));
-            }
-            element.dispatchEvent(new Event('change', { bubbles: true }));
-        },
-
-        clearEditable(element) {
-            if (!element) return;
-            if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-                const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-                if (setter) setter.call(element, '');
-                else element.value = '';
-                return;
-            }
-            element.focus();
-            const selection = window.getSelection?.();
-            if (selection) {
-                const range = document.createRange();
-                range.selectNodeContents(element);
-                selection.removeAllRanges();
-                selection.addRange(range);
-            }
-            if (document.execCommand) document.execCommand('delete', false, null);
-            if (element.textContent) element.textContent = '';
-        },
-
-        async writeTextToEditable(element, message, replace = true, options = {}) {
-            const raw = options.raw === true;
-            const value = raw ? EH.WhatsAppText.raw(message) : EH.WhatsAppText.normalize(message);
-            if (!element || !value) return false;
-
-            try {
-                element.focus();
-                const previousText = replace ? '' : this.editableText(element);
-                const targetValue = `${previousText}${value}`;
-
-                // textarea/input: usar o setter nativo. Isso preserva \n exatamente.
-                if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-                    const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
-                    if (setter) setter.call(element, targetValue);
-                    else element.value = targetValue;
-                    this.dispatchTextInput(element, targetValue, 'insertText');
-                    return EH.WhatsAppText.comparable(element.value) === EH.WhatsAppText.comparable(targetValue);
+                composer.focus();
+                const selection = window.getSelection?.();
+                if (selection) {
+                    const range = document.createRange();
+                    range.selectNodeContents(composer);
+                    range.collapse(!replace);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    if (replace && document.execCommand) document.execCommand('delete', false, null);
                 }
-
-                // Para contenteditable, sempre reconstruir o valor-alvo completo. Isso evita
-                // duplicação quando uma tentativa de paste parcial falha.
-                this.clearEditable(element);
-
-                // 1) Preferir paste text/plain. O editor do WhatsApp trata esse caminho
-                // como texto real e preserva linhas em branco/asteriscos sem HTML.
-                if (typeof DataTransfer !== 'undefined' && typeof ClipboardEvent !== 'undefined') {
-                    try {
-                        const dt = new DataTransfer();
-                        dt.setData('text/plain', targetValue);
-                        const paste = new ClipboardEvent('paste', {
-                            bubbles: true,
-                            cancelable: true,
-                            clipboardData: dt
-                        });
-                        element.dispatchEvent(paste);
-                        await EH.Utils.sleep(35);
-                        if (EH.WhatsAppText.comparable(this.editableText(element)) === EH.WhatsAppText.comparable(targetValue)) {
-                            return true;
-                        }
-                    } catch (error) {
-                        EH.Logger.debug('Paste text/plain não aceito pelo editor do WhatsApp:', error);
-                    }
-                }
-
-                // 2) Inserir a string inteira de uma vez. Evita o antigo loop
-                // insertText + insertLineBreak, que fazia o editor perder a estrutura.
-                this.clearEditable(element);
                 if (document.execCommand) {
-                    const inserted = document.execCommand('insertText', false, targetValue);
-                    await EH.Utils.sleep(25);
-                    if (inserted && EH.WhatsAppText.comparable(this.editableText(element)) === EH.WhatsAppText.comparable(targetValue)) {
-                        return true;
-                    }
+                    document.execCommand('insertText', false, message);
+                } else {
+                    if (replace) composer.textContent = '';
+                    composer.textContent = `${composer.textContent || ''}${message}`;
+                    composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
                 }
-
-                // 3) Fallback DOM: texto puro + <br> somente como estrutura visual do
-                // contenteditable; o conteúdo enviado continua sendo text/plain.
-                element.replaceChildren();
-                const fragment = document.createDocumentFragment();
-                const lines = targetValue.split('\n');
-                lines.forEach((line, index) => {
-                    if (line) fragment.appendChild(document.createTextNode(line));
-                    if (index < lines.length - 1) fragment.appendChild(document.createElement('br'));
-                });
-                element.appendChild(fragment);
-                this.dispatchTextInput(element, targetValue, 'insertFromPaste');
-                await EH.Utils.sleep(25);
-
-                const actual = EH.WhatsAppText.comparable(this.editableText(element));
-                const expected = EH.WhatsAppText.comparable(targetValue);
-                if (actual !== expected) {
-                    EH.Logger.warn('O editor do WhatsApp não preservou a mensagem exatamente.', { expected, actual });
-                    return false;
-                }
+                composer.dispatchEvent(new Event('input', { bubbles: true }));
                 return true;
             } catch (error) {
-                EH.Logger.warn('Falha ao preencher texto no WhatsApp Web:', error);
+                EH.Logger.warn('Falha ao preencher mensagem no WhatsApp Web:', error);
                 return false;
             }
         },
 
-        async insertTextIntoCurrentChat(message, replace = false, options = {}) {
-            if (!message) return true;
-            const composer = await this.waitForComposer(12000);
-            if (!composer) return false;
-            return this.writeTextToEditable(composer, message, replace, options);
-        },
-
-        async sendTextNow(message, options = {}) {
-            const inserted = await this.insertTextIntoCurrentChat(message, true, options);
+        async sendTextNow(message) {
+            const inserted = await this.insertTextIntoCurrentChat(message, true);
             if (!inserted) return false;
             await EH.Utils.sleep(120);
             const sendIcon = document.querySelector('[data-icon="send"], [data-testid="send"]');
@@ -1653,8 +1496,9 @@
                     const paste = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
                     composer.focus();
                     composer.dispatchEvent(paste);
-                    const mediaSurface = await EH.Utils.waitFor(() => this.findMediaDialog(), 6000, 160);
-                    if (mediaSurface) return true;
+                    await EH.Utils.sleep(700);
+                    const previewVisible = document.querySelector('[data-animate-modal-popup="true"], div[role="dialog"] img[src^="blob:"], div[role="dialog"] canvas, [data-testid*="media-preview"]');
+                    if (previewVisible) return true;
                 } catch (error) {
                     EH.Logger.warn('Colagem direta da imagem no WhatsApp não funcionou:', error);
                 }
@@ -1671,60 +1515,18 @@
                 dt.items.add(file);
                 input.files = dt.files;
                 input.dispatchEvent(new Event('change', { bubbles: true }));
-                return Boolean(await EH.Utils.waitFor(() => this.findMediaDialog(), 6500, 180));
+                return true;
             } catch (error) {
                 EH.Logger.warn('Não foi possível anexar a imagem pelo seletor de arquivos:', error);
                 return false;
             }
         },
 
-        findMediaDialog() {
-            const visible = element => {
-                const rect = element?.getBoundingClientRect?.();
-                if (!rect || rect.width < 80 || rect.height < 80) return false;
-                const style = window.getComputedStyle?.(element);
-                return !style || (style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0);
-            };
-
-            const direct = Array.from(document.querySelectorAll('[role="dialog"], [data-animate-modal-popup="true"], [data-testid*="media-preview"], [data-testid*="media-editor"]'))
-                .find(el => visible(el) && (el.querySelector('[data-icon="send"], [data-testid="compose-btn-send"], [contenteditable="true"]') || /enviar|send/i.test(el.textContent || '')));
-            if (direct) return direct;
-
-            // Algumas versões do WhatsApp não usam role=dialog no editor de mídia.
-            // Procura a superfície pela combinação prévia de mídia + botão de envio.
-            const mediaNodes = Array.from(document.querySelectorAll('img[src^="blob:"], video[src^="blob:"], canvas, [data-testid*="media-preview"]'))
-                .filter(node => visible(node));
-            for (const media of mediaNodes) {
-                let ancestor = media.parentElement;
-                for (let depth = 0; ancestor && depth < 9; depth += 1, ancestor = ancestor.parentElement) {
-                    if (ancestor === document.body || ancestor === document.documentElement) break;
-                    if (!visible(ancestor)) continue;
-                    const hasSend = ancestor.querySelector?.('[data-icon="send"], [data-testid="send"], [data-testid="compose-btn-send"], button[aria-label*="Enviar" i], button[aria-label*="Send" i]');
-                    const hasEditor = ancestor.querySelector?.('[contenteditable="true"], textarea');
-                    if (hasSend && hasEditor) return ancestor;
-                }
-            }
-            return null;
-        },
-
-        findMediaCaptionComposer() {
-            const modal = this.findMediaDialog();
-            if (!modal) return null;
-            const candidates = Array.from(modal.querySelectorAll(
-                '[contenteditable="true"][role="textbox"], [contenteditable="true"][data-tab], div[contenteditable="true"], textarea'
-            ));
-            return candidates.find(el => {
-                const rect = el.getBoundingClientRect?.();
-                return rect && rect.width > 80 && rect.height > 15;
-            }) || null;
-        },
-
-        async insertTextIntoElement(element, message, replace = true, options = {}) {
-            return this.writeTextToEditable(element, message, replace, options);
-        },
-
         findMediaSendButton() {
-            const modal = this.findMediaDialog() || document;
+            const modal = Array.from(document.querySelectorAll('[role="dialog"], [data-animate-modal-popup="true"]')).find(el => {
+                const rect = el.getBoundingClientRect?.();
+                return rect && rect.width > 80 && rect.height > 80;
+            }) || document;
             const icon = modal.querySelector?.('[data-icon="send"], [data-testid="send"], [data-testid="compose-btn-send"]');
             return icon?.closest?.('button') || Array.from(modal.querySelectorAll?.('button') || []).find(button => {
                 const label = `${button.getAttribute('aria-label') || ''} ${button.title || ''} ${button.textContent || ''}`;
@@ -1734,41 +1536,21 @@
 
         async sendAttachedImage(dataUrl, filename = 'epass-atendimento.png', followupMessage = '') {
             const attached = await this.attachImage(dataUrl, filename);
-            if (!attached) return { attached: false, sent: false, textSent: false, captionAttached: false };
-
-            const message = EH.WhatsAppText.normalize(followupMessage);
-            let captionAttached = false;
-
-            // Primeiro tenta colocar o texto COMO LEGENDA da própria imagem.
-            // Assim imagem + mensagem saem em uma única ação pelo composer integrado.
-            if (message) {
-                const caption = await EH.Utils.waitFor(() => this.findMediaCaptionComposer(), 5000, 160);
-                if (caption) captionAttached = await this.insertTextIntoElement(caption, message, true);
-            }
-
+            if (!attached) return { attached: false, sent: false, textSent: false };
             const sendButton = await EH.Utils.waitFor(() => this.findMediaSendButton(), 10000, 200);
-            if (!sendButton) {
-                return { attached: true, sent: false, textSent: false, captionAttached };
-            }
-
+            if (!sendButton) return { attached: true, sent: false, textSent: false };
             try {
                 sendButton.click();
-                // Aguarda o editor de mídia realmente fechar antes de qualquer fallback.
-                await EH.Utils.waitFor(() => !this.findMediaDialog(), 6500, 180);
-                await EH.Utils.sleep(180);
-
-                // Se a versão do WhatsApp não aceitou legenda, envia o texto logo após
-                // a imagem. Para o atendente continua sendo uma única ação no composer.
+                await EH.Utils.sleep(650);
                 let textSent = true;
-                if (message && !captionAttached) {
-                    textSent = await this.sendTextNow(message);
+                if (String(followupMessage || '').trim()) {
+                    textSent = await this.sendTextNow(String(followupMessage || '').trim());
                 }
-
                 this.publishUiState(true);
-                return { attached: true, sent: true, textSent, captionAttached };
+                return { attached: true, sent: true, textSent };
             } catch (error) {
                 EH.Logger.warn('Não foi possível concluir o envio da imagem:', error);
-                return { attached: true, sent: false, textSent: false, captionAttached };
+                return { attached: true, sent: false, textSent: false };
             }
         },
 
@@ -1810,70 +1592,26 @@
                 return;
             }
 
-            // O fluxo integrado não navega por número e não muda de URL.
-            // Comandos antigos que tragam telefone são ignorados como destino;
-            // a conversa selecionada no painel é a única fonte de verdade.
-            if (phone && !command.chatTitle) {
-                sessionStorage.setItem(doneKey, command.id);
-                sessionStorage.removeItem(pendingKey);
-                EH.Storage.set('waAck', {
-                    id: command.id,
-                    at: Date.now(),
-                    action,
-                    ok: false,
-                    reason: 'conversation-required'
-                });
+            if (phone && !pending) {
+                sessionStorage.setItem(pendingKey, command.id);
+                location.assign(`https://web.whatsapp.com/send?phone=${encodeURIComponent(phone)}`);
                 return;
             }
 
             if (command.chatTitle) {
-                const selected = await this.selectChatByTitle(command.chatTitle);
-                if (!selected) {
-                    sessionStorage.setItem(doneKey, command.id);
-                    EH.Storage.set('waAck', {
-                        id: command.id,
-                        at: Date.now(),
-                        action,
-                        ok: false,
-                        reason: 'chat-not-found'
-                    });
-                    return;
-                }
+                await this.selectChatByTitle(command.chatTitle);
             }
 
             let ok = true;
             let imageAttached = false;
             let imageSent = false;
-            let textSent = true;
-            let captionAttached = false;
             if (action === 'send_text') {
                 ok = await this.sendTextNow(command.message || '');
             } else if (action === 'send_pair') {
                 ok = await this.sendTextNow(command.message || '');
                 if (ok && command.message2) {
                     await EH.Utils.sleep(260);
-                    // PIX Copia e Cola: enviar exatamente o payload original, sem normalização.
-                    ok = await this.sendTextNow(command.message2 || '', { raw: true });
-                }
-            } else if (action === 'send_bundle') {
-                // Uma única confirmação do atendente envia a sequência: instrução -> payload -> QR.
-                ok = await this.sendTextNow(command.message || '');
-                if (ok && command.message2) {
-                    await EH.Utils.sleep(260);
-                    ok = await this.sendTextNow(command.message2 || '', { raw: true });
-                }
-                if (ok && command.imageDataUrl) {
-                    await EH.Utils.sleep(320);
-                    const result = await this.sendAttachedImage(
-                        command.imageDataUrl || '',
-                        command.filename || 'PIX-QR-CODE.png',
-                        ''
-                    );
-                    imageAttached = Boolean(result.attached);
-                    imageSent = Boolean(result.sent);
-                    captionAttached = Boolean(result.captionAttached);
-                    textSent = result.textSent !== false;
-                    ok = imageSent && textSent;
+                    ok = await this.sendTextNow(command.message2 || '');
                 }
             } else if (action === 'send_image') {
                 const result = await this.sendAttachedImage(
@@ -1883,9 +1621,7 @@
                 );
                 imageAttached = Boolean(result.attached);
                 imageSent = Boolean(result.sent);
-                textSent = result.textSent !== false;
-                captionAttached = Boolean(result.captionAttached);
-                ok = imageSent && textSent;
+                ok = imageSent && (result.textSent !== false);
             } else {
                 if (command.message) ok = await this.insertTextIntoCurrentChat(command.message, false);
                 if (command.imageDataUrl) {
@@ -1903,8 +1639,6 @@
                 action,
                 imageAttached,
                 imageSent,
-                textSent,
-                captionAttached,
                 ok
             });
             this.publishUiState(true);
@@ -2067,15 +1801,8 @@
 
         idFor(record) {
             const raw = [
-                record.source || 'manual',
-                record.whatsappGroup || '',
-                record.routeId || '',
-                record.serviceKey || '',
-                record.originKey || '',
-                record.destinationKey || '',
-                record.departureDateTime || '',
-                record.arrivalDateTime || '',
-                Math.round(Number(record.durationMinutes) || 0)
+                record.source || 'manual', record.whatsappGroup || '', record.originKey || '', record.destinationKey || '',
+                record.departureDateTime || '', record.arrivalDateTime || '', Math.round(Number(record.durationMinutes) || 0)
             ].join('|');
             let hash = 2166136261;
             for (let i = 0; i < raw.length; i += 1) {
@@ -2135,10 +1862,6 @@
                     if (minutes < 3 || minutes > EH.Config.TRAVEL_MAX_DURATION_MIN) continue;
                     records.push({
                         routeId: meta.routeId || meta.whatsappGroup || '',
-                        serviceKey: meta.serviceKey || '',
-                        serviceTime: meta.serviceTime || '',
-                        routeOrigin: meta.routeOrigin || '',
-                        routeDestination: meta.routeDestination || '',
                         direction: `${this.normalizePlace(ordered[i].city)}>${this.normalizePlace(ordered[j].city)}`,
                         origin: ordered[i].city,
                         destination: ordered[j].city,
@@ -2169,22 +1892,15 @@
             return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
         },
 
-        stats(origin, destination, whatsappGroup = '', serviceKey = '') {
+        stats(origin, destination, whatsappGroup = '') {
             const o = this.normalizePlace(origin);
             const d = this.normalizePlace(destination);
             const group = EH.Utils.clean(whatsappGroup);
-            const service = EH.Utils.clean(serviceKey);
             if (!o || !d) return null;
             let rows = this.load().filter(row => row.originKey === o && row.destinationKey === d);
             if (group) {
                 const exactOrGeneric = rows.filter(row => !row.whatsappGroup || row.whatsappGroup === group);
                 if (exactOrGeneric.length) rows = exactOrGeneric;
-            }
-            if (service) {
-                const exactService = rows.filter(row => EH.Utils.clean(row.serviceKey || '') === service);
-                // Só restringe ao carro/linha quando já existe base mínima; caso
-                // contrário mantém a média do mesmo trecho/grupo como fallback.
-                if (exactService.length >= 2) rows = exactService;
             }
             if (!rows.length) return null;
 
@@ -2290,14 +2006,7 @@
             if (!match) {
                 match = raw.match(/^\s*([01]?\d|2[0-3])\s*:\s*([0-5]\d)\s*h?\b/i);
             }
-            if (!match) return '';
-
-            // Um horário no início só é "horário do carro/linha" quando vem
-            // acompanhado da identificação da rota. "13:50 saiu de Piranhas"
-            // continua sendo tratado como horário operacional, não serviceTime.
-            const after = raw.slice(match[0].length, match.index + match[0].length + 170);
-            const hasRouteIdentity = /[\p{L}]{2,}[\s\S]{0,70}\s(?:x|×|→|a)\s[\p{L}]{2,}/iu.test(after);
-            return hasRouteIdentity ? this.normalizeClock(match[1], match[2] || '00') : '';
+            return match ? this.normalizeClock(match[1], match[2] || '00') : '';
         },
 
         extractExplicitDepartureTime(text) {
@@ -2305,7 +2014,6 @@
             const action = '(?:saiu|saindo|partiu|sa[ií]da)';
             const patterns = [
                 new RegExp(`${action}[\\s\\S]{0,90}?(?:\\b(?:as|às)\\b\\s*)?([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\b`, 'i'),
-                new RegExp(`^\\s*([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\s*(?:[-–—]\\s*)?${action}\\b`, 'i'),
                 new RegExp(`\\b(?:as|às)\\b\\s*([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\b`, 'i')
             ];
             for (const pattern of patterns) {
@@ -2407,13 +2115,9 @@
             const text = EH.Utils.clean(message?.text || '');
             if (!text || !this.isOperationalUpdate(text)) return null;
 
-            // Há dois relógios diferentes na operação:
-            // 1) serviceTime = horário que identifica o carro/linha (ex.: 11:00 Goiânia → Cuiabá)
-            // 2) cityDepartureTime = horário REAL em que saiu da cidade atual.
-            // O primeiro jamais é usado como passagem pela cidade.
-            const serviceTime = this.extractRouteSchedule(text);
-            const direction = this.extractDirection(text, serviceTime);
-            const explicitCityDeparture = this.extractExplicitDepartureTime(text);
+            const routeSchedule = this.extractRouteSchedule(text);
+            const direction = this.extractDirection(text, routeSchedule);
+            const explicitTime = this.extractExplicitDepartureTime(text);
             const messageTimestamp = this.extractMessageTimestamp(message);
             const departureCandidate = this.extractDepartureCandidate(text);
 
@@ -2425,35 +2129,23 @@
             }
             if (!currentCity) return null;
 
-            let cityDepartureTime = explicitCityDeparture;
-            let timeSource = explicitCityDeparture ? 'explicit' : '';
-
-            // "saindo agora" usa o timestamp REAL da mensagem, nunca serviceTime.
-            if (!cityDepartureTime && messageTimestamp && /\b(?:saiu|saindo|partiu)\s+agora\b/i.test(text)) {
-                cityDepartureTime = messageTimestamp;
+            let actualDepartureTime = explicitTime;
+            let timeSource = explicitTime ? 'explicit_message' : '';
+            if (!actualDepartureTime && messageTimestamp && /\bsaindo\s+agora\b/i.test(text)) {
+                actualDepartureTime = messageTimestamp;
                 timeSource = 'whatsapp_timestamp';
-            } else if (!cityDepartureTime && messageTimestamp && this.isOperationalUpdate(text)) {
-                // Atualização operacional sem horário explícito: o timestamp da mensagem
-                // é uma aproximação identificada como inferida.
-                cityDepartureTime = messageTimestamp;
-                timeSource = 'whatsapp_timestamp_inferred';
+            } else if (!actualDepartureTime && messageTimestamp && this.isOperationalUpdate(text)) {
+                actualDepartureTime = messageTimestamp;
+                timeSource = 'whatsapp_timestamp';
             }
-            if (!cityDepartureTime) return null;
+            if (!actualDepartureTime) return null;
 
-            const date = this.dateFromMeta(message, cityDepartureTime);
+            // O horário inicial da linha (ex.: "11hrs") nunca substitui o horário
+            // operacional real. Só é utilizado como identificação da linha.
+            const date = this.dateFromMeta(message, actualDepartureTime);
             if (!date) return null;
 
-            const routeOrigin = direction.origin || '';
-            const routeDestination = direction.destination || '';
-            const serviceKey = serviceTime && (routeOrigin || routeDestination)
-                ? [
-                    serviceTime,
-                    EH.Utils.normalize(routeOrigin || '?'),
-                    EH.Utils.normalize(routeDestination || '?')
-                ].join('|')
-                : '';
-
-            const confidence = explicitCityDeparture && citySource === 'message'
+            const confidence = explicitTime && citySource === 'message'
                 ? 'high'
                 : citySource === 'message'
                     ? 'medium'
@@ -2463,15 +2155,12 @@
                 city: currentCity,
                 cityKey: EH.TravelHistory.normalizePlace(currentCity),
                 currentCity,
-
-                // Campos novos e semanticamente explícitos.
-                serviceTime,
-                routeOrigin,
-                routeDestination,
-                serviceKey,
-                cityDepartureTime,
-
+                routeSchedule,
                 direction: direction.label,
+                directionOrigin: direction.origin,
+                directionDestination: direction.destination,
+                actualDepartureTime,
+                time: actualDepartureTime,
                 timeSource,
                 citySource,
                 at: date.getTime(),
@@ -2480,125 +2169,52 @@
                 sender: message?.sender || '',
                 vehicle: this.extractVehicle(text),
                 driver: this.extractDriver(text),
-                confidence,
-
-                // Aliases legados mantidos para compatibilidade com histórico/UI antigos.
-                routeSchedule: serviceTime,
-                directionOrigin: routeOrigin,
-                directionDestination: routeDestination,
-                actualDepartureTime: cityDepartureTime,
-                time: cityDepartureTime
+                confidence
             };
         },
 
-        enrichServiceContext(events) {
-            const sorted = [...(Array.isArray(events) ? events : [])]
-                .map(event => ({ ...event }))
-                .sort((a, b) => a.at - b.at);
-
-            // Mensagens curtas como "Saiu de Piranhas às 13:50" podem não repetir
-            // o identificador do carro. Só herdamos contexto quando há UMA única
-            // viagem identificável por perto; em caso ambíguo, não adivinhamos.
-            for (const event of sorted) {
-                if (event.serviceKey) continue;
-                const candidates = sorted
-                    .filter(other => other !== event && other.serviceKey && Math.abs(other.at - event.at) <= 150 * 60000)
-                    .sort((a, b) => Math.abs(a.at - event.at) - Math.abs(b.at - event.at));
-                const uniqueKeys = [...new Set(candidates.map(item => item.serviceKey))];
-                if (uniqueKeys.length !== 1 || !candidates[0]) continue;
-                const source = candidates[0];
-                event.serviceTime = source.serviceTime || '';
-                event.routeSchedule = event.serviceTime;
-                event.routeOrigin = source.routeOrigin || '';
-                event.routeDestination = source.routeDestination || '';
-                event.directionOrigin = event.routeOrigin;
-                event.directionDestination = event.routeDestination;
-                event.direction = source.direction || '';
-                event.serviceKey = source.serviceKey;
-                event.serviceSource = 'conversation_context';
-            }
-            return sorted;
-        },
-
         clusterTrips(events) {
-            const sorted = [...(Array.isArray(events) ? events : [])].sort((a, b) => a.at - b.at);
-            const buckets = new Map();
-
-            for (const event of sorted) {
-                const bucketKey = event.serviceKey
-                    || (event.direction ? `direction:${EH.Utils.normalize(event.direction)}` : 'unidentified');
-                if (!buckets.has(bucketKey)) buckets.set(bucketKey, []);
-                buckets.get(bucketKey).push(event);
-            }
-
+            const sorted = [...events].sort((a, b) => a.at - b.at);
             const trips = [];
-            for (const bucket of buckets.values()) {
-                let current = [];
-                const flush = () => {
-                    if (current.length >= 2) trips.push(current);
-                    current = [];
-                };
-
-                for (const event of bucket) {
-                    const prev = current[current.length - 1];
-                    if (prev) {
-                        const gap = (event.at - prev.at) / 60000;
-                        const totalSpan = (event.at - current[0].at) / 60000;
-                        const repeatedEarlier = current.slice(0, -1).some(item => item.cityKey === event.cityKey);
-                        const routeRestart = current.length >= 2 && event.cityKey === current[0].cityKey && gap > 60;
-                        if (
-                            gap > EH.Config.TRAVEL_TRIP_GAP_MIN ||
-                            gap < -5 ||
-                            totalSpan > EH.Config.TRAVEL_MAX_DURATION_MIN ||
-                            routeRestart ||
-                            (repeatedEarlier && gap > 90)
-                        ) {
-                            flush();
-                        }
-                    }
-
-                    const last = current[current.length - 1];
-                    if (last && last.cityKey === event.cityKey && (event.at - last.at) <= 45 * 60000) {
-                        // Para uma mesma cidade, conserva a atualização operacional mais recente.
-                        current[current.length - 1] = event;
-                    } else {
-                        current.push(event);
-                    }
+            let current = [];
+            const flush = () => { if (current.length >= 2) trips.push(current); current = []; };
+            for (const event of sorted) {
+                const prev = current[current.length - 1];
+                if (prev) {
+                    const gap = (event.at - prev.at) / 60000;
+                    const totalSpan = current.length ? (event.at - current[0].at) / 60000 : 0;
+                    const repeatedEarlier = current.slice(0, -1).some(item => item.cityKey === event.cityKey);
+                    const routeRestart = current.length >= 2 && event.cityKey === current[0].cityKey && gap > 60;
+                    const directionChanged = Boolean(
+                        prev.direction && event.direction &&
+                        EH.Utils.normalize(prev.direction) !== EH.Utils.normalize(event.direction)
+                    );
+                    const scheduleChanged = Boolean(
+                        prev.routeSchedule && event.routeSchedule &&
+                        prev.routeSchedule !== event.routeSchedule &&
+                        gap > 45
+                    );
+                    if (gap > EH.Config.TRAVEL_TRIP_GAP_MIN || gap < -5 || totalSpan > EH.Config.TRAVEL_MAX_DURATION_MIN || routeRestart || directionChanged || scheduleChanged || (repeatedEarlier && gap > 90)) flush();
                 }
-                flush();
+                const last = current[current.length - 1];
+                if (last && last.cityKey === event.cityKey && (event.at - last.at) <= 45 * 60000) current[current.length - 1] = event;
+                else current.push(event);
             }
-
-            return trips.sort((a, b) => Number(a[0]?.at || 0) - Number(b[0]?.at || 0));
+            flush();
+            return trips;
         },
 
         ingest(whatsappGroup, messages) {
-            const parsedEvents = (Array.isArray(messages) ? messages : [])
-                .map(message => this.parseMessage(message))
-                .filter(Boolean);
-            const events = this.enrichServiceContext(parsedEvents);
+            const events = (Array.isArray(messages) ? messages : []).map(message => this.parseMessage(message)).filter(Boolean);
             const trips = this.clusterTrips(events);
             let added = 0;
-
             for (const trip of trips) {
-                const service = trip.find(event => event.serviceKey) || null;
-                const routeLabel = service?.direction || trip.find(event => event.direction)?.direction || whatsappGroup;
-                const serviceIdentity = service?.serviceKey || routeLabel || whatsappGroup;
-                added += EH.TravelHistory.addTrip(
-                    trip.map(event => ({
-                        city: event.city,
-                        // event.at foi construído exclusivamente com cityDepartureTime.
-                        at: event.at
-                    })),
-                    {
-                        source: 'whatsapp',
-                        whatsappGroup,
-                        routeId: [whatsappGroup, serviceIdentity].filter(Boolean).join('|'),
-                        serviceKey: service?.serviceKey || '',
-                        serviceTime: service?.serviceTime || '',
-                        routeOrigin: service?.routeOrigin || '',
-                        routeDestination: service?.routeDestination || ''
-                    }
-                ).added;
+                const routeLabel = trip.find(event => event.direction)?.direction || whatsappGroup;
+                added += EH.TravelHistory.addTrip(trip.map(event => ({ city: event.city, at: event.at })), {
+                    source: 'whatsapp',
+                    whatsappGroup,
+                    routeId: routeLabel || whatsappGroup
+                }).added;
             }
             return { events, trips, added };
         }
@@ -2638,10 +2254,10 @@
             return `⚠️ Pouco histórico • ${stats.count} ${stats.count === 1 ? 'viagem' : 'viagens'}`;
         },
 
-        predict({ origin, destination, whatsappGroup = '', departureAt, serviceKey = '' }) {
+        predict({ origin, destination, whatsappGroup = '', departureAt }) {
             const start = departureAt instanceof Date ? departureAt.getTime() : Number(departureAt);
             if (!Number.isFinite(start)) return { ok: false, reason: 'Informe uma saída real para calcular a previsão.' };
-            const stats = EH.TravelHistory.stats(origin, destination, whatsappGroup, serviceKey);
+            const stats = EH.TravelHistory.stats(origin, destination, whatsappGroup);
             if (!stats) return { ok: false, reason: `Ainda não há histórico de ${origin} para ${destination}.` };
             const eta = start + stats.averageMinutes * 60000;
             const low = start + stats.lowMinutes * 60000;
@@ -2845,7 +2461,7 @@
                 service: data.service || '',
                 tickets: data.tickets.map(ticket => ({ ...ticket })),
                 chatTitle: EH.WhatsAppBridge.getState().activeTitle || EH.WhatsAppDock?.currentState?.active?.title || '',
-                phone: ''
+                phone: EH.UI?.getPhone?.() || ''
             };
             EH.OperationPanel?.refreshBadge?.();
         },
@@ -3116,13 +2732,7 @@
                         status.textContent = `${parsed.events.length} saída(s) reconhecida(s) • ${parsed.added} novo(s) tempo(s) aprendido(s)`;
                     }
                     if (!Number.isFinite(departureAt)) throw new Error(`Não encontrei uma saída recente de ${from}. Informe a saída manual.`);
-                    const prediction = EH.TravelEstimator.predict({
-                        origin: from,
-                        destination: to,
-                        whatsappGroup: group.value,
-                        departureAt,
-                        serviceKey: latest?.serviceKey || ''
-                    });
+                    const prediction = EH.TravelEstimator.predict({ origin: from, destination: to, whatsappGroup: group.value, departureAt });
                     if (!prediction.ok) throw new Error(prediction.reason);
                     this.lastPrediction = prediction;
                     result.hidden = false;
@@ -3130,10 +2740,7 @@
                     const heading = document.createElement('strong');
                     heading.textContent = `${EH.TravelHistory.displayPlace(to)} • ${EH.TravelEstimator.formatClock(prediction.eta)}`;
                     const detail = document.createElement('div');
-                    const serviceLabel = latest?.serviceTime
-                        ? `Carro ${latest.serviceTime}${latest.direction ? ` ${latest.direction}` : ''} • `
-                        : '';
-                    detail.textContent = `${serviceLabel}Última saída: ${from} ${EH.TravelEstimator.formatClock(prediction.departureAt)} • médio ${EH.TravelEstimator.formatDuration(prediction.stats.averageMinutes)}`;
+                    detail.textContent = `Última saída: ${from} ${EH.TravelEstimator.formatClock(prediction.departureAt)} • médio ${EH.TravelEstimator.formatDuration(prediction.stats.averageMinutes)}`;
                     const range = document.createElement('div');
                     range.textContent = `Faixa provável: ${EH.TravelEstimator.formatClock(prediction.low)} às ${EH.TravelEstimator.formatClock(prediction.high)}`;
                     const confidence = document.createElement('small');
@@ -3438,7 +3045,7 @@
                 id: `wa-compose-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
                 type: String(input.type || 'message'),
                 chatTitle: String(input.chatTitle || EH.WhatsAppBridge.getState().activeTitle || '').trim(),
-                text: EH.WhatsAppText.normalize(input.text),
+                text: String(input.text || ''),
                 message2: String(input.message2 || ''),
                 attachment,
                 createdAt: Date.now()
@@ -3447,13 +3054,17 @@
 
             if (this.hasContent() && !replace) {
                 if (this.current?.fingerprint === next.fingerprint) {
+                    EH.WhatsAppDock?.renderPrepared?.();
                     return { ok: true, duplicate: true, item: this.current };
                 }
                 EH.Toast.warning('Já existe conteúdo preparado. Envie ou remova antes de preparar outro.');
+                EH.WhatsAppDock?.renderPrepared?.();
                 return { ok: false, blocked: true, item: this.current };
             }
 
             this.current = next;
+            EH.WhatsAppDock?.applyPreparedToInput?.();
+            EH.WhatsAppDock?.renderPrepared?.();
             if (!silent) EH.Toast.success(`✓ ${this.typeLabel(next.type)} preparado no WhatsApp`);
             return { ok: true, item: next };
         },
@@ -3463,27 +3074,6 @@
             if (!keepInput && EH.WhatsAppDock?.composer) EH.WhatsAppDock.composer.value = '';
             EH.WhatsAppDock?.renderPrepared?.();
             EH.WhatsAppDock?.refreshConnection?.();
-        },
-
-        updateText(text) {
-            if (!this.current) return false;
-            this.current.text = EH.WhatsAppText.normalize(text);
-            this.current.fingerprint = this.fingerprint(this.current);
-            EH.WhatsAppDock?.renderPrepared?.();
-            return true;
-        },
-
-        removeAttachment() {
-            if (!this.current?.attachment) return false;
-            this.current.attachment = null;
-            if (!this.current.text && !this.current.message2) {
-                this.clear({ keepInput: true });
-                return true;
-            }
-            this.current.fingerprint = this.fingerprint(this.current);
-            EH.WhatsAppDock?.renderPrepared?.();
-            EH.WhatsAppDock?.refreshConnection?.();
-            return true;
         },
 
         get() {
@@ -3513,12 +3103,9 @@
         preparedWrap: null,
         preparedTarget: null,
         preparedImage: null,
-        preparedImageWrap: null,
         preparedText: null,
         preparedRemove: null,
-        preparedAttachmentRemove: null,
         pendingPreparedId: '',
-        requestedChatTitle: '',
 
         init() {
             if (this.root || EH.WhatsAppBridge.isWhatsAppHost() || !document.body) return;
@@ -3592,23 +3179,13 @@
             preparedHead.append(preparedLabel, preparedTarget, preparedRemove);
             const preparedBody = document.createElement('div');
             preparedBody.className = 'eh-wa-prepared-body';
-            const preparedImageWrap = document.createElement('div');
-            preparedImageWrap.className = 'eh-wa-prepared-image-wrap';
-            preparedImageWrap.hidden = true;
             const preparedImage = document.createElement('img');
             preparedImage.className = 'eh-wa-prepared-image';
             preparedImage.alt = 'Imagem preparada';
-            const preparedAttachmentRemove = document.createElement('button');
-            preparedAttachmentRemove.type = 'button';
-            preparedAttachmentRemove.className = 'eh-wa-prepared-attachment-remove';
-            preparedAttachmentRemove.title = 'Remover somente a imagem';
-            preparedAttachmentRemove.setAttribute('aria-label', preparedAttachmentRemove.title);
-            preparedAttachmentRemove.textContent = '×';
-            preparedAttachmentRemove.addEventListener('click', () => EH.WhatsAppComposer.removeAttachment());
-            preparedImageWrap.append(preparedImage, preparedAttachmentRemove);
+            preparedImage.hidden = true;
             const preparedText = document.createElement('div');
             preparedText.className = 'eh-wa-prepared-text';
-            preparedBody.append(preparedImageWrap, preparedText);
+            preparedBody.append(preparedImage, preparedText);
             prepared.append(preparedHead, preparedBody);
 
             const composerWrap = document.createElement('div');
@@ -3617,9 +3194,6 @@
             composer.rows = 1;
             composer.placeholder = 'Digite uma mensagem ou cole uma imagem';
             composer.addEventListener('paste', event => this.handlePaste(event));
-            composer.addEventListener('input', () => {
-                if (EH.WhatsAppComposer.hasContent()) EH.WhatsAppComposer.updateText(composer.value);
-            });
             composer.addEventListener('keydown', event => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
@@ -3681,10 +3255,8 @@
             this.preparedWrap = prepared;
             this.preparedTarget = preparedTarget;
             this.preparedImage = preparedImage;
-            this.preparedImageWrap = preparedImageWrap;
             this.preparedText = preparedText;
             this.preparedRemove = preparedRemove;
-            this.preparedAttachmentRemove = preparedAttachmentRemove;
             this.applyLayout();
             this.render(EH.WhatsAppBridge.getUiState());
             this.renderPrepared();
@@ -3707,8 +3279,6 @@
                             EH.Toast.success('✓ Enviado pelo WhatsApp');
                         } else if (ack.imageAttached && !ack.imageSent) {
                             EH.Toast.warning('A imagem foi anexada, mas o WhatsApp não confirmou o envio.');
-                        } else if (ack.imageSent && ack.textSent === false) {
-                            EH.Toast.warning('A imagem foi enviada, mas o texto não foi confirmado. O conteúdo continua visível para revisão.');
                         } else {
                             EH.Toast.error('Não foi possível concluir o envio pelo WhatsApp.');
                         }
@@ -3745,21 +3315,10 @@
             // O botão de envio só libera quando existe uma conversa selecionada.
             if (this.composer) this.composer.disabled = !connection.connected;
             if (this.sendButton) {
-                const prepared = EH.WhatsAppComposer.get();
-                const activeTitle = String(connection.activeTitle || this.currentState?.active?.title || '').trim();
-                const targetTitle = String(prepared?.chatTitle || '').trim();
-                const targetMismatch = Boolean(
-                    prepared &&
-                    targetTitle &&
-                    activeTitle &&
-                    EH.Utils.normalize(targetTitle) !== EH.Utils.normalize(activeTitle)
-                );
-                this.sendButton.disabled = !connection.readyToSend || targetMismatch;
-                this.sendButton.title = targetMismatch
-                    ? `Conteúdo preparado para ${targetTitle}. Volte para essa conversa ou remova.`
-                    : EH.WhatsAppComposer.hasContent()
-                        ? 'Enviar conteúdo preparado'
-                        : (this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem');
+                this.sendButton.disabled = !connection.readyToSend;
+                this.sendButton.title = EH.WhatsAppComposer.hasContent()
+                    ? 'Enviar conteúdo preparado'
+                    : (this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem');
             }
             return connection;
         },
@@ -3772,24 +3331,11 @@
 
         render(state) {
             this.currentState = state || { chats: [], active: null, messages: [] };
-            const activeTitle = String(this.currentState.active?.title || '').trim();
-            if (this.requestedChatTitle && activeTitle && EH.Utils.normalize(this.requestedChatTitle) === EH.Utils.normalize(activeTitle)) {
-                this.requestedChatTitle = '';
-            }
             this.refreshConnection();
-            if (this.titleEl) this.titleEl.textContent = this.requestedChatTitle || activeTitle || 'Selecione uma conversa';
+            if (this.titleEl) this.titleEl.textContent = this.currentState.active?.title || 'Selecione uma conversa';
             this.renderChats();
             this.renderMessages();
             this.renderPrepared();
-        },
-
-        selectedTitle() {
-            return String(
-                this.requestedChatTitle ||
-                this.currentState?.active?.title ||
-                EH.WhatsAppBridge.getState().activeTitle ||
-                ''
-            ).trim();
         },
 
         renderPrepared() {
@@ -3799,31 +3345,23 @@
             this.preparedWrap.hidden = !has;
             this.root?.classList.toggle('eh-wa-has-prepared', has);
             if (!has) {
-                if (this.preparedImageWrap) this.preparedImageWrap.hidden = true;
-                if (this.preparedImage) this.preparedImage.removeAttribute('src');
-                if (this.preparedText) this.preparedText.textContent = '';
-                if (this.preparedTarget) {
-                    this.preparedTarget.textContent = 'Para: selecione uma conversa';
-                    this.preparedTarget.classList.remove('mismatch');
+                if (this.preparedImage) {
+                    this.preparedImage.hidden = true;
+                    this.preparedImage.removeAttribute('src');
                 }
+                if (this.preparedText) this.preparedText.textContent = '';
+                if (this.preparedTarget) this.preparedTarget.textContent = 'Para: selecione uma conversa';
                 this.refreshConnection();
                 return;
             }
-            const activeTitle = String(this.currentState?.active?.title || EH.WhatsAppBridge.getState().activeTitle || '').trim();
-            const target = String(item.chatTitle || activeTitle || '').trim();
-            const mismatch = Boolean(target && activeTitle && EH.Utils.normalize(target) !== EH.Utils.normalize(activeTitle));
-            if (this.preparedTarget) {
-                this.preparedTarget.textContent = target
-                    ? (mismatch ? `Para: ${target} • conversa atual: ${activeTitle}` : `Para: ${target}`)
-                    : 'Para: selecione uma conversa';
-                this.preparedTarget.classList.toggle('mismatch', mismatch);
-            }
+            const target = item.chatTitle || this.currentState?.active?.title || EH.WhatsAppBridge.getState().activeTitle || '';
+            if (this.preparedTarget) this.preparedTarget.textContent = target ? `Para: ${target}` : 'Para: selecione uma conversa';
             if (this.preparedImage) {
                 if (item.attachment?.dataUrl) {
                     this.preparedImage.src = item.attachment.dataUrl;
-                    if (this.preparedImageWrap) this.preparedImageWrap.hidden = false;
+                    this.preparedImage.hidden = false;
                 } else {
-                    if (this.preparedImageWrap) this.preparedImageWrap.hidden = true;
+                    this.preparedImage.hidden = true;
                     this.preparedImage.removeAttribute('src');
                 }
             }
@@ -3839,26 +3377,12 @@
         applyPreparedToInput() {
             const item = EH.WhatsAppComposer.get();
             if (!item || !this.composer) return;
-            this.composer.value = EH.WhatsAppText.normalize(item.text);
+            this.composer.value = String(item.text || '');
             this.renderPrepared();
         },
 
         prepareContent(input, options = {}) {
-            const currentTitle = this.selectedTitle();
-            const requestedTitle = String(input?.chatTitle || '').trim();
-            const targetTitle = requestedTitle || currentTitle;
-
-            // Conteúdo operacional sempre pertence a uma conversa explícita.
-            // Não pedimos telefone e não tentamos abrir outra conversa/aba.
-            if (!targetTitle && options.allowUnassigned !== true) {
-                if (!options.silent) EH.Toast.warning('⚠️ Selecione uma conversa no WhatsApp.');
-                return { ok: false, reason: 'no-chat' };
-            }
-
-            const result = EH.WhatsAppComposer.prepare({
-                ...input,
-                chatTitle: targetTitle
-            }, options);
+            const result = EH.WhatsAppComposer.prepare(input, options);
             if (result.ok) {
                 EH.State.setPanel('right', true);
                 this.applyPreparedToInput();
@@ -4013,8 +3537,6 @@
         },
 
         async selectChat(title) {
-            const wanted = String(title || '').trim();
-            if (!wanted) return;
             const state = await EH.WhatsAppBridge.ensureReady({
                 requireConversation: false,
                 verifyStale: true,
@@ -4024,11 +3546,10 @@
                 EH.WhatsAppBridge.notifyUnavailable(state);
                 return;
             }
-            this.requestedChatTitle = wanted;
-            if (this.titleEl) this.titleEl.textContent = wanted;
-            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: wanted }));
+            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: title }));
+            if (this.titleEl) this.titleEl.textContent = title;
             if (EH.WhatsAppComposer.current && !EH.WhatsAppComposer.current.chatTitle) {
-                EH.WhatsAppComposer.current.chatTitle = wanted;
+                EH.WhatsAppComposer.current.chatTitle = title;
                 EH.WhatsAppComposer.current.fingerprint = EH.WhatsAppComposer.fingerprint(EH.WhatsAppComposer.current);
                 this.renderPrepared();
             }
@@ -4049,24 +3570,9 @@
             }
 
             const target = String(item.chatTitle || activeTitle).trim();
-            if (target && activeTitle && EH.Utils.normalize(target) !== EH.Utils.normalize(activeTitle)) {
-                EH.Toast.warning(`⚠️ Conteúdo preparado para ${target}. Volte para essa conversa ou remova o conteúdo preparado.`);
-                this.renderPrepared();
-                return false;
-            }
-
-            const editedText = EH.WhatsAppText.normalize(this.composer?.value ?? item.text ?? '');
+            const editedText = String(this.composer?.value ?? item.text ?? '').trim();
             let command;
-            if (item.attachment?.dataUrl && item.message2) {
-                command = EH.WhatsAppBridge.makeCommand({
-                    action: 'send_bundle',
-                    chatTitle: target,
-                    message: editedText,
-                    message2: item.message2,
-                    imageDataUrl: item.attachment.dataUrl,
-                    filename: item.attachment.filename || 'PIX-QR-CODE.png'
-                });
-            } else if (item.attachment?.dataUrl) {
+            if (item.attachment?.dataUrl) {
                 command = EH.WhatsAppBridge.makeCommand({
                     action: 'send_image',
                     chatTitle: target,
@@ -4103,7 +3609,7 @@
                 await this.sendPrepared();
                 return;
             }
-            const message = EH.WhatsAppText.normalize(this.composer?.value || '');
+            const message = String(this.composer?.value || '').trim();
             const state = await EH.WhatsAppBridge.ensureReady({
                 requireConversation: true,
                 verifyStale: true,
@@ -4496,26 +4002,6 @@
                     padding: 11px 14px;
                     border-top: 1px solid #e3e6ec;
                     background: rgba(255, 255, 255, .98);
-                }
-
-                .eh-modal-more {
-                    flex: 1 1 100%;
-                    border-top: 1px solid #edf0f4;
-                    padding-top: 6px;
-                }
-                .eh-modal-more > summary {
-                    cursor: pointer;
-                    list-style: none;
-                    color: #667085;
-                    font-size: 11px;
-                    font-weight: 700;
-                }
-                .eh-modal-more > summary::-webkit-details-marker { display: none; }
-                .eh-modal-more-actions {
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 7px;
-                    margin-top: 7px;
                 }
 
                 .eh-modal-btn {
@@ -5308,13 +4794,10 @@
                 .eh-wa-prepared-head { min-height:27px; display:grid; grid-template-columns:auto minmax(0,1fr) 24px; align-items:center; gap:6px; padding:4px 7px; border-bottom:1px solid #edf0f1; color:#54656f; }
                 .eh-wa-prepared-head strong { font-size:8.5px; color:#111b21; }
                 .eh-wa-prepared-head span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:8px; text-align:right; }
-                .eh-wa-prepared-head span.mismatch { color:#b54708; font-weight:700; }
                 .eh-wa-prepared-remove { width:22px; height:22px; border:0; border-radius:50%; background:#eef1f2; color:#54656f; cursor:pointer; font-size:15px; line-height:1; }
                 .eh-wa-prepared-body { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:7px; padding:6px 8px; }
-                .eh-wa-prepared-image-wrap { position:relative; width:46px; height:46px; }
-                .eh-wa-prepared-image-wrap[hidden] { display:none !important; }
                 .eh-wa-prepared-image { width:46px; height:46px; object-fit:cover; border-radius:5px; border:1px solid #d8dedf; background:#fff; }
-                .eh-wa-prepared-attachment-remove { position:absolute; right:-5px; top:-5px; width:17px; height:17px; padding:0; border:1px solid #d8dedf; border-radius:50%; background:#fff; color:#54656f; font-size:12px; line-height:15px; cursor:pointer; box-shadow:0 1px 3px rgba(0,0,0,.12); }
+                .eh-wa-prepared-image[hidden] { display:none !important; }
                 .eh-wa-prepared-text { max-height:62px; overflow:hidden; color:#334047; font-size:8.5px; line-height:1.35; white-space:pre-wrap; overflow-wrap:anywhere; }
                 .eh-wa-paste-preview { position:relative; display:grid; grid-template-columns:48px minmax(0,1fr) 26px; align-items:center; gap:8px; padding:7px 8px; border-top:1px solid #d8dedf; background:#f7f9fa; }
                 .eh-wa-paste-preview[hidden] { display:none !important; }
@@ -5346,7 +4829,6 @@
                 #eh-wa-dock.eh-profile-station .eh-wa-avatar { width:29px; height:29px; }
                 #eh-wa-dock.eh-profile-station .eh-wa-messages { padding:7px 6px 9px; }
                 #eh-wa-dock.eh-profile-station .eh-wa-prepared { max-height:104px; }
-                #eh-wa-dock.eh-profile-station .eh-wa-prepared-image-wrap,
                 #eh-wa-dock.eh-profile-station .eh-wa-prepared-image { width:38px; height:38px; }
                 #eh-wa-dock.eh-profile-station .eh-wa-prepared-text { max-height:48px; }
                 .eh-operation-modal { width:min(720px,96vw); max-height:min(820px,94vh); }
@@ -8262,14 +7744,12 @@
                     applyOriginFees: EH.Config.APLICAR_TAXAS_ORIGEM,
                     originFees: { ...(EH.Config.TAXAS_ORIGEM || {}) },
                     panelZoom: EH.Config.PANEL_ZOOM,
-                    whatsappZoom: EH.Config.WHATSAPP_DOCK_ZOOM,
-                    confirmationMode: EH.Config.CONFIRMATION_MODE
+                    whatsappZoom: EH.Config.WHATSAPP_DOCK_ZOOM
                 },
                 interface: {
                     state: EH.State?.snapshot?.() || null,
                     layout: EH.Layout?.lastMetrics || null,
-                    whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null,
-                    whatsappComposer: EH.WhatsAppComposer?.get?.() || null
+                    whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null
                 },
                 runtime: {
                     listeners: EH.Runtime?.listeners?.size || 0,
@@ -8365,255 +7845,91 @@
             return { cards };
         },
 
-        titleCase(value) {
-            const text = EH.Utils.clean(value);
-            if (!text) return '';
-            return text.toLocaleLowerCase('pt-BR')
-                .replace(/(^|[\s/–—-])([\p{L}])/gu, (_m, lead, letter) => `${lead}${letter.toLocaleUpperCase('pt-BR')}`)
-                .replace(/\b(Go|Mt|Df|To|Ba|Sp|Rj|Mg|Ma|Pi|Se|Al|Pe)\b/g, match => match.toUpperCase());
-        },
-
-        valueOnly(line, labelPattern) {
-            return EH.Utils.clean(String(line || '').replace(new RegExp(`^(?:${labelPattern})\\s*:\\s*`, 'i'), ''));
-        },
-
-        prettyLocation(value) {
-            const raw = EH.Utils.clean(value);
-            if (!raw) return '';
-            const stateMatch = raw.match(/\s*-\s*([A-Z]{2})\s*$/i);
-            const cityRaw = stateMatch ? raw.slice(0, stateMatch.index).trim() : raw;
-            const canonical = EH.CityAliases?.canonicalize?.(cityRaw) || cityRaw;
-            const city = this.titleCase(canonical);
-            return `${city}${stateMatch ? ` - ${stateMatch[1].toUpperCase()}` : ''}`;
-        },
-
-        parseRouteDate(routeDate) {
-            const raw = EH.Utils.clean(routeDate);
-            const dateMatch = raw.match(/\b(\d{2}\/\d{2}\/\d{4})\b/);
-            const timeMatch = raw.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
-            let routePart = raw;
-            if (dateMatch) routePart = routePart.slice(0, dateMatch.index).replace(/\s*-\s*$/, '').trim();
-            const routeMatch = routePart.match(/^(.*?)\s+(?:x|×|→)\s+(.*?)$/i);
-            return {
-                origin: this.prettyLocation(routeMatch?.[1] || ''),
-                destination: this.prettyLocation(routeMatch?.[2] || ''),
-                routeLabel: routeMatch ? '' : this.titleCase(routePart),
-                date: dateMatch?.[1] || '',
-                time: timeMatch?.[0] || ''
-            };
-        },
-
-        normalizeConfirmationCard(card = {}) {
-            const trip = this.parseRouteDate(card.routeDate || '');
-            return {
-                ...trip,
-                passenger: this.titleCase(card.passenger || ''),
-                seat: EH.Utils.clean(card.seat || ''),
-                tarifa: this.valueOnly(card.tarifa, 'TARIFA'),
-                taxa: this.valueOnly(card.taxa, 'TAXA DE EMBARQUE').replace(/^\+\s*/, ''),
-                pedagio: this.valueOnly(card.pedagio, 'PEDAGIO|PEDÁGIO').replace(/^\+\s*/, ''),
-                beneficio: this.valueOnly(card.beneficio, 'BENEFÍCIO|BENEFICIO'),
-                credito: this.valueOnly(card.credito, 'CRÉDITO|CREDITO'),
-                total: this.valueOnly(card.total, 'TOTAL')
-            };
-        },
-
-        hasPositiveMoney(value) {
-            return EH.Utils.parseMoney(value) > 0.0001;
-        },
-
-        confirmationInstruction() {
-            const fallback = 'Confira os dados da sua viagem.\n\nSe estiver tudo correto, responda *SIM* para eu gerar o pagamento via PIX.';
-            const raw = String(EH.Messages.get('resumo') || fallback).replace(/\r\n?/g, '\n').trim();
-            if (!raw) return fallback;
-            if (/\n/.test(raw)) return raw.replace(/\n{3,}/g, '\n\n');
-            return raw.replace(/\.\s+(?=Se\b)/i, '.\n\n').trim();
-        },
-
         formatSummary(summary) {
             if (!summary?.cards?.length) return '';
-            const cards = summary.cards.map(card => this.normalizeConfirmationCard(card));
-            const parts = ['*CONFIRMAÇÃO DA VIAGEM*', ''];
 
-            cards.forEach((card, index) => {
-                if (cards.length > 1) parts.push(`*Passagem ${index + 1}*`);
+            const titleCase = value => {
+                const text = EH.Utils.clean(value);
+                if (!text) return '';
+                return text.toLocaleLowerCase('pt-BR')
+                    .replace(/(^|[\s/–—-])([\p{L}])/gu, (_m, lead, letter) => `${lead}${letter.toLocaleUpperCase('pt-BR')}`)
+                    .replace(/\b(Go|Mt|Df|To|Ba|Sp|Rj|Mg|Ma|Pi|Se|Al|Pe)\b/g, match => match.toUpperCase());
+            };
+            const valueOnly = (line, label) => EH.Utils.clean(String(line || '').replace(new RegExp(`^(?:${label})\\s*:\\s*`, 'i'), ''));
+            const prettyLocation = value => {
+                const raw = EH.Utils.clean(value);
+                if (!raw) return '';
+                const stateMatch = raw.match(/\s*-\s*([A-Z]{2})\s*$/i);
+                const cityRaw = stateMatch ? raw.slice(0, stateMatch.index).trim() : raw;
+                const canonical = EH.CityAliases?.canonicalize?.(cityRaw) || cityRaw;
+                const city = titleCase(canonical);
+                return `${city}${stateMatch ? ` - ${stateMatch[1].toUpperCase()}` : ''}`;
+            };
+            const parseRouteDate = routeDate => {
+                const raw = EH.Utils.clean(routeDate);
+                const dateMatch = raw.match(/\b(\d{2}\/\d{2}\/\d{4})\b/);
+                const timeMatch = raw.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
+                let routePart = raw;
+                if (dateMatch) routePart = routePart.slice(0, dateMatch.index).replace(/\s*-\s*$/, '').trim();
+                const routeMatch = routePart.match(/^(.*?)\s+(?:x|×|→)\s+(.*?)$/i);
+                return {
+                    origin: prettyLocation(routeMatch?.[1] || ''),
+                    destination: prettyLocation(routeMatch?.[2] || ''),
+                    date: dateMatch?.[1] || '',
+                    time: timeMatch?.[0] || ''
+                };
+            };
 
-                const route = card.origin && card.destination
-                    ? `${card.origin} → ${card.destination}`
-                    : card.routeLabel;
-                if (route) parts.push(`🚌 *${route}*`);
-
-                if (card.date && card.time) parts.push(`📅 *${card.date}*  🕐 *${card.time}*`);
-                else {
-                    if (card.date) parts.push(`📅 *${card.date}*`);
-                    if (card.time) parts.push(`🕐 *${card.time}*`);
+            const parts = ['*CONFIRMAÇÃO DA VIAGEM 🚌*', ''];
+            summary.cards.forEach((card, index) => {
+                if (summary.cards.length > 1) {
+                    parts.push(`*Passagem ${index + 1}*`);
                 }
+
+                const trip = parseRouteDate(card.routeDate);
+                if (trip.origin && trip.destination) {
+                    parts.push(`${trip.origin} → ${trip.destination}`);
+                } else if (card.routeDate) {
+                    parts.push(titleCase(card.routeDate));
+                }
+                if (trip.date) parts.push(`📅 ${trip.date}`);
+                if (trip.time) parts.push(`🕐 ${trip.time}`);
 
                 parts.push('');
-                if (card.passenger) parts.push(`👤 *Passageiro: ${card.passenger}*`);
-                if (card.seat) parts.push(`💺 *Poltrona: ${card.seat}*`);
+                if (card.passenger) parts.push(`👤 Passageiro: ${titleCase(card.passenger)}`);
+                if (card.seat) parts.push(`💺 Poltrona: ${card.seat}`);
 
-                const hasValues = card.tarifa || this.hasPositiveMoney(card.taxa) || this.hasPositiveMoney(card.pedagio) ||
-                    this.hasPositiveMoney(card.beneficio) || this.hasPositiveMoney(card.credito) || card.total;
-                if (hasValues) parts.push('');
-                if (card.tarifa) parts.push(`💰 *Tarifa: ${card.tarifa}*`);
-                if (this.hasPositiveMoney(card.taxa)) parts.push(`Taxa de embarque: + ${card.taxa}`);
-                if (this.hasPositiveMoney(card.pedagio)) parts.push(`Pedágio: + ${card.pedagio}`);
-                if (this.hasPositiveMoney(card.beneficio)) parts.push(`Benefício: ${card.beneficio}`);
-                if (this.hasPositiveMoney(card.credito)) parts.push(`Crédito: ${card.credito}`);
-                if (card.total) {
+                const tarifa = valueOnly(card.tarifa, 'TARIFA');
+                const taxa = valueOnly(card.taxa, 'TAXA DE EMBARQUE');
+                const pedagio = valueOnly(card.pedagio, 'PEDAGIO|PEDÁGIO');
+                const beneficio = valueOnly(card.beneficio, 'BENEFÍCIO|BENEFICIO');
+                const credito = valueOnly(card.credito, 'CRÉDITO|CREDITO');
+                const total = valueOnly(card.total, 'TOTAL');
+
+                parts.push('');
+                if (tarifa) parts.push(`💰 Tarifa: ${tarifa}`);
+                if (taxa) parts.push(`Taxa de embarque: ${taxa}`);
+                if (pedagio) parts.push(`Pedágio: ${pedagio}`);
+                if (beneficio && !/R\$\s*0[,.]00/.test(beneficio)) parts.push(`Benefício: ${beneficio}`);
+                if (credito && !/R\$\s*0[,.]00/.test(credito)) parts.push(`Crédito: ${credito}`);
+                if (total) {
                     parts.push('');
-                    parts.push(`*Total: ${card.total}*`);
+                    parts.push(`*Total: ${total}*`);
                 }
-
-                if (index < cards.length - 1) parts.push('', '—', '');
+                if (index < summary.cards.length - 1) parts.push('', '—', '');
             });
 
-            parts.push('', ...this.confirmationInstruction().split('\n'));
+            const instruction = EH.Messages.get('resumo');
+            if (instruction) {
+                parts.push('');
+                const lines = instruction
+                    .replace(/\.\s+(?=Se\b)/i, '.\n')
+                    .split(/\n+/)
+                    .map(line => line.trim())
+                    .filter(Boolean);
+                parts.push(...lines);
+            }
             return parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
-        },
-
-        confirmationShortText() {
-            return this.confirmationInstruction();
-        },
-
-        renderConfirmationCanvas(summary) {
-            if (!summary?.cards?.length) throw new Error('Resumo da confirmação não encontrado.');
-            const cards = summary.cards.map(card => this.normalizeConfirmationCard(card));
-            const width = 900;
-            const outer = 28;
-            const cardGap = 16;
-            const cardHeight = 310;
-            const headerHeight = 74;
-            const footerHeight = 76;
-            const panelHeight = headerHeight + cards.length * cardHeight + Math.max(0, cards.length - 1) * cardGap + footerHeight + 34;
-            const height = panelHeight + outer * 2;
-            const scale = Math.max(1.5, Math.min(2.5, EH.Config.CAPTURE_SCALE || 2));
-            const canvas = document.createElement('canvas');
-            canvas.width = Math.round(width * scale);
-            canvas.height = Math.round(height * scale);
-            const ctx = canvas.getContext('2d');
-            ctx.scale(scale, scale);
-            ctx.textBaseline = 'top';
-
-            ctx.fillStyle = '#edf1f5';
-            ctx.fillRect(0, 0, width, height);
-            EH.Capture.drawRoundRect(ctx, outer, outer, width - outer * 2, panelHeight, 18);
-            ctx.fillStyle = '#ffffff';
-            ctx.fill();
-            ctx.strokeStyle = '#dce3ea';
-            ctx.lineWidth = 1;
-            ctx.stroke();
-
-            let y = outer + 22;
-            const left = outer + 26;
-            const contentWidth = width - (outer + 26) * 2;
-            ctx.fillStyle = '#1f2a3b';
-            ctx.font = '700 25px Arial';
-            ctx.fillText('CONFIRMAÇÃO DA VIAGEM', left, y);
-            y += 38;
-            ctx.fillStyle = '#6a7487';
-            ctx.font = '400 13px Arial';
-            ctx.fillText(cards.length > 1 ? `${cards.length} trechos na reserva` : 'Confira os dados antes de gerar o PIX', left, y);
-            y = outer + headerHeight + 18;
-
-            cards.forEach((card, index) => {
-                const x = left;
-                const w = contentWidth;
-                EH.Capture.drawRoundRect(ctx, x, y, w, cardHeight, 14);
-                ctx.fillStyle = '#f9fbfd';
-                ctx.fill();
-                ctx.strokeStyle = '#dfe5ec';
-                ctx.stroke();
-
-                let cy = y + 18;
-                const route = card.origin && card.destination ? `${card.origin} → ${card.destination}` : (card.routeLabel || 'Viagem');
-                ctx.fillStyle = '#202735';
-                ctx.font = '700 20px Arial';
-                const routeLines = EH.Capture.wrapCanvasText(ctx, route, w - 36).slice(0, 2);
-                routeLines.forEach(line => { ctx.fillText(line, x + 18, cy); cy += 24; });
-
-                ctx.fillStyle = '#667284';
-                ctx.font = '600 14px Arial';
-                const dateTime = [card.date, card.time].filter(Boolean).join(' • ');
-                if (dateTime) ctx.fillText(dateTime, x + 18, cy + 2);
-                cy += 32;
-
-                const colGap = 18;
-                const colW = (w - 36 - colGap) / 2;
-                const drawField = (fx, fy, label, value) => {
-                    ctx.fillStyle = '#7a8492';
-                    ctx.font = '600 11px Arial';
-                    ctx.fillText(label.toUpperCase(), fx, fy);
-                    ctx.fillStyle = '#202735';
-                    ctx.font = '700 16px Arial';
-                    const lines = EH.Capture.wrapCanvasText(ctx, value || '—', colW).slice(0, 2);
-                    lines.forEach((line, li) => ctx.fillText(line, fx, fy + 17 + li * 18));
-                };
-                drawField(x + 18, cy, 'Passageiro', card.passenger || '—');
-                drawField(x + 18 + colW + colGap, cy, 'Poltrona', card.seat || '—');
-                cy += 62;
-
-                const amountRows = [];
-                if (card.tarifa) amountRows.push(['Tarifa', card.tarifa]);
-                if (this.hasPositiveMoney(card.taxa)) amountRows.push(['Taxa de embarque', card.taxa]);
-                if (this.hasPositiveMoney(card.pedagio)) amountRows.push(['Pedágio', card.pedagio]);
-                if (this.hasPositiveMoney(card.beneficio)) amountRows.push(['Benefício', card.beneficio]);
-                if (this.hasPositiveMoney(card.credito)) amountRows.push(['Crédito', card.credito]);
-
-                ctx.font = '600 13px Arial';
-                amountRows.slice(0, 4).forEach(([label, value], rowIndex) => {
-                    const ry = cy + rowIndex * 21;
-                    ctx.fillStyle = '#667284';
-                    ctx.textAlign = 'left';
-                    ctx.fillText(label, x + 18, ry);
-                    ctx.fillStyle = '#202735';
-                    ctx.textAlign = 'right';
-                    ctx.fillText(value, x + w - 18, ry);
-                });
-                ctx.textAlign = 'left';
-
-                if (card.total) {
-                    const ty = y + cardHeight - 52;
-                    ctx.strokeStyle = '#dfe5ec';
-                    ctx.beginPath();
-                    ctx.moveTo(x + 18, ty - 10);
-                    ctx.lineTo(x + w - 18, ty - 10);
-                    ctx.stroke();
-                    ctx.fillStyle = '#202735';
-                    ctx.font = '700 13px Arial';
-                    ctx.fillText('TOTAL', x + 18, ty);
-                    ctx.fillStyle = '#167447';
-                    ctx.font = '700 22px Arial';
-                    ctx.textAlign = 'right';
-                    ctx.fillText(card.total, x + w - 18, ty - 5);
-                    ctx.textAlign = 'left';
-                }
-
-                y += cardHeight + cardGap;
-            });
-
-            y += 4;
-            ctx.fillStyle = '#334155';
-            ctx.font = '600 14px Arial';
-            ctx.fillText('Confira os dados da sua viagem.', left, y);
-            ctx.fillStyle = '#1f2a3b';
-            ctx.font = '700 14px Arial';
-            ctx.fillText('Se estiver tudo correto, responda SIM para gerar o pagamento via PIX.', left, y + 24);
-            return canvas;
-        },
-
-        async createConfirmationImage(summary) {
-            const canvas = this.renderConfirmationCanvas(summary);
-            const blob = await EH.Clipboard.canvasToBlob(canvas);
-            const dataUrl = canvas.toDataURL('image/png', 1);
-            return {
-                canvas,
-                blob,
-                dataUrl,
-                filename: 'confirmacao-viagem.png',
-                text: this.confirmationShortText()
-            };
         },
 
         toUtf8Bytes(text) {
@@ -8716,14 +8032,7 @@
             if (!pixOriginal) return null;
             const value = this.clean(EH.Utils.first(EH.Selectors.PIX_VALOR)?.textContent || modal.querySelector('.pixValor strong')?.textContent || '');
             const expires = this.clean(EH.Utils.first(EH.Selectors.PIX_EXPIRA)?.textContent || modal.querySelector('.pixExpiraEm strong')?.textContent || '');
-            const qrElement = EH.Utils.first(EH.Selectors.PIX_QR) || modal.querySelector('.qrCodeImg');
-            let qrSource = '';
-            if (qrElement) {
-                qrSource = String(qrElement.currentSrc || qrElement.src || qrElement.getAttribute?.('src') || '');
-                if (!qrSource && qrElement instanceof HTMLCanvasElement) {
-                    try { qrSource = qrElement.toDataURL('image/png'); } catch (error) { EH.Logger.debug('QR original em canvas não pôde ser exportado:', error); }
-                }
-            }
+            const qrSource = EH.Utils.first(EH.Selectors.PIX_QR)?.getAttribute('src') || modal.querySelector('.qrCodeImg')?.getAttribute('src') || '';
             const validation = this.validatePix(pixOriginal);
             const dynamic = this.detectDynamicPix(pixOriginal);
             return {
@@ -8744,11 +8053,13 @@
         },
 
         formatPixInstruction() {
-            return EH.WhatsAppText.normalize([
+            return [
                 '👇 *Para copiar o PIX:*',
+                '',
                 'Segure a próxima mensagem e toque em 📋 *Copiar*.',
+                '',
                 '⚠️ Não toque somente no trecho azul.'
-            ].join('\n'));
+            ].join('\n');
         },
 
 
@@ -8788,99 +8099,21 @@
             return EH.LocalQR.createCanvas(payload, 440);
         },
 
-        getGeneratedQrDataUrl(pix = this.parsePix()) {
+        getQrDataUrl(pix = this.parsePix()) {
             const canvas = this.generateQrCanvas(pix);
             return canvas.toDataURL('image/png');
         },
 
-        getQrDataUrl(pix = this.parsePix()) {
-            // Caminho síncrono: se o E-Pass já forneceu o QR como data URL, usar o original.
-            const original = String(pix?.qr || '').trim();
-            if (/^data:image\//i.test(original)) return original;
-            return this.getGeneratedQrDataUrl(pix);
-        },
-
-        async resolveQrImage(pix = this.parsePix()) {
-            const original = String(pix?.qr || '').trim();
-            if (/^data:image\//i.test(original)) {
-                const mime = original.match(/^data:([^;,]+)/i)?.[1] || 'image/png';
-                return { dataUrl: original, mime, original: true, source: 'epass-data-url' };
-            }
-
-            if (/^(?:blob:|https?:)/i.test(original)) {
-                try {
-                    const response = await fetch(original);
-                    if (response.ok) {
-                        const blob = await response.blob();
-                        if (String(blob.type || '').startsWith('image/')) {
-                            const dataUrl = await EH.Clipboard.blobToDataUrl(blob);
-                            return { dataUrl, mime: blob.type || 'image/png', original: true, source: 'epass-src' };
-                        }
-                    }
-                } catch (error) {
-                    EH.Logger.debug('Não foi possível ler o QR original pela URL:', error);
-                }
-            }
-
-            // Segunda tentativa: capturar o elemento que ainda está renderizado na cobrança.
-            try {
-                const element = EH.Utils.first(EH.Selectors.PIX_QR);
-                if (element instanceof HTMLCanvasElement) {
-                    const dataUrl = element.toDataURL('image/png');
-                    return { dataUrl, mime: 'image/png', original: true, source: 'epass-canvas' };
-                }
-                if (element instanceof HTMLImageElement && element.complete && element.naturalWidth > 0) {
-                    const canvas = document.createElement('canvas');
-                    canvas.width = element.naturalWidth;
-                    canvas.height = element.naturalHeight;
-                    const ctx = canvas.getContext('2d');
-                    ctx.drawImage(element, 0, 0);
-                    const dataUrl = canvas.toDataURL('image/png');
-                    return { dataUrl, mime: 'image/png', original: true, source: 'epass-rendered-image' };
-                }
-            } catch (error) {
-                EH.Logger.debug('QR original renderizado não pôde ser capturado:', error);
-            }
-
-            // Somente aqui gerar um QR novo, sempre a partir do pixOriginal validado.
-            return {
-                dataUrl: this.getGeneratedQrDataUrl(pix),
-                mime: 'image/png',
-                original: false,
-                source: 'local-fallback'
-            };
-        },
-
         async copyQrCode(pix = this.parsePix()) {
             try {
-                const qr = await this.resolveQrImage(pix);
-                let blob = EH.Clipboard.dataUrlToBlob(qr.dataUrl);
-                let clipboardDataUrl = qr.dataUrl;
-
-                // ClipboardItem é mais confiável com image/png. Quando o QR original
-                // do E-Pass é JPEG, apenas reencodamos A MESMA IMAGEM para PNG; não
-                // recriamos o QR nem alteramos o pixOriginal.
-                if (blob.type !== 'image/png') {
-                    const image = new Image();
-                    image.src = qr.dataUrl;
-                    await new Promise((resolve, reject) => {
-                        image.onload = resolve;
-                        image.onerror = () => reject(new Error('Não foi possível ler o QR Code original.'));
-                    });
-                    const canvas = document.createElement('canvas');
-                    canvas.width = image.naturalWidth || image.width;
-                    canvas.height = image.naturalHeight || image.height;
-                    canvas.getContext('2d').drawImage(image, 0, 0);
-                    clipboardDataUrl = canvas.toDataURL('image/png');
-                    blob = await EH.Clipboard.canvasToBlob(canvas);
-                }
-
-                const result = await EH.Clipboard.copyImageAnyContext(blob, clipboardDataUrl, 'PIX-QR-CODE.png');
+                const canvas = this.generateQrCanvas(pix);
+                const blob = await EH.Clipboard.canvasToBlob(canvas);
+                const result = await EH.Clipboard.copyImageAnyContext(blob);
                 if (!result?.copied) {
-                    EH.Toast.warning(`QR Code pronto, mas o navegador bloqueou a cópia da imagem. ${result?.reason || ''}`.trim());
+                    EH.Toast.warning(`QR Code gerado, mas o navegador bloqueou a cópia da imagem. ${result?.reason || ''}`.trim());
                     return false;
                 }
-                EH.Toast.success(qr.original ? '✅ QR Code original copiado' : '✅ QR Code copiado');
+                EH.Toast.success('✅ QR Code copiado');
                 return true;
             } catch (error) {
                 EH.Logger.warn('Falha ao copiar QR Code:', error);
@@ -9019,8 +8252,11 @@
             const steps = document.createElement('div');
             steps.className = 'eh-steps';
 
-            // O WhatsApp fica integrado na lateral direita e utiliza a conversa
-            // selecionada. Não há telefone manual neste fluxo.
+            // O WhatsApp agora fica integrado na lateral direita. Não há botão de abrir.
+            // Mantemos o telefone em memória apenas para fluxos que já o informaram anteriormente.
+            const phone = document.createElement('input');
+            phone.type = 'hidden';
+            phone.value = String(EH.Storage.get('currentPhone', '') || '');
 
             const quickTitle = document.createElement('div');
             quickTitle.className = 'eh-dock-title';
@@ -9045,6 +8281,7 @@
             const bilhete = this.createButton('🎫', 'BILHETE', '', () => EH.Tickets.activateSelection());
             const rotas = this.createButton('🧭', 'ROTAS', '', () => this.showRoutes());
             const historico = this.createButton('🕘', 'HISTÓRICO', '', () => this.showHistory());
+            const enviar = this.createButton('📤', 'ENVIAR', '', () => this.showSend());
             const resumo = this.createButton('📋', 'RESUMO', 'eh-primary', () => this.copyCurrentSummary());
             const detalhes = this.createButton('📄', 'DETALHES', '', () => this.copyCurrentDetails());
 
@@ -9053,6 +8290,7 @@
             bilhete.id = 'eh-btn-bilhete';
             rotas.id = 'eh-btn-rotas';
             historico.id = 'eh-btn-historico';
+            enviar.id = 'eh-btn-enviar';
             resumo.id = 'eh-btn-resumo';
             detalhes.id = 'eh-btn-detalhes';
             // Ações mais usadas ficam visíveis. As demais continuam disponíveis,
@@ -9064,7 +8302,7 @@
             moreSummary.textContent = 'Mais';
             const secondaryActions = document.createElement('div');
             secondaryActions.className = 'eh-actions eh-actions-secondary';
-            secondaryActions.append(rotas, historico, detalhes);
+            secondaryActions.append(rotas, historico, enviar, detalhes);
             more.append(moreSummary, secondaryActions);
 
             const status = document.createElement('div');
@@ -9105,8 +8343,9 @@
             this.body = body;
             this.statusText = statusText;
             this.statusDot = dot;
-            this.buttons = { horarios, reserva, bilhete, rotas, historico, resumo, detalhes };
+            this.buttons = { horarios, reserva, bilhete, rotas, historico, enviar, resumo, detalhes };
             this.steps = steps;
+            this.phoneInput = phone;
             this.quickRoutes = quickRoutes;
             this.contextBox = context;
             this.renderQuickRoutes();
@@ -9171,32 +8410,64 @@
             });
         },
 
+        getPhone() {
+            return String(this.phoneInput?.value || EH.Storage.get('currentPhone', '') || '').replace(/\D/g, '');
+        },
+
+
         async openWhatsApp(message = '', options = {}) {
-            // Caminho principal único: sempre usar o painel integrado.
-            // Não abre nova guia, não navega por telefone e não exige número manual.
             const imageDataUrl = String(options.imageDataUrl || '');
             const filename = String(options.filename || 'epass-atendimento.png');
+            const forceWeb = options.bridgeOnly === true;
+            const currentWebState = EH.WhatsAppBridge.getState();
+
+            // Preserve o modo App do Windows como fallback. No modo Web, o conteúdo
+            // é sempre entregue ao composer integrado e nunca é disparado sozinho.
+            const useApp = !forceWeb && EH.Config.WHATSAPP_MODE === 'app' && !currentWebState.connected;
+            let phone = useApp ? this.getPhone() : '';
+            if (phone && !phone.startsWith('55')) phone = `55${phone}`;
+
+            if (useApp) {
+                if (imageDataUrl) {
+                    try {
+                        const blob = EH.Clipboard.dataUrlToBlob(imageDataUrl);
+                        await EH.Clipboard.copyImageAnyContext(blob, imageDataUrl);
+                    } catch (error) {
+                        EH.Logger.warn('Não foi possível preparar a imagem para o WhatsApp do Windows:', error);
+                    }
+                }
+                const encoded = encodeURIComponent(String(message || ''));
+                const appUrl = phone
+                    ? `whatsapp://send?phone=${phone}${message ? `&text=${encoded}` : ''}`
+                    : `whatsapp://send${message ? `?text=${encoded}` : ''}`;
+                const link = document.createElement('a');
+                link.href = appUrl;
+                link.style.display = 'none';
+                document.body.appendChild(link);
+                link.click();
+                link.remove();
+                return { mode: 'app', connected: true, readyToSend: true };
+            }
 
             const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: true,
+                requireConversation: false,
                 verifyStale: true,
-                context: imageDataUrl ? 'preparar-imagem-integrada' : 'preparar-mensagem-integrada'
+                context: imageDataUrl ? 'preparar-imagem' : 'preparar-mensagem'
             });
-            if (!state.readyToSend) {
+            if (!state.connected) {
                 EH.WhatsAppBridge.notifyUnavailable(state);
-                return { mode: 'integrated', connected: Boolean(state.connected), readyToSend: false, state };
+                return { mode: 'web', connected: false, readyToSend: false, state };
             }
 
             const typeMap = { pesquisa: 'schedules', reserva: 'seats', bilhete: 'ticket' };
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: options.type || typeMap[options.captureType] || 'message',
-                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
-                text: EH.WhatsAppText.normalize(message),
-                message2: String(options.message2 || ''),
+                chatTitle: state.activeTitle || '',
+                text: String(message || ''),
                 attachment: imageDataUrl ? {
                     dataUrl: imageDataUrl,
                     filename,
-                    mime: String(options.mime || 'image/png')
+                    mime: 'image/png'
                 } : null
             }, {
                 replace: options.replace === true,
@@ -9204,84 +8475,13 @@
             });
 
             return {
-                mode: 'integrated',
+                mode: 'web',
                 connected: true,
-                readyToSend: true,
+                readyToSend: Boolean(state.readyToSend),
                 prepared: Boolean(prepared?.ok),
+                missingChat: !state.conversationSelected,
                 state
             };
-        },
-
-        async prepareConfirmationWhatsApp(summary, options = {}) {
-            if (!summary?.cards?.length) {
-                EH.Toast.warning('Resumo não encontrado.');
-                return null;
-            }
-            const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: true,
-                verifyStale: true,
-                context: 'preparar-confirmacao'
-            });
-            if (!state.readyToSend) {
-                EH.WhatsAppBridge.notifyUnavailable(state);
-                return null;
-            }
-
-            const mode = options.mode === 'text' || options.mode === 'image'
-                ? options.mode
-                : EH.Config.CONFIRMATION_MODE;
-
-            if (mode === 'text') {
-                return EH.WhatsAppDock?.prepareContent?.({
-                    type: 'reservation',
-                    chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
-                    text: EH.Payment.formatSummary(summary)
-                }, { replace: options.replace === true, silent: options.silent === true });
-            }
-
-            try {
-                const image = await EH.Payment.createConfirmationImage(summary);
-                EH.Clipboard.rememberImage(image.dataUrl, image.filename);
-                return EH.WhatsAppDock?.prepareContent?.({
-                    type: 'reservation',
-                    chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
-                    text: image.text,
-                    attachment: {
-                        dataUrl: image.dataUrl,
-                        filename: image.filename,
-                        mime: 'image/png'
-                    }
-                }, { replace: options.replace === true, silent: options.silent === true });
-            } catch (error) {
-                EH.Logger.error('Falha ao gerar confirmação em imagem:', error);
-                EH.Toast.error('Não foi possível gerar a imagem da confirmação.');
-                return null;
-            }
-        },
-
-        async previewConfirmationImage(summary) {
-            try {
-                const image = await EH.Payment.createConfirmationImage(summary);
-                EH.Clipboard.rememberImage(image.dataUrl, image.filename);
-                this.showPreview({
-                    blob: image.blob,
-                    dataUrl: image.dataUrl,
-                    text: EH.Payment.formatSummary(summary),
-                    summaryText: EH.Payment.formatSummary(summary),
-                    detailsText: EH.Payment.formatSummary(summary),
-                    message: image.text,
-                    filename: image.filename,
-                    captureType: 'confirmacao',
-                    historyId: '',
-                    copied: false,
-                    reason: 'Confirmação gerada em imagem.'
-                });
-                return image;
-            } catch (error) {
-                EH.Logger.error('Falha ao abrir confirmação em imagem:', error);
-                EH.Toast.error('Não foi possível gerar a imagem da confirmação.');
-                return null;
-            }
         },
 
         async sendPixPairToWhatsApp(pix) {
@@ -9306,30 +8506,12 @@
                 return null;
             }
 
-            let qrAttachment = null;
-            try {
-                const qr = await EH.Payment.resolveQrImage(pix);
-                if (qr?.dataUrl) {
-                    const ext = /jpeg|jpg/i.test(qr.mime || '') ? 'jpg' : /webp/i.test(qr.mime || '') ? 'webp' : 'png';
-                    qrAttachment = {
-                        dataUrl: qr.dataUrl,
-                        filename: `PIX-QR-CODE.${ext}`,
-                        mime: qr.mime || 'image/png',
-                        original: Boolean(qr.original)
-                    };
-                }
-            } catch (error) {
-                EH.Logger.warn('Não foi possível preparar o QR Code do PIX:', error);
-            }
-
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: 'pix',
-                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
+                chatTitle: state.activeTitle,
                 text: EH.Payment.formatPixInstruction(pix),
                 // A segunda mensagem contém SOMENTE o payload original.
-                message2: payload,
-                // Terceiro item: QR original do E-Pass quando disponível.
-                attachment: qrAttachment
+                message2: payload
             });
             if (prepared?.ok) {
                 EH.Toast.info('PIX preparado no painel. Confira e pressione Enviar.');
@@ -9344,19 +8526,18 @@
                 EH.Toast.warning('O PIX precisa estar válido antes de enviar o QR Code.');
                 return null;
             }
-            let qr;
+            let imageDataUrl = '';
             try {
-                qr = await EH.Payment.resolveQrImage(pix);
+                imageDataUrl = EH.Payment.getQrDataUrl(pix);
             } catch (error) {
-                EH.Toast.error(`Não foi possível obter o QR Code. ${error.message || ''}`.trim());
+                EH.Toast.error(`Não foi possível gerar o QR Code. ${error.message || ''}`.trim());
                 return null;
             }
-            const ext = /jpeg|jpg/i.test(qr?.mime || '') ? 'jpg' : /webp/i.test(qr?.mime || '') ? 'webp' : 'png';
             return EH.WhatsAppDock?.prepareContent?.({
                 type: 'qr',
                 text: '',
-                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '',
-                attachment: { dataUrl: qr.dataUrl, filename: `PIX-QR-CODE.${ext}`, mime: qr.mime || 'image/png' }
+                chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
+                attachment: { dataUrl: imageDataUrl, filename: 'PIX-QR-CODE.png', mime: 'image/png' }
             });
         },
 
@@ -9378,7 +8559,7 @@
             }
             return EH.WhatsAppDock?.prepareContent?.({
                 type: 'pix',
-                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
+                chatTitle: state.activeTitle,
                 text: EH.Payment.formatPixMonospace(pix)
             });
         },
@@ -9443,7 +8624,7 @@
                         try { localQr = EH.Payment.getQrDataUrl(pix); } catch (error) { EH.Logger.warn('QR local:', error); }
                     }
 
-                    const sendPix = this.contextButton('💬 Preparar no WhatsApp', 'primary', () => this.sendPixPairToWhatsApp(pix));
+                    const sendPix = this.contextButton('💬 ENVIAR PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
                     const copyPix = this.contextButton('📋 Copiar código PIX', '', () => EH.Payment.copyPixCode(pix));
                     [sendPix, copyPix].forEach(btn => { btn.disabled = !validation.valid; });
                     actions.append(sendPix, copyPix);
@@ -9464,7 +8645,7 @@
                     const extraActions = document.createElement('div');
                     extraActions.className = 'eh-context-actions eh-context-actions-secondary';
                     const copyQr = this.contextButton('🖼️ Copiar QR Code', '', () => EH.Payment.copyQrCode(pix));
-                    const sendQr = this.contextButton('🖼️ Preparar QR no WhatsApp', '', () => this.sendPixQrToWhatsApp(pix));
+                    const sendQr = this.contextButton('🖼️ Enviar QR Code', '', () => this.sendPixQrToWhatsApp(pix));
                     const txt = this.contextButton('📄 PIX em arquivo', '', () => EH.Payment.downloadPixTxt(pix));
                     const mono = this.contextButton('` Monoespaçado (opcional)', '', () => this.sendPixMonospaceToWhatsApp(pix));
                     [copyQr, sendQr, txt, mono].forEach(btn => { btn.disabled = !validation.valid; });
@@ -9478,12 +8659,14 @@
                 const msg = EH.Payment.formatSummary(summary);
                 actions.append(
                     this.contextButton('📋 Copiar confirmação', 'primary', async () => { if (!msg) return EH.Toast.warning('Resumo não encontrado.'); await EH.Clipboard.copyText(msg); EH.Toast.success('✓ Confirmação copiada'); }),
-                    this.contextButton('💬 Preparar no WhatsApp', '', async () => {
+                    this.contextButton('💬 Preparar no WhatsApp', '', () => {
                         if (!msg) return EH.Toast.warning('Resumo não encontrado.');
-                        const prepared = await this.prepareConfirmationWhatsApp(summary);
-                        if (prepared?.ok) EH.Toast.success('✓ Confirmação preparada no painel do WhatsApp');
+                        EH.WhatsAppDock?.prepareContent?.({
+                            type: 'reservation',
+                            text: msg,
+                            chatTitle: EH.WhatsAppBridge.getState().activeTitle || ''
+                        });
                     }),
-                    this.contextButton('🖼️ Ver confirmação em imagem', '', () => this.previewConfirmationImage(summary)),
                     this.contextButton('✅ Cliente confirmou → Gerar PIX', 'success', () => EH.Payment.clientConfirmed())
                 );
             } else if (page === 'passagens') {
@@ -9530,6 +8713,7 @@
             this.buttons.rotas.disabled = this.busy;
             const hasHistory = EH.History.list().length > 0;
             this.buttons.historico.disabled = !hasHistory || this.busy;
+            this.buttons.enviar.disabled = !hasHistory || this.busy;
             this.buttons.resumo.disabled = (!isPesquisa && !isReserva) || this.busy;
             this.buttons.detalhes.disabled = (!isPesquisa && !isReserva) || this.busy;
 
@@ -9639,19 +8823,16 @@
                 };
                 EH.BoardingReminders.setTicketCandidate(prepared.data);
 
-                const activeChatTitle = EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '';
-                const waPreparedResult = activeChatTitle
-                    ? EH.WhatsAppDock?.prepareContent?.({
-                        type: 'ticket',
-                        text: message,
-                        chatTitle: activeChatTitle,
-                        attachment: {
-                            dataUrl,
-                            filename: prepared.filename || 'bilhete-epass.png',
-                            mime: 'image/png'
-                        }
-                    }, { silent: true })
-                    : null;
+                const waPreparedResult = EH.WhatsAppDock?.prepareContent?.({
+                    type: 'ticket',
+                    text: message,
+                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
+                    attachment: {
+                        dataUrl,
+                        filename: prepared.filename || 'bilhete-epass.png',
+                        mime: 'image/png'
+                    }
+                }, { silent: true });
                 const waPrepared = Boolean(waPreparedResult?.ok);
 
                 this.showPreview({
@@ -9734,20 +8915,16 @@
 
                 // O conteúdo é preparado no composer integrado, mas nunca enviado
                 // automaticamente. A conversa atual fica registrada como destino.
-                const activeChatTitle = EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '';
-                const shouldPrepareAutomatically = Boolean(opts.automatic || opts.prepareWhatsApp === true);
-                const waPreparedResult = shouldPrepareAutomatically && activeChatTitle
-                    ? EH.WhatsAppDock?.prepareContent?.({
-                        type: page === 'pesquisa' ? 'schedules' : 'seats',
-                        text: message,
-                        chatTitle: activeChatTitle,
-                        attachment: {
-                            dataUrl,
-                            filename: capture.prepared.filename || `${page}-epass.png`,
-                            mime: 'image/png'
-                        }
-                    }, { silent: true })
-                    : null;
+                const waPreparedResult = EH.WhatsAppDock?.prepareContent?.({
+                    type: page === 'pesquisa' ? 'schedules' : 'seats',
+                    text: message,
+                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
+                    attachment: {
+                        dataUrl,
+                        filename: capture.prepared.filename || `${page}-epass.png`,
+                        mime: 'image/png'
+                    }
+                }, { silent: true });
                 const waPrepared = Boolean(waPreparedResult?.ok);
 
                 const shouldShowPreview = opts.showPreview === true || (opts.showPreview === 'ifFailed' && !autoCopy.copied && !waPrepared);
@@ -10036,20 +9213,10 @@
                 const send = document.createElement('button');
                 send.type = 'button';
                 send.className = 'eh-mini-btn';
-                send.textContent = 'WhatsApp';
+                send.textContent = 'Enviar';
                 send.addEventListener('click', () => {
-                    const entry = EH.History.get(meta.id);
-                    if (!entry) return EH.Toast.error('A imagem não está mais disponível no histórico.');
-                    const result = EH.WhatsAppDock?.prepareContent?.({
-                        type: entry.type === 'pesquisa' ? 'schedules' : entry.type === 'reserva' ? 'seats' : entry.type === 'bilhete' ? 'ticket' : 'message',
-                        text: entry.message || EH.Messages.get(entry.type) || '',
-                        attachment: entry.dataUrl ? {
-                            dataUrl: entry.dataUrl,
-                            filename: entry.filename || 'epass-atendimento.png',
-                            mime: 'image/png'
-                        } : null
-                    });
-                    if (result?.ok) close();
+                    close();
+                    this.showSend(meta.id);
                 });
                 const remove = document.createElement('button');
                 remove.type = 'button';
@@ -10084,6 +9251,146 @@
             closeBottom.className = 'eh-modal-btn';
             closeBottom.textContent = 'Fechar';
             actions.append(clear, closeBottom);
+            const close = () => overlay.remove();
+            closeTop.addEventListener('click', close);
+            closeBottom.addEventListener('click', close);
+            overlay.addEventListener('click', event => { if (event.target === overlay) close(); });
+            modal.append(head, content, actions);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+        },
+
+        showSend(historyId = '') {
+            document.querySelector('#eh-send-overlay')?.remove();
+            const entry = historyId ? EH.History.get(historyId) : EH.History.latest();
+            if (!entry) {
+                EH.Toast.info('Gere uma imagem antes de usar “Enviar”.');
+                return;
+            }
+
+            const overlay = document.createElement('div');
+            overlay.className = 'eh-overlay';
+            overlay.id = 'eh-send-overlay';
+            const modal = document.createElement('div');
+            modal.className = 'eh-modal';
+            modal.style.width = 'min(620px, 96vw)';
+            const head = document.createElement('div');
+            head.className = 'eh-modal-head';
+            const title = document.createElement('div');
+            title.className = 'eh-modal-title';
+            title.textContent = 'Enviar atendimento';
+            const closeTop = document.createElement('button');
+            closeTop.type = 'button';
+            closeTop.className = 'eh-modal-close';
+            closeTop.textContent = '✕';
+            head.append(title, closeTop);
+
+            const content = document.createElement('div');
+            content.className = 'eh-modal-content';
+            const summary = document.createElement('div');
+            summary.className = 'eh-help-box';
+            summary.style.marginTop = '0';
+            summary.innerHTML = `<strong>Resumo:</strong> ${entry.summary || entry.filename}`;
+
+            const phoneField = document.createElement('div');
+            phoneField.className = 'eh-field';
+            phoneField.style.marginTop = '12px';
+            const phoneLabel = document.createElement('label');
+            phoneLabel.textContent = 'Telefone do cliente (somente modo App)';
+            const phone = document.createElement('input');
+            phone.type = 'tel';
+            phone.placeholder = 'Ex.: (64) 99999-9999';
+            phoneField.append(phoneLabel, phone);
+
+            const msgField = document.createElement('div');
+            msgField.className = 'eh-field';
+            msgField.style.marginTop = '12px';
+            const msgLabel = document.createElement('label');
+            msgLabel.textContent = 'Mensagem';
+            const msg = document.createElement('textarea');
+            msg.rows = 4;
+            msg.value = entry.message || EH.Messages.get(entry.type);
+            msgField.append(msgLabel, msg);
+
+            const includeSummary = document.createElement('label');
+            includeSummary.className = 'eh-check';
+            includeSummary.style.marginTop = '10px';
+            const includeCheck = document.createElement('input');
+            includeCheck.type = 'checkbox';
+            const includeText = document.createElement('span');
+            includeText.textContent = 'Incluir o resumo do atendimento na mensagem';
+            includeSummary.append(includeCheck, includeText);
+
+            const clipboardInfo = document.createElement('div');
+            clipboardInfo.className = 'eh-help-box';
+            clipboardInfo.textContent = `Modo deste computador: ${EH.Config.WHATSAPP_MODE === 'app' ? 'WhatsApp do Windows' : 'WhatsApp Web'}. No modo Web, as conversas aparecem integradas na lateral direita do E-Pass e usam a aba já aberta do WhatsApp Web como conexão; nenhuma nova aba ou popup é aberto.`;
+
+            content.append(summary, phoneField, msgField, includeSummary, clipboardInfo);
+
+            const finalMessage = () => {
+                const base = msg.value.trim();
+                return includeCheck.checked && entry.summary
+                    ? `${base}${base ? '\n\n' : ''}${entry.summary}`
+                    : base;
+            };
+
+            const actions = document.createElement('div');
+            actions.className = 'eh-modal-actions';
+            const openWhats = document.createElement('button');
+            openWhats.type = 'button';
+            openWhats.className = 'eh-modal-btn success';
+            openWhats.textContent = '📤 Preparar no WhatsApp';
+            openWhats.addEventListener('click', async () => {
+                const webState = EH.WhatsAppBridge.getState();
+                const appFallback = EH.Config.WHATSAPP_MODE === 'app' && !webState.connected;
+                if (appFallback) {
+                    let digits = phone.value.replace(/\D/g, '');
+                    if (digits.length === 10 || digits.length === 11) digits = `55${digits}`;
+                    if (digits.length < 12) {
+                        EH.Toast.warning('Informe o telefone com DDD para usar o WhatsApp do Windows.');
+                        phone.focus();
+                        return;
+                    }
+                    this.phoneInput.value = digits.startsWith('55') ? digits.slice(2) : digits;
+                    EH.Storage.set('currentPhone', this.phoneInput.value);
+                }
+                const result = await this.openWhatsApp(finalMessage(), {
+                    imageDataUrl: entry.dataUrl,
+                    filename: entry.filename || 'epass-atendimento.png',
+                    captureType: entry.type
+                });
+                if (result?.prepared) EH.Toast.success('✓ Atendimento preparado no painel do WhatsApp');
+            });
+
+            const imageButton = document.createElement('button');
+            imageButton.type = 'button';
+            imageButton.className = 'eh-modal-btn primary';
+            imageButton.textContent = '📋 Copiar imagem';
+            imageButton.addEventListener('click', async () => {
+                const blob = EH.Clipboard.dataUrlToBlob(entry.dataUrl);
+                const result = await EH.Clipboard.copyImageAnyContext(blob);
+                if (result.copied) EH.Toast.success('✓ Imagem copiada');
+                else EH.Toast.error(result.reason || 'O navegador bloqueou a cópia do PNG. Use o composer do WhatsApp ou baixe a imagem.', 5200);
+            });
+
+            const copyMessage = document.createElement('button');
+            copyMessage.type = 'button';
+            copyMessage.className = 'eh-modal-btn';
+            copyMessage.textContent = '💬 Copiar mensagem';
+            copyMessage.addEventListener('click', async () => {
+                try {
+                    await EH.Clipboard.copyText(finalMessage());
+                    EH.Toast.success('Mensagem copiada.');
+                } catch (error) {
+                    EH.Toast.error(error.message || 'Não foi possível copiar a mensagem.');
+                }
+            });
+
+            const closeBottom = document.createElement('button');
+            closeBottom.type = 'button';
+            closeBottom.className = 'eh-modal-btn';
+            closeBottom.textContent = 'Fechar';
+            actions.append(openWhats, imageButton, copyMessage, closeBottom);
             const close = () => overlay.remove();
             closeTop.addEventListener('click', close);
             closeBottom.addEventListener('click', close);
@@ -10193,12 +9500,22 @@
             sendWhatsApp.textContent = '💬 Preparar no WhatsApp';
             sendWhatsApp.addEventListener('click', () => {
                 const result = EH.WhatsAppDock?.prepareContent?.({
-                    type: captureType === 'pesquisa' ? 'schedules' : captureType === 'reserva' ? 'seats' : captureType === 'bilhete' ? 'ticket' : captureType === 'confirmacao' ? 'reservation' : 'message',
+                    type: captureType === 'pesquisa' ? 'schedules' : captureType === 'reserva' ? 'seats' : captureType === 'bilhete' ? 'ticket' : 'message',
                     text: automaticMessage,
-                    chatTitle: EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '',
+                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
                     attachment: { dataUrl, filename: filename || 'epass.png', mime: 'image/png' }
                 });
                 if (result?.ok) close();
+            });
+
+            const send = document.createElement('button');
+            send.type = 'button';
+            send.className = 'eh-modal-btn success';
+            send.textContent = '📤 Enviar atendimento';
+            send.disabled = !historyId;
+            send.addEventListener('click', () => {
+                close();
+                this.showSend(historyId);
             });
 
             const copyText = document.createElement('button');
@@ -10226,15 +9543,6 @@
                 EH.OperationPanel.open('boarding', EH.BoardingReminders.ticketPrefill());
             });
 
-            const more = document.createElement('details');
-            more.className = 'eh-modal-more';
-            const moreSummary = document.createElement('summary');
-            moreSummary.textContent = '⋯ Mais';
-            const moreActions = document.createElement('div');
-            moreActions.className = 'eh-modal-more-actions';
-            moreActions.append(copyImage, download, copyText);
-            more.append(moreSummary, moreActions);
-
             const closeBottom = document.createElement('button');
             closeBottom.type = 'button';
             closeBottom.className = 'eh-modal-btn';
@@ -10247,7 +9555,7 @@
                 if (event.target === overlay) close();
             });
 
-            actions.append(copySummary, sendWhatsApp, reminder, more, closeBottom);
+            actions.append(copySummary, copyImage, sendWhatsApp, download, send, copyText, reminder, closeBottom);
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
@@ -10357,15 +9665,6 @@
             panelSizeSelect.value = EH.Config.PANEL_SIZE;
             panelSizeField.append(panelSizeLabel, panelSizeSelect);
 
-            const confirmationModeField = document.createElement('div');
-            confirmationModeField.className = 'eh-field';
-            const confirmationModeLabel = document.createElement('label');
-            confirmationModeLabel.textContent = 'Confirmação da viagem';
-            const confirmationModeSelect = document.createElement('select');
-            confirmationModeSelect.innerHTML = '<option value="image">Imagem + texto curto</option><option value="text">Somente texto organizado</option>';
-            confirmationModeSelect.value = EH.Config.CONFIRMATION_MODE;
-            confirmationModeField.append(confirmationModeLabel, confirmationModeSelect);
-
             const ticketWidthField = document.createElement('div');
             ticketWidthField.className = 'eh-field';
             const ticketWidthLabel = document.createElement('label');
@@ -10378,7 +9677,17 @@
             ticketWidthInput.value = String(EH.Config.TICKET_CAPTURE_WIDTH);
             ticketWidthField.append(ticketWidthLabel, ticketWidthInput);
 
-            grid.append(profileField, panelSizeField, confirmationModeField, feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField);
+            const whatsappField = document.createElement('div');
+            whatsappField.className = 'eh-field';
+            const whatsappLabel = document.createElement('label');
+            whatsappLabel.textContent = 'WhatsApp deste computador';
+            const whatsappSelect = document.createElement('select');
+            whatsappSelect.style.cssText = 'width:100%;padding:9px 10px;border:1px solid #cfd5df;border-radius:8px;background:#fff;';
+            whatsappSelect.innerHTML = '<option value="web">WhatsApp Web</option><option value="app">App do WhatsApp no Windows</option>';
+            whatsappSelect.value = EH.Config.WHATSAPP_MODE;
+            whatsappField.append(whatsappLabel, whatsappSelect);
+
+            grid.append(profileField, panelSizeField, feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField, whatsappField);
 
             const checkWrap = document.createElement('label');
             checkWrap.className = 'eh-check';
@@ -10436,7 +9745,7 @@
 
             const help = document.createElement('div');
             help.className = 'eh-help-box';
-            help.textContent = 'O perfil Automático adapta somente os painéis do helper à tela disponível; a plataforma E-Pass não é deslocada nem redimensionada. O atendimento usa o WhatsApp integrado e a conversa selecionada no painel. Zoom padrão: painel E-Pass 150% e WhatsApp 110%. As preferências ficam salvas separadamente em cada navegador.';
+            help.textContent = 'O perfil Automático adapta somente os painéis do helper à tela disponível; a plataforma E-Pass não é deslocada nem redimensionada. Zoom padrão: painel E-Pass 150% e WhatsApp 110%. As preferências ficam salvas separadamente em cada navegador.';
 
             content.append(grid, checkWrap, autoCopyWrap, autoRouteWrap, messageSection, msgHorarios, msgReserva, msgBilhete, msgResumo, msgPix, help);
 
@@ -10466,10 +9775,10 @@
                 EH.Config.WHATSAPP_DOCK_ZOOM = whatsappDockZoom;
                 EH.Config.INTERFACE_PROFILE = ['home', 'station'].includes(profileSelect.value) ? profileSelect.value : 'auto';
                 EH.Config.PANEL_SIZE = ['small', 'large'].includes(panelSizeSelect.value) ? panelSizeSelect.value : 'medium';
-                EH.Config.CONFIRMATION_MODE = confirmationModeSelect.value === 'text' ? 'text' : 'image';
                 EH.Config.APLICAR_TAXAS_ORIGEM = check.checked;
                 EH.Config.AUTO_COPY_IMAGES = autoCopyCheck.checked;
                 EH.Config.AUTO_ROUTE_CAPTURE = autoRouteCheck.checked;
+                EH.Config.WHATSAPP_MODE = whatsappSelect.value === 'app' ? 'app' : 'web';
                 EH.Messages.setAll({
                     pesquisa: messageFields.pesquisa.value.trim(),
                     reserva: messageFields.reserva.value.trim(),
@@ -10485,10 +9794,10 @@
                 EH.Storage.set('whatsappDockZoom', whatsappDockZoom);
                 EH.Storage.set('interfaceProfile', EH.Config.INTERFACE_PROFILE);
                 EH.Storage.set('panelSize', EH.Config.PANEL_SIZE);
-                EH.Storage.set('confirmationMode', EH.Config.CONFIRMATION_MODE);
                 EH.Storage.set('aplicarTaxasOrigem', check.checked);
                 EH.Storage.set('autoCopyImages', autoCopyCheck.checked);
                 EH.Storage.set('autoRouteCapture', autoRouteCheck.checked);
+                EH.Storage.set('whatsappMode', EH.Config.WHATSAPP_MODE);
                 EH.Storage.set('aplicarTaxaIpora', check.checked);
 
                 const savedScale = Number(EH.Storage.get('captureScale', 0));
@@ -10497,13 +9806,13 @@
                 const savedWaZoom = Number(EH.Storage.get('whatsappDockZoom', 0));
                 const savedProfile = String(EH.Storage.get('interfaceProfile', 'auto'));
                 const savedPanelSize = String(EH.Storage.get('panelSize', 'medium'));
-                const savedConfirmationMode = String(EH.Storage.get('confirmationMode', 'image'));
                 const savedTaxes = EH.Storage.get('taxasOrigem', null);
                 const savedAutoTax = Boolean(EH.Storage.get('aplicarTaxasOrigem', false));
                 const savedMessages = EH.Storage.get('messages', null);
+                const savedWaMode = EH.Storage.get('whatsappMode', 'web');
                 const savedAutoCopy = Boolean(EH.Storage.get('autoCopyImages', false));
                 const savedAutoRoute = Boolean(EH.Storage.get('autoRouteCapture', false));
-                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedProfile === EH.Config.INTERFACE_PROFILE && savedPanelSize === EH.Config.PANEL_SIZE && savedConfirmationMode === EH.Config.CONFIRMATION_MODE && savedAutoTax === check.checked && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
+                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedProfile === EH.Config.INTERFACE_PROFILE && savedPanelSize === EH.Config.PANEL_SIZE && savedAutoTax === check.checked && savedWaMode === EH.Config.WHATSAPP_MODE && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
 
                 if (!savedCorrectly) {
                     EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
@@ -10511,6 +9820,7 @@
                 }
 
                 EH.Layout.sync();
+                if (this.waModeButton) this.waModeButton.textContent = EH.Config.WHATSAPP_MODE === 'app' ? 'APP' : 'WEB';
                 EH.Toast.success('Configurações salvas neste navegador.');
                 close();
             });
