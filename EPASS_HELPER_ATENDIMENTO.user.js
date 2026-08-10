@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.32.0
-// @description  Atendimento integrado E-Pass + WhatsApp, composer, previsão de viagem e lembretes de embarque
+// @version      5.33.0
+// @description  Atendimento integrado E-Pass + WhatsApp, composer interno, previsão operacional e lembretes
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.32.0',
+        VERSION: '5.33.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -42,7 +42,6 @@
         HISTORY_MAX_CHARS: 45000000,
         AUTO_COPY_IMAGES: true,
         AUTO_ROUTE_CAPTURE: true,
-        WHATSAPP_MODE: 'web',
         PANEL_WIDTH: 228,
         PANEL_ZOOM: 1.5,
         PANEL_MIN_BASE: 112,
@@ -240,8 +239,6 @@
             }
             EH.Config.AUTO_COPY_IMAGES = Boolean(this.get('autoCopyImages', EH.Config.AUTO_COPY_IMAGES));
             EH.Config.AUTO_ROUTE_CAPTURE = Boolean(this.get('autoRouteCapture', EH.Config.AUTO_ROUTE_CAPTURE));
-            const waMode = String(this.get('whatsappMode', EH.Config.WHATSAPP_MODE) || 'web').toLowerCase();
-            EH.Config.WHATSAPP_MODE = ['web', 'app'].includes(waMode) ? waMode : 'web';
             EH.Config.PANEL_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('panelZoom', EH.Config.PANEL_ZOOM)) || 1.5));
             EH.Config.WHATSAPP_DOCK_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('whatsappDockZoom', EH.Config.WHATSAPP_DOCK_ZOOM)) || 1.1));
             const interfaceProfile = String(this.get('interfaceProfile', EH.Config.INTERFACE_PROFILE) || 'auto').toLowerCase();
@@ -1289,6 +1286,7 @@
         async readChatHistory(title, { limit = EH.Config.WA_HISTORY_LIMIT, scrolls = EH.Config.WA_HISTORY_SCROLLS } = {}) {
             const wanted = this.cleanText(title);
             if (!wanted) return { ok: false, chatTitle: '', messages: [], reason: 'Grupo não informado.' };
+            const previousTitle = this.collectActiveConversation(1)?.active?.title || '';
             const selected = await this.selectChatByTitle(wanted);
             if (!selected) return { ok: false, chatTitle: wanted, messages: [], reason: 'Conversa não encontrada na lista atual.' };
             await EH.Utils.sleep(500);
@@ -1314,7 +1312,18 @@
             if (scroller) {
                 try { scroller.scrollTop = scroller.scrollHeight; } catch (error) { EH.Logger.debug('Não foi possível restaurar a rolagem do WhatsApp:', error); }
             }
-            this.publishUiState(true);
+
+            // A leitura operacional de um grupo não deve roubar a conversa do cliente
+            // que estava sendo atendido no painel integrado.
+            if (
+                previousTitle &&
+                this.cleanText(previousTitle).toLocaleLowerCase('pt-BR') !== wanted.toLocaleLowerCase('pt-BR')
+            ) {
+                await this.selectChatByTitle(previousTitle);
+            } else {
+                this.publishUiState(true);
+            }
+
             return {
                 ok: Boolean(convo.active?.title && convo.messages.length),
                 chatTitle: convo.active?.title || wanted,
@@ -1397,7 +1406,17 @@
         },
 
         async selectChatByTitle(title) {
-            const row = this.findChatRowByTitle(title);
+            const wanted = this.cleanText(title);
+            if (!wanted) return false;
+
+            // Se a conversa já é a ativa, não clique novamente na lista e não
+            // provoque mudanças visuais desnecessárias na aba-motor.
+            const current = this.collectActiveConversation(1)?.active?.title || '';
+            if (current && this.cleanText(current).toLocaleLowerCase('pt-BR') === wanted.toLocaleLowerCase('pt-BR')) {
+                return true;
+            }
+
+            const row = this.findChatRowByTitle(wanted);
             if (!row) return false;
             try {
                 row.scrollIntoView({ block: 'nearest' });
@@ -1522,11 +1541,60 @@
             }
         },
 
-        findMediaSendButton() {
-            const modal = Array.from(document.querySelectorAll('[role="dialog"], [data-animate-modal-popup="true"]')).find(el => {
+        findMediaDialog() {
+            return Array.from(document.querySelectorAll('[role="dialog"], [data-animate-modal-popup="true"]')).find(el => {
                 const rect = el.getBoundingClientRect?.();
                 return rect && rect.width > 80 && rect.height > 80;
-            }) || document;
+            }) || null;
+        },
+
+        findMediaCaptionComposer() {
+            const modal = this.findMediaDialog();
+            if (!modal) return null;
+            const candidates = Array.from(modal.querySelectorAll(
+                '[contenteditable="true"][role="textbox"], [contenteditable="true"][data-tab], div[contenteditable="true"]'
+            ));
+            return candidates.find(el => {
+                const rect = el.getBoundingClientRect?.();
+                return rect && rect.width > 80 && rect.height > 15;
+            }) || null;
+        },
+
+        async insertTextIntoElement(element, message, replace = true) {
+            const value = String(message || '');
+            if (!element || !value) return false;
+            try {
+                element.focus();
+                const selection = window.getSelection?.();
+                if (selection) {
+                    const range = document.createRange();
+                    range.selectNodeContents(element);
+                    range.collapse(!replace);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                    if (replace && document.execCommand) document.execCommand('delete', false, null);
+                }
+                if (document.execCommand) {
+                    document.execCommand('insertText', false, value);
+                } else {
+                    if (replace) element.textContent = '';
+                    element.textContent = `${element.textContent || ''}${value}`;
+                    element.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertText',
+                        data: value
+                    }));
+                }
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+                return true;
+            } catch (error) {
+                EH.Logger.warn('Falha ao preencher legenda da mídia no WhatsApp:', error);
+                return false;
+            }
+        },
+
+        findMediaSendButton() {
+            const modal = this.findMediaDialog() || document;
             const icon = modal.querySelector?.('[data-icon="send"], [data-testid="send"], [data-testid="compose-btn-send"]');
             return icon?.closest?.('button') || Array.from(modal.querySelectorAll?.('button') || []).find(button => {
                 const label = `${button.getAttribute('aria-label') || ''} ${button.title || ''} ${button.textContent || ''}`;
@@ -1536,21 +1604,39 @@
 
         async sendAttachedImage(dataUrl, filename = 'epass-atendimento.png', followupMessage = '') {
             const attached = await this.attachImage(dataUrl, filename);
-            if (!attached) return { attached: false, sent: false, textSent: false };
+            if (!attached) return { attached: false, sent: false, textSent: false, captionAttached: false };
+
+            const message = String(followupMessage || '').trim();
+            let captionAttached = false;
+
+            // Primeiro tenta colocar o texto COMO LEGENDA da própria imagem.
+            // Assim imagem + mensagem saem em uma única ação pelo composer integrado.
+            if (message) {
+                const caption = await EH.Utils.waitFor(() => this.findMediaCaptionComposer(), 5000, 160);
+                if (caption) captionAttached = await this.insertTextIntoElement(caption, message, true);
+            }
+
             const sendButton = await EH.Utils.waitFor(() => this.findMediaSendButton(), 10000, 200);
-            if (!sendButton) return { attached: true, sent: false, textSent: false };
+            if (!sendButton) {
+                return { attached: true, sent: false, textSent: false, captionAttached };
+            }
+
             try {
                 sendButton.click();
                 await EH.Utils.sleep(650);
+
+                // Em versões do WhatsApp sem editor de legenda detectável, conserva o
+                // comportamento compatível: envia a imagem e depois o texto.
                 let textSent = true;
-                if (String(followupMessage || '').trim()) {
-                    textSent = await this.sendTextNow(String(followupMessage || '').trim());
+                if (message && !captionAttached) {
+                    textSent = await this.sendTextNow(message);
                 }
+
                 this.publishUiState(true);
-                return { attached: true, sent: true, textSent };
+                return { attached: true, sent: true, textSent, captionAttached };
             } catch (error) {
                 EH.Logger.warn('Não foi possível concluir o envio da imagem:', error);
-                return { attached: true, sent: false, textSent: false };
+                return { attached: true, sent: false, textSent: false, captionAttached };
             }
         },
 
@@ -1592,14 +1678,35 @@
                 return;
             }
 
-            if (phone && !pending) {
-                sessionStorage.setItem(pendingKey, command.id);
-                location.assign(`https://web.whatsapp.com/send?phone=${encodeURIComponent(phone)}`);
+            // O fluxo integrado não navega por número e não muda de URL.
+            // Comandos antigos que tragam telefone são ignorados como destino;
+            // a conversa selecionada no painel é a única fonte de verdade.
+            if (phone && !command.chatTitle) {
+                sessionStorage.setItem(doneKey, command.id);
+                sessionStorage.removeItem(pendingKey);
+                EH.Storage.set('waAck', {
+                    id: command.id,
+                    at: Date.now(),
+                    action,
+                    ok: false,
+                    reason: 'conversation-required'
+                });
                 return;
             }
 
             if (command.chatTitle) {
-                await this.selectChatByTitle(command.chatTitle);
+                const selected = await this.selectChatByTitle(command.chatTitle);
+                if (!selected) {
+                    sessionStorage.setItem(doneKey, command.id);
+                    EH.Storage.set('waAck', {
+                        id: command.id,
+                        at: Date.now(),
+                        action,
+                        ok: false,
+                        reason: 'chat-not-found'
+                    });
+                    return;
+                }
             }
 
             let ok = true;
@@ -1801,8 +1908,15 @@
 
         idFor(record) {
             const raw = [
-                record.source || 'manual', record.whatsappGroup || '', record.originKey || '', record.destinationKey || '',
-                record.departureDateTime || '', record.arrivalDateTime || '', Math.round(Number(record.durationMinutes) || 0)
+                record.source || 'manual',
+                record.whatsappGroup || '',
+                record.routeId || '',
+                record.serviceKey || '',
+                record.originKey || '',
+                record.destinationKey || '',
+                record.departureDateTime || '',
+                record.arrivalDateTime || '',
+                Math.round(Number(record.durationMinutes) || 0)
             ].join('|');
             let hash = 2166136261;
             for (let i = 0; i < raw.length; i += 1) {
@@ -1862,6 +1976,10 @@
                     if (minutes < 3 || minutes > EH.Config.TRAVEL_MAX_DURATION_MIN) continue;
                     records.push({
                         routeId: meta.routeId || meta.whatsappGroup || '',
+                        serviceKey: meta.serviceKey || '',
+                        serviceTime: meta.serviceTime || '',
+                        routeOrigin: meta.routeOrigin || '',
+                        routeDestination: meta.routeDestination || '',
                         direction: `${this.normalizePlace(ordered[i].city)}>${this.normalizePlace(ordered[j].city)}`,
                         origin: ordered[i].city,
                         destination: ordered[j].city,
@@ -1892,15 +2010,22 @@
             return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
         },
 
-        stats(origin, destination, whatsappGroup = '') {
+        stats(origin, destination, whatsappGroup = '', serviceKey = '') {
             const o = this.normalizePlace(origin);
             const d = this.normalizePlace(destination);
             const group = EH.Utils.clean(whatsappGroup);
+            const service = EH.Utils.clean(serviceKey);
             if (!o || !d) return null;
             let rows = this.load().filter(row => row.originKey === o && row.destinationKey === d);
             if (group) {
                 const exactOrGeneric = rows.filter(row => !row.whatsappGroup || row.whatsappGroup === group);
                 if (exactOrGeneric.length) rows = exactOrGeneric;
+            }
+            if (service) {
+                const exactService = rows.filter(row => EH.Utils.clean(row.serviceKey || '') === service);
+                // Só restringe ao carro/linha quando já existe base mínima; caso
+                // contrário mantém a média do mesmo trecho/grupo como fallback.
+                if (exactService.length >= 2) rows = exactService;
             }
             if (!rows.length) return null;
 
@@ -2006,7 +2131,14 @@
             if (!match) {
                 match = raw.match(/^\s*([01]?\d|2[0-3])\s*:\s*([0-5]\d)\s*h?\b/i);
             }
-            return match ? this.normalizeClock(match[1], match[2] || '00') : '';
+            if (!match) return '';
+
+            // Um horário no início só é "horário do carro/linha" quando vem
+            // acompanhado da identificação da rota. "13:50 saiu de Piranhas"
+            // continua sendo tratado como horário operacional, não serviceTime.
+            const after = raw.slice(match[0].length, match.index + match[0].length + 170);
+            const hasRouteIdentity = /[\p{L}]{2,}[\s\S]{0,70}\s(?:x|×|→|a)\s[\p{L}]{2,}/iu.test(after);
+            return hasRouteIdentity ? this.normalizeClock(match[1], match[2] || '00') : '';
         },
 
         extractExplicitDepartureTime(text) {
@@ -2014,6 +2146,7 @@
             const action = '(?:saiu|saindo|partiu|sa[ií]da)';
             const patterns = [
                 new RegExp(`${action}[\\s\\S]{0,90}?(?:\\b(?:as|às)\\b\\s*)?([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\b`, 'i'),
+                new RegExp(`^\\s*([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\s*(?:[-–—]\\s*)?${action}\\b`, 'i'),
                 new RegExp(`\\b(?:as|às)\\b\\s*([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\b`, 'i')
             ];
             for (const pattern of patterns) {
@@ -2115,9 +2248,13 @@
             const text = EH.Utils.clean(message?.text || '');
             if (!text || !this.isOperationalUpdate(text)) return null;
 
-            const routeSchedule = this.extractRouteSchedule(text);
-            const direction = this.extractDirection(text, routeSchedule);
-            const explicitTime = this.extractExplicitDepartureTime(text);
+            // Há dois relógios diferentes na operação:
+            // 1) serviceTime = horário que identifica o carro/linha (ex.: 11:00 Goiânia → Cuiabá)
+            // 2) cityDepartureTime = horário REAL em que saiu da cidade atual.
+            // O primeiro jamais é usado como passagem pela cidade.
+            const serviceTime = this.extractRouteSchedule(text);
+            const direction = this.extractDirection(text, serviceTime);
+            const explicitCityDeparture = this.extractExplicitDepartureTime(text);
             const messageTimestamp = this.extractMessageTimestamp(message);
             const departureCandidate = this.extractDepartureCandidate(text);
 
@@ -2129,23 +2266,35 @@
             }
             if (!currentCity) return null;
 
-            let actualDepartureTime = explicitTime;
-            let timeSource = explicitTime ? 'explicit_message' : '';
-            if (!actualDepartureTime && messageTimestamp && /\bsaindo\s+agora\b/i.test(text)) {
-                actualDepartureTime = messageTimestamp;
-                timeSource = 'whatsapp_timestamp';
-            } else if (!actualDepartureTime && messageTimestamp && this.isOperationalUpdate(text)) {
-                actualDepartureTime = messageTimestamp;
-                timeSource = 'whatsapp_timestamp';
-            }
-            if (!actualDepartureTime) return null;
+            let cityDepartureTime = explicitCityDeparture;
+            let timeSource = explicitCityDeparture ? 'explicit' : '';
 
-            // O horário inicial da linha (ex.: "11hrs") nunca substitui o horário
-            // operacional real. Só é utilizado como identificação da linha.
-            const date = this.dateFromMeta(message, actualDepartureTime);
+            // "saindo agora" usa o timestamp REAL da mensagem, nunca serviceTime.
+            if (!cityDepartureTime && messageTimestamp && /\b(?:saiu|saindo|partiu)\s+agora\b/i.test(text)) {
+                cityDepartureTime = messageTimestamp;
+                timeSource = 'whatsapp_timestamp';
+            } else if (!cityDepartureTime && messageTimestamp && this.isOperationalUpdate(text)) {
+                // Atualização operacional sem horário explícito: o timestamp da mensagem
+                // é uma aproximação identificada como inferida.
+                cityDepartureTime = messageTimestamp;
+                timeSource = 'whatsapp_timestamp_inferred';
+            }
+            if (!cityDepartureTime) return null;
+
+            const date = this.dateFromMeta(message, cityDepartureTime);
             if (!date) return null;
 
-            const confidence = explicitTime && citySource === 'message'
+            const routeOrigin = direction.origin || '';
+            const routeDestination = direction.destination || '';
+            const serviceKey = serviceTime && (routeOrigin || routeDestination)
+                ? [
+                    serviceTime,
+                    EH.Utils.normalize(routeOrigin || '?'),
+                    EH.Utils.normalize(routeDestination || '?')
+                ].join('|')
+                : '';
+
+            const confidence = explicitCityDeparture && citySource === 'message'
                 ? 'high'
                 : citySource === 'message'
                     ? 'medium'
@@ -2155,12 +2304,15 @@
                 city: currentCity,
                 cityKey: EH.TravelHistory.normalizePlace(currentCity),
                 currentCity,
-                routeSchedule,
+
+                // Campos novos e semanticamente explícitos.
+                serviceTime,
+                routeOrigin,
+                routeDestination,
+                serviceKey,
+                cityDepartureTime,
+
                 direction: direction.label,
-                directionOrigin: direction.origin,
-                directionDestination: direction.destination,
-                actualDepartureTime,
-                time: actualDepartureTime,
                 timeSource,
                 citySource,
                 at: date.getTime(),
@@ -2169,52 +2321,125 @@
                 sender: message?.sender || '',
                 vehicle: this.extractVehicle(text),
                 driver: this.extractDriver(text),
-                confidence
+                confidence,
+
+                // Aliases legados mantidos para compatibilidade com histórico/UI antigos.
+                routeSchedule: serviceTime,
+                directionOrigin: routeOrigin,
+                directionDestination: routeDestination,
+                actualDepartureTime: cityDepartureTime,
+                time: cityDepartureTime
             };
         },
 
-        clusterTrips(events) {
-            const sorted = [...events].sort((a, b) => a.at - b.at);
-            const trips = [];
-            let current = [];
-            const flush = () => { if (current.length >= 2) trips.push(current); current = []; };
+        enrichServiceContext(events) {
+            const sorted = [...(Array.isArray(events) ? events : [])]
+                .map(event => ({ ...event }))
+                .sort((a, b) => a.at - b.at);
+
+            // Mensagens curtas como "Saiu de Piranhas às 13:50" podem não repetir
+            // o identificador do carro. Só herdamos contexto quando há UMA única
+            // viagem identificável por perto; em caso ambíguo, não adivinhamos.
             for (const event of sorted) {
-                const prev = current[current.length - 1];
-                if (prev) {
-                    const gap = (event.at - prev.at) / 60000;
-                    const totalSpan = current.length ? (event.at - current[0].at) / 60000 : 0;
-                    const repeatedEarlier = current.slice(0, -1).some(item => item.cityKey === event.cityKey);
-                    const routeRestart = current.length >= 2 && event.cityKey === current[0].cityKey && gap > 60;
-                    const directionChanged = Boolean(
-                        prev.direction && event.direction &&
-                        EH.Utils.normalize(prev.direction) !== EH.Utils.normalize(event.direction)
-                    );
-                    const scheduleChanged = Boolean(
-                        prev.routeSchedule && event.routeSchedule &&
-                        prev.routeSchedule !== event.routeSchedule &&
-                        gap > 45
-                    );
-                    if (gap > EH.Config.TRAVEL_TRIP_GAP_MIN || gap < -5 || totalSpan > EH.Config.TRAVEL_MAX_DURATION_MIN || routeRestart || directionChanged || scheduleChanged || (repeatedEarlier && gap > 90)) flush();
-                }
-                const last = current[current.length - 1];
-                if (last && last.cityKey === event.cityKey && (event.at - last.at) <= 45 * 60000) current[current.length - 1] = event;
-                else current.push(event);
+                if (event.serviceKey) continue;
+                const candidates = sorted
+                    .filter(other => other !== event && other.serviceKey && Math.abs(other.at - event.at) <= 150 * 60000)
+                    .sort((a, b) => Math.abs(a.at - event.at) - Math.abs(b.at - event.at));
+                const uniqueKeys = [...new Set(candidates.map(item => item.serviceKey))];
+                if (uniqueKeys.length !== 1 || !candidates[0]) continue;
+                const source = candidates[0];
+                event.serviceTime = source.serviceTime || '';
+                event.routeSchedule = event.serviceTime;
+                event.routeOrigin = source.routeOrigin || '';
+                event.routeDestination = source.routeDestination || '';
+                event.directionOrigin = event.routeOrigin;
+                event.directionDestination = event.routeDestination;
+                event.direction = source.direction || '';
+                event.serviceKey = source.serviceKey;
+                event.serviceSource = 'conversation_context';
             }
-            flush();
-            return trips;
+            return sorted;
+        },
+
+        clusterTrips(events) {
+            const sorted = [...(Array.isArray(events) ? events : [])].sort((a, b) => a.at - b.at);
+            const buckets = new Map();
+
+            for (const event of sorted) {
+                const bucketKey = event.serviceKey
+                    || (event.direction ? `direction:${EH.Utils.normalize(event.direction)}` : 'unidentified');
+                if (!buckets.has(bucketKey)) buckets.set(bucketKey, []);
+                buckets.get(bucketKey).push(event);
+            }
+
+            const trips = [];
+            for (const bucket of buckets.values()) {
+                let current = [];
+                const flush = () => {
+                    if (current.length >= 2) trips.push(current);
+                    current = [];
+                };
+
+                for (const event of bucket) {
+                    const prev = current[current.length - 1];
+                    if (prev) {
+                        const gap = (event.at - prev.at) / 60000;
+                        const totalSpan = (event.at - current[0].at) / 60000;
+                        const repeatedEarlier = current.slice(0, -1).some(item => item.cityKey === event.cityKey);
+                        const routeRestart = current.length >= 2 && event.cityKey === current[0].cityKey && gap > 60;
+                        if (
+                            gap > EH.Config.TRAVEL_TRIP_GAP_MIN ||
+                            gap < -5 ||
+                            totalSpan > EH.Config.TRAVEL_MAX_DURATION_MIN ||
+                            routeRestart ||
+                            (repeatedEarlier && gap > 90)
+                        ) {
+                            flush();
+                        }
+                    }
+
+                    const last = current[current.length - 1];
+                    if (last && last.cityKey === event.cityKey && (event.at - last.at) <= 45 * 60000) {
+                        // Para uma mesma cidade, conserva a atualização operacional mais recente.
+                        current[current.length - 1] = event;
+                    } else {
+                        current.push(event);
+                    }
+                }
+                flush();
+            }
+
+            return trips.sort((a, b) => Number(a[0]?.at || 0) - Number(b[0]?.at || 0));
         },
 
         ingest(whatsappGroup, messages) {
-            const events = (Array.isArray(messages) ? messages : []).map(message => this.parseMessage(message)).filter(Boolean);
+            const parsedEvents = (Array.isArray(messages) ? messages : [])
+                .map(message => this.parseMessage(message))
+                .filter(Boolean);
+            const events = this.enrichServiceContext(parsedEvents);
             const trips = this.clusterTrips(events);
             let added = 0;
+
             for (const trip of trips) {
-                const routeLabel = trip.find(event => event.direction)?.direction || whatsappGroup;
-                added += EH.TravelHistory.addTrip(trip.map(event => ({ city: event.city, at: event.at })), {
-                    source: 'whatsapp',
-                    whatsappGroup,
-                    routeId: routeLabel || whatsappGroup
-                }).added;
+                const service = trip.find(event => event.serviceKey) || null;
+                const routeLabel = service?.direction || trip.find(event => event.direction)?.direction || whatsappGroup;
+                const serviceIdentity = service?.serviceKey || routeLabel || whatsappGroup;
+                added += EH.TravelHistory.addTrip(
+                    trip.map(event => ({
+                        city: event.city,
+                        // event.at foi construído exclusivamente com cityDepartureTime.
+                        at: event.at
+                    })),
+                    {
+                        source: 'whatsapp',
+                        whatsappGroup,
+                        routeId: [whatsappGroup, serviceIdentity].filter(Boolean).join('|'),
+                        serviceKey: service?.serviceKey || '',
+                        serviceTime: service?.serviceTime || '',
+                        routeOrigin: service?.routeOrigin || '',
+                        routeDestination: service?.routeDestination || ''
+                    }
+                ).added;
             }
             return { events, trips, added };
         }
@@ -2254,10 +2479,10 @@
             return `⚠️ Pouco histórico • ${stats.count} ${stats.count === 1 ? 'viagem' : 'viagens'}`;
         },
 
-        predict({ origin, destination, whatsappGroup = '', departureAt }) {
+        predict({ origin, destination, whatsappGroup = '', departureAt, serviceKey = '' }) {
             const start = departureAt instanceof Date ? departureAt.getTime() : Number(departureAt);
             if (!Number.isFinite(start)) return { ok: false, reason: 'Informe uma saída real para calcular a previsão.' };
-            const stats = EH.TravelHistory.stats(origin, destination, whatsappGroup);
+            const stats = EH.TravelHistory.stats(origin, destination, whatsappGroup, serviceKey);
             if (!stats) return { ok: false, reason: `Ainda não há histórico de ${origin} para ${destination}.` };
             const eta = start + stats.averageMinutes * 60000;
             const low = start + stats.lowMinutes * 60000;
@@ -2461,7 +2686,7 @@
                 service: data.service || '',
                 tickets: data.tickets.map(ticket => ({ ...ticket })),
                 chatTitle: EH.WhatsAppBridge.getState().activeTitle || EH.WhatsAppDock?.currentState?.active?.title || '',
-                phone: EH.UI?.getPhone?.() || ''
+                phone: ''
             };
             EH.OperationPanel?.refreshBadge?.();
         },
@@ -2732,7 +2957,13 @@
                         status.textContent = `${parsed.events.length} saída(s) reconhecida(s) • ${parsed.added} novo(s) tempo(s) aprendido(s)`;
                     }
                     if (!Number.isFinite(departureAt)) throw new Error(`Não encontrei uma saída recente de ${from}. Informe a saída manual.`);
-                    const prediction = EH.TravelEstimator.predict({ origin: from, destination: to, whatsappGroup: group.value, departureAt });
+                    const prediction = EH.TravelEstimator.predict({
+                        origin: from,
+                        destination: to,
+                        whatsappGroup: group.value,
+                        departureAt,
+                        serviceKey: latest?.serviceKey || ''
+                    });
                     if (!prediction.ok) throw new Error(prediction.reason);
                     this.lastPrediction = prediction;
                     result.hidden = false;
@@ -2740,7 +2971,10 @@
                     const heading = document.createElement('strong');
                     heading.textContent = `${EH.TravelHistory.displayPlace(to)} • ${EH.TravelEstimator.formatClock(prediction.eta)}`;
                     const detail = document.createElement('div');
-                    detail.textContent = `Última saída: ${from} ${EH.TravelEstimator.formatClock(prediction.departureAt)} • médio ${EH.TravelEstimator.formatDuration(prediction.stats.averageMinutes)}`;
+                    const serviceLabel = latest?.serviceTime
+                        ? `Carro ${latest.serviceTime}${latest.direction ? ` ${latest.direction}` : ''} • `
+                        : '';
+                    detail.textContent = `${serviceLabel}Última saída: ${from} ${EH.TravelEstimator.formatClock(prediction.departureAt)} • médio ${EH.TravelEstimator.formatDuration(prediction.stats.averageMinutes)}`;
                     const range = document.createElement('div');
                     range.textContent = `Faixa provável: ${EH.TravelEstimator.formatClock(prediction.low)} às ${EH.TravelEstimator.formatClock(prediction.high)}`;
                     const confidence = document.createElement('small');
@@ -3054,17 +3288,13 @@
 
             if (this.hasContent() && !replace) {
                 if (this.current?.fingerprint === next.fingerprint) {
-                    EH.WhatsAppDock?.renderPrepared?.();
                     return { ok: true, duplicate: true, item: this.current };
                 }
                 EH.Toast.warning('Já existe conteúdo preparado. Envie ou remova antes de preparar outro.');
-                EH.WhatsAppDock?.renderPrepared?.();
                 return { ok: false, blocked: true, item: this.current };
             }
 
             this.current = next;
-            EH.WhatsAppDock?.applyPreparedToInput?.();
-            EH.WhatsAppDock?.renderPrepared?.();
             if (!silent) EH.Toast.success(`✓ ${this.typeLabel(next.type)} preparado no WhatsApp`);
             return { ok: true, item: next };
         },
@@ -3315,10 +3545,21 @@
             // O botão de envio só libera quando existe uma conversa selecionada.
             if (this.composer) this.composer.disabled = !connection.connected;
             if (this.sendButton) {
-                this.sendButton.disabled = !connection.readyToSend;
-                this.sendButton.title = EH.WhatsAppComposer.hasContent()
-                    ? 'Enviar conteúdo preparado'
-                    : (this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem');
+                const prepared = EH.WhatsAppComposer.get();
+                const activeTitle = String(connection.activeTitle || this.currentState?.active?.title || '').trim();
+                const targetTitle = String(prepared?.chatTitle || '').trim();
+                const targetMismatch = Boolean(
+                    prepared &&
+                    targetTitle &&
+                    activeTitle &&
+                    EH.Utils.normalize(targetTitle) !== EH.Utils.normalize(activeTitle)
+                );
+                this.sendButton.disabled = !connection.readyToSend || targetMismatch;
+                this.sendButton.title = targetMismatch
+                    ? `Conteúdo preparado para ${targetTitle}. Volte para essa conversa ou remova.`
+                    : EH.WhatsAppComposer.hasContent()
+                        ? 'Enviar conteúdo preparado'
+                        : (this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem');
             }
             return connection;
         },
@@ -3350,12 +3591,22 @@
                     this.preparedImage.removeAttribute('src');
                 }
                 if (this.preparedText) this.preparedText.textContent = '';
-                if (this.preparedTarget) this.preparedTarget.textContent = 'Para: selecione uma conversa';
+                if (this.preparedTarget) {
+                    this.preparedTarget.textContent = 'Para: selecione uma conversa';
+                    this.preparedTarget.classList.remove('mismatch');
+                }
                 this.refreshConnection();
                 return;
             }
-            const target = item.chatTitle || this.currentState?.active?.title || EH.WhatsAppBridge.getState().activeTitle || '';
-            if (this.preparedTarget) this.preparedTarget.textContent = target ? `Para: ${target}` : 'Para: selecione uma conversa';
+            const activeTitle = String(this.currentState?.active?.title || EH.WhatsAppBridge.getState().activeTitle || '').trim();
+            const target = String(item.chatTitle || activeTitle || '').trim();
+            const mismatch = Boolean(target && activeTitle && EH.Utils.normalize(target) !== EH.Utils.normalize(activeTitle));
+            if (this.preparedTarget) {
+                this.preparedTarget.textContent = target
+                    ? (mismatch ? `Para: ${target} • conversa atual: ${activeTitle}` : `Para: ${target}`)
+                    : 'Para: selecione uma conversa';
+                this.preparedTarget.classList.toggle('mismatch', mismatch);
+            }
             if (this.preparedImage) {
                 if (item.attachment?.dataUrl) {
                     this.preparedImage.src = item.attachment.dataUrl;
@@ -3382,7 +3633,25 @@
         },
 
         prepareContent(input, options = {}) {
-            const result = EH.WhatsAppComposer.prepare(input, options);
+            const currentTitle = String(
+                this.currentState?.active?.title ||
+                EH.WhatsAppBridge.getState().activeTitle ||
+                ''
+            ).trim();
+            const requestedTitle = String(input?.chatTitle || '').trim();
+            const targetTitle = requestedTitle || currentTitle;
+
+            // Conteúdo operacional sempre pertence a uma conversa explícita.
+            // Não pedimos telefone e não tentamos abrir outra conversa/aba.
+            if (!targetTitle && options.allowUnassigned !== true) {
+                if (!options.silent) EH.Toast.warning('⚠️ Selecione uma conversa no WhatsApp.');
+                return { ok: false, reason: 'no-chat' };
+            }
+
+            const result = EH.WhatsAppComposer.prepare({
+                ...input,
+                chatTitle: targetTitle
+            }, options);
             if (result.ok) {
                 EH.State.setPanel('right', true);
                 this.applyPreparedToInput();
@@ -3570,6 +3839,12 @@
             }
 
             const target = String(item.chatTitle || activeTitle).trim();
+            if (target && activeTitle && EH.Utils.normalize(target) !== EH.Utils.normalize(activeTitle)) {
+                EH.Toast.warning(`⚠️ Conteúdo preparado para ${target}. Volte para essa conversa ou remova o conteúdo preparado.`);
+                this.renderPrepared();
+                return false;
+            }
+
             const editedText = String(this.composer?.value ?? item.text ?? '').trim();
             let command;
             if (item.attachment?.dataUrl) {
@@ -4002,6 +4277,26 @@
                     padding: 11px 14px;
                     border-top: 1px solid #e3e6ec;
                     background: rgba(255, 255, 255, .98);
+                }
+
+                .eh-modal-more {
+                    flex: 1 1 100%;
+                    border-top: 1px solid #edf0f4;
+                    padding-top: 6px;
+                }
+                .eh-modal-more > summary {
+                    cursor: pointer;
+                    list-style: none;
+                    color: #667085;
+                    font-size: 11px;
+                    font-weight: 700;
+                }
+                .eh-modal-more > summary::-webkit-details-marker { display: none; }
+                .eh-modal-more-actions {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 7px;
+                    margin-top: 7px;
                 }
 
                 .eh-modal-btn {
@@ -4794,6 +5089,7 @@
                 .eh-wa-prepared-head { min-height:27px; display:grid; grid-template-columns:auto minmax(0,1fr) 24px; align-items:center; gap:6px; padding:4px 7px; border-bottom:1px solid #edf0f1; color:#54656f; }
                 .eh-wa-prepared-head strong { font-size:8.5px; color:#111b21; }
                 .eh-wa-prepared-head span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:8px; text-align:right; }
+                .eh-wa-prepared-head span.mismatch { color:#b54708; font-weight:700; }
                 .eh-wa-prepared-remove { width:22px; height:22px; border:0; border-radius:50%; background:#eef1f2; color:#54656f; cursor:pointer; font-size:15px; line-height:1; }
                 .eh-wa-prepared-body { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:7px; padding:6px 8px; }
                 .eh-wa-prepared-image { width:46px; height:46px; object-fit:cover; border-radius:5px; border:1px solid #d8dedf; background:#fff; }
@@ -8252,11 +8548,8 @@
             const steps = document.createElement('div');
             steps.className = 'eh-steps';
 
-            // O WhatsApp agora fica integrado na lateral direita. Não há botão de abrir.
-            // Mantemos o telefone em memória apenas para fluxos que já o informaram anteriormente.
-            const phone = document.createElement('input');
-            phone.type = 'hidden';
-            phone.value = String(EH.Storage.get('currentPhone', '') || '');
+            // O WhatsApp fica integrado na lateral direita e utiliza a conversa
+            // selecionada. Não há telefone manual neste fluxo.
 
             const quickTitle = document.createElement('div');
             quickTitle.className = 'eh-dock-title';
@@ -8281,7 +8574,6 @@
             const bilhete = this.createButton('🎫', 'BILHETE', '', () => EH.Tickets.activateSelection());
             const rotas = this.createButton('🧭', 'ROTAS', '', () => this.showRoutes());
             const historico = this.createButton('🕘', 'HISTÓRICO', '', () => this.showHistory());
-            const enviar = this.createButton('📤', 'ENVIAR', '', () => this.showSend());
             const resumo = this.createButton('📋', 'RESUMO', 'eh-primary', () => this.copyCurrentSummary());
             const detalhes = this.createButton('📄', 'DETALHES', '', () => this.copyCurrentDetails());
 
@@ -8290,7 +8582,6 @@
             bilhete.id = 'eh-btn-bilhete';
             rotas.id = 'eh-btn-rotas';
             historico.id = 'eh-btn-historico';
-            enviar.id = 'eh-btn-enviar';
             resumo.id = 'eh-btn-resumo';
             detalhes.id = 'eh-btn-detalhes';
             // Ações mais usadas ficam visíveis. As demais continuam disponíveis,
@@ -8302,7 +8593,7 @@
             moreSummary.textContent = 'Mais';
             const secondaryActions = document.createElement('div');
             secondaryActions.className = 'eh-actions eh-actions-secondary';
-            secondaryActions.append(rotas, historico, enviar, detalhes);
+            secondaryActions.append(rotas, historico, detalhes);
             more.append(moreSummary, secondaryActions);
 
             const status = document.createElement('div');
@@ -8343,9 +8634,8 @@
             this.body = body;
             this.statusText = statusText;
             this.statusDot = dot;
-            this.buttons = { horarios, reserva, bilhete, rotas, historico, enviar, resumo, detalhes };
+            this.buttons = { horarios, reserva, bilhete, rotas, historico, resumo, detalhes };
             this.steps = steps;
-            this.phoneInput = phone;
             this.quickRoutes = quickRoutes;
             this.contextBox = context;
             this.renderQuickRoutes();
@@ -8410,64 +8700,32 @@
             });
         },
 
-        getPhone() {
-            return String(this.phoneInput?.value || EH.Storage.get('currentPhone', '') || '').replace(/\D/g, '');
-        },
-
-
         async openWhatsApp(message = '', options = {}) {
+            // Caminho principal único: sempre usar o painel integrado.
+            // Não abre nova guia, não navega por telefone e não exige número manual.
             const imageDataUrl = String(options.imageDataUrl || '');
             const filename = String(options.filename || 'epass-atendimento.png');
-            const forceWeb = options.bridgeOnly === true;
-            const currentWebState = EH.WhatsAppBridge.getState();
-
-            // Preserve o modo App do Windows como fallback. No modo Web, o conteúdo
-            // é sempre entregue ao composer integrado e nunca é disparado sozinho.
-            const useApp = !forceWeb && EH.Config.WHATSAPP_MODE === 'app' && !currentWebState.connected;
-            let phone = useApp ? this.getPhone() : '';
-            if (phone && !phone.startsWith('55')) phone = `55${phone}`;
-
-            if (useApp) {
-                if (imageDataUrl) {
-                    try {
-                        const blob = EH.Clipboard.dataUrlToBlob(imageDataUrl);
-                        await EH.Clipboard.copyImageAnyContext(blob, imageDataUrl);
-                    } catch (error) {
-                        EH.Logger.warn('Não foi possível preparar a imagem para o WhatsApp do Windows:', error);
-                    }
-                }
-                const encoded = encodeURIComponent(String(message || ''));
-                const appUrl = phone
-                    ? `whatsapp://send?phone=${phone}${message ? `&text=${encoded}` : ''}`
-                    : `whatsapp://send${message ? `?text=${encoded}` : ''}`;
-                const link = document.createElement('a');
-                link.href = appUrl;
-                link.style.display = 'none';
-                document.body.appendChild(link);
-                link.click();
-                link.remove();
-                return { mode: 'app', connected: true, readyToSend: true };
-            }
 
             const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: false,
+                requireConversation: true,
                 verifyStale: true,
-                context: imageDataUrl ? 'preparar-imagem' : 'preparar-mensagem'
+                context: imageDataUrl ? 'preparar-imagem-integrada' : 'preparar-mensagem-integrada'
             });
-            if (!state.connected) {
+            if (!state.readyToSend) {
                 EH.WhatsAppBridge.notifyUnavailable(state);
-                return { mode: 'web', connected: false, readyToSend: false, state };
+                return { mode: 'integrated', connected: Boolean(state.connected), readyToSend: false, state };
             }
 
             const typeMap = { pesquisa: 'schedules', reserva: 'seats', bilhete: 'ticket' };
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: options.type || typeMap[options.captureType] || 'message',
-                chatTitle: state.activeTitle || '',
+                chatTitle: state.activeTitle,
                 text: String(message || ''),
+                message2: String(options.message2 || ''),
                 attachment: imageDataUrl ? {
                     dataUrl: imageDataUrl,
                     filename,
-                    mime: 'image/png'
+                    mime: String(options.mime || 'image/png')
                 } : null
             }, {
                 replace: options.replace === true,
@@ -8475,11 +8733,10 @@
             });
 
             return {
-                mode: 'web',
+                mode: 'integrated',
                 connected: true,
-                readyToSend: Boolean(state.readyToSend),
+                readyToSend: true,
                 prepared: Boolean(prepared?.ok),
-                missingChat: !state.conversationSelected,
                 state
             };
         },
@@ -8624,7 +8881,7 @@
                         try { localQr = EH.Payment.getQrDataUrl(pix); } catch (error) { EH.Logger.warn('QR local:', error); }
                     }
 
-                    const sendPix = this.contextButton('💬 ENVIAR PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
+                    const sendPix = this.contextButton('💬 Preparar no WhatsApp', 'primary', () => this.sendPixPairToWhatsApp(pix));
                     const copyPix = this.contextButton('📋 Copiar código PIX', '', () => EH.Payment.copyPixCode(pix));
                     [sendPix, copyPix].forEach(btn => { btn.disabled = !validation.valid; });
                     actions.append(sendPix, copyPix);
@@ -8645,7 +8902,7 @@
                     const extraActions = document.createElement('div');
                     extraActions.className = 'eh-context-actions eh-context-actions-secondary';
                     const copyQr = this.contextButton('🖼️ Copiar QR Code', '', () => EH.Payment.copyQrCode(pix));
-                    const sendQr = this.contextButton('🖼️ Enviar QR Code', '', () => this.sendPixQrToWhatsApp(pix));
+                    const sendQr = this.contextButton('🖼️ Preparar QR no WhatsApp', '', () => this.sendPixQrToWhatsApp(pix));
                     const txt = this.contextButton('📄 PIX em arquivo', '', () => EH.Payment.downloadPixTxt(pix));
                     const mono = this.contextButton('` Monoespaçado (opcional)', '', () => this.sendPixMonospaceToWhatsApp(pix));
                     [copyQr, sendQr, txt, mono].forEach(btn => { btn.disabled = !validation.valid; });
@@ -8713,7 +8970,6 @@
             this.buttons.rotas.disabled = this.busy;
             const hasHistory = EH.History.list().length > 0;
             this.buttons.historico.disabled = !hasHistory || this.busy;
-            this.buttons.enviar.disabled = !hasHistory || this.busy;
             this.buttons.resumo.disabled = (!isPesquisa && !isReserva) || this.busy;
             this.buttons.detalhes.disabled = (!isPesquisa && !isReserva) || this.busy;
 
@@ -8823,16 +9079,19 @@
                 };
                 EH.BoardingReminders.setTicketCandidate(prepared.data);
 
-                const waPreparedResult = EH.WhatsAppDock?.prepareContent?.({
-                    type: 'ticket',
-                    text: message,
-                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
-                    attachment: {
-                        dataUrl,
-                        filename: prepared.filename || 'bilhete-epass.png',
-                        mime: 'image/png'
-                    }
-                }, { silent: true });
+                const activeChatTitle = EH.WhatsAppBridge.getState().activeTitle || '';
+                const waPreparedResult = activeChatTitle
+                    ? EH.WhatsAppDock?.prepareContent?.({
+                        type: 'ticket',
+                        text: message,
+                        chatTitle: activeChatTitle,
+                        attachment: {
+                            dataUrl,
+                            filename: prepared.filename || 'bilhete-epass.png',
+                            mime: 'image/png'
+                        }
+                    }, { silent: true })
+                    : null;
                 const waPrepared = Boolean(waPreparedResult?.ok);
 
                 this.showPreview({
@@ -8915,16 +9174,19 @@
 
                 // O conteúdo é preparado no composer integrado, mas nunca enviado
                 // automaticamente. A conversa atual fica registrada como destino.
-                const waPreparedResult = EH.WhatsAppDock?.prepareContent?.({
-                    type: page === 'pesquisa' ? 'schedules' : 'seats',
-                    text: message,
-                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
-                    attachment: {
-                        dataUrl,
-                        filename: capture.prepared.filename || `${page}-epass.png`,
-                        mime: 'image/png'
-                    }
-                }, { silent: true });
+                const activeChatTitle = EH.WhatsAppBridge.getState().activeTitle || '';
+                const waPreparedResult = activeChatTitle
+                    ? EH.WhatsAppDock?.prepareContent?.({
+                        type: page === 'pesquisa' ? 'schedules' : 'seats',
+                        text: message,
+                        chatTitle: activeChatTitle,
+                        attachment: {
+                            dataUrl,
+                            filename: capture.prepared.filename || `${page}-epass.png`,
+                            mime: 'image/png'
+                        }
+                    }, { silent: true })
+                    : null;
                 const waPrepared = Boolean(waPreparedResult?.ok);
 
                 const shouldShowPreview = opts.showPreview === true || (opts.showPreview === 'ifFailed' && !autoCopy.copied && !waPrepared);
@@ -9213,10 +9475,20 @@
                 const send = document.createElement('button');
                 send.type = 'button';
                 send.className = 'eh-mini-btn';
-                send.textContent = 'Enviar';
+                send.textContent = 'WhatsApp';
                 send.addEventListener('click', () => {
-                    close();
-                    this.showSend(meta.id);
+                    const entry = EH.History.get(meta.id);
+                    if (!entry) return EH.Toast.error('A imagem não está mais disponível no histórico.');
+                    const result = EH.WhatsAppDock?.prepareContent?.({
+                        type: entry.type === 'pesquisa' ? 'schedules' : entry.type === 'reserva' ? 'seats' : entry.type === 'bilhete' ? 'ticket' : 'message',
+                        text: entry.message || EH.Messages.get(entry.type) || '',
+                        attachment: entry.dataUrl ? {
+                            dataUrl: entry.dataUrl,
+                            filename: entry.filename || 'epass-atendimento.png',
+                            mime: 'image/png'
+                        } : null
+                    });
+                    if (result?.ok) close();
                 });
                 const remove = document.createElement('button');
                 remove.type = 'button';
@@ -9251,146 +9523,6 @@
             closeBottom.className = 'eh-modal-btn';
             closeBottom.textContent = 'Fechar';
             actions.append(clear, closeBottom);
-            const close = () => overlay.remove();
-            closeTop.addEventListener('click', close);
-            closeBottom.addEventListener('click', close);
-            overlay.addEventListener('click', event => { if (event.target === overlay) close(); });
-            modal.append(head, content, actions);
-            overlay.appendChild(modal);
-            document.body.appendChild(overlay);
-        },
-
-        showSend(historyId = '') {
-            document.querySelector('#eh-send-overlay')?.remove();
-            const entry = historyId ? EH.History.get(historyId) : EH.History.latest();
-            if (!entry) {
-                EH.Toast.info('Gere uma imagem antes de usar “Enviar”.');
-                return;
-            }
-
-            const overlay = document.createElement('div');
-            overlay.className = 'eh-overlay';
-            overlay.id = 'eh-send-overlay';
-            const modal = document.createElement('div');
-            modal.className = 'eh-modal';
-            modal.style.width = 'min(620px, 96vw)';
-            const head = document.createElement('div');
-            head.className = 'eh-modal-head';
-            const title = document.createElement('div');
-            title.className = 'eh-modal-title';
-            title.textContent = 'Enviar atendimento';
-            const closeTop = document.createElement('button');
-            closeTop.type = 'button';
-            closeTop.className = 'eh-modal-close';
-            closeTop.textContent = '✕';
-            head.append(title, closeTop);
-
-            const content = document.createElement('div');
-            content.className = 'eh-modal-content';
-            const summary = document.createElement('div');
-            summary.className = 'eh-help-box';
-            summary.style.marginTop = '0';
-            summary.innerHTML = `<strong>Resumo:</strong> ${entry.summary || entry.filename}`;
-
-            const phoneField = document.createElement('div');
-            phoneField.className = 'eh-field';
-            phoneField.style.marginTop = '12px';
-            const phoneLabel = document.createElement('label');
-            phoneLabel.textContent = 'Telefone do cliente (somente modo App)';
-            const phone = document.createElement('input');
-            phone.type = 'tel';
-            phone.placeholder = 'Ex.: (64) 99999-9999';
-            phoneField.append(phoneLabel, phone);
-
-            const msgField = document.createElement('div');
-            msgField.className = 'eh-field';
-            msgField.style.marginTop = '12px';
-            const msgLabel = document.createElement('label');
-            msgLabel.textContent = 'Mensagem';
-            const msg = document.createElement('textarea');
-            msg.rows = 4;
-            msg.value = entry.message || EH.Messages.get(entry.type);
-            msgField.append(msgLabel, msg);
-
-            const includeSummary = document.createElement('label');
-            includeSummary.className = 'eh-check';
-            includeSummary.style.marginTop = '10px';
-            const includeCheck = document.createElement('input');
-            includeCheck.type = 'checkbox';
-            const includeText = document.createElement('span');
-            includeText.textContent = 'Incluir o resumo do atendimento na mensagem';
-            includeSummary.append(includeCheck, includeText);
-
-            const clipboardInfo = document.createElement('div');
-            clipboardInfo.className = 'eh-help-box';
-            clipboardInfo.textContent = `Modo deste computador: ${EH.Config.WHATSAPP_MODE === 'app' ? 'WhatsApp do Windows' : 'WhatsApp Web'}. No modo Web, as conversas aparecem integradas na lateral direita do E-Pass e usam a aba já aberta do WhatsApp Web como conexão; nenhuma nova aba ou popup é aberto.`;
-
-            content.append(summary, phoneField, msgField, includeSummary, clipboardInfo);
-
-            const finalMessage = () => {
-                const base = msg.value.trim();
-                return includeCheck.checked && entry.summary
-                    ? `${base}${base ? '\n\n' : ''}${entry.summary}`
-                    : base;
-            };
-
-            const actions = document.createElement('div');
-            actions.className = 'eh-modal-actions';
-            const openWhats = document.createElement('button');
-            openWhats.type = 'button';
-            openWhats.className = 'eh-modal-btn success';
-            openWhats.textContent = '📤 Preparar no WhatsApp';
-            openWhats.addEventListener('click', async () => {
-                const webState = EH.WhatsAppBridge.getState();
-                const appFallback = EH.Config.WHATSAPP_MODE === 'app' && !webState.connected;
-                if (appFallback) {
-                    let digits = phone.value.replace(/\D/g, '');
-                    if (digits.length === 10 || digits.length === 11) digits = `55${digits}`;
-                    if (digits.length < 12) {
-                        EH.Toast.warning('Informe o telefone com DDD para usar o WhatsApp do Windows.');
-                        phone.focus();
-                        return;
-                    }
-                    this.phoneInput.value = digits.startsWith('55') ? digits.slice(2) : digits;
-                    EH.Storage.set('currentPhone', this.phoneInput.value);
-                }
-                const result = await this.openWhatsApp(finalMessage(), {
-                    imageDataUrl: entry.dataUrl,
-                    filename: entry.filename || 'epass-atendimento.png',
-                    captureType: entry.type
-                });
-                if (result?.prepared) EH.Toast.success('✓ Atendimento preparado no painel do WhatsApp');
-            });
-
-            const imageButton = document.createElement('button');
-            imageButton.type = 'button';
-            imageButton.className = 'eh-modal-btn primary';
-            imageButton.textContent = '📋 Copiar imagem';
-            imageButton.addEventListener('click', async () => {
-                const blob = EH.Clipboard.dataUrlToBlob(entry.dataUrl);
-                const result = await EH.Clipboard.copyImageAnyContext(blob);
-                if (result.copied) EH.Toast.success('✓ Imagem copiada');
-                else EH.Toast.error(result.reason || 'O navegador bloqueou a cópia do PNG. Use o composer do WhatsApp ou baixe a imagem.', 5200);
-            });
-
-            const copyMessage = document.createElement('button');
-            copyMessage.type = 'button';
-            copyMessage.className = 'eh-modal-btn';
-            copyMessage.textContent = '💬 Copiar mensagem';
-            copyMessage.addEventListener('click', async () => {
-                try {
-                    await EH.Clipboard.copyText(finalMessage());
-                    EH.Toast.success('Mensagem copiada.');
-                } catch (error) {
-                    EH.Toast.error(error.message || 'Não foi possível copiar a mensagem.');
-                }
-            });
-
-            const closeBottom = document.createElement('button');
-            closeBottom.type = 'button';
-            closeBottom.className = 'eh-modal-btn';
-            closeBottom.textContent = 'Fechar';
-            actions.append(openWhats, imageButton, copyMessage, closeBottom);
             const close = () => overlay.remove();
             closeTop.addEventListener('click', close);
             closeBottom.addEventListener('click', close);
@@ -9508,16 +9640,6 @@
                 if (result?.ok) close();
             });
 
-            const send = document.createElement('button');
-            send.type = 'button';
-            send.className = 'eh-modal-btn success';
-            send.textContent = '📤 Enviar atendimento';
-            send.disabled = !historyId;
-            send.addEventListener('click', () => {
-                close();
-                this.showSend(historyId);
-            });
-
             const copyText = document.createElement('button');
             copyText.type = 'button';
             copyText.className = 'eh-modal-btn';
@@ -9543,6 +9665,15 @@
                 EH.OperationPanel.open('boarding', EH.BoardingReminders.ticketPrefill());
             });
 
+            const more = document.createElement('details');
+            more.className = 'eh-modal-more';
+            const moreSummary = document.createElement('summary');
+            moreSummary.textContent = '⋯ Mais';
+            const moreActions = document.createElement('div');
+            moreActions.className = 'eh-modal-more-actions';
+            moreActions.append(copyImage, download, copyText);
+            more.append(moreSummary, moreActions);
+
             const closeBottom = document.createElement('button');
             closeBottom.type = 'button';
             closeBottom.className = 'eh-modal-btn';
@@ -9555,7 +9686,7 @@
                 if (event.target === overlay) close();
             });
 
-            actions.append(copySummary, copyImage, sendWhatsApp, download, send, copyText, reminder, closeBottom);
+            actions.append(copySummary, sendWhatsApp, reminder, more, closeBottom);
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
@@ -9677,17 +9808,7 @@
             ticketWidthInput.value = String(EH.Config.TICKET_CAPTURE_WIDTH);
             ticketWidthField.append(ticketWidthLabel, ticketWidthInput);
 
-            const whatsappField = document.createElement('div');
-            whatsappField.className = 'eh-field';
-            const whatsappLabel = document.createElement('label');
-            whatsappLabel.textContent = 'WhatsApp deste computador';
-            const whatsappSelect = document.createElement('select');
-            whatsappSelect.style.cssText = 'width:100%;padding:9px 10px;border:1px solid #cfd5df;border-radius:8px;background:#fff;';
-            whatsappSelect.innerHTML = '<option value="web">WhatsApp Web</option><option value="app">App do WhatsApp no Windows</option>';
-            whatsappSelect.value = EH.Config.WHATSAPP_MODE;
-            whatsappField.append(whatsappLabel, whatsappSelect);
-
-            grid.append(profileField, panelSizeField, feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField, whatsappField);
+            grid.append(profileField, panelSizeField, feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField);
 
             const checkWrap = document.createElement('label');
             checkWrap.className = 'eh-check';
@@ -9745,7 +9866,7 @@
 
             const help = document.createElement('div');
             help.className = 'eh-help-box';
-            help.textContent = 'O perfil Automático adapta somente os painéis do helper à tela disponível; a plataforma E-Pass não é deslocada nem redimensionada. Zoom padrão: painel E-Pass 150% e WhatsApp 110%. As preferências ficam salvas separadamente em cada navegador.';
+            help.textContent = 'O perfil Automático adapta somente os painéis do helper à tela disponível; a plataforma E-Pass não é deslocada nem redimensionada. O atendimento usa o WhatsApp integrado e a conversa selecionada no painel. Zoom padrão: painel E-Pass 150% e WhatsApp 110%. As preferências ficam salvas separadamente em cada navegador.';
 
             content.append(grid, checkWrap, autoCopyWrap, autoRouteWrap, messageSection, msgHorarios, msgReserva, msgBilhete, msgResumo, msgPix, help);
 
@@ -9778,7 +9899,6 @@
                 EH.Config.APLICAR_TAXAS_ORIGEM = check.checked;
                 EH.Config.AUTO_COPY_IMAGES = autoCopyCheck.checked;
                 EH.Config.AUTO_ROUTE_CAPTURE = autoRouteCheck.checked;
-                EH.Config.WHATSAPP_MODE = whatsappSelect.value === 'app' ? 'app' : 'web';
                 EH.Messages.setAll({
                     pesquisa: messageFields.pesquisa.value.trim(),
                     reserva: messageFields.reserva.value.trim(),
@@ -9797,7 +9917,6 @@
                 EH.Storage.set('aplicarTaxasOrigem', check.checked);
                 EH.Storage.set('autoCopyImages', autoCopyCheck.checked);
                 EH.Storage.set('autoRouteCapture', autoRouteCheck.checked);
-                EH.Storage.set('whatsappMode', EH.Config.WHATSAPP_MODE);
                 EH.Storage.set('aplicarTaxaIpora', check.checked);
 
                 const savedScale = Number(EH.Storage.get('captureScale', 0));
@@ -9809,10 +9928,9 @@
                 const savedTaxes = EH.Storage.get('taxasOrigem', null);
                 const savedAutoTax = Boolean(EH.Storage.get('aplicarTaxasOrigem', false));
                 const savedMessages = EH.Storage.get('messages', null);
-                const savedWaMode = EH.Storage.get('whatsappMode', 'web');
                 const savedAutoCopy = Boolean(EH.Storage.get('autoCopyImages', false));
                 const savedAutoRoute = Boolean(EH.Storage.get('autoRouteCapture', false));
-                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedProfile === EH.Config.INTERFACE_PROFILE && savedPanelSize === EH.Config.PANEL_SIZE && savedAutoTax === check.checked && savedWaMode === EH.Config.WHATSAPP_MODE && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
+                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedProfile === EH.Config.INTERFACE_PROFILE && savedPanelSize === EH.Config.PANEL_SIZE && savedAutoTax === check.checked && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
 
                 if (!savedCorrectly) {
                     EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
@@ -9820,7 +9938,6 @@
                 }
 
                 EH.Layout.sync();
-                if (this.waModeButton) this.waModeButton.textContent = EH.Config.WHATSAPP_MODE === 'app' ? 'APP' : 'WEB';
                 EH.Toast.success('Configurações salvas neste navegador.');
                 close();
             });
