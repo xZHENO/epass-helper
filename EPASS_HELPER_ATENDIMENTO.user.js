@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.35.0
-// @description  Atendimento integrado E-Pass + WhatsApp, quebras de linha preservadas, PIX com QR original e operação de viagem
+// @version      5.36.0
+// @description  Atendimento integrado E-Pass + WhatsApp, fluxo PIX em 3 envios sequenciais com QR original
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.35.0',
+        VERSION: '5.36.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -1154,7 +1154,17 @@
             return EH.Storage.get('waUiState', null) || { chats: [], active: null, messages: [], connection: null, at: 0 };
         },
 
-        makeCommand({ action = 'prepare', phone = '', chatTitle = '', message = '', message2 = '', imageDataUrl = '', filename = '', target = 'web' } = {}) {
+        makeCommand({
+            action = 'prepare',
+            phone = '',
+            chatTitle = '',
+            message = '',
+            message2 = '',
+            imageDataUrl = '',
+            filename = '',
+            target = 'web',
+            pixStartAt = 'instruction'
+        } = {}) {
             return {
                 id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
                 createdAt: Date.now(),
@@ -1166,7 +1176,10 @@
                 // message2 é mantida crua: no fluxo PIX ela contém pixOriginal e não pode ser alterada.
                 message2: EH.WhatsAppText.raw(message2),
                 imageDataUrl: String(imageDataUrl || ''),
-                filename: String(filename || 'epass-atendimento.png')
+                filename: String(filename || 'epass-atendimento.png'),
+                pixStartAt: ['instruction', 'payload', 'qr'].includes(String(pixStartAt || ''))
+                    ? String(pixStartAt)
+                    : 'instruction'
             };
         },
 
@@ -1772,6 +1785,241 @@
             }
         },
 
+        // ========================================================
+        // PIX — fila exclusiva e sequencial
+        // 1) instrução com 3 linhas; 2) pixOriginal cru; 3) QR sem legenda.
+        // ========================================================
+        pixEditableMatches(actual, expected, raw = false) {
+            const left = String(actual == null ? '' : actual).replace(/\r\n?/g, '\n');
+            const right = String(expected == null ? '' : expected).replace(/\r\n?/g, '\n');
+            return raw
+                ? left === right
+                : EH.WhatsAppText.normalize(left) === EH.WhatsAppText.normalize(right);
+        },
+
+        pixHistoryComparable(value, raw = false) {
+            const base = raw
+                ? String(value == null ? '' : value).replace(/\r\n?/g, '\n').trim()
+                : EH.WhatsAppText.normalize(value);
+            if (raw) return base;
+            // O histórico renderizado pode omitir os marcadores visuais de Markdown.
+            // A comparação mantém as quebras de linha e remove apenas os marcadores.
+            return base
+                .replace(/\\([*_~`])/g, '$1')
+                .replace(/[*_~`]/g, '');
+        },
+
+        outgoingMessageSnapshot(limit = 80) {
+            const messages = this.collectActiveConversation(limit)?.messages || [];
+            return new Set(
+                messages
+                    .filter(item => item.direction === 'out')
+                    .map(item => `${item.id || ''}|${String(item.text || '')}`)
+            );
+        },
+
+        async waitForOutgoingText(expected, beforeSnapshot, { raw = false, timeout = 9000 } = {}) {
+            const wanted = this.pixHistoryComparable(expected, raw);
+            const started = Date.now();
+            while (Date.now() - started < timeout) {
+                const messages = this.collectActiveConversation(90)?.messages || [];
+                for (let index = messages.length - 1; index >= 0; index -= 1) {
+                    const item = messages[index];
+                    if (item.direction !== 'out') continue;
+                    const key = `${item.id || ''}|${String(item.text || '')}`;
+                    if (beforeSnapshot?.has(key)) continue;
+                    if (this.pixHistoryComparable(item.text || '', raw) === wanted) {
+                        return { ok: true, method: 'history', message: item };
+                    }
+                }
+                await EH.Utils.sleep(180);
+            }
+            return { ok: false, method: 'history-timeout' };
+        },
+
+        async writePixTextToEditable(element, message, { raw = false } = {}) {
+            const value = raw ? EH.WhatsAppText.raw(message) : EH.WhatsAppText.normalize(message);
+            if (!element || !value) return false;
+
+            try {
+                element.focus();
+
+                if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+                    const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(element, value);
+                    else element.value = value;
+                    this.dispatchTextInput(element, value, 'insertText');
+                    return this.pixEditableMatches(element.value, value, raw);
+                }
+
+                // O PIX não usa o caminho genérico de paste/execCommand.
+                // O DOM do editor recebe texto puro e <br> apenas como estrutura visual.
+                this.clearEditable(element);
+                element.replaceChildren();
+
+                const fragment = document.createDocumentFragment();
+                const lines = value.split('\n');
+                lines.forEach((line, index) => {
+                    fragment.appendChild(document.createTextNode(line));
+                    if (index < lines.length - 1) fragment.appendChild(document.createElement('br'));
+                });
+                element.appendChild(fragment);
+
+                const selection = window.getSelection?.();
+                if (selection) {
+                    const range = document.createRange();
+                    range.selectNodeContents(element);
+                    range.collapse(false);
+                    selection.removeAllRanges();
+                    selection.addRange(range);
+                }
+
+                try {
+                    element.dispatchEvent(new InputEvent('input', {
+                        bubbles: true,
+                        inputType: 'insertFromPaste',
+                        data: value
+                    }));
+                } catch (error) {
+                    element.dispatchEvent(new Event('input', { bubbles: true }));
+                }
+                element.dispatchEvent(new Event('change', { bubbles: true }));
+                await EH.Utils.sleep(80);
+
+                const actual = this.editableText(element);
+                if (!this.pixEditableMatches(actual, value, raw)) {
+                    EH.Logger.warn('[PIX] O editor alterou o texto antes do envio.', {
+                        expected: JSON.stringify(value),
+                        actual: JSON.stringify(actual)
+                    });
+                    return false;
+                }
+                return true;
+            } catch (error) {
+                EH.Logger.warn('[PIX] Falha ao preencher o editor do WhatsApp:', error);
+                return false;
+            }
+        },
+
+        async sendPixTextStep(message, { raw = false, stage = 'text' } = {}) {
+            const value = raw ? EH.WhatsAppText.raw(message) : EH.WhatsAppText.normalize(message);
+            if (!value) return { ok: false, stage, reason: 'empty-text' };
+
+            if (EH.Config.DEBUG) EH.Logger.info(`[PIX][${stage}] gerado:`, JSON.stringify(value));
+
+            const before = this.outgoingMessageSnapshot(90);
+            const composer = await this.waitForComposer(12000);
+            if (!composer) return { ok: false, stage, reason: 'composer-not-found' };
+
+            const inserted = await this.writePixTextToEditable(composer, value, { raw });
+            if (!inserted) return { ok: false, stage, reason: 'editor-did-not-preserve-text' };
+
+            if (EH.Config.DEBUG) EH.Logger.info(`[PIX][${stage}] editor:`, JSON.stringify(this.editableText(composer)));
+
+            const sendIcon = document.querySelector('[data-icon="send"], [data-testid="send"]');
+            const button = sendIcon?.closest('button')
+                || document.querySelector('button[aria-label="Enviar" i], button[aria-label="Send" i], [data-testid="compose-btn-send"]');
+
+            try {
+                if (button) {
+                    button.click();
+                } else {
+                    composer.dispatchEvent(new KeyboardEvent('keydown', {
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                        bubbles: true, cancelable: true
+                    }));
+                    composer.dispatchEvent(new KeyboardEvent('keyup', {
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13,
+                        bubbles: true, cancelable: true
+                    }));
+                }
+            } catch (error) {
+                return { ok: false, stage, reason: 'send-trigger-failed' };
+            }
+
+            const confirmed = await this.waitForOutgoingText(value, before, { raw, timeout: 9000 });
+            if (!confirmed.ok) {
+                EH.Logger.warn(`[PIX][${stage}] O histórico não confirmou a mensagem enviada.`);
+                return { ok: false, stage, reason: 'history-not-confirmed' };
+            }
+
+            this.publishUiState(true);
+            return { ok: true, stage, confirmedBy: confirmed.method };
+        },
+
+        async sendPixQrStep(dataUrl, filename = 'PIX-QR-CODE.png') {
+            if (!dataUrl) return { ok: false, stage: 'qr', reason: 'qr-missing' };
+            const result = await this.sendAttachedImage(dataUrl, filename, '');
+            if (!result?.attached || !result?.sent) {
+                return {
+                    ok: false,
+                    stage: 'qr',
+                    reason: result?.attached ? 'qr-send-failed' : 'qr-attach-failed'
+                };
+            }
+            const closed = await EH.Utils.waitFor(() => !this.findMediaDialog(), 6500, 180);
+            if (!closed) return { ok: false, stage: 'qr', reason: 'media-dialog-still-open' };
+            this.publishUiState(true);
+            return { ok: true, stage: 'qr', confirmedBy: 'media-dialog-closed' };
+        },
+
+        async sendPixQueue(command) {
+            const startAt = ['instruction', 'payload', 'qr'].includes(command.pixStartAt)
+                ? command.pixStartAt
+                : 'instruction';
+            const order = ['instruction', 'payload', 'qr'];
+            const startIndex = order.indexOf(startAt);
+            const stages = {
+                instruction: startIndex > 0 ? 'already-sent' : 'pending',
+                payload: startIndex > 1 ? 'already-sent' : 'pending',
+                qr: 'pending'
+            };
+
+            if (startIndex <= 0) {
+                const step = await this.sendPixTextStep(command.message || '', {
+                    raw: false,
+                    stage: 'instruction'
+                });
+                stages.instruction = step.ok ? 'sent' : 'failed';
+                if (!step.ok) return {
+                    ok: false,
+                    failedStage: 'instruction',
+                    reason: step.reason || 'instruction-failed',
+                    stages
+                };
+            }
+
+            if (startIndex <= 1) {
+                const step = await this.sendPixTextStep(command.message2 || '', {
+                    raw: true,
+                    stage: 'payload'
+                });
+                stages.payload = step.ok ? 'sent' : 'failed';
+                if (!step.ok) return {
+                    ok: false,
+                    failedStage: 'payload',
+                    reason: step.reason || 'payload-failed',
+                    stages
+                };
+            }
+
+            const step = await this.sendPixQrStep(
+                command.imageDataUrl || '',
+                command.filename || 'PIX-QR-CODE.png'
+            );
+            stages.qr = step.ok ? 'sent' : 'failed';
+            if (!step.ok) return {
+                ok: false,
+                failedStage: 'qr',
+                reason: step.reason || 'qr-failed',
+                stages
+            };
+
+            return { ok: true, failedStage: '', reason: '', stages };
+        },
+
+
         async handleCommand(command) {
             if (!command?.id || !command.createdAt) return;
             if ((Date.now() - Number(command.createdAt)) > this.COMMAND_TTL) return;
@@ -1846,6 +2094,9 @@
             let imageSent = false;
             let textSent = true;
             let captionAttached = false;
+            let pixStages = null;
+            let failedStage = '';
+            let failureReason = '';
             if (action === 'send_text') {
                 ok = await this.sendTextNow(command.message || '');
             } else if (action === 'send_pair') {
@@ -1855,8 +2106,18 @@
                     // PIX Copia e Cola: enviar exatamente o payload original, sem normalização.
                     ok = await this.sendTextNow(command.message2 || '', { raw: true });
                 }
+            } else if (action === 'send_pix_queue') {
+                // PIX: três itens independentes, na ordem e com confirmação entre etapas.
+                const queueResult = await this.sendPixQueue(command);
+                ok = Boolean(queueResult.ok);
+                pixStages = queueResult.stages || null;
+                failedStage = queueResult.failedStage || '';
+                failureReason = queueResult.reason || '';
+                imageAttached = pixStages?.qr === 'sent';
+                imageSent = pixStages?.qr === 'sent';
+                textSent = pixStages?.instruction !== 'failed' && pixStages?.payload !== 'failed';
             } else if (action === 'send_bundle') {
-                // Uma única confirmação do atendente envia a sequência: instrução -> payload -> QR.
+                // Compatibilidade com conteúdo antigo salvo; o PIX novo não usa este caminho.
                 ok = await this.sendTextNow(command.message || '');
                 if (ok && command.message2) {
                     await EH.Utils.sleep(260);
@@ -1905,6 +2166,9 @@
                 imageSent,
                 textSent,
                 captionAttached,
+                pixStages,
+                failedStage,
+                failureReason,
                 ok
             });
             this.publishUiState(true);
@@ -3441,6 +3705,8 @@
                 text: EH.WhatsAppText.normalize(input.text),
                 message2: String(input.message2 || ''),
                 attachment,
+                // Exclusivo do PIX: retoma a etapa que falhou sem duplicar as anteriores.
+                pixRetryStage: String(input.pixRetryStage || ''),
                 createdAt: Date.now()
             };
             next.fingerprint = this.fingerprint(next);
@@ -3704,7 +3970,35 @@
                                 if (this.pendingImage) this.clearPendingImage();
                                 if (this.composer) this.composer.value = '';
                             }
-                            EH.Toast.success('✓ Enviado pelo WhatsApp');
+                            EH.Toast.success(ack.action === 'send_pix_queue' ? '✓ PIX enviado' : '✓ Enviado pelo WhatsApp');
+                        } else if (ack.action === 'send_pix_queue') {
+                            const current = (
+                                this.pendingPreparedId &&
+                                EH.WhatsAppComposer.current?.id === this.pendingPreparedId
+                            ) ? EH.WhatsAppComposer.current : null;
+
+                            if (ack.failedStage === 'qr') {
+                                if (current) {
+                                    current.pixRetryStage = 'qr';
+                                    current.fingerprint = EH.WhatsAppComposer.fingerprint(current);
+                                    EH.WhatsAppDock?.renderPrepared?.();
+                                }
+                                EH.Toast.warning('⚠️ Código enviado, mas houve falha ao enviar o QR Code. Pressione Enviar para reenviar somente o QR.');
+                            } else if (ack.failedStage === 'payload') {
+                                if (current) {
+                                    current.pixRetryStage = 'payload';
+                                    current.fingerprint = EH.WhatsAppComposer.fingerprint(current);
+                                    EH.WhatsAppDock?.renderPrepared?.();
+                                }
+                                EH.Toast.warning('⚠️ A instrução foi enviada, mas o código PIX não foi confirmado. Pressione Enviar para retomar do código.');
+                            } else {
+                                if (current) {
+                                    current.pixRetryStage = 'instruction';
+                                    current.fingerprint = EH.WhatsAppComposer.fingerprint(current);
+                                    EH.WhatsAppDock?.renderPrepared?.();
+                                }
+                                EH.Toast.error('Não foi possível confirmar a primeira mensagem do PIX. Nada seguinte foi enviado.');
+                            }
                         } else if (ack.imageAttached && !ack.imageSent) {
                             EH.Toast.warning('A imagem foi anexada, mas o WhatsApp não confirmou o envio.');
                         } else if (ack.imageSent && ack.textSent === false) {
@@ -3829,9 +4123,28 @@
             }
             if (this.preparedText) {
                 const typeLabel = EH.WhatsAppComposer.typeLabel(item.type);
-                const preview = String(item.text || item.message2 || '').trim();
-                const second = item.message2 ? ' • 2 mensagens' : '';
-                this.preparedText.textContent = `${typeLabel}${second}${preview ? `\n${preview}` : ''}`;
+                if (item.type === 'pix' && item.message2 && item.attachment?.dataUrl) {
+                    const retryLabel = item.pixRetryStage === 'payload'
+                        ? 'Código PIX'
+                        : item.pixRetryStage === 'qr'
+                            ? 'QR Code'
+                            : item.pixRetryStage === 'instruction'
+                                ? 'Instrução'
+                                : '';
+                    const lines = [
+                        'PIX • 3 itens',
+                        '1. Instrução',
+                        '2. Código PIX',
+                        '3. QR Code'
+                    ];
+                    if (retryLabel) lines.push(`Retomar em: ${retryLabel}`);
+                    lines.push('', String(item.text || '').trim());
+                    this.preparedText.textContent = lines.join('\n');
+                } else {
+                    const preview = String(item.text || item.message2 || '').trim();
+                    const second = item.message2 ? ' • 2 mensagens' : '';
+                    this.preparedText.textContent = `${typeLabel}${second}${preview ? `\n${preview}` : ''}`;
+                }
             }
             this.refreshConnection();
         },
@@ -4057,7 +4370,23 @@
 
             const editedText = EH.WhatsAppText.normalize(this.composer?.value ?? item.text ?? '');
             let command;
-            if (item.attachment?.dataUrl && item.message2) {
+            if (item.type === 'pix' && item.message2 && item.attachment?.dataUrl) {
+                if (this.pendingCommandId) {
+                    EH.Toast.info('Enviando PIX… aguarde a conclusão.');
+                    return false;
+                }
+                command = EH.WhatsAppBridge.makeCommand({
+                    action: 'send_pix_queue',
+                    chatTitle: target,
+                    // A fila PIX usa a instrução original preparada, não o campo editado,
+                    // evitando qualquer normalização acidental antes do envio.
+                    message: item.text,
+                    message2: item.message2,
+                    imageDataUrl: item.attachment.dataUrl,
+                    filename: item.attachment.filename || 'PIX-QR-CODE.png',
+                    pixStartAt: item.pixRetryStage || 'instruction'
+                });
+            } else if (item.attachment?.dataUrl && item.message2) {
                 command = EH.WhatsAppBridge.makeCommand({
                     action: 'send_bundle',
                     chatTitle: target,
@@ -4094,7 +4423,9 @@
             this.pendingCommandId = command.id;
             this.pendingPreparedId = item.id;
             EH.WhatsAppBridge.send(command);
-            EH.Toast.info(`Enviando ${EH.WhatsAppComposer.typeLabel(item.type).toLowerCase()}…`);
+            EH.Toast.info(item.type === 'pix'
+                ? 'Enviando PIX…'
+                : `Enviando ${EH.WhatsAppComposer.typeLabel(item.type).toLowerCase()}…`);
             return true;
         },
 
@@ -8716,7 +9047,11 @@
             if (!pixOriginal) return null;
             const value = this.clean(EH.Utils.first(EH.Selectors.PIX_VALOR)?.textContent || modal.querySelector('.pixValor strong')?.textContent || '');
             const expires = this.clean(EH.Utils.first(EH.Selectors.PIX_EXPIRA)?.textContent || modal.querySelector('.pixExpiraEm strong')?.textContent || '');
-            const qrElement = EH.Utils.first(EH.Selectors.PIX_QR) || modal.querySelector('.qrCodeImg');
+            const qrRoot = EH.Utils.first(EH.Selectors.PIX_QR) || modal.querySelector('.qrCodeImg');
+            const qrElement = (
+                qrRoot instanceof HTMLImageElement ||
+                qrRoot instanceof HTMLCanvasElement
+            ) ? qrRoot : (qrRoot?.querySelector?.('img, canvas') || qrRoot);
             let qrSource = '';
             if (qrElement) {
                 qrSource = String(qrElement.currentSrc || qrElement.src || qrElement.getAttribute?.('src') || '');
@@ -8824,7 +9159,11 @@
 
             // Segunda tentativa: capturar o elemento que ainda está renderizado na cobrança.
             try {
-                const element = EH.Utils.first(EH.Selectors.PIX_QR);
+                const root = EH.Utils.first(EH.Selectors.PIX_QR);
+                const element = (
+                    root instanceof HTMLCanvasElement ||
+                    root instanceof HTMLImageElement
+                ) ? root : (root?.querySelector?.('canvas, img') || root);
                 if (element instanceof HTMLCanvasElement) {
                     const dataUrl = element.toDataURL('image/png');
                     return { dataUrl, mime: 'image/png', original: true, source: 'epass-canvas' };
@@ -9322,17 +9661,29 @@
                 EH.Logger.warn('Não foi possível preparar o QR Code do PIX:', error);
             }
 
+            if (!qrAttachment?.dataUrl) {
+                EH.Toast.error('Não foi possível preparar o QR Code do PIX.');
+                return null;
+            }
+
+            const instruction = EH.Payment.formatPixInstruction(pix);
+            if (EH.Config.DEBUG) {
+                EH.Logger.info('[PIX][A] instrução:', JSON.stringify(instruction));
+                EH.Logger.info('[PIX][A] payload:', JSON.stringify(payload));
+                EH.Logger.info('[PIX][A] QR:', qrAttachment.original ? 'original E-Pass' : 'fallback validado');
+            }
+
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: 'pix',
                 chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
-                text: EH.Payment.formatPixInstruction(pix),
-                // A segunda mensagem contém SOMENTE o payload original.
+                // Fila: 1) instrução; 2) pixOriginal cru; 3) QR sozinho.
+                text: instruction,
                 message2: payload,
-                // Terceiro item: QR original do E-Pass quando disponível.
-                attachment: qrAttachment
+                attachment: qrAttachment,
+                pixRetryStage: ''
             });
             if (prepared?.ok) {
-                EH.Toast.info('PIX preparado no painel. Confira e pressione Enviar.');
+                EH.Toast.info('PIX preparado: instrução → código → QR. Confira e pressione Enviar.');
             }
             return prepared;
         },
@@ -9443,7 +9794,7 @@
                         try { localQr = EH.Payment.getQrDataUrl(pix); } catch (error) { EH.Logger.warn('QR local:', error); }
                     }
 
-                    const sendPix = this.contextButton('💬 Preparar no WhatsApp', 'primary', () => this.sendPixPairToWhatsApp(pix));
+                    const sendPix = this.contextButton('💬 Enviar PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
                     const copyPix = this.contextButton('📋 Copiar código PIX', '', () => EH.Payment.copyPixCode(pix));
                     [sendPix, copyPix].forEach(btn => { btn.disabled = !validation.valid; });
                     actions.append(sendPix, copyPix);
