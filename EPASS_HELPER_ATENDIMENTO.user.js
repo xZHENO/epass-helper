@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.34.0
-// @description  Atendimento integrado E-Pass + WhatsApp, composer unificado, confirmação organizada e operação de viagem
+// @version      5.35.0
+// @description  Atendimento integrado E-Pass + WhatsApp, quebras de linha preservadas, PIX com QR original e operação de viagem
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.34.0',
+        VERSION: '5.35.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -863,6 +863,39 @@
     };
 
     // ============================================================
+    // TEXTO DO WHATSAPP — fonte central de normalização
+    // Preserva quebras reais de linha e Markdown simples do WhatsApp.
+    // Nunca deve ser usado para alterar o payload financeiro PIX.
+    // ============================================================
+    EH.WhatsAppText = {
+        normalize(value) {
+            let text = String(value == null ? '' : value)
+                .replace(/\r\n?/g, '\n')
+                // Corrige strings antigas que chegaram com \n literal entre blocos.
+                .replace(/\\n/g, '\n')
+                // O sistema usa Markdown simples do WhatsApp; não escapar asteriscos.
+                .replace(/\\\*/g, '*');
+
+            const lines = text.split('\n').map(line => line.replace(/[ \t]+$/g, ''));
+            while (lines.length && !lines[0].trim()) lines.shift();
+            while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+            return lines.join('\n');
+        },
+
+        raw(value) {
+            // Usado para conteúdos que precisam permanecer byte-a-byte iguais, como pixOriginal.
+            return String(value == null ? '' : value);
+        },
+
+        comparable(value) {
+            return this.normalize(value)
+                .replace(/\u00a0/g, ' ')
+                .replace(/\u200b|\u200c|\u200d|\ufeff/g, '')
+                .replace(/[ \t]+$/gm, '');
+        }
+    };
+
+    // ============================================================
     // PONTE COM WHATSAPP WEB
     // O mesmo userscript roda no E-Pass e no WhatsApp Web. A comunicação
     // entre as abas usa o armazenamento compartilhado do Tampermonkey.
@@ -1129,8 +1162,9 @@
                 target,
                 phone: String(phone || '').replace(/\D/g, ''),
                 chatTitle: String(chatTitle || '').trim(),
-                message: String(message || ''),
-                message2: String(message2 || ''),
+                message: EH.WhatsAppText.normalize(message),
+                // message2 é mantida crua: no fluxo PIX ela contém pixOriginal e não pode ser alterada.
+                message2: EH.WhatsAppText.raw(message2),
                 imageDataUrl: String(imageDataUrl || ''),
                 filename: String(filename || 'epass-atendimento.png')
             };
@@ -1443,44 +1477,123 @@
             }, timeout, 250);
         },
 
-        writeTextToEditable(element, message, replace = true) {
-            const value = String(message == null ? '' : message).replace(/\r\n?/g, '\n');
+        editableText(element) {
+            if (!element) return '';
+            if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+                return String(element.value || '').replace(/\r\n?/g, '\n');
+            }
+            return String(element.innerText || element.textContent || '').replace(/\r\n?/g, '\n');
+        },
+
+        dispatchTextInput(element, value, inputType = 'insertText') {
+            try {
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType,
+                    data: inputType === 'insertText' ? value : null
+                }));
+            } catch (error) {
+                element.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            element.dispatchEvent(new Event('change', { bubbles: true }));
+        },
+
+        clearEditable(element) {
+            if (!element) return;
+            if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+                const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(element, '');
+                else element.value = '';
+                return;
+            }
+            element.focus();
+            const selection = window.getSelection?.();
+            if (selection) {
+                const range = document.createRange();
+                range.selectNodeContents(element);
+                selection.removeAllRanges();
+                selection.addRange(range);
+            }
+            if (document.execCommand) document.execCommand('delete', false, null);
+            if (element.textContent) element.textContent = '';
+        },
+
+        async writeTextToEditable(element, message, replace = true, options = {}) {
+            const raw = options.raw === true;
+            const value = raw ? EH.WhatsAppText.raw(message) : EH.WhatsAppText.normalize(message);
             if (!element || !value) return false;
+
             try {
                 element.focus();
-                const selection = window.getSelection?.();
-                if (selection) {
-                    const range = document.createRange();
-                    range.selectNodeContents(element);
-                    range.collapse(!replace);
-                    selection.removeAllRanges();
-                    selection.addRange(range);
-                    if (replace && document.execCommand) document.execCommand('delete', false, null);
+                const previousText = replace ? '' : this.editableText(element);
+                const targetValue = `${previousText}${value}`;
+
+                // textarea/input: usar o setter nativo. Isso preserva \n exatamente.
+                if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+                    const proto = element instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+                    const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                    if (setter) setter.call(element, targetValue);
+                    else element.value = targetValue;
+                    this.dispatchTextInput(element, targetValue, 'insertText');
+                    return EH.WhatsAppText.comparable(element.value) === EH.WhatsAppText.comparable(targetValue);
                 }
 
-                let inserted = false;
-                if (document.execCommand) {
-                    const lines = value.split('\n');
-                    inserted = true;
-                    for (let index = 0; index < lines.length; index += 1) {
-                        if (lines[index]) inserted = document.execCommand('insertText', false, lines[index]) !== false && inserted;
-                        if (index < lines.length - 1) {
-                            const broke = document.execCommand('insertLineBreak', false, null);
-                            if (broke === false) document.execCommand('insertText', false, '\n');
+                // Para contenteditable, sempre reconstruir o valor-alvo completo. Isso evita
+                // duplicação quando uma tentativa de paste parcial falha.
+                this.clearEditable(element);
+
+                // 1) Preferir paste text/plain. O editor do WhatsApp trata esse caminho
+                // como texto real e preserva linhas em branco/asteriscos sem HTML.
+                if (typeof DataTransfer !== 'undefined' && typeof ClipboardEvent !== 'undefined') {
+                    try {
+                        const dt = new DataTransfer();
+                        dt.setData('text/plain', targetValue);
+                        const paste = new ClipboardEvent('paste', {
+                            bubbles: true,
+                            cancelable: true,
+                            clipboardData: dt
+                        });
+                        element.dispatchEvent(paste);
+                        await EH.Utils.sleep(35);
+                        if (EH.WhatsAppText.comparable(this.editableText(element)) === EH.WhatsAppText.comparable(targetValue)) {
+                            return true;
                         }
+                    } catch (error) {
+                        EH.Logger.debug('Paste text/plain não aceito pelo editor do WhatsApp:', error);
                     }
                 }
 
-                if (!inserted) {
-                    if (replace) element.textContent = '';
-                    element.textContent = `${element.textContent || ''}${value}`;
+                // 2) Inserir a string inteira de uma vez. Evita o antigo loop
+                // insertText + insertLineBreak, que fazia o editor perder a estrutura.
+                this.clearEditable(element);
+                if (document.execCommand) {
+                    const inserted = document.execCommand('insertText', false, targetValue);
+                    await EH.Utils.sleep(25);
+                    if (inserted && EH.WhatsAppText.comparable(this.editableText(element)) === EH.WhatsAppText.comparable(targetValue)) {
+                        return true;
+                    }
                 }
-                element.dispatchEvent(new InputEvent('input', {
-                    bubbles: true,
-                    inputType: 'insertText',
-                    data: value
-                }));
-                element.dispatchEvent(new Event('change', { bubbles: true }));
+
+                // 3) Fallback DOM: texto puro + <br> somente como estrutura visual do
+                // contenteditable; o conteúdo enviado continua sendo text/plain.
+                element.replaceChildren();
+                const fragment = document.createDocumentFragment();
+                const lines = targetValue.split('\n');
+                lines.forEach((line, index) => {
+                    if (line) fragment.appendChild(document.createTextNode(line));
+                    if (index < lines.length - 1) fragment.appendChild(document.createElement('br'));
+                });
+                element.appendChild(fragment);
+                this.dispatchTextInput(element, targetValue, 'insertFromPaste');
+                await EH.Utils.sleep(25);
+
+                const actual = EH.WhatsAppText.comparable(this.editableText(element));
+                const expected = EH.WhatsAppText.comparable(targetValue);
+                if (actual !== expected) {
+                    EH.Logger.warn('O editor do WhatsApp não preservou a mensagem exatamente.', { expected, actual });
+                    return false;
+                }
                 return true;
             } catch (error) {
                 EH.Logger.warn('Falha ao preencher texto no WhatsApp Web:', error);
@@ -1488,15 +1601,15 @@
             }
         },
 
-        async insertTextIntoCurrentChat(message, replace = false) {
+        async insertTextIntoCurrentChat(message, replace = false, options = {}) {
             if (!message) return true;
             const composer = await this.waitForComposer(12000);
             if (!composer) return false;
-            return this.writeTextToEditable(composer, message, replace);
+            return this.writeTextToEditable(composer, message, replace, options);
         },
 
-        async sendTextNow(message) {
-            const inserted = await this.insertTextIntoCurrentChat(message, true);
+        async sendTextNow(message, options = {}) {
+            const inserted = await this.insertTextIntoCurrentChat(message, true, options);
             if (!inserted) return false;
             await EH.Utils.sleep(120);
             const sendIcon = document.querySelector('[data-icon="send"], [data-testid="send"]');
@@ -1606,8 +1719,8 @@
             }) || null;
         },
 
-        async insertTextIntoElement(element, message, replace = true) {
-            return this.writeTextToEditable(element, message, replace);
+        async insertTextIntoElement(element, message, replace = true, options = {}) {
+            return this.writeTextToEditable(element, message, replace, options);
         },
 
         findMediaSendButton() {
@@ -1623,7 +1736,7 @@
             const attached = await this.attachImage(dataUrl, filename);
             if (!attached) return { attached: false, sent: false, textSent: false, captionAttached: false };
 
-            const message = String(followupMessage || '').trim();
+            const message = EH.WhatsAppText.normalize(followupMessage);
             let captionAttached = false;
 
             // Primeiro tenta colocar o texto COMO LEGENDA da própria imagem.
@@ -1739,7 +1852,28 @@
                 ok = await this.sendTextNow(command.message || '');
                 if (ok && command.message2) {
                     await EH.Utils.sleep(260);
-                    ok = await this.sendTextNow(command.message2 || '');
+                    // PIX Copia e Cola: enviar exatamente o payload original, sem normalização.
+                    ok = await this.sendTextNow(command.message2 || '', { raw: true });
+                }
+            } else if (action === 'send_bundle') {
+                // Uma única confirmação do atendente envia a sequência: instrução -> payload -> QR.
+                ok = await this.sendTextNow(command.message || '');
+                if (ok && command.message2) {
+                    await EH.Utils.sleep(260);
+                    ok = await this.sendTextNow(command.message2 || '', { raw: true });
+                }
+                if (ok && command.imageDataUrl) {
+                    await EH.Utils.sleep(320);
+                    const result = await this.sendAttachedImage(
+                        command.imageDataUrl || '',
+                        command.filename || 'PIX-QR-CODE.png',
+                        ''
+                    );
+                    imageAttached = Boolean(result.attached);
+                    imageSent = Boolean(result.sent);
+                    captionAttached = Boolean(result.captionAttached);
+                    textSent = result.textSent !== false;
+                    ok = imageSent && textSent;
                 }
             } else if (action === 'send_image') {
                 const result = await this.sendAttachedImage(
@@ -3304,7 +3438,7 @@
                 id: `wa-compose-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
                 type: String(input.type || 'message'),
                 chatTitle: String(input.chatTitle || EH.WhatsAppBridge.getState().activeTitle || '').trim(),
-                text: String(input.text || ''),
+                text: EH.WhatsAppText.normalize(input.text),
                 message2: String(input.message2 || ''),
                 attachment,
                 createdAt: Date.now()
@@ -3333,7 +3467,7 @@
 
         updateText(text) {
             if (!this.current) return false;
-            this.current.text = String(text == null ? '' : text);
+            this.current.text = EH.WhatsAppText.normalize(text);
             this.current.fingerprint = this.fingerprint(this.current);
             EH.WhatsAppDock?.renderPrepared?.();
             return true;
@@ -3705,7 +3839,7 @@
         applyPreparedToInput() {
             const item = EH.WhatsAppComposer.get();
             if (!item || !this.composer) return;
-            this.composer.value = String(item.text || '');
+            this.composer.value = EH.WhatsAppText.normalize(item.text);
             this.renderPrepared();
         },
 
@@ -3921,9 +4055,18 @@
                 return false;
             }
 
-            const editedText = String(this.composer?.value ?? item.text ?? '').trim();
+            const editedText = EH.WhatsAppText.normalize(this.composer?.value ?? item.text ?? '');
             let command;
-            if (item.attachment?.dataUrl) {
+            if (item.attachment?.dataUrl && item.message2) {
+                command = EH.WhatsAppBridge.makeCommand({
+                    action: 'send_bundle',
+                    chatTitle: target,
+                    message: editedText,
+                    message2: item.message2,
+                    imageDataUrl: item.attachment.dataUrl,
+                    filename: item.attachment.filename || 'PIX-QR-CODE.png'
+                });
+            } else if (item.attachment?.dataUrl) {
                 command = EH.WhatsAppBridge.makeCommand({
                     action: 'send_image',
                     chatTitle: target,
@@ -3960,7 +4103,7 @@
                 await this.sendPrepared();
                 return;
             }
-            const message = String(this.composer?.value || '').trim();
+            const message = EH.WhatsAppText.normalize(this.composer?.value || '');
             const state = await EH.WhatsAppBridge.ensureReady({
                 requireConversation: true,
                 verifyStale: true,
@@ -8573,7 +8716,14 @@
             if (!pixOriginal) return null;
             const value = this.clean(EH.Utils.first(EH.Selectors.PIX_VALOR)?.textContent || modal.querySelector('.pixValor strong')?.textContent || '');
             const expires = this.clean(EH.Utils.first(EH.Selectors.PIX_EXPIRA)?.textContent || modal.querySelector('.pixExpiraEm strong')?.textContent || '');
-            const qrSource = EH.Utils.first(EH.Selectors.PIX_QR)?.getAttribute('src') || modal.querySelector('.qrCodeImg')?.getAttribute('src') || '';
+            const qrElement = EH.Utils.first(EH.Selectors.PIX_QR) || modal.querySelector('.qrCodeImg');
+            let qrSource = '';
+            if (qrElement) {
+                qrSource = String(qrElement.currentSrc || qrElement.src || qrElement.getAttribute?.('src') || '');
+                if (!qrSource && qrElement instanceof HTMLCanvasElement) {
+                    try { qrSource = qrElement.toDataURL('image/png'); } catch (error) { EH.Logger.debug('QR original em canvas não pôde ser exportado:', error); }
+                }
+            }
             const validation = this.validatePix(pixOriginal);
             const dynamic = this.detectDynamicPix(pixOriginal);
             return {
@@ -8594,13 +8744,11 @@
         },
 
         formatPixInstruction() {
-            return [
+            return EH.WhatsAppText.normalize([
                 '👇 *Para copiar o PIX:*',
-                '',
                 'Segure a próxima mensagem e toque em 📋 *Copiar*.',
-                '',
                 '⚠️ Não toque somente no trecho azul.'
-            ].join('\n');
+            ].join('\n'));
         },
 
 
@@ -8640,21 +8788,99 @@
             return EH.LocalQR.createCanvas(payload, 440);
         },
 
-        getQrDataUrl(pix = this.parsePix()) {
+        getGeneratedQrDataUrl(pix = this.parsePix()) {
             const canvas = this.generateQrCanvas(pix);
             return canvas.toDataURL('image/png');
         },
 
+        getQrDataUrl(pix = this.parsePix()) {
+            // Caminho síncrono: se o E-Pass já forneceu o QR como data URL, usar o original.
+            const original = String(pix?.qr || '').trim();
+            if (/^data:image\//i.test(original)) return original;
+            return this.getGeneratedQrDataUrl(pix);
+        },
+
+        async resolveQrImage(pix = this.parsePix()) {
+            const original = String(pix?.qr || '').trim();
+            if (/^data:image\//i.test(original)) {
+                const mime = original.match(/^data:([^;,]+)/i)?.[1] || 'image/png';
+                return { dataUrl: original, mime, original: true, source: 'epass-data-url' };
+            }
+
+            if (/^(?:blob:|https?:)/i.test(original)) {
+                try {
+                    const response = await fetch(original);
+                    if (response.ok) {
+                        const blob = await response.blob();
+                        if (String(blob.type || '').startsWith('image/')) {
+                            const dataUrl = await EH.Clipboard.blobToDataUrl(blob);
+                            return { dataUrl, mime: blob.type || 'image/png', original: true, source: 'epass-src' };
+                        }
+                    }
+                } catch (error) {
+                    EH.Logger.debug('Não foi possível ler o QR original pela URL:', error);
+                }
+            }
+
+            // Segunda tentativa: capturar o elemento que ainda está renderizado na cobrança.
+            try {
+                const element = EH.Utils.first(EH.Selectors.PIX_QR);
+                if (element instanceof HTMLCanvasElement) {
+                    const dataUrl = element.toDataURL('image/png');
+                    return { dataUrl, mime: 'image/png', original: true, source: 'epass-canvas' };
+                }
+                if (element instanceof HTMLImageElement && element.complete && element.naturalWidth > 0) {
+                    const canvas = document.createElement('canvas');
+                    canvas.width = element.naturalWidth;
+                    canvas.height = element.naturalHeight;
+                    const ctx = canvas.getContext('2d');
+                    ctx.drawImage(element, 0, 0);
+                    const dataUrl = canvas.toDataURL('image/png');
+                    return { dataUrl, mime: 'image/png', original: true, source: 'epass-rendered-image' };
+                }
+            } catch (error) {
+                EH.Logger.debug('QR original renderizado não pôde ser capturado:', error);
+            }
+
+            // Somente aqui gerar um QR novo, sempre a partir do pixOriginal validado.
+            return {
+                dataUrl: this.getGeneratedQrDataUrl(pix),
+                mime: 'image/png',
+                original: false,
+                source: 'local-fallback'
+            };
+        },
+
         async copyQrCode(pix = this.parsePix()) {
             try {
-                const canvas = this.generateQrCanvas(pix);
-                const blob = await EH.Clipboard.canvasToBlob(canvas);
-                const result = await EH.Clipboard.copyImageAnyContext(blob);
+                const qr = await this.resolveQrImage(pix);
+                let blob = EH.Clipboard.dataUrlToBlob(qr.dataUrl);
+                let clipboardDataUrl = qr.dataUrl;
+
+                // ClipboardItem é mais confiável com image/png. Quando o QR original
+                // do E-Pass é JPEG, apenas reencodamos A MESMA IMAGEM para PNG; não
+                // recriamos o QR nem alteramos o pixOriginal.
+                if (blob.type !== 'image/png') {
+                    const image = new Image();
+                    image.src = qr.dataUrl;
+                    await new Promise((resolve, reject) => {
+                        image.onload = resolve;
+                        image.onerror = () => reject(new Error('Não foi possível ler o QR Code original.'));
+                    });
+                    const canvas = document.createElement('canvas');
+                    canvas.width = image.naturalWidth || image.width;
+                    canvas.height = image.naturalHeight || image.height;
+                    canvas.getContext('2d').drawImage(image, 0, 0);
+                    clipboardDataUrl = canvas.toDataURL('image/png');
+                    blob = await EH.Clipboard.canvasToBlob(canvas);
+                }
+
+                const result = await EH.Clipboard.copyImageAnyContext(blob, clipboardDataUrl, 'PIX-QR-CODE.png');
                 if (!result?.copied) {
-                    EH.Toast.warning(`QR Code gerado, mas o navegador bloqueou a cópia da imagem. ${result?.reason || ''}`.trim());
+                    EH.Toast.warning(`QR Code pronto, mas o navegador bloqueou a cópia da imagem. ${result?.reason || ''}`.trim());
                     return false;
                 }
-                EH.Toast.success('✅ QR Code copiado');
+                EH.Toast.success(qr.original ? '✅ QR Code original copiado' : '✅ QR Code copiado');
                 return true;
             } catch (error) {
                 EH.Logger.warn('Falha ao copiar QR Code:', error);
@@ -8965,7 +9191,7 @@
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: options.type || typeMap[options.captureType] || 'message',
                 chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
-                text: String(message || ''),
+                text: EH.WhatsAppText.normalize(message),
                 message2: String(options.message2 || ''),
                 attachment: imageDataUrl ? {
                     dataUrl: imageDataUrl,
@@ -9080,12 +9306,30 @@
                 return null;
             }
 
+            let qrAttachment = null;
+            try {
+                const qr = await EH.Payment.resolveQrImage(pix);
+                if (qr?.dataUrl) {
+                    const ext = /jpeg|jpg/i.test(qr.mime || '') ? 'jpg' : /webp/i.test(qr.mime || '') ? 'webp' : 'png';
+                    qrAttachment = {
+                        dataUrl: qr.dataUrl,
+                        filename: `PIX-QR-CODE.${ext}`,
+                        mime: qr.mime || 'image/png',
+                        original: Boolean(qr.original)
+                    };
+                }
+            } catch (error) {
+                EH.Logger.warn('Não foi possível preparar o QR Code do PIX:', error);
+            }
+
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: 'pix',
                 chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
                 text: EH.Payment.formatPixInstruction(pix),
                 // A segunda mensagem contém SOMENTE o payload original.
-                message2: payload
+                message2: payload,
+                // Terceiro item: QR original do E-Pass quando disponível.
+                attachment: qrAttachment
             });
             if (prepared?.ok) {
                 EH.Toast.info('PIX preparado no painel. Confira e pressione Enviar.');
@@ -9100,18 +9344,19 @@
                 EH.Toast.warning('O PIX precisa estar válido antes de enviar o QR Code.');
                 return null;
             }
-            let imageDataUrl = '';
+            let qr;
             try {
-                imageDataUrl = EH.Payment.getQrDataUrl(pix);
+                qr = await EH.Payment.resolveQrImage(pix);
             } catch (error) {
-                EH.Toast.error(`Não foi possível gerar o QR Code. ${error.message || ''}`.trim());
+                EH.Toast.error(`Não foi possível obter o QR Code. ${error.message || ''}`.trim());
                 return null;
             }
+            const ext = /jpeg|jpg/i.test(qr?.mime || '') ? 'jpg' : /webp/i.test(qr?.mime || '') ? 'webp' : 'png';
             return EH.WhatsAppDock?.prepareContent?.({
                 type: 'qr',
                 text: '',
                 chatTitle: EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '',
-                attachment: { dataUrl: imageDataUrl, filename: 'PIX-QR-CODE.png', mime: 'image/png' }
+                attachment: { dataUrl: qr.dataUrl, filename: `PIX-QR-CODE.${ext}`, mime: qr.mime || 'image/png' }
             });
         },
 
