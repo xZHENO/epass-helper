@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.36.0
-// @description  Atendimento integrado E-Pass + WhatsApp, fluxo PIX em 3 envios sequenciais com QR original
+// @version      5.37.0
+// @description  Atendimento integrado E-Pass + WhatsApp, fluxo PIX por máquina de estados com confirmação entre etapas
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.36.0',
+        VERSION: '5.37.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -62,6 +62,9 @@
         WA_HEARTBEAT_TTL_MS: 150000,
         WA_UI_CACHE_TTL_MS: 10 * 60 * 1000,
         WA_VERIFY_TIMEOUT_MS: 3600,
+        WA_PIX_STEP_TIMEOUT_MS: 12000,
+        WA_PIX_MEDIA_TIMEOUT_MS: 15000,
+        WA_PIX_IDLE_STABLE_MS: 220,
         WA_HISTORY_LIMIT: 260,
         WA_HISTORY_SCROLLS: 10,
         TRAVEL_HISTORY_LIMIT: 2400,
@@ -912,6 +915,9 @@
         uiTimer: null,
         receiverStarted: false,
         lastUiHash: '',
+        sendQueueTail: Promise.resolve(),
+        activeSendCommand: '',
+        pixFlow: null,
 
         isWhatsAppHost() {
             return String(location.hostname || '').toLowerCase() === 'web.whatsapp.com';
@@ -1148,6 +1154,66 @@
                 EH.Toast.warning('⚠️ WhatsApp ainda não está pronto para envio.');
             }
             return false;
+        },
+
+        isSendAction(action) {
+            return ['send_text', 'send_pair', 'send_pix_queue', 'send_bundle', 'send_image', 'prepare'].includes(String(action || ''));
+        },
+
+        async runInSendQueue(label, task) {
+            const previous = this.sendQueueTail || Promise.resolve();
+            let release = null;
+            const gate = new Promise(resolve => { release = resolve; });
+            this.sendQueueTail = previous.catch(() => {}).then(() => gate);
+
+            await previous.catch(error => EH.Logger.debug('[WhatsApp Queue] tarefa anterior terminou com erro:', error));
+            this.activeSendCommand = String(label || 'send');
+            try {
+                return await task();
+            } finally {
+                this.activeSendCommand = '';
+                release?.();
+            }
+        },
+
+        publishPixProgress(command, state, stages = {}, extra = {}) {
+            const payload = {
+                commandId: String(command?.id || ''),
+                chatTitle: String(command?.chatTitle || ''),
+                state: String(state || 'idle'),
+                stages: {
+                    instruction: String(stages.instruction || 'pending'),
+                    payload: String(stages.payload || 'pending'),
+                    qr: String(stages.qr || 'pending')
+                },
+                at: Date.now(),
+                ...extra
+            };
+            EH.Storage.set('waPixProgress', payload);
+            return payload;
+        },
+
+        setPixFlowState(command, state, stages = {}, extra = {}) {
+            const active = !['completed', 'error', 'idle'].includes(String(state || 'idle'));
+            this.pixFlow = {
+                commandId: String(command?.id || ''),
+                chatTitle: String(command?.chatTitle || ''),
+                state: String(state || 'idle'),
+                stages: { ...stages },
+                active,
+                at: Date.now(),
+                ...extra
+            };
+            if (EH.Config.DEBUG) {
+                EH.Logger.info('[PIX FLOW]', state, {
+                    commandId: this.pixFlow.commandId,
+                    chatTitle: this.pixFlow.chatTitle,
+                    stages: this.pixFlow.stages,
+                    ...extra
+                });
+            }
+            this.publishPixProgress(command, state, stages, extra);
+            return this.pixFlow;
         },
 
         getUiState() {
@@ -1788,7 +1854,104 @@
         // ========================================================
         // PIX — fila exclusiva e sequencial
         // 1) instrução com 3 linhas; 2) pixOriginal cru; 3) QR sem legenda.
+        // Cada passo só termina quando o WhatsApp confirma o estado real.
         // ========================================================
+        findComposerNow() {
+            const candidates = Array.from(document.querySelectorAll(
+                'footer [contenteditable="true"], footer textarea, [data-tab][contenteditable="true"], div[contenteditable="true"][role="textbox"]'
+            ));
+            return candidates.find(el => {
+                const rect = el.getBoundingClientRect?.();
+                return rect && rect.width > 40 && rect.height > 15;
+            }) || null;
+        },
+
+        composerIsEmpty(element = this.findComposerNow()) {
+            if (!element) return false;
+            return !String(this.editableText(element) || '')
+                .replace(/\u200b|\u200c|\u200d|\ufeff/g, '')
+                .replace(/\u00a0/g, ' ')
+                .trim();
+        },
+
+        async waitForPixComposerIdle(timeout = EH.Config.WA_PIX_STEP_TIMEOUT_MS) {
+            const started = Date.now();
+            let stableSince = 0;
+            let lastComposer = null;
+            while ((Date.now() - started) < timeout) {
+                const mediaOpen = Boolean(this.findMediaDialog());
+                const composer = this.findComposerNow();
+                lastComposer = composer || lastComposer;
+                const empty = Boolean(composer && this.composerIsEmpty(composer));
+                if (!mediaOpen && empty) {
+                    if (!stableSince) stableSince = Date.now();
+                    if ((Date.now() - stableSince) >= EH.Config.WA_PIX_IDLE_STABLE_MS) {
+                        return { ok: true, composer };
+                    }
+                } else {
+                    stableSince = 0;
+                }
+                await EH.Utils.sleep(90);
+            }
+            return {
+                ok: false,
+                composer: lastComposer,
+                reason: this.findMediaDialog() ? 'media-editor-busy' : 'composer-not-empty'
+            };
+        },
+
+        pixConversationMatches(chatTitle) {
+            const wanted = String(chatTitle || '').trim();
+            if (!wanted) return false;
+            const active = String(this.collectActiveConversation(1)?.active?.title || '').trim();
+            return Boolean(active && EH.Utils.normalize(active) === EH.Utils.normalize(wanted));
+        },
+
+        findTextSendButton(composer = this.findComposerNow()) {
+            const scope = composer?.closest?.('footer') || document;
+            const icon = scope.querySelector?.('[data-icon="send"], [data-testid="send"], [data-testid="compose-btn-send"]');
+            const button = icon?.closest?.('button') || Array.from(scope.querySelectorAll?.('button') || []).find(candidate => {
+                const label = `${candidate.getAttribute?.('aria-label') || ''} ${candidate.title || ''}`;
+                return /enviar|send/i.test(label);
+            }) || null;
+            if (!button) return null;
+            const rect = button.getBoundingClientRect?.();
+            const disabled = button.disabled || button.getAttribute?.('aria-disabled') === 'true';
+            return !disabled && (!rect || (rect.width > 0 && rect.height > 0)) ? button : null;
+        },
+
+        outgoingDomSnapshot() {
+            const main = this.findConversationMain();
+            const nodes = main ? Array.from(main.querySelectorAll('div.message-out, [data-id].message-out')) : [];
+            const ids = new Set(nodes.map(node => String(node.getAttribute?.('data-id') || '')).filter(Boolean));
+            const mediaCount = nodes.filter(node => Boolean(node.querySelector?.('img, video, canvas, [data-testid*="media" i], [data-icon*="media" i]'))).length;
+            return { count: nodes.length, mediaCount, ids };
+        },
+
+        async waitForOutgoingMedia(before, timeout = EH.Config.WA_PIX_MEDIA_TIMEOUT_MS) {
+            const started = Date.now();
+            while ((Date.now() - started) < timeout) {
+                const main = this.findConversationMain();
+                const nodes = main ? Array.from(main.querySelectorAll('div.message-out, [data-id].message-out')) : [];
+                const mediaNodes = nodes.filter(node => Boolean(node.querySelector?.('img, video, canvas, [data-testid*="media" i], [data-icon*="media" i]')));
+                const hasNewId = nodes.some(node => {
+                    const id = String(node.getAttribute?.('data-id') || '');
+                    return Boolean(id && !before?.ids?.has(id));
+                });
+                if (mediaNodes.length > Number(before?.mediaCount || 0)) {
+                    return { ok: true, method: 'media-count' };
+                }
+                if (nodes.length > Number(before?.count || 0) && hasNewId) {
+                    const newest = nodes.slice(-3);
+                    if (newest.some(node => Boolean(node.querySelector?.('img, video, canvas, [data-testid*="media" i], [data-icon*="media" i]')))) {
+                        return { ok: true, method: 'new-outgoing-media' };
+                    }
+                }
+                await EH.Utils.sleep(140);
+            }
+            return { ok: false, method: 'media-history-timeout' };
+        },
+
         pixEditableMatches(actual, expected, raw = false) {
             const left = String(actual == null ? '' : actual).replace(/\r\n?/g, '\n');
             const right = String(expected == null ? '' : expected).replace(/\r\n?/g, '\n');
@@ -1818,23 +1981,62 @@
             );
         },
 
-        async waitForOutgoingText(expected, beforeSnapshot, { raw = false, timeout = 9000 } = {}) {
+        async waitForOutgoingText(expected, beforeSnapshot, { raw = false, timeout = EH.Config.WA_PIX_STEP_TIMEOUT_MS, requireComposerEmpty = false, chatTitle = '' } = {}) {
             const wanted = this.pixHistoryComparable(expected, raw);
             const started = Date.now();
+            let historyConfirmed = false;
+            let emptySince = 0;
+            let confirmedMessage = null;
+
             while (Date.now() - started < timeout) {
-                const messages = this.collectActiveConversation(90)?.messages || [];
-                for (let index = messages.length - 1; index >= 0; index -= 1) {
-                    const item = messages[index];
-                    if (item.direction !== 'out') continue;
-                    const key = `${item.id || ''}|${String(item.text || '')}`;
-                    if (beforeSnapshot?.has(key)) continue;
-                    if (this.pixHistoryComparable(item.text || '', raw) === wanted) {
-                        return { ok: true, method: 'history', message: item };
+                if (chatTitle && !this.pixConversationMatches(chatTitle)) {
+                    return { ok: false, method: 'conversation-changed', historyConfirmed, composerCleared: false };
+                }
+
+                if (!historyConfirmed) {
+                    const messages = this.collectActiveConversation(110)?.messages || [];
+                    for (let index = messages.length - 1; index >= 0; index -= 1) {
+                        const item = messages[index];
+                        if (item.direction !== 'out') continue;
+                        const key = `${item.id || ''}|${String(item.text || '')}`;
+                        if (beforeSnapshot?.has(key)) continue;
+                        if (this.pixHistoryComparable(item.text || '', raw) === wanted) {
+                            historyConfirmed = true;
+                            confirmedMessage = item;
+                            break;
+                        }
                     }
                 }
-                await EH.Utils.sleep(180);
+
+                let composerCleared = true;
+                if (requireComposerEmpty) {
+                    const composer = this.findComposerNow();
+                    composerCleared = Boolean(composer && this.composerIsEmpty(composer) && !this.findMediaDialog());
+                    if (composerCleared) {
+                        if (!emptySince) emptySince = Date.now();
+                    } else {
+                        emptySince = 0;
+                    }
+                    composerCleared = Boolean(emptySince && (Date.now() - emptySince) >= EH.Config.WA_PIX_IDLE_STABLE_MS);
+                }
+
+                if (historyConfirmed && composerCleared) {
+                    return {
+                        ok: true,
+                        method: requireComposerEmpty ? 'history+composer-empty' : 'history',
+                        message: confirmedMessage,
+                        historyConfirmed: true,
+                        composerCleared: true
+                    };
+                }
+                await EH.Utils.sleep(140);
             }
-            return { ok: false, method: 'history-timeout' };
+            return {
+                ok: false,
+                method: historyConfirmed ? 'composer-not-cleared' : 'history-timeout',
+                historyConfirmed,
+                composerCleared: false
+            };
         },
 
         async writePixTextToEditable(element, message, { raw = false } = {}) {
@@ -1902,25 +2104,39 @@
             }
         },
 
-        async sendPixTextStep(message, { raw = false, stage = 'text' } = {}) {
+        async sendPixTextStep(message, { raw = false, stage = 'text', chatTitle = '' } = {}) {
             const value = raw ? EH.WhatsAppText.raw(message) : EH.WhatsAppText.normalize(message);
             if (!value) return { ok: false, stage, reason: 'empty-text' };
+            if (chatTitle && !this.pixConversationMatches(chatTitle)) {
+                return { ok: false, stage, reason: 'conversation-changed' };
+            }
 
-            if (EH.Config.DEBUG) EH.Logger.info(`[PIX][${stage}] gerado:`, JSON.stringify(value));
+            if (EH.Config.DEBUG) EH.Logger.info(`[PIX FLOW] ${stage}: waiting composer idle`);
+            const idle = await this.waitForPixComposerIdle(EH.Config.WA_PIX_STEP_TIMEOUT_MS);
+            if (!idle.ok || !idle.composer) {
+                return { ok: false, stage, reason: idle.reason || 'composer-not-idle' };
+            }
 
-            const before = this.outgoingMessageSnapshot(90);
-            const composer = await this.waitForComposer(12000);
-            if (!composer) return { ok: false, stage, reason: 'composer-not-found' };
-
+            const before = this.outgoingMessageSnapshot(110);
+            const composer = idle.composer;
+            if (EH.Config.DEBUG) EH.Logger.info(`[PIX FLOW] ${stage}: inserting`, JSON.stringify(value));
             const inserted = await this.writePixTextToEditable(composer, value, { raw });
             if (!inserted) return { ok: false, stage, reason: 'editor-did-not-preserve-text' };
 
-            if (EH.Config.DEBUG) EH.Logger.info(`[PIX][${stage}] editor:`, JSON.stringify(this.editableText(composer)));
+            if (chatTitle && !this.pixConversationMatches(chatTitle)) {
+                this.clearEditable(composer);
+                return { ok: false, stage, reason: 'conversation-changed-before-send' };
+            }
 
-            const sendIcon = document.querySelector('[data-icon="send"], [data-testid="send"]');
-            const button = sendIcon?.closest('button')
-                || document.querySelector('button[aria-label="Enviar" i], button[aria-label="Send" i], [data-testid="compose-btn-send"]');
+            const actual = this.editableText(composer);
+            if (!this.pixEditableMatches(actual, value, raw)) {
+                return { ok: false, stage, reason: 'editor-content-mismatch' };
+            }
 
+            // Pequena estabilização complementar; a decisão continua baseada no estado real.
+            await EH.Utils.sleep(90);
+            const button = await EH.Utils.waitFor(() => this.findTextSendButton(composer), 3500, 100);
+            if (EH.Config.DEBUG) EH.Logger.info(`[PIX FLOW] ${stage}: sending`);
             try {
                 if (button) {
                     button.click();
@@ -1935,33 +2151,74 @@
                     }));
                 }
             } catch (error) {
+                EH.Logger.warn(`[PIX FLOW] ${stage}: falha ao acionar envio`, error);
                 return { ok: false, stage, reason: 'send-trigger-failed' };
             }
 
-            const confirmed = await this.waitForOutgoingText(value, before, { raw, timeout: 9000 });
+            const confirmed = await this.waitForOutgoingText(value, before, {
+                raw,
+                timeout: EH.Config.WA_PIX_STEP_TIMEOUT_MS,
+                requireComposerEmpty: true,
+                chatTitle
+            });
             if (!confirmed.ok) {
-                EH.Logger.warn(`[PIX][${stage}] O histórico não confirmou a mensagem enviada.`);
-                return { ok: false, stage, reason: 'history-not-confirmed' };
+                EH.Logger.warn(`[PIX FLOW] ${stage}: não confirmado`, confirmed);
+                return { ok: false, stage, reason: confirmed.method || 'text-not-confirmed' };
             }
 
+            if (EH.Config.DEBUG) EH.Logger.info(`[PIX FLOW] ${stage}: confirmed`);
             this.publishUiState(true);
             return { ok: true, stage, confirmedBy: confirmed.method };
         },
 
-        async sendPixQrStep(dataUrl, filename = 'PIX-QR-CODE.png') {
+        async sendPixQrStep(dataUrl, filename = 'PIX-QR-CODE.png', { chatTitle = '' } = {}) {
             if (!dataUrl) return { ok: false, stage: 'qr', reason: 'qr-missing' };
-            const result = await this.sendAttachedImage(dataUrl, filename, '');
-            if (!result?.attached || !result?.sent) {
-                return {
-                    ok: false,
-                    stage: 'qr',
-                    reason: result?.attached ? 'qr-send-failed' : 'qr-attach-failed'
-                };
+            if (chatTitle && !this.pixConversationMatches(chatTitle)) {
+                return { ok: false, stage: 'qr', reason: 'conversation-changed' };
             }
-            const closed = await EH.Utils.waitFor(() => !this.findMediaDialog(), 6500, 180);
-            if (!closed) return { ok: false, stage: 'qr', reason: 'media-dialog-still-open' };
+
+            // QR só começa com o composer textual realmente vazio e sem editor de mídia aberto.
+            const idle = await this.waitForPixComposerIdle(EH.Config.WA_PIX_STEP_TIMEOUT_MS);
+            if (!idle.ok) return { ok: false, stage: 'qr', reason: idle.reason || 'composer-not-idle-before-qr' };
+
+            const before = this.outgoingDomSnapshot();
+            if (EH.Config.DEBUG) EH.Logger.info('[PIX FLOW] qr: attaching original image');
+            const attached = await this.attachImage(dataUrl, filename);
+            if (!attached) return { ok: false, stage: 'qr', reason: 'qr-attach-failed' };
+
+            const mediaReady = await EH.Utils.waitFor(() => {
+                const dialog = this.findMediaDialog();
+                const button = this.findMediaSendButton();
+                return dialog && button && !button.disabled && button.getAttribute?.('aria-disabled') !== 'true' ? { dialog, button } : null;
+            }, EH.Config.WA_PIX_MEDIA_TIMEOUT_MS, 140);
+            if (!mediaReady) return { ok: false, stage: 'qr', reason: 'qr-preview-not-ready' };
+
+            if (chatTitle && !this.pixConversationMatches(chatTitle)) {
+                return { ok: false, stage: 'qr', reason: 'conversation-changed-before-qr-send' };
+            }
+
+            if (EH.Config.DEBUG) EH.Logger.info('[PIX FLOW] qr: preview ready; sending');
+            try {
+                mediaReady.button.click();
+            } catch (error) {
+                EH.Logger.warn('[PIX FLOW] qr: falha ao acionar envio', error);
+                return { ok: false, stage: 'qr', reason: 'qr-send-trigger-failed' };
+            }
+
+            const dialogClosed = await EH.Utils.waitFor(() => !this.findMediaDialog(), EH.Config.WA_PIX_MEDIA_TIMEOUT_MS, 140);
+            if (!dialogClosed) return { ok: false, stage: 'qr', reason: 'media-dialog-still-open' };
+
+            const mediaConfirmed = await this.waitForOutgoingMedia(before, EH.Config.WA_PIX_MEDIA_TIMEOUT_MS);
+            if (!mediaConfirmed.ok) {
+                return { ok: false, stage: 'qr', reason: mediaConfirmed.method || 'qr-history-not-confirmed' };
+            }
+
+            const afterIdle = await this.waitForPixComposerIdle(5000);
+            if (!afterIdle.ok) return { ok: false, stage: 'qr', reason: 'composer-not-idle-after-qr' };
+
+            if (EH.Config.DEBUG) EH.Logger.info('[PIX FLOW] qr: confirmed');
             this.publishUiState(true);
-            return { ok: true, stage: 'qr', confirmedBy: 'media-dialog-closed' };
+            return { ok: true, stage: 'qr', confirmedBy: `${mediaConfirmed.method}+editor-closed` };
         },
 
         async sendPixQueue(command) {
@@ -1973,51 +2230,64 @@
             const stages = {
                 instruction: startIndex > 0 ? 'already-sent' : 'pending',
                 payload: startIndex > 1 ? 'already-sent' : 'pending',
-                qr: 'pending'
+                qr: startIndex > 2 ? 'already-sent' : 'pending'
+            };
+            const fail = (failedStage, reason) => {
+                stages[failedStage] = 'failed';
+                this.setPixFlowState(command, 'error', stages, { failedStage, reason });
+                if (EH.Config.DEBUG) EH.Logger.error(`[PIX FLOW] FAILED at ${failedStage}`, reason);
+                return { ok: false, failedStage, reason, stages: { ...stages } };
             };
 
+            this.setPixFlowState(command, 'idle', stages, { startAt });
+            if (!command.chatTitle || !this.pixConversationMatches(command.chatTitle)) {
+                return fail('instruction', 'conversation-not-ready');
+            }
+
             if (startIndex <= 0) {
+                stages.instruction = 'sending';
+                this.setPixFlowState(command, 'sending_instruction', stages);
                 const step = await this.sendPixTextStep(command.message || '', {
                     raw: false,
-                    stage: 'instruction'
+                    stage: 'instruction',
+                    chatTitle: command.chatTitle
                 });
-                stages.instruction = step.ok ? 'sent' : 'failed';
-                if (!step.ok) return {
-                    ok: false,
-                    failedStage: 'instruction',
-                    reason: step.reason || 'instruction-failed',
-                    stages
-                };
+                if (!step.ok) return fail('instruction', step.reason || 'instruction-failed');
+                stages.instruction = 'sent';
+                this.setPixFlowState(command, 'instruction_sent', stages);
             }
 
             if (startIndex <= 1) {
+                if (!this.pixConversationMatches(command.chatTitle)) return fail('payload', 'conversation-changed');
+                stages.payload = 'sending';
+                this.setPixFlowState(command, 'sending_pix', stages);
                 const step = await this.sendPixTextStep(command.message2 || '', {
                     raw: true,
-                    stage: 'payload'
+                    stage: 'payload',
+                    chatTitle: command.chatTitle
                 });
-                stages.payload = step.ok ? 'sent' : 'failed';
-                if (!step.ok) return {
-                    ok: false,
-                    failedStage: 'payload',
-                    reason: step.reason || 'payload-failed',
-                    stages
-                };
+                if (!step.ok) return fail('payload', step.reason || 'payload-failed');
+                stages.payload = 'sent';
+                this.setPixFlowState(command, 'pix_sent', stages);
             }
 
-            const step = await this.sendPixQrStep(
+            if (!this.pixConversationMatches(command.chatTitle)) return fail('qr', 'conversation-changed');
+            stages.qr = 'preparing';
+            this.setPixFlowState(command, 'preparing_qr', stages);
+            stages.qr = 'sending';
+            this.setPixFlowState(command, 'sending_qr', stages);
+            const qrStep = await this.sendPixQrStep(
                 command.imageDataUrl || '',
-                command.filename || 'PIX-QR-CODE.png'
+                command.filename || 'PIX-QR-CODE.png',
+                { chatTitle: command.chatTitle }
             );
-            stages.qr = step.ok ? 'sent' : 'failed';
-            if (!step.ok) return {
-                ok: false,
-                failedStage: 'qr',
-                reason: step.reason || 'qr-failed',
-                stages
-            };
-
-            return { ok: true, failedStage: '', reason: '', stages };
+            if (!qrStep.ok) return fail('qr', qrStep.reason || 'qr-failed');
+            stages.qr = 'sent';
+            this.setPixFlowState(command, 'completed', stages);
+            if (EH.Config.DEBUG) EH.Logger.info('[PIX FLOW] Completed');
+            return { ok: true, failedStage: '', reason: '', stages: { ...stages } };
         },
+
 
 
         async handleCommand(command) {
@@ -2040,6 +2310,10 @@
             }
 
             if (action === 'select_chat') {
+                if (this.activeSendCommand || this.pixFlow?.active) {
+                    EH.Storage.set('waAck', { id: command.id, at: Date.now(), action, ok: false, reason: 'send-in-progress' });
+                    return;
+                }
                 const ok = await this.selectChatByTitle(command.chatTitle || '');
                 sessionStorage.setItem(doneKey, command.id);
                 EH.Storage.set('waAck', { id: command.id, at: Date.now(), action, ok });
@@ -2047,6 +2321,10 @@
             }
 
             if (action === 'read_history') {
+                if (this.activeSendCommand || this.pixFlow?.active) {
+                    EH.Storage.set('waAck', { id: command.id, at: Date.now(), action, ok: false, reason: 'send-in-progress' });
+                    return;
+                }
                 const result = await this.readChatHistory(command.chatTitle || '', {
                     limit: command.historyLimit,
                     scrolls: command.historyScrolls
@@ -2074,22 +2352,26 @@
                 return;
             }
 
-            if (command.chatTitle) {
-                const selected = await this.selectChatByTitle(command.chatTitle);
-                if (!selected) {
-                    sessionStorage.setItem(doneKey, command.id);
-                    EH.Storage.set('waAck', {
-                        id: command.id,
-                        at: Date.now(),
-                        action,
-                        ok: false,
-                        reason: 'chat-not-found'
-                    });
-                    return;
+            const executeSendAction = async () => {
+                // A seleção da conversa acontece DENTRO da fila. Assim outro comando
+                // não pode trocar o destino entre a seleção e o envio.
+                if (command.chatTitle) {
+                    const selected = await this.selectChatByTitle(command.chatTitle);
+                    if (!selected) {
+                        return {
+                            ok: false,
+                            imageAttached: false,
+                            imageSent: false,
+                            textSent: false,
+                            captionAttached: false,
+                            pixStages: null,
+                            failedStage: '',
+                            failureReason: 'chat-not-found'
+                        };
+                    }
                 }
-            }
 
-            let ok = true;
+                let ok = true;
             let imageAttached = false;
             let imageSent = false;
             let textSent = true;
@@ -2155,6 +2437,32 @@
                     ok = ok && imageAttached;
                 }
             }
+
+                return {
+                    ok,
+                    imageAttached,
+                    imageSent,
+                    textSent,
+                    captionAttached,
+                    pixStages,
+                    failedStage,
+                    failureReason
+                };
+            };
+
+            const sendResult = this.isSendAction(action)
+                ? await this.runInSendQueue(`${action}:${command.id}`, executeSendAction)
+                : await executeSendAction();
+            const {
+                ok,
+                imageAttached,
+                imageSent,
+                textSent,
+                captionAttached,
+                pixStages,
+                failedStage,
+                failureReason
+            } = sendResult;
 
             sessionStorage.setItem(doneKey, command.id);
             sessionStorage.removeItem(pendingKey);
@@ -3769,6 +4077,8 @@
         currentState: null,
         listenerId: null,
         ackListenerId: null,
+        pixProgressListenerId: null,
+        pixProgress: null,
         collapsed: false,
         pendingImage: null,
         pendingCommandId: '',
@@ -3970,8 +4280,16 @@
                                 if (this.pendingImage) this.clearPendingImage();
                                 if (this.composer) this.composer.value = '';
                             }
+                            if (ack.action === 'send_pix_queue') this.pixProgress = null;
                             EH.Toast.success(ack.action === 'send_pix_queue' ? '✓ PIX enviado' : '✓ Enviado pelo WhatsApp');
                         } else if (ack.action === 'send_pix_queue') {
+                            this.pixProgress = {
+                                commandId: ack.id,
+                                state: 'error',
+                                stages: ack.pixStages || {},
+                                failedStage: ack.failedStage || '',
+                                at: Date.now()
+                            };
                             const current = (
                                 this.pendingPreparedId &&
                                 EH.WhatsAppComposer.current?.id === this.pendingPreparedId
@@ -4011,6 +4329,15 @@
                     }
                     setTimeout(() => this.requestSync(), 160);
                 });
+                this.pixProgressListenerId = GM_addValueChangeListener(EH.Storage.key('waPixProgress'), (_name, _oldValue, newValue) => {
+                    const progress = EH.WhatsAppBridge.parseStored(newValue);
+                    if (!progress?.commandId) return;
+                    if (progress.commandId === this.pendingCommandId) {
+                        this.pixProgress = progress;
+                        this.renderPrepared();
+                        this.refreshConnection();
+                    }
+                });
             }
             this.requestSync();
             EH.Runtime.interval('wa-dock-status', () => this.refreshConnection(), EH.Config.WA_STATUS_REFRESH_MS);
@@ -4048,12 +4375,15 @@
                     activeTitle &&
                     EH.Utils.normalize(targetTitle) !== EH.Utils.normalize(activeTitle)
                 );
-                this.sendButton.disabled = !connection.readyToSend || targetMismatch;
-                this.sendButton.title = targetMismatch
-                    ? `Conteúdo preparado para ${targetTitle}. Volte para essa conversa ou remova.`
-                    : EH.WhatsAppComposer.hasContent()
-                        ? 'Enviar conteúdo preparado'
-                        : (this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem');
+                const sending = Boolean(this.pendingCommandId);
+                this.sendButton.disabled = !connection.readyToSend || targetMismatch || sending;
+                this.sendButton.title = sending
+                    ? 'Envio em andamento. Aguarde a conclusão.'
+                    : targetMismatch
+                        ? `Conteúdo preparado para ${targetTitle}. Volte para essa conversa ou remova.`
+                        : EH.WhatsAppComposer.hasContent()
+                            ? 'Enviar conteúdo preparado'
+                            : (this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem');
             }
             return connection;
         },
@@ -4131,13 +4461,25 @@
                             : item.pixRetryStage === 'instruction'
                                 ? 'Instrução'
                                 : '';
+                    const progress = (this.pixProgress?.commandId && this.pixProgress.commandId === this.pendingCommandId)
+                        ? this.pixProgress
+                        : null;
+                    const statusIcon = status => {
+                        if (status === 'sent' || status === 'already-sent') return '✅';
+                        if (status === 'sending' || status === 'preparing') return '⏳';
+                        if (status === 'failed') return '❌';
+                        return '○';
+                    };
+                    const stages = progress?.stages || { instruction: 'pending', payload: 'pending', qr: 'pending' };
                     const lines = [
-                        'PIX • 3 itens',
-                        '1. Instrução',
-                        '2. Código PIX',
-                        '3. QR Code'
+                        progress ? 'Enviando PIX' : 'PIX • 3 itens',
+                        `${statusIcon(stages.instruction)} Instrução`,
+                        `${statusIcon(stages.payload)} Código PIX`,
+                        `${statusIcon(stages.qr)} QR Code`
                     ];
-                    if (retryLabel) lines.push(`Retomar em: ${retryLabel}`);
+                    if (progress?.state === 'completed') lines.push('✓ PIX enviado');
+                    if (progress?.state === 'error') lines.push('⚠️ Envio pausado');
+                    if (retryLabel && !progress) lines.push(`Retomar em: ${retryLabel}`);
                     lines.push('', String(item.text || '').trim());
                     this.preparedText.textContent = lines.join('\n');
                 } else {
@@ -4328,6 +4670,10 @@
         async selectChat(title) {
             const wanted = String(title || '').trim();
             if (!wanted) return;
+            if (this.pendingCommandId) {
+                EH.Toast.info('Envio em andamento. Aguarde antes de trocar de conversa.');
+                return;
+            }
             const state = await EH.WhatsAppBridge.ensureReady({
                 requireConversation: false,
                 verifyStale: true,
@@ -4422,6 +4768,19 @@
 
             this.pendingCommandId = command.id;
             this.pendingPreparedId = item.id;
+            if (item.type === 'pix') {
+                this.pixProgress = {
+                    commandId: command.id,
+                    state: 'queued',
+                    stages: {
+                        instruction: item.pixRetryStage && item.pixRetryStage !== 'instruction' ? 'already-sent' : 'pending',
+                        payload: item.pixRetryStage === 'qr' ? 'already-sent' : 'pending',
+                        qr: 'pending'
+                    },
+                    at: Date.now()
+                };
+                this.renderPrepared();
+            }
             EH.WhatsAppBridge.send(command);
             EH.Toast.info(item.type === 'pix'
                 ? 'Enviando PIX…'
