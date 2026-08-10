@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.33.0
-// @description  Atendimento integrado E-Pass + WhatsApp, composer interno, previsão operacional e lembretes
+// @version      5.34.0
+// @description  Atendimento integrado E-Pass + WhatsApp, composer unificado, confirmação organizada e operação de viagem
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.33.0',
+        VERSION: '5.34.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -51,6 +51,7 @@
         LAYOUT_TRANSITION_MS: 180,
         INTERFACE_PROFILE: 'auto',
         PANEL_SIZE: 'medium',
+        CONFIRMATION_MODE: 'image',
         PANEL_TOP_FALLBACK: 86,
         PANEL_BOTTOM_GAP: 0,
         APP_OBSERVER_DEBOUNCE_MS: 420,
@@ -245,6 +246,8 @@
             EH.Config.INTERFACE_PROFILE = ['auto', 'home', 'station'].includes(interfaceProfile) ? interfaceProfile : 'auto';
             const panelSize = String(this.get('panelSize', EH.Config.PANEL_SIZE) || 'medium').toLowerCase();
             EH.Config.PANEL_SIZE = ['small', 'medium', 'large'].includes(panelSize) ? panelSize : 'medium';
+            const confirmationMode = String(this.get('confirmationMode', EH.Config.CONFIRMATION_MODE) || 'image').toLowerCase();
+            EH.Config.CONFIRMATION_MODE = ['text', 'image'].includes(confirmationMode) ? confirmationMode : 'image';
             EH.Config.BOARDING_DEFAULT_REMIND_MINUTES = Math.min(1440, Math.max(5, Number(
                 this.get('boardingDefaultRemindMinutes', EH.Config.BOARDING_DEFAULT_REMIND_MINUTES)
             ) || 120));
@@ -1440,34 +1443,56 @@
             }, timeout, 250);
         },
 
-        async insertTextIntoCurrentChat(message, replace = false) {
-            if (!message) return true;
-            const composer = await this.waitForComposer(12000);
-            if (!composer) return false;
+        writeTextToEditable(element, message, replace = true) {
+            const value = String(message == null ? '' : message).replace(/\r\n?/g, '\n');
+            if (!element || !value) return false;
             try {
-                composer.focus();
+                element.focus();
                 const selection = window.getSelection?.();
                 if (selection) {
                     const range = document.createRange();
-                    range.selectNodeContents(composer);
+                    range.selectNodeContents(element);
                     range.collapse(!replace);
                     selection.removeAllRanges();
                     selection.addRange(range);
                     if (replace && document.execCommand) document.execCommand('delete', false, null);
                 }
+
+                let inserted = false;
                 if (document.execCommand) {
-                    document.execCommand('insertText', false, message);
-                } else {
-                    if (replace) composer.textContent = '';
-                    composer.textContent = `${composer.textContent || ''}${message}`;
-                    composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: message }));
+                    const lines = value.split('\n');
+                    inserted = true;
+                    for (let index = 0; index < lines.length; index += 1) {
+                        if (lines[index]) inserted = document.execCommand('insertText', false, lines[index]) !== false && inserted;
+                        if (index < lines.length - 1) {
+                            const broke = document.execCommand('insertLineBreak', false, null);
+                            if (broke === false) document.execCommand('insertText', false, '\n');
+                        }
+                    }
                 }
-                composer.dispatchEvent(new Event('input', { bubbles: true }));
+
+                if (!inserted) {
+                    if (replace) element.textContent = '';
+                    element.textContent = `${element.textContent || ''}${value}`;
+                }
+                element.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: value
+                }));
+                element.dispatchEvent(new Event('change', { bubbles: true }));
                 return true;
             } catch (error) {
-                EH.Logger.warn('Falha ao preencher mensagem no WhatsApp Web:', error);
+                EH.Logger.warn('Falha ao preencher texto no WhatsApp Web:', error);
                 return false;
             }
+        },
+
+        async insertTextIntoCurrentChat(message, replace = false) {
+            if (!message) return true;
+            const composer = await this.waitForComposer(12000);
+            if (!composer) return false;
+            return this.writeTextToEditable(composer, message, replace);
         },
 
         async sendTextNow(message) {
@@ -1515,9 +1540,8 @@
                     const paste = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: dt });
                     composer.focus();
                     composer.dispatchEvent(paste);
-                    await EH.Utils.sleep(700);
-                    const previewVisible = document.querySelector('[data-animate-modal-popup="true"], div[role="dialog"] img[src^="blob:"], div[role="dialog"] canvas, [data-testid*="media-preview"]');
-                    if (previewVisible) return true;
+                    const mediaSurface = await EH.Utils.waitFor(() => this.findMediaDialog(), 6000, 160);
+                    if (mediaSurface) return true;
                 } catch (error) {
                     EH.Logger.warn('Colagem direta da imagem no WhatsApp não funcionou:', error);
                 }
@@ -1534,7 +1558,7 @@
                 dt.items.add(file);
                 input.files = dt.files;
                 input.dispatchEvent(new Event('change', { bubbles: true }));
-                return true;
+                return Boolean(await EH.Utils.waitFor(() => this.findMediaDialog(), 6500, 180));
             } catch (error) {
                 EH.Logger.warn('Não foi possível anexar a imagem pelo seletor de arquivos:', error);
                 return false;
@@ -1542,17 +1566,39 @@
         },
 
         findMediaDialog() {
-            return Array.from(document.querySelectorAll('[role="dialog"], [data-animate-modal-popup="true"]')).find(el => {
-                const rect = el.getBoundingClientRect?.();
-                return rect && rect.width > 80 && rect.height > 80;
-            }) || null;
+            const visible = element => {
+                const rect = element?.getBoundingClientRect?.();
+                if (!rect || rect.width < 80 || rect.height < 80) return false;
+                const style = window.getComputedStyle?.(element);
+                return !style || (style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) !== 0);
+            };
+
+            const direct = Array.from(document.querySelectorAll('[role="dialog"], [data-animate-modal-popup="true"], [data-testid*="media-preview"], [data-testid*="media-editor"]'))
+                .find(el => visible(el) && (el.querySelector('[data-icon="send"], [data-testid="compose-btn-send"], [contenteditable="true"]') || /enviar|send/i.test(el.textContent || '')));
+            if (direct) return direct;
+
+            // Algumas versões do WhatsApp não usam role=dialog no editor de mídia.
+            // Procura a superfície pela combinação prévia de mídia + botão de envio.
+            const mediaNodes = Array.from(document.querySelectorAll('img[src^="blob:"], video[src^="blob:"], canvas, [data-testid*="media-preview"]'))
+                .filter(node => visible(node));
+            for (const media of mediaNodes) {
+                let ancestor = media.parentElement;
+                for (let depth = 0; ancestor && depth < 9; depth += 1, ancestor = ancestor.parentElement) {
+                    if (ancestor === document.body || ancestor === document.documentElement) break;
+                    if (!visible(ancestor)) continue;
+                    const hasSend = ancestor.querySelector?.('[data-icon="send"], [data-testid="send"], [data-testid="compose-btn-send"], button[aria-label*="Enviar" i], button[aria-label*="Send" i]');
+                    const hasEditor = ancestor.querySelector?.('[contenteditable="true"], textarea');
+                    if (hasSend && hasEditor) return ancestor;
+                }
+            }
+            return null;
         },
 
         findMediaCaptionComposer() {
             const modal = this.findMediaDialog();
             if (!modal) return null;
             const candidates = Array.from(modal.querySelectorAll(
-                '[contenteditable="true"][role="textbox"], [contenteditable="true"][data-tab], div[contenteditable="true"]'
+                '[contenteditable="true"][role="textbox"], [contenteditable="true"][data-tab], div[contenteditable="true"], textarea'
             ));
             return candidates.find(el => {
                 const rect = el.getBoundingClientRect?.();
@@ -1561,36 +1607,7 @@
         },
 
         async insertTextIntoElement(element, message, replace = true) {
-            const value = String(message || '');
-            if (!element || !value) return false;
-            try {
-                element.focus();
-                const selection = window.getSelection?.();
-                if (selection) {
-                    const range = document.createRange();
-                    range.selectNodeContents(element);
-                    range.collapse(!replace);
-                    selection.removeAllRanges();
-                    selection.addRange(range);
-                    if (replace && document.execCommand) document.execCommand('delete', false, null);
-                }
-                if (document.execCommand) {
-                    document.execCommand('insertText', false, value);
-                } else {
-                    if (replace) element.textContent = '';
-                    element.textContent = `${element.textContent || ''}${value}`;
-                    element.dispatchEvent(new InputEvent('input', {
-                        bubbles: true,
-                        inputType: 'insertText',
-                        data: value
-                    }));
-                }
-                element.dispatchEvent(new Event('input', { bubbles: true }));
-                return true;
-            } catch (error) {
-                EH.Logger.warn('Falha ao preencher legenda da mídia no WhatsApp:', error);
-                return false;
-            }
+            return this.writeTextToEditable(element, message, replace);
         },
 
         findMediaSendButton() {
@@ -1623,10 +1640,12 @@
 
             try {
                 sendButton.click();
-                await EH.Utils.sleep(650);
+                // Aguarda o editor de mídia realmente fechar antes de qualquer fallback.
+                await EH.Utils.waitFor(() => !this.findMediaDialog(), 6500, 180);
+                await EH.Utils.sleep(180);
 
-                // Em versões do WhatsApp sem editor de legenda detectável, conserva o
-                // comportamento compatível: envia a imagem e depois o texto.
+                // Se a versão do WhatsApp não aceitou legenda, envia o texto logo após
+                // a imagem. Para o atendente continua sendo uma única ação no composer.
                 let textSent = true;
                 if (message && !captionAttached) {
                     textSent = await this.sendTextNow(message);
@@ -1712,6 +1731,8 @@
             let ok = true;
             let imageAttached = false;
             let imageSent = false;
+            let textSent = true;
+            let captionAttached = false;
             if (action === 'send_text') {
                 ok = await this.sendTextNow(command.message || '');
             } else if (action === 'send_pair') {
@@ -1728,7 +1749,9 @@
                 );
                 imageAttached = Boolean(result.attached);
                 imageSent = Boolean(result.sent);
-                ok = imageSent && (result.textSent !== false);
+                textSent = result.textSent !== false;
+                captionAttached = Boolean(result.captionAttached);
+                ok = imageSent && textSent;
             } else {
                 if (command.message) ok = await this.insertTextIntoCurrentChat(command.message, false);
                 if (command.imageDataUrl) {
@@ -1746,6 +1769,8 @@
                 action,
                 imageAttached,
                 imageSent,
+                textSent,
+                captionAttached,
                 ok
             });
             this.publishUiState(true);
@@ -3306,6 +3331,27 @@
             EH.WhatsAppDock?.refreshConnection?.();
         },
 
+        updateText(text) {
+            if (!this.current) return false;
+            this.current.text = String(text == null ? '' : text);
+            this.current.fingerprint = this.fingerprint(this.current);
+            EH.WhatsAppDock?.renderPrepared?.();
+            return true;
+        },
+
+        removeAttachment() {
+            if (!this.current?.attachment) return false;
+            this.current.attachment = null;
+            if (!this.current.text && !this.current.message2) {
+                this.clear({ keepInput: true });
+                return true;
+            }
+            this.current.fingerprint = this.fingerprint(this.current);
+            EH.WhatsAppDock?.renderPrepared?.();
+            EH.WhatsAppDock?.refreshConnection?.();
+            return true;
+        },
+
         get() {
             return this.current ? { ...this.current, attachment: this.current.attachment ? { ...this.current.attachment } : null } : null;
         }
@@ -3333,9 +3379,12 @@
         preparedWrap: null,
         preparedTarget: null,
         preparedImage: null,
+        preparedImageWrap: null,
         preparedText: null,
         preparedRemove: null,
+        preparedAttachmentRemove: null,
         pendingPreparedId: '',
+        requestedChatTitle: '',
 
         init() {
             if (this.root || EH.WhatsAppBridge.isWhatsAppHost() || !document.body) return;
@@ -3409,13 +3458,23 @@
             preparedHead.append(preparedLabel, preparedTarget, preparedRemove);
             const preparedBody = document.createElement('div');
             preparedBody.className = 'eh-wa-prepared-body';
+            const preparedImageWrap = document.createElement('div');
+            preparedImageWrap.className = 'eh-wa-prepared-image-wrap';
+            preparedImageWrap.hidden = true;
             const preparedImage = document.createElement('img');
             preparedImage.className = 'eh-wa-prepared-image';
             preparedImage.alt = 'Imagem preparada';
-            preparedImage.hidden = true;
+            const preparedAttachmentRemove = document.createElement('button');
+            preparedAttachmentRemove.type = 'button';
+            preparedAttachmentRemove.className = 'eh-wa-prepared-attachment-remove';
+            preparedAttachmentRemove.title = 'Remover somente a imagem';
+            preparedAttachmentRemove.setAttribute('aria-label', preparedAttachmentRemove.title);
+            preparedAttachmentRemove.textContent = '×';
+            preparedAttachmentRemove.addEventListener('click', () => EH.WhatsAppComposer.removeAttachment());
+            preparedImageWrap.append(preparedImage, preparedAttachmentRemove);
             const preparedText = document.createElement('div');
             preparedText.className = 'eh-wa-prepared-text';
-            preparedBody.append(preparedImage, preparedText);
+            preparedBody.append(preparedImageWrap, preparedText);
             prepared.append(preparedHead, preparedBody);
 
             const composerWrap = document.createElement('div');
@@ -3424,6 +3483,9 @@
             composer.rows = 1;
             composer.placeholder = 'Digite uma mensagem ou cole uma imagem';
             composer.addEventListener('paste', event => this.handlePaste(event));
+            composer.addEventListener('input', () => {
+                if (EH.WhatsAppComposer.hasContent()) EH.WhatsAppComposer.updateText(composer.value);
+            });
             composer.addEventListener('keydown', event => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault();
@@ -3485,8 +3547,10 @@
             this.preparedWrap = prepared;
             this.preparedTarget = preparedTarget;
             this.preparedImage = preparedImage;
+            this.preparedImageWrap = preparedImageWrap;
             this.preparedText = preparedText;
             this.preparedRemove = preparedRemove;
+            this.preparedAttachmentRemove = preparedAttachmentRemove;
             this.applyLayout();
             this.render(EH.WhatsAppBridge.getUiState());
             this.renderPrepared();
@@ -3509,6 +3573,8 @@
                             EH.Toast.success('✓ Enviado pelo WhatsApp');
                         } else if (ack.imageAttached && !ack.imageSent) {
                             EH.Toast.warning('A imagem foi anexada, mas o WhatsApp não confirmou o envio.');
+                        } else if (ack.imageSent && ack.textSent === false) {
+                            EH.Toast.warning('A imagem foi enviada, mas o texto não foi confirmado. O conteúdo continua visível para revisão.');
                         } else {
                             EH.Toast.error('Não foi possível concluir o envio pelo WhatsApp.');
                         }
@@ -3572,11 +3638,24 @@
 
         render(state) {
             this.currentState = state || { chats: [], active: null, messages: [] };
+            const activeTitle = String(this.currentState.active?.title || '').trim();
+            if (this.requestedChatTitle && activeTitle && EH.Utils.normalize(this.requestedChatTitle) === EH.Utils.normalize(activeTitle)) {
+                this.requestedChatTitle = '';
+            }
             this.refreshConnection();
-            if (this.titleEl) this.titleEl.textContent = this.currentState.active?.title || 'Selecione uma conversa';
+            if (this.titleEl) this.titleEl.textContent = this.requestedChatTitle || activeTitle || 'Selecione uma conversa';
             this.renderChats();
             this.renderMessages();
             this.renderPrepared();
+        },
+
+        selectedTitle() {
+            return String(
+                this.requestedChatTitle ||
+                this.currentState?.active?.title ||
+                EH.WhatsAppBridge.getState().activeTitle ||
+                ''
+            ).trim();
         },
 
         renderPrepared() {
@@ -3586,10 +3665,8 @@
             this.preparedWrap.hidden = !has;
             this.root?.classList.toggle('eh-wa-has-prepared', has);
             if (!has) {
-                if (this.preparedImage) {
-                    this.preparedImage.hidden = true;
-                    this.preparedImage.removeAttribute('src');
-                }
+                if (this.preparedImageWrap) this.preparedImageWrap.hidden = true;
+                if (this.preparedImage) this.preparedImage.removeAttribute('src');
                 if (this.preparedText) this.preparedText.textContent = '';
                 if (this.preparedTarget) {
                     this.preparedTarget.textContent = 'Para: selecione uma conversa';
@@ -3610,9 +3687,9 @@
             if (this.preparedImage) {
                 if (item.attachment?.dataUrl) {
                     this.preparedImage.src = item.attachment.dataUrl;
-                    this.preparedImage.hidden = false;
+                    if (this.preparedImageWrap) this.preparedImageWrap.hidden = false;
                 } else {
-                    this.preparedImage.hidden = true;
+                    if (this.preparedImageWrap) this.preparedImageWrap.hidden = true;
                     this.preparedImage.removeAttribute('src');
                 }
             }
@@ -3633,11 +3710,7 @@
         },
 
         prepareContent(input, options = {}) {
-            const currentTitle = String(
-                this.currentState?.active?.title ||
-                EH.WhatsAppBridge.getState().activeTitle ||
-                ''
-            ).trim();
+            const currentTitle = this.selectedTitle();
             const requestedTitle = String(input?.chatTitle || '').trim();
             const targetTitle = requestedTitle || currentTitle;
 
@@ -3806,6 +3879,8 @@
         },
 
         async selectChat(title) {
+            const wanted = String(title || '').trim();
+            if (!wanted) return;
             const state = await EH.WhatsAppBridge.ensureReady({
                 requireConversation: false,
                 verifyStale: true,
@@ -3815,10 +3890,11 @@
                 EH.WhatsAppBridge.notifyUnavailable(state);
                 return;
             }
-            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: title }));
-            if (this.titleEl) this.titleEl.textContent = title;
+            this.requestedChatTitle = wanted;
+            if (this.titleEl) this.titleEl.textContent = wanted;
+            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: wanted }));
             if (EH.WhatsAppComposer.current && !EH.WhatsAppComposer.current.chatTitle) {
-                EH.WhatsAppComposer.current.chatTitle = title;
+                EH.WhatsAppComposer.current.chatTitle = wanted;
                 EH.WhatsAppComposer.current.fingerprint = EH.WhatsAppComposer.fingerprint(EH.WhatsAppComposer.current);
                 this.renderPrepared();
             }
@@ -5092,8 +5168,10 @@
                 .eh-wa-prepared-head span.mismatch { color:#b54708; font-weight:700; }
                 .eh-wa-prepared-remove { width:22px; height:22px; border:0; border-radius:50%; background:#eef1f2; color:#54656f; cursor:pointer; font-size:15px; line-height:1; }
                 .eh-wa-prepared-body { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:7px; padding:6px 8px; }
+                .eh-wa-prepared-image-wrap { position:relative; width:46px; height:46px; }
+                .eh-wa-prepared-image-wrap[hidden] { display:none !important; }
                 .eh-wa-prepared-image { width:46px; height:46px; object-fit:cover; border-radius:5px; border:1px solid #d8dedf; background:#fff; }
-                .eh-wa-prepared-image[hidden] { display:none !important; }
+                .eh-wa-prepared-attachment-remove { position:absolute; right:-5px; top:-5px; width:17px; height:17px; padding:0; border:1px solid #d8dedf; border-radius:50%; background:#fff; color:#54656f; font-size:12px; line-height:15px; cursor:pointer; box-shadow:0 1px 3px rgba(0,0,0,.12); }
                 .eh-wa-prepared-text { max-height:62px; overflow:hidden; color:#334047; font-size:8.5px; line-height:1.35; white-space:pre-wrap; overflow-wrap:anywhere; }
                 .eh-wa-paste-preview { position:relative; display:grid; grid-template-columns:48px minmax(0,1fr) 26px; align-items:center; gap:8px; padding:7px 8px; border-top:1px solid #d8dedf; background:#f7f9fa; }
                 .eh-wa-paste-preview[hidden] { display:none !important; }
@@ -5125,6 +5203,7 @@
                 #eh-wa-dock.eh-profile-station .eh-wa-avatar { width:29px; height:29px; }
                 #eh-wa-dock.eh-profile-station .eh-wa-messages { padding:7px 6px 9px; }
                 #eh-wa-dock.eh-profile-station .eh-wa-prepared { max-height:104px; }
+                #eh-wa-dock.eh-profile-station .eh-wa-prepared-image-wrap,
                 #eh-wa-dock.eh-profile-station .eh-wa-prepared-image { width:38px; height:38px; }
                 #eh-wa-dock.eh-profile-station .eh-wa-prepared-text { max-height:48px; }
                 .eh-operation-modal { width:min(720px,96vw); max-height:min(820px,94vh); }
@@ -8040,12 +8119,14 @@
                     applyOriginFees: EH.Config.APLICAR_TAXAS_ORIGEM,
                     originFees: { ...(EH.Config.TAXAS_ORIGEM || {}) },
                     panelZoom: EH.Config.PANEL_ZOOM,
-                    whatsappZoom: EH.Config.WHATSAPP_DOCK_ZOOM
+                    whatsappZoom: EH.Config.WHATSAPP_DOCK_ZOOM,
+                    confirmationMode: EH.Config.CONFIRMATION_MODE
                 },
                 interface: {
                     state: EH.State?.snapshot?.() || null,
                     layout: EH.Layout?.lastMetrics || null,
-                    whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null
+                    whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null,
+                    whatsappComposer: EH.WhatsAppComposer?.get?.() || null
                 },
                 runtime: {
                     listeners: EH.Runtime?.listeners?.size || 0,
@@ -8141,91 +8222,255 @@
             return { cards };
         },
 
+        titleCase(value) {
+            const text = EH.Utils.clean(value);
+            if (!text) return '';
+            return text.toLocaleLowerCase('pt-BR')
+                .replace(/(^|[\s/–—-])([\p{L}])/gu, (_m, lead, letter) => `${lead}${letter.toLocaleUpperCase('pt-BR')}`)
+                .replace(/\b(Go|Mt|Df|To|Ba|Sp|Rj|Mg|Ma|Pi|Se|Al|Pe)\b/g, match => match.toUpperCase());
+        },
+
+        valueOnly(line, labelPattern) {
+            return EH.Utils.clean(String(line || '').replace(new RegExp(`^(?:${labelPattern})\\s*:\\s*`, 'i'), ''));
+        },
+
+        prettyLocation(value) {
+            const raw = EH.Utils.clean(value);
+            if (!raw) return '';
+            const stateMatch = raw.match(/\s*-\s*([A-Z]{2})\s*$/i);
+            const cityRaw = stateMatch ? raw.slice(0, stateMatch.index).trim() : raw;
+            const canonical = EH.CityAliases?.canonicalize?.(cityRaw) || cityRaw;
+            const city = this.titleCase(canonical);
+            return `${city}${stateMatch ? ` - ${stateMatch[1].toUpperCase()}` : ''}`;
+        },
+
+        parseRouteDate(routeDate) {
+            const raw = EH.Utils.clean(routeDate);
+            const dateMatch = raw.match(/\b(\d{2}\/\d{2}\/\d{4})\b/);
+            const timeMatch = raw.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
+            let routePart = raw;
+            if (dateMatch) routePart = routePart.slice(0, dateMatch.index).replace(/\s*-\s*$/, '').trim();
+            const routeMatch = routePart.match(/^(.*?)\s+(?:x|×|→)\s+(.*?)$/i);
+            return {
+                origin: this.prettyLocation(routeMatch?.[1] || ''),
+                destination: this.prettyLocation(routeMatch?.[2] || ''),
+                routeLabel: routeMatch ? '' : this.titleCase(routePart),
+                date: dateMatch?.[1] || '',
+                time: timeMatch?.[0] || ''
+            };
+        },
+
+        normalizeConfirmationCard(card = {}) {
+            const trip = this.parseRouteDate(card.routeDate || '');
+            return {
+                ...trip,
+                passenger: this.titleCase(card.passenger || ''),
+                seat: EH.Utils.clean(card.seat || ''),
+                tarifa: this.valueOnly(card.tarifa, 'TARIFA'),
+                taxa: this.valueOnly(card.taxa, 'TAXA DE EMBARQUE').replace(/^\+\s*/, ''),
+                pedagio: this.valueOnly(card.pedagio, 'PEDAGIO|PEDÁGIO').replace(/^\+\s*/, ''),
+                beneficio: this.valueOnly(card.beneficio, 'BENEFÍCIO|BENEFICIO'),
+                credito: this.valueOnly(card.credito, 'CRÉDITO|CREDITO'),
+                total: this.valueOnly(card.total, 'TOTAL')
+            };
+        },
+
+        hasPositiveMoney(value) {
+            return EH.Utils.parseMoney(value) > 0.0001;
+        },
+
+        confirmationInstruction() {
+            const fallback = 'Confira os dados da sua viagem.\n\nSe estiver tudo correto, responda *SIM* para eu gerar o pagamento via PIX.';
+            const raw = String(EH.Messages.get('resumo') || fallback).replace(/\r\n?/g, '\n').trim();
+            if (!raw) return fallback;
+            if (/\n/.test(raw)) return raw.replace(/\n{3,}/g, '\n\n');
+            return raw.replace(/\.\s+(?=Se\b)/i, '.\n\n').trim();
+        },
+
         formatSummary(summary) {
             if (!summary?.cards?.length) return '';
+            const cards = summary.cards.map(card => this.normalizeConfirmationCard(card));
+            const parts = ['*CONFIRMAÇÃO DA VIAGEM*', ''];
 
-            const titleCase = value => {
-                const text = EH.Utils.clean(value);
-                if (!text) return '';
-                return text.toLocaleLowerCase('pt-BR')
-                    .replace(/(^|[\s/–—-])([\p{L}])/gu, (_m, lead, letter) => `${lead}${letter.toLocaleUpperCase('pt-BR')}`)
-                    .replace(/\b(Go|Mt|Df|To|Ba|Sp|Rj|Mg|Ma|Pi|Se|Al|Pe)\b/g, match => match.toUpperCase());
-            };
-            const valueOnly = (line, label) => EH.Utils.clean(String(line || '').replace(new RegExp(`^(?:${label})\\s*:\\s*`, 'i'), ''));
-            const prettyLocation = value => {
-                const raw = EH.Utils.clean(value);
-                if (!raw) return '';
-                const stateMatch = raw.match(/\s*-\s*([A-Z]{2})\s*$/i);
-                const cityRaw = stateMatch ? raw.slice(0, stateMatch.index).trim() : raw;
-                const canonical = EH.CityAliases?.canonicalize?.(cityRaw) || cityRaw;
-                const city = titleCase(canonical);
-                return `${city}${stateMatch ? ` - ${stateMatch[1].toUpperCase()}` : ''}`;
-            };
-            const parseRouteDate = routeDate => {
-                const raw = EH.Utils.clean(routeDate);
-                const dateMatch = raw.match(/\b(\d{2}\/\d{2}\/\d{4})\b/);
-                const timeMatch = raw.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
-                let routePart = raw;
-                if (dateMatch) routePart = routePart.slice(0, dateMatch.index).replace(/\s*-\s*$/, '').trim();
-                const routeMatch = routePart.match(/^(.*?)\s+(?:x|×|→)\s+(.*?)$/i);
-                return {
-                    origin: prettyLocation(routeMatch?.[1] || ''),
-                    destination: prettyLocation(routeMatch?.[2] || ''),
-                    date: dateMatch?.[1] || '',
-                    time: timeMatch?.[0] || ''
-                };
-            };
+            cards.forEach((card, index) => {
+                if (cards.length > 1) parts.push(`*Passagem ${index + 1}*`);
 
-            const parts = ['*CONFIRMAÇÃO DA VIAGEM 🚌*', ''];
-            summary.cards.forEach((card, index) => {
-                if (summary.cards.length > 1) {
-                    parts.push(`*Passagem ${index + 1}*`);
+                const route = card.origin && card.destination
+                    ? `${card.origin} → ${card.destination}`
+                    : card.routeLabel;
+                if (route) parts.push(`🚌 *${route}*`);
+
+                if (card.date && card.time) parts.push(`📅 *${card.date}*  🕐 *${card.time}*`);
+                else {
+                    if (card.date) parts.push(`📅 *${card.date}*`);
+                    if (card.time) parts.push(`🕐 *${card.time}*`);
                 }
 
-                const trip = parseRouteDate(card.routeDate);
-                if (trip.origin && trip.destination) {
-                    parts.push(`${trip.origin} → ${trip.destination}`);
-                } else if (card.routeDate) {
-                    parts.push(titleCase(card.routeDate));
-                }
-                if (trip.date) parts.push(`📅 ${trip.date}`);
-                if (trip.time) parts.push(`🕐 ${trip.time}`);
-
                 parts.push('');
-                if (card.passenger) parts.push(`👤 Passageiro: ${titleCase(card.passenger)}`);
-                if (card.seat) parts.push(`💺 Poltrona: ${card.seat}`);
+                if (card.passenger) parts.push(`👤 *Passageiro: ${card.passenger}*`);
+                if (card.seat) parts.push(`💺 *Poltrona: ${card.seat}*`);
 
-                const tarifa = valueOnly(card.tarifa, 'TARIFA');
-                const taxa = valueOnly(card.taxa, 'TAXA DE EMBARQUE');
-                const pedagio = valueOnly(card.pedagio, 'PEDAGIO|PEDÁGIO');
-                const beneficio = valueOnly(card.beneficio, 'BENEFÍCIO|BENEFICIO');
-                const credito = valueOnly(card.credito, 'CRÉDITO|CREDITO');
-                const total = valueOnly(card.total, 'TOTAL');
-
-                parts.push('');
-                if (tarifa) parts.push(`💰 Tarifa: ${tarifa}`);
-                if (taxa) parts.push(`Taxa de embarque: ${taxa}`);
-                if (pedagio) parts.push(`Pedágio: ${pedagio}`);
-                if (beneficio && !/R\$\s*0[,.]00/.test(beneficio)) parts.push(`Benefício: ${beneficio}`);
-                if (credito && !/R\$\s*0[,.]00/.test(credito)) parts.push(`Crédito: ${credito}`);
-                if (total) {
+                const hasValues = card.tarifa || this.hasPositiveMoney(card.taxa) || this.hasPositiveMoney(card.pedagio) ||
+                    this.hasPositiveMoney(card.beneficio) || this.hasPositiveMoney(card.credito) || card.total;
+                if (hasValues) parts.push('');
+                if (card.tarifa) parts.push(`💰 *Tarifa: ${card.tarifa}*`);
+                if (this.hasPositiveMoney(card.taxa)) parts.push(`Taxa de embarque: + ${card.taxa}`);
+                if (this.hasPositiveMoney(card.pedagio)) parts.push(`Pedágio: + ${card.pedagio}`);
+                if (this.hasPositiveMoney(card.beneficio)) parts.push(`Benefício: ${card.beneficio}`);
+                if (this.hasPositiveMoney(card.credito)) parts.push(`Crédito: ${card.credito}`);
+                if (card.total) {
                     parts.push('');
-                    parts.push(`*Total: ${total}*`);
+                    parts.push(`*Total: ${card.total}*`);
                 }
-                if (index < summary.cards.length - 1) parts.push('', '—', '');
+
+                if (index < cards.length - 1) parts.push('', '—', '');
             });
 
-            const instruction = EH.Messages.get('resumo');
-            if (instruction) {
-                parts.push('');
-                const lines = instruction
-                    .replace(/\.\s+(?=Se\b)/i, '.\n')
-                    .split(/\n+/)
-                    .map(line => line.trim())
-                    .filter(Boolean);
-                parts.push(...lines);
-            }
+            parts.push('', ...this.confirmationInstruction().split('\n'));
             return parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        },
+
+        confirmationShortText() {
+            return this.confirmationInstruction();
+        },
+
+        renderConfirmationCanvas(summary) {
+            if (!summary?.cards?.length) throw new Error('Resumo da confirmação não encontrado.');
+            const cards = summary.cards.map(card => this.normalizeConfirmationCard(card));
+            const width = 900;
+            const outer = 28;
+            const cardGap = 16;
+            const cardHeight = 310;
+            const headerHeight = 74;
+            const footerHeight = 76;
+            const panelHeight = headerHeight + cards.length * cardHeight + Math.max(0, cards.length - 1) * cardGap + footerHeight + 34;
+            const height = panelHeight + outer * 2;
+            const scale = Math.max(1.5, Math.min(2.5, EH.Config.CAPTURE_SCALE || 2));
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.round(width * scale);
+            canvas.height = Math.round(height * scale);
+            const ctx = canvas.getContext('2d');
+            ctx.scale(scale, scale);
+            ctx.textBaseline = 'top';
+
+            ctx.fillStyle = '#edf1f5';
+            ctx.fillRect(0, 0, width, height);
+            EH.Capture.drawRoundRect(ctx, outer, outer, width - outer * 2, panelHeight, 18);
+            ctx.fillStyle = '#ffffff';
+            ctx.fill();
+            ctx.strokeStyle = '#dce3ea';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            let y = outer + 22;
+            const left = outer + 26;
+            const contentWidth = width - (outer + 26) * 2;
+            ctx.fillStyle = '#1f2a3b';
+            ctx.font = '700 25px Arial';
+            ctx.fillText('CONFIRMAÇÃO DA VIAGEM', left, y);
+            y += 38;
+            ctx.fillStyle = '#6a7487';
+            ctx.font = '400 13px Arial';
+            ctx.fillText(cards.length > 1 ? `${cards.length} trechos na reserva` : 'Confira os dados antes de gerar o PIX', left, y);
+            y = outer + headerHeight + 18;
+
+            cards.forEach((card, index) => {
+                const x = left;
+                const w = contentWidth;
+                EH.Capture.drawRoundRect(ctx, x, y, w, cardHeight, 14);
+                ctx.fillStyle = '#f9fbfd';
+                ctx.fill();
+                ctx.strokeStyle = '#dfe5ec';
+                ctx.stroke();
+
+                let cy = y + 18;
+                const route = card.origin && card.destination ? `${card.origin} → ${card.destination}` : (card.routeLabel || 'Viagem');
+                ctx.fillStyle = '#202735';
+                ctx.font = '700 20px Arial';
+                const routeLines = EH.Capture.wrapCanvasText(ctx, route, w - 36).slice(0, 2);
+                routeLines.forEach(line => { ctx.fillText(line, x + 18, cy); cy += 24; });
+
+                ctx.fillStyle = '#667284';
+                ctx.font = '600 14px Arial';
+                const dateTime = [card.date, card.time].filter(Boolean).join(' • ');
+                if (dateTime) ctx.fillText(dateTime, x + 18, cy + 2);
+                cy += 32;
+
+                const colGap = 18;
+                const colW = (w - 36 - colGap) / 2;
+                const drawField = (fx, fy, label, value) => {
+                    ctx.fillStyle = '#7a8492';
+                    ctx.font = '600 11px Arial';
+                    ctx.fillText(label.toUpperCase(), fx, fy);
+                    ctx.fillStyle = '#202735';
+                    ctx.font = '700 16px Arial';
+                    const lines = EH.Capture.wrapCanvasText(ctx, value || '—', colW).slice(0, 2);
+                    lines.forEach((line, li) => ctx.fillText(line, fx, fy + 17 + li * 18));
+                };
+                drawField(x + 18, cy, 'Passageiro', card.passenger || '—');
+                drawField(x + 18 + colW + colGap, cy, 'Poltrona', card.seat || '—');
+                cy += 62;
+
+                const amountRows = [];
+                if (card.tarifa) amountRows.push(['Tarifa', card.tarifa]);
+                if (this.hasPositiveMoney(card.taxa)) amountRows.push(['Taxa de embarque', card.taxa]);
+                if (this.hasPositiveMoney(card.pedagio)) amountRows.push(['Pedágio', card.pedagio]);
+                if (this.hasPositiveMoney(card.beneficio)) amountRows.push(['Benefício', card.beneficio]);
+                if (this.hasPositiveMoney(card.credito)) amountRows.push(['Crédito', card.credito]);
+
+                ctx.font = '600 13px Arial';
+                amountRows.slice(0, 4).forEach(([label, value], rowIndex) => {
+                    const ry = cy + rowIndex * 21;
+                    ctx.fillStyle = '#667284';
+                    ctx.textAlign = 'left';
+                    ctx.fillText(label, x + 18, ry);
+                    ctx.fillStyle = '#202735';
+                    ctx.textAlign = 'right';
+                    ctx.fillText(value, x + w - 18, ry);
+                });
+                ctx.textAlign = 'left';
+
+                if (card.total) {
+                    const ty = y + cardHeight - 52;
+                    ctx.strokeStyle = '#dfe5ec';
+                    ctx.beginPath();
+                    ctx.moveTo(x + 18, ty - 10);
+                    ctx.lineTo(x + w - 18, ty - 10);
+                    ctx.stroke();
+                    ctx.fillStyle = '#202735';
+                    ctx.font = '700 13px Arial';
+                    ctx.fillText('TOTAL', x + 18, ty);
+                    ctx.fillStyle = '#167447';
+                    ctx.font = '700 22px Arial';
+                    ctx.textAlign = 'right';
+                    ctx.fillText(card.total, x + w - 18, ty - 5);
+                    ctx.textAlign = 'left';
+                }
+
+                y += cardHeight + cardGap;
+            });
+
+            y += 4;
+            ctx.fillStyle = '#334155';
+            ctx.font = '600 14px Arial';
+            ctx.fillText('Confira os dados da sua viagem.', left, y);
+            ctx.fillStyle = '#1f2a3b';
+            ctx.font = '700 14px Arial';
+            ctx.fillText('Se estiver tudo correto, responda SIM para gerar o pagamento via PIX.', left, y + 24);
+            return canvas;
+        },
+
+        async createConfirmationImage(summary) {
+            const canvas = this.renderConfirmationCanvas(summary);
+            const blob = await EH.Clipboard.canvasToBlob(canvas);
+            const dataUrl = canvas.toDataURL('image/png', 1);
+            return {
+                canvas,
+                blob,
+                dataUrl,
+                filename: 'confirmacao-viagem.png',
+                text: this.confirmationShortText()
+            };
         },
 
         toUtf8Bytes(text) {
@@ -8719,7 +8964,7 @@
             const typeMap = { pesquisa: 'schedules', reserva: 'seats', bilhete: 'ticket' };
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: options.type || typeMap[options.captureType] || 'message',
-                chatTitle: state.activeTitle,
+                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
                 text: String(message || ''),
                 message2: String(options.message2 || ''),
                 attachment: imageDataUrl ? {
@@ -8739,6 +8984,78 @@
                 prepared: Boolean(prepared?.ok),
                 state
             };
+        },
+
+        async prepareConfirmationWhatsApp(summary, options = {}) {
+            if (!summary?.cards?.length) {
+                EH.Toast.warning('Resumo não encontrado.');
+                return null;
+            }
+            const state = await EH.WhatsAppBridge.ensureReady({
+                requireConversation: true,
+                verifyStale: true,
+                context: 'preparar-confirmacao'
+            });
+            if (!state.readyToSend) {
+                EH.WhatsAppBridge.notifyUnavailable(state);
+                return null;
+            }
+
+            const mode = options.mode === 'text' || options.mode === 'image'
+                ? options.mode
+                : EH.Config.CONFIRMATION_MODE;
+
+            if (mode === 'text') {
+                return EH.WhatsAppDock?.prepareContent?.({
+                    type: 'reservation',
+                    chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
+                    text: EH.Payment.formatSummary(summary)
+                }, { replace: options.replace === true, silent: options.silent === true });
+            }
+
+            try {
+                const image = await EH.Payment.createConfirmationImage(summary);
+                EH.Clipboard.rememberImage(image.dataUrl, image.filename);
+                return EH.WhatsAppDock?.prepareContent?.({
+                    type: 'reservation',
+                    chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
+                    text: image.text,
+                    attachment: {
+                        dataUrl: image.dataUrl,
+                        filename: image.filename,
+                        mime: 'image/png'
+                    }
+                }, { replace: options.replace === true, silent: options.silent === true });
+            } catch (error) {
+                EH.Logger.error('Falha ao gerar confirmação em imagem:', error);
+                EH.Toast.error('Não foi possível gerar a imagem da confirmação.');
+                return null;
+            }
+        },
+
+        async previewConfirmationImage(summary) {
+            try {
+                const image = await EH.Payment.createConfirmationImage(summary);
+                EH.Clipboard.rememberImage(image.dataUrl, image.filename);
+                this.showPreview({
+                    blob: image.blob,
+                    dataUrl: image.dataUrl,
+                    text: EH.Payment.formatSummary(summary),
+                    summaryText: EH.Payment.formatSummary(summary),
+                    detailsText: EH.Payment.formatSummary(summary),
+                    message: image.text,
+                    filename: image.filename,
+                    captureType: 'confirmacao',
+                    historyId: '',
+                    copied: false,
+                    reason: 'Confirmação gerada em imagem.'
+                });
+                return image;
+            } catch (error) {
+                EH.Logger.error('Falha ao abrir confirmação em imagem:', error);
+                EH.Toast.error('Não foi possível gerar a imagem da confirmação.');
+                return null;
+            }
         },
 
         async sendPixPairToWhatsApp(pix) {
@@ -8765,7 +9082,7 @@
 
             const prepared = EH.WhatsAppDock?.prepareContent?.({
                 type: 'pix',
-                chatTitle: state.activeTitle,
+                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
                 text: EH.Payment.formatPixInstruction(pix),
                 // A segunda mensagem contém SOMENTE o payload original.
                 message2: payload
@@ -8793,7 +9110,7 @@
             return EH.WhatsAppDock?.prepareContent?.({
                 type: 'qr',
                 text: '',
-                chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
+                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '',
                 attachment: { dataUrl: imageDataUrl, filename: 'PIX-QR-CODE.png', mime: 'image/png' }
             });
         },
@@ -8816,7 +9133,7 @@
             }
             return EH.WhatsAppDock?.prepareContent?.({
                 type: 'pix',
-                chatTitle: state.activeTitle,
+                chatTitle: EH.WhatsAppDock?.selectedTitle?.() || state.activeTitle,
                 text: EH.Payment.formatPixMonospace(pix)
             });
         },
@@ -8916,14 +9233,12 @@
                 const msg = EH.Payment.formatSummary(summary);
                 actions.append(
                     this.contextButton('📋 Copiar confirmação', 'primary', async () => { if (!msg) return EH.Toast.warning('Resumo não encontrado.'); await EH.Clipboard.copyText(msg); EH.Toast.success('✓ Confirmação copiada'); }),
-                    this.contextButton('💬 Preparar no WhatsApp', '', () => {
+                    this.contextButton('💬 Preparar no WhatsApp', '', async () => {
                         if (!msg) return EH.Toast.warning('Resumo não encontrado.');
-                        EH.WhatsAppDock?.prepareContent?.({
-                            type: 'reservation',
-                            text: msg,
-                            chatTitle: EH.WhatsAppBridge.getState().activeTitle || ''
-                        });
+                        const prepared = await this.prepareConfirmationWhatsApp(summary);
+                        if (prepared?.ok) EH.Toast.success('✓ Confirmação preparada no painel do WhatsApp');
                     }),
+                    this.contextButton('🖼️ Ver confirmação em imagem', '', () => this.previewConfirmationImage(summary)),
                     this.contextButton('✅ Cliente confirmou → Gerar PIX', 'success', () => EH.Payment.clientConfirmed())
                 );
             } else if (page === 'passagens') {
@@ -9079,7 +9394,7 @@
                 };
                 EH.BoardingReminders.setTicketCandidate(prepared.data);
 
-                const activeChatTitle = EH.WhatsAppBridge.getState().activeTitle || '';
+                const activeChatTitle = EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '';
                 const waPreparedResult = activeChatTitle
                     ? EH.WhatsAppDock?.prepareContent?.({
                         type: 'ticket',
@@ -9174,8 +9489,9 @@
 
                 // O conteúdo é preparado no composer integrado, mas nunca enviado
                 // automaticamente. A conversa atual fica registrada como destino.
-                const activeChatTitle = EH.WhatsAppBridge.getState().activeTitle || '';
-                const waPreparedResult = activeChatTitle
+                const activeChatTitle = EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '';
+                const shouldPrepareAutomatically = Boolean(opts.automatic || opts.prepareWhatsApp === true);
+                const waPreparedResult = shouldPrepareAutomatically && activeChatTitle
                     ? EH.WhatsAppDock?.prepareContent?.({
                         type: page === 'pesquisa' ? 'schedules' : 'seats',
                         text: message,
@@ -9632,9 +9948,9 @@
             sendWhatsApp.textContent = '💬 Preparar no WhatsApp';
             sendWhatsApp.addEventListener('click', () => {
                 const result = EH.WhatsAppDock?.prepareContent?.({
-                    type: captureType === 'pesquisa' ? 'schedules' : captureType === 'reserva' ? 'seats' : captureType === 'bilhete' ? 'ticket' : 'message',
+                    type: captureType === 'pesquisa' ? 'schedules' : captureType === 'reserva' ? 'seats' : captureType === 'bilhete' ? 'ticket' : captureType === 'confirmacao' ? 'reservation' : 'message',
                     text: automaticMessage,
-                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
+                    chatTitle: EH.WhatsAppDock?.selectedTitle?.() || EH.WhatsAppBridge.getState().activeTitle || '',
                     attachment: { dataUrl, filename: filename || 'epass.png', mime: 'image/png' }
                 });
                 if (result?.ok) close();
@@ -9796,6 +10112,15 @@
             panelSizeSelect.value = EH.Config.PANEL_SIZE;
             panelSizeField.append(panelSizeLabel, panelSizeSelect);
 
+            const confirmationModeField = document.createElement('div');
+            confirmationModeField.className = 'eh-field';
+            const confirmationModeLabel = document.createElement('label');
+            confirmationModeLabel.textContent = 'Confirmação da viagem';
+            const confirmationModeSelect = document.createElement('select');
+            confirmationModeSelect.innerHTML = '<option value="image">Imagem + texto curto</option><option value="text">Somente texto organizado</option>';
+            confirmationModeSelect.value = EH.Config.CONFIRMATION_MODE;
+            confirmationModeField.append(confirmationModeLabel, confirmationModeSelect);
+
             const ticketWidthField = document.createElement('div');
             ticketWidthField.className = 'eh-field';
             const ticketWidthLabel = document.createElement('label');
@@ -9808,7 +10133,7 @@
             ticketWidthInput.value = String(EH.Config.TICKET_CAPTURE_WIDTH);
             ticketWidthField.append(ticketWidthLabel, ticketWidthInput);
 
-            grid.append(profileField, panelSizeField, feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField);
+            grid.append(profileField, panelSizeField, confirmationModeField, feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField);
 
             const checkWrap = document.createElement('label');
             checkWrap.className = 'eh-check';
@@ -9896,6 +10221,7 @@
                 EH.Config.WHATSAPP_DOCK_ZOOM = whatsappDockZoom;
                 EH.Config.INTERFACE_PROFILE = ['home', 'station'].includes(profileSelect.value) ? profileSelect.value : 'auto';
                 EH.Config.PANEL_SIZE = ['small', 'large'].includes(panelSizeSelect.value) ? panelSizeSelect.value : 'medium';
+                EH.Config.CONFIRMATION_MODE = confirmationModeSelect.value === 'text' ? 'text' : 'image';
                 EH.Config.APLICAR_TAXAS_ORIGEM = check.checked;
                 EH.Config.AUTO_COPY_IMAGES = autoCopyCheck.checked;
                 EH.Config.AUTO_ROUTE_CAPTURE = autoRouteCheck.checked;
@@ -9914,6 +10240,7 @@
                 EH.Storage.set('whatsappDockZoom', whatsappDockZoom);
                 EH.Storage.set('interfaceProfile', EH.Config.INTERFACE_PROFILE);
                 EH.Storage.set('panelSize', EH.Config.PANEL_SIZE);
+                EH.Storage.set('confirmationMode', EH.Config.CONFIRMATION_MODE);
                 EH.Storage.set('aplicarTaxasOrigem', check.checked);
                 EH.Storage.set('autoCopyImages', autoCopyCheck.checked);
                 EH.Storage.set('autoRouteCapture', autoRouteCheck.checked);
@@ -9925,12 +10252,13 @@
                 const savedWaZoom = Number(EH.Storage.get('whatsappDockZoom', 0));
                 const savedProfile = String(EH.Storage.get('interfaceProfile', 'auto'));
                 const savedPanelSize = String(EH.Storage.get('panelSize', 'medium'));
+                const savedConfirmationMode = String(EH.Storage.get('confirmationMode', 'image'));
                 const savedTaxes = EH.Storage.get('taxasOrigem', null);
                 const savedAutoTax = Boolean(EH.Storage.get('aplicarTaxasOrigem', false));
                 const savedMessages = EH.Storage.get('messages', null);
                 const savedAutoCopy = Boolean(EH.Storage.get('autoCopyImages', false));
                 const savedAutoRoute = Boolean(EH.Storage.get('autoRouteCapture', false));
-                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedProfile === EH.Config.INTERFACE_PROFILE && savedPanelSize === EH.Config.PANEL_SIZE && savedAutoTax === check.checked && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
+                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedProfile === EH.Config.INTERFACE_PROFILE && savedPanelSize === EH.Config.PANEL_SIZE && savedConfirmationMode === EH.Config.CONFIRMATION_MODE && savedAutoTax === check.checked && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
 
                 if (!savedCorrectly) {
                     EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
