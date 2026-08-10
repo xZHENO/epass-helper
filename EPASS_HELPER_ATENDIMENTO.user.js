@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.32.0
-// @description  Atendimento integrado E-Pass + WhatsApp, composer, previsão de viagem e lembretes de embarque
+// @version      5.29.0
+// @description  Atendimento integrado E-Pass + WhatsApp, com fluxo modular e interface otimizada
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.32.0',
+        VERSION: '5.29.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -49,28 +49,13 @@
         WHATSAPP_DOCK_WIDTH: 360,
         WHATSAPP_DOCK_ZOOM: 1.1,
         WHATSAPP_MIN_BASE: 160,
+        CENTRAL_MIN_WIDTH: 280,
         LAYOUT_TRANSITION_MS: 180,
-        INTERFACE_PROFILE: 'auto',
-        PANEL_SIZE: 'medium',
-        PANEL_TOP_FALLBACK: 86,
-        PANEL_BOTTOM_GAP: 0,
         APP_OBSERVER_DEBOUNCE_MS: 420,
         WA_OBSERVER_DEBOUNCE_MS: 650,
-        WA_UI_FALLBACK_MS: 12000,
-        WA_HEARTBEAT_MS: 15000,
-        WA_STATUS_REFRESH_MS: 4000,
-        WA_HEARTBEAT_TTL_MS: 150000,
-        WA_UI_CACHE_TTL_MS: 10 * 60 * 1000,
-        WA_VERIFY_TIMEOUT_MS: 3600,
-        WA_HISTORY_LIMIT: 260,
-        WA_HISTORY_SCROLLS: 10,
-        TRAVEL_HISTORY_LIMIT: 2400,
-        TRAVEL_MAX_DURATION_MIN: 18 * 60,
-        TRAVEL_TRIP_GAP_MIN: 8 * 60,
-        BOARDING_DEFAULT_REMIND_MINUTES: 120,
-        BOARDING_DEFAULT_ALERTS: [120],
-        BOARDING_CHECK_MS: 30000,
-        BOARDING_BROWSER_NOTIFICATIONS: false,
+        WA_UI_FALLBACK_MS: 6500,
+        WA_HEARTBEAT_MS: 4500,
+        WA_STATUS_REFRESH_MS: 5000,
         MESSAGES: {
             pesquisa: 'Escolha o horário desejado. Após isso, vou encaminhar as poltronas disponíveis.',
             reserva: 'Estas são as poltronas disponíveis. Informe o número da poltrona desejada.',
@@ -244,21 +229,6 @@
             EH.Config.WHATSAPP_MODE = ['web', 'app'].includes(waMode) ? waMode : 'web';
             EH.Config.PANEL_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('panelZoom', EH.Config.PANEL_ZOOM)) || 1.5));
             EH.Config.WHATSAPP_DOCK_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('whatsappDockZoom', EH.Config.WHATSAPP_DOCK_ZOOM)) || 1.1));
-            const interfaceProfile = String(this.get('interfaceProfile', EH.Config.INTERFACE_PROFILE) || 'auto').toLowerCase();
-            EH.Config.INTERFACE_PROFILE = ['auto', 'home', 'station'].includes(interfaceProfile) ? interfaceProfile : 'auto';
-            const panelSize = String(this.get('panelSize', EH.Config.PANEL_SIZE) || 'medium').toLowerCase();
-            EH.Config.PANEL_SIZE = ['small', 'medium', 'large'].includes(panelSize) ? panelSize : 'medium';
-            EH.Config.BOARDING_DEFAULT_REMIND_MINUTES = Math.min(1440, Math.max(5, Number(
-                this.get('boardingDefaultRemindMinutes', EH.Config.BOARDING_DEFAULT_REMIND_MINUTES)
-            ) || 120));
-            const savedBoardingAlerts = this.get('boardingDefaultAlerts', EH.Config.BOARDING_DEFAULT_ALERTS);
-            EH.Config.BOARDING_DEFAULT_ALERTS = Array.isArray(savedBoardingAlerts)
-                ? savedBoardingAlerts.map(Number).filter(value => Number.isFinite(value) && value >= 5 && value <= 1440).sort((a, b) => b - a)
-                : [EH.Config.BOARDING_DEFAULT_REMIND_MINUTES];
-            if (!EH.Config.BOARDING_DEFAULT_ALERTS.length) EH.Config.BOARDING_DEFAULT_ALERTS = [EH.Config.BOARDING_DEFAULT_REMIND_MINUTES];
-            EH.Config.BOARDING_BROWSER_NOTIFICATIONS = Boolean(
-                this.get('boardingBrowserNotifications', EH.Config.BOARDING_BROWSER_NOTIFICATIONS)
-            );
         }
     };
 
@@ -282,7 +252,7 @@
         off(key) {
             const item = this.listeners.get(key);
             if (!item) return;
-            try { item.target.removeEventListener(item.type, item.handler, item.options); } catch (error) { EH.Logger.debug('Listener já removido:', key, error); }
+            try { item.target.removeEventListener(item.type, item.handler, item.options); } catch (error) {}
             this.listeners.delete(key);
         },
 
@@ -517,7 +487,7 @@
             let changed = false;
             const observerTarget = oldTable?.parentElement || document.querySelector('app-pesquisa') || document.body;
             const localObserver = new MutationObserver(() => { changed = true; });
-            try { localObserver.observe(observerTarget, { childList: true, subtree: true, characterData: true }); } catch (error) { EH.Logger.debug('Observer local indisponível:', error); }
+            try { localObserver.observe(observerTarget, { childList: true, subtree: true, characterData: true }); } catch (error) {}
 
             const button = this.findSearchButton();
             if (!button) throw new Error('Não encontrei o botão Pesquisar da consulta.');
@@ -807,6 +777,23 @@
                 .replace(/\s+/g, ' ')
                 .trim();
         },
+        formatVehicleTypeLines(value) {
+            const text = this.extractVehicleType(value, value);
+            if (!text) return [];
+            if (text.includes(' - DOIS ANDARES')) {
+                const parts = text.split(/\s*-\s*DOIS ANDARES\s*/i);
+                const first = parts[0]?.trim();
+                const secondTail = text.match(/DOIS ANDARES.*$/i)?.[0]?.trim();
+                return [first, secondTail].filter(Boolean).map(line => this.stabilizeDisplayText(line));
+            }
+            return [this.stabilizeDisplayText(text)];
+        },
+        stabilizeDisplayText(value) {
+            return String(value || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .replace(/ /g, ' ');
+        },
         unique(values) {
             return [...new Set(values.filter(Boolean))];
         },
@@ -869,10 +856,7 @@
     // ============================================================
     EH.WhatsAppBridge = {
         COMMAND_TTL: 2 * 60 * 1000,
-        HEARTBEAT_TTL: EH.Config.WA_HEARTBEAT_TTL_MS,
-        UI_CACHE_TTL: EH.Config.WA_UI_CACHE_TTL_MS,
-        VERIFY_TIMEOUT: EH.Config.WA_VERIFY_TIMEOUT_MS,
-        statusBootAt: Date.now(),
+        HEARTBEAT_TTL: 18 * 1000,
         heartbeatTimer: null,
         listenerId: null,
         uiObserver: null,
@@ -916,7 +900,7 @@
             const probe = online ? this.probeConnection() : { state: 'disconnected', ready: false, reason: 'page-hidden' };
             EH.Storage.set('waHeartbeat', {
                 online: Boolean(online),
-                at: Date.now(),
+                at: online ? Date.now() : 0,
                 href: online ? location.href : '',
                 phase: probe.state,
                 ready: Boolean(probe.ready),
@@ -924,197 +908,28 @@
             });
         },
 
-        getState() {
-            const now = Date.now();
-            const hb = EH.Storage.get('waHeartbeat', null);
-            const ui = this.getUiState();
-            const uiProbe = ui?.connection && typeof ui.connection === 'object' ? ui.connection : null;
-            const hbAt = Number(hb?.at || 0);
-            const uiAt = Number(ui?.at || 0);
-            const hbAge = hbAt ? Math.max(0, now - hbAt) : Number.POSITIVE_INFINITY;
-            const uiAge = uiAt ? Math.max(0, now - uiAt) : Number.POSITIVE_INFINITY;
-            const hbPhase = String(hb?.phase || (hb?.ready ? 'connected' : 'loading'));
-            const uiPhase = String(uiProbe?.state || '');
-            const explicitOffline = Boolean(hb && hb.online === false);
-            const heartbeatFresh = Boolean(hb?.online && hbAt && hbAge <= this.HEARTBEAT_TTL);
-            const uiFresh = Boolean(uiAt && uiAge <= this.HEARTBEAT_TTL);
-            const cachedPositive = Boolean(
-                !explicitOffline &&
-                (
-                    (hb?.online && hbPhase === 'connected' && hbAge <= this.UI_CACHE_TTL) ||
-                    (uiPhase === 'connected' && uiAge <= this.UI_CACHE_TTL)
-                )
-            );
-
-            let state = 'loading';
-            let connected = false;
-            let loaded = false;
-            let source = 'initializing';
-
-            if (explicitOffline) {
-                state = 'disconnected';
-                loaded = true;
-                source = 'explicit-offline';
-            } else if (heartbeatFresh) {
-                loaded = hbPhase !== 'loading';
-                if (hbPhase === 'connected') {
-                    connected = true;
-                    state = 'connected';
-                    loaded = true;
-                    source = 'heartbeat';
-                } else if (hbPhase === 'loading') {
-                    state = 'loading';
-                    source = 'heartbeat-loading';
-                } else {
-                    state = 'disconnected';
-                    loaded = true;
-                    source = 'heartbeat-disconnected';
-                }
-            } else if (uiFresh && uiPhase === 'connected') {
-                connected = true;
-                loaded = true;
-                state = 'connected';
-                source = 'ui-state';
-            } else if (cachedPositive) {
-                // Abas em segundo plano podem ter timers fortemente desacelerados pelo
-                // navegador. Um último estado positivo permanece utilizável até prova
-                // contrária; antes de ações sensíveis fazemos um ping/ACK real.
-                connected = true;
-                loaded = true;
-                state = 'connected';
-                source = 'cached-positive';
-            } else if ((uiFresh && uiPhase === 'loading') || (hb?.online && hbPhase === 'loading' && hbAge <= this.UI_CACHE_TTL)) {
-                state = 'loading';
-                source = 'loading';
-            } else if (!hb && !uiAt && (now - this.statusBootAt) < 8000) {
-                state = 'loading';
-                source = 'startup-grace';
-            } else {
-                state = 'disconnected';
-                loaded = Boolean(hb || uiAt);
-                source = 'no-live-signal';
-            }
-
-            const activeTitle = String(ui?.active?.title || '').trim();
-            const conversationSelected = Boolean(connected && activeTitle);
-            const readyToSend = Boolean(connected && conversationSelected);
-            const stale = Boolean(connected && !heartbeatFresh && !(uiFresh && uiPhase === 'connected'));
-
-            if (connected) state = readyToSend ? 'ready' : 'no-chat';
-
-            const label = state === 'ready'
-                ? 'Conectado'
-                : state === 'no-chat'
-                    ? 'Selecione uma conversa'
-                    : state === 'loading'
-                        ? 'Conectando…'
-                        : 'Desconectado';
-
-            return {
-                state,
-                loaded,
-                connected,
-                conversationSelected,
-                readyToSend,
-                activeTitle,
-                stale,
-                source,
-                heartbeatAge: Number.isFinite(hbAge) ? hbAge : null,
-                uiAge: Number.isFinite(uiAge) ? uiAge : null,
-                label
-            };
-        },
-
         getConnectionStatus() {
-            return this.getState();
-        },
-
-
-        logState(context = '') {
-            if (!EH.Config.DEBUG) return this.getState();
-            const state = this.getState();
-            console.debug('[EPass][WhatsApp]', context || 'state', {
-                loaded: state.loaded,
-                connected: state.connected,
-                conversationSelected: state.conversationSelected,
-                readyToSend: state.readyToSend,
-                state: state.state,
-                source: state.source,
-                stale: state.stale,
-                activeTitle: state.activeTitle,
-                heartbeatAge: state.heartbeatAge,
-                uiAge: state.uiAge
-            });
-            return state;
-        },
-
-        async verifyConnection(timeout = this.VERIFY_TIMEOUT) {
-            const command = this.makeCommand({ action: 'sync', target: 'web' });
-            this.send(command);
-            const started = Date.now();
-
-            while ((Date.now() - started) < Math.max(600, Number(timeout) || this.VERIFY_TIMEOUT)) {
-                const ack = EH.Storage.get('waAck', null);
-                if (ack?.id === command.id) {
-                    const state = this.getState();
-                    this.logState('sync-ack');
-                    return { ...state, verified: Boolean(ack.ok), ack };
-                }
-                await EH.Utils.sleep(120);
+            const hb = EH.Storage.get('waHeartbeat', null);
+            const fresh = Boolean(hb?.online && hb?.at && (Date.now() - Number(hb.at)) < this.HEARTBEAT_TTL);
+            if (!fresh) {
+                return { state: 'disconnected', connected: false, readyToSend: false, label: '🔴 WhatsApp desconectado' };
             }
-
-            const state = this.getState();
-            this.logState('sync-timeout');
-            return { ...state, verified: false, verifyTimedOut: true };
+            const phase = String(hb?.phase || (hb?.ready ? 'connected' : 'loading'));
+            if (phase === 'loading') {
+                return { state: 'loading', connected: false, readyToSend: false, label: '🟡 Conectando…' };
+            }
+            if (phase !== 'connected') {
+                return { state: 'disconnected', connected: false, readyToSend: false, label: '🔴 WhatsApp desconectado' };
+            }
+            const state = this.getUiState();
+            const hasChat = Boolean(String(state?.active?.title || '').trim());
+            return hasChat
+                ? { state: 'ready', connected: true, readyToSend: true, label: '🟢 WhatsApp conectado' }
+                : { state: 'no-chat', connected: true, readyToSend: false, label: '⚠️ Selecione uma conversa' };
         },
 
-        async ensureReady({ requireConversation = true, verifyStale = true, context = 'envio' } = {}) {
-            let state = this.getState();
-            this.logState(`${context}:before`);
-
-            const alreadyUsable = state.connected && (!requireConversation || state.conversationSelected);
-            if (alreadyUsable && (!verifyStale || !state.stale)) return state;
-
-            // Uma tentativa de sincronização é a autoridade final. Isso também permite
-            // recuperar a conexão após reconexão do WhatsApp sem recarregar o E-Pass.
-            if (state.stale || state.state === 'loading' || !state.connected) {
-                const verified = await this.verifyConnection();
-                if (!verified.verified) {
-                    state = verified.state === 'loading'
-                        ? verified
-                        : {
-                            ...verified,
-                            state: 'disconnected',
-                            connected: false,
-                            conversationSelected: false,
-                            readyToSend: false,
-                            source: 'verification-timeout',
-                            label: 'Desconectado'
-                        };
-                } else {
-                    state = verified;
-                }
-            } else {
-                // conectado, mas sem conversa: não há motivo para esperar um ping.
-                state = this.getState();
-            }
-
-            this.logState(`${context}:after`);
-            return state;
-        },
-
-        notifyUnavailable(state) {
-            const current = state || this.getState();
-            if (current.state === 'loading') {
-                EH.Toast.info('🟡 Verificando WhatsApp…');
-            } else if (!current.connected) {
-                EH.Toast.error('🔴 WhatsApp desconectado.');
-            } else if (!current.conversationSelected) {
-                EH.Toast.warning('⚠️ Selecione uma conversa.');
-            } else {
-                EH.Toast.warning('⚠️ WhatsApp ainda não está pronto para envio.');
-            }
-            return false;
+        isOnline() {
+            return Boolean(this.getConnectionStatus().connected);
         },
 
         getUiState() {
@@ -1216,7 +1031,7 @@
             return chats;
         },
 
-        collectActiveConversation(limit = 45) {
+        collectActiveConversation() {
             const main = this.findConversationMain();
             if (!main) return { active: null, messages: [] };
             const header = main.querySelector('header') || main;
@@ -1232,8 +1047,7 @@
             }
             const messages = [];
             const seen = new Set();
-            const safeLimit = Math.min(500, Math.max(1, Number(limit) || 45));
-            for (const node of nodes.slice(-Math.max(70, safeLimit + 12))) {
+            for (const node of nodes.slice(-70)) {
                 const id = String(node.getAttribute?.('data-id') || '');
                 if (id && seen.has(id)) continue;
                 if (id) seen.add(id);
@@ -1256,94 +1070,13 @@
                     direction: out ? 'out' : 'in',
                     sender,
                     text: body.slice(0, 4000),
-                    time: tm ? this.cleanText(tm[1]) : '',
-                    meta: this.cleanText(pre),
-                    dataId: id
+                    time: tm ? this.cleanText(tm[1]) : ''
                 });
             }
             return {
                 active: title ? { title } : null,
-                messages: messages.slice(-safeLimit)
+                messages: messages.slice(-45)
             };
-        },
-
-        findMessageScroller() {
-            const main = this.findConversationMain();
-            if (!main) return null;
-            const sample = main.querySelector('div.message-in, div.message-out, [data-id]');
-            let node = sample;
-            for (let i = 0; i < 9 && node; i += 1, node = node.parentElement) {
-                if (!(node instanceof HTMLElement)) continue;
-                const style = getComputedStyle(node);
-                if (node.scrollHeight > node.clientHeight + 120 && /(auto|scroll)/i.test(style.overflowY || '')) return node;
-            }
-            return Array.from(main.querySelectorAll('div')).find(el => {
-                if (!(el instanceof HTMLElement)) return false;
-                const rect = el.getBoundingClientRect?.();
-                if (!rect || rect.height < 180) return false;
-                const style = getComputedStyle(el);
-                return el.scrollHeight > el.clientHeight + 240 && /(auto|scroll)/i.test(style.overflowY || '');
-            }) || null;
-        },
-
-        async readChatHistory(title, { limit = EH.Config.WA_HISTORY_LIMIT, scrolls = EH.Config.WA_HISTORY_SCROLLS } = {}) {
-            const wanted = this.cleanText(title);
-            if (!wanted) return { ok: false, chatTitle: '', messages: [], reason: 'Grupo não informado.' };
-            const selected = await this.selectChatByTitle(wanted);
-            if (!selected) return { ok: false, chatTitle: wanted, messages: [], reason: 'Conversa não encontrada na lista atual.' };
-            await EH.Utils.sleep(500);
-
-            const scroller = this.findMessageScroller();
-            if (scroller) {
-                let stagnant = 0;
-                let previousHeight = scroller.scrollHeight;
-                const maxScrolls = Math.min(18, Math.max(0, Number(scrolls) || 0));
-                for (let i = 0; i < maxScrolls; i += 1) {
-                    scroller.scrollTop = 0;
-                    scroller.dispatchEvent(new Event('scroll', { bubbles: true }));
-                    await EH.Utils.sleep(420);
-                    const nextHeight = scroller.scrollHeight;
-                    if (nextHeight <= previousHeight + 4) stagnant += 1;
-                    else stagnant = 0;
-                    previousHeight = nextHeight;
-                    if (stagnant >= 2) break;
-                }
-            }
-
-            const convo = this.collectActiveConversation(Math.min(500, Math.max(30, Number(limit) || EH.Config.WA_HISTORY_LIMIT)));
-            if (scroller) {
-                try { scroller.scrollTop = scroller.scrollHeight; } catch (error) { EH.Logger.debug('Não foi possível restaurar a rolagem do WhatsApp:', error); }
-            }
-            this.publishUiState(true);
-            return {
-                ok: Boolean(convo.active?.title && convo.messages.length),
-                chatTitle: convo.active?.title || wanted,
-                messages: convo.messages,
-                count: convo.messages.length,
-                at: Date.now()
-            };
-        },
-
-        async requestChatHistory(chatTitle, { timeout = 18000 } = {}) {
-            const title = this.cleanText(chatTitle);
-            if (!title) return { ok: false, messages: [], reason: 'Selecione o grupo de referência.' };
-            const state = await this.ensureReady({ requireConversation: false, verifyStale: true, context: 'historico-grupo' });
-            if (!state.connected) return { ok: false, messages: [], reason: 'WhatsApp desconectado.', state };
-            const command = this.makeCommand({
-                action: 'read_history',
-                target: 'web',
-                chatTitle: title,
-                historyLimit: EH.Config.WA_HISTORY_LIMIT,
-                historyScrolls: EH.Config.WA_HISTORY_SCROLLS
-            });
-            this.send(command);
-            const started = Date.now();
-            while (Date.now() - started < Math.max(4000, Number(timeout) || 18000)) {
-                const result = EH.Storage.get('waHistoryResult', null);
-                if (result?.id === command.id) return result;
-                await EH.Utils.sleep(160);
-            }
-            return { ok: false, messages: [], reason: 'O WhatsApp não respondeu a tempo.' };
         },
 
         publishUiState(force = false) {
@@ -1506,7 +1239,7 @@
             let input = Array.from(document.querySelectorAll('input[type="file"]')).find(el => /image|video/i.test(el.accept || '')) || null;
             if (!input) {
                 const attach = document.querySelector('[data-icon="plus-rounded"], [data-icon="attach-menu-plus"], button[aria-label*="Anexar" i], button[title*="Anexar" i], button[aria-label*="Attach" i]');
-                try { (attach?.closest('button') || attach)?.click(); } catch (error) { EH.Logger.debug('Botão de anexo indisponível:', error); }
+                try { (attach?.closest('button') || attach)?.click(); } catch (error) {}
                 input = await EH.Utils.waitFor(() => Array.from(document.querySelectorAll('input[type="file"]')).find(el => /image|video/i.test(el.accept || '')) || null, 3500, 180);
             }
             if (!input || typeof DataTransfer === 'undefined') return false;
@@ -1577,18 +1310,6 @@
                 const ok = await this.selectChatByTitle(command.chatTitle || '');
                 sessionStorage.setItem(doneKey, command.id);
                 EH.Storage.set('waAck', { id: command.id, at: Date.now(), action, ok });
-                return;
-            }
-
-            if (action === 'read_history') {
-                const result = await this.readChatHistory(command.chatTitle || '', {
-                    limit: command.historyLimit,
-                    scrolls: command.historyScrolls
-                });
-                const stored = { ...result, id: command.id, action, at: Date.now() };
-                EH.Storage.set('waHistoryResult', stored);
-                sessionStorage.setItem(doneKey, command.id);
-                EH.Storage.set('waAck', { id: command.id, at: Date.now(), action, ok: Boolean(result.ok), count: result.count || 0 });
                 return;
             }
 
@@ -1682,1405 +1403,10 @@
     };
 
     // ============================================================
-    // OPERAÇÃO DE VIAGEM — HISTÓRICO, PREVISÃO E EMBARQUES
-    // Módulos isolados para permitir evolução sem acoplar a venda/PIX.
-
-    // ============================================================
-    // CIDADES / ALIASES OPERACIONAIS
-    // Normaliza abreviações usadas em grupos e nomes de agências sem
-    // obrigar o parser a depender de uma grafia exata.
-    // ============================================================
-    EH.CityAliases = {
-        entries: [
-            ['SÃO LUÍS DE MONTES BELOS', ['SLMB', 'SAO LUIS', 'SÃO LUÍS', 'SAO LUIS DE MONTES BELOS', 'SÃO LUÍS DE MONTES BELOS', 'EXPRESSO MAIA SLMB', 'EXP MAIA SLMB']],
-            ['IPORÁ', ['IPORA', 'IPORÁ', 'AG IPORA', 'AG IPORÁ', 'EXP MAIA AG IPORA GO', 'EXP MAIA AG - IPORA GO']],
-            ['ARENÓPOLIS', ['ARENOPOLIS', 'ARENÓPOLIS']],
-            ['PIRANHAS', ['PIRANHAS', 'EXPRESSO MAIA PIRANHAS']],
-            ['BOM JARDIM', ['BJ', 'BOM JARDIM', 'AG BOM JARDIM', 'TAIS AG BOM JARDIM', 'TAÍS AG BOM JARDIM']],
-            ['GOIÂNIA', ['GOIANIA', 'GOIÂNIA', 'GOIANIA CENTRAL', 'GOIÂNIA CENTRAL', 'CENTRAL GOIANIA', 'CENTRAL GOIÂNIA']],
-            ['CAMPINAS', ['CAMPINAS', 'RODOVIARIA DE CAMPINAS', 'RODOVIÁRIA DE CAMPINAS']],
-            ['TRINDADE', ['TRINDADE']],
-            ['BARRA DO GARÇAS', ['BARRA', 'BARRA DO GARCAS', 'BARRA DO GARÇAS']],
-            ['ARAGARÇAS', ['ARAGARCAS', 'ARAGARÇAS']],
-            ['CUIABÁ', ['CUIABA', 'CUIABÁ']],
-            ['PALMEIRAS DO TOCANTINS', ['PALMEIRAS DO TOCANTINS']]
-        ],
-
-        norm(value) {
-            return EH.Utils.normalize(value)
-                .replace(/[.,;:()[\]{}]/g, ' ')
-                .replace(/\s+/g, ' ')
-                .trim();
-        },
-
-        aliasMap() {
-            if (this._map) return this._map;
-            this._map = new Map();
-            for (const [canonical, aliases] of this.entries) {
-                [canonical, ...aliases].forEach(alias => this._map.set(this.norm(alias), canonical));
-            }
-            return this._map;
-        },
-
-        canonicalize(value) {
-            const raw = EH.Utils.clean(value);
-            if (!raw) return '';
-            const normalized = this.norm(raw)
-                .replace(/^(?:AG|AGENCIA|AGÊNCIA|EXPRESSO MAIA|EXP MAIA|MAIA)\s*[-:]?\s*/i, '')
-                .replace(/\s+-\s+(?:GO|MT|TO|DF|BA|SP|RJ|MG|MA|PI|SE|AL|PE)$/i, '')
-                .trim();
-            const map = this.aliasMap();
-            if (map.has(normalized)) return map.get(normalized);
-            for (const [alias, canonical] of map.entries()) {
-                if (alias.length < 4) continue;
-                const re = new RegExp(`(?:^|\\b)${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\b|$)`, 'i');
-                if (re.test(this.norm(raw))) return canonical;
-            }
-            return EH.Utils.prettifyWords(raw)
-                .replace(/\s+-\s+(?:GO|MT|TO|DF|BA|SP|RJ|MG|MA|PI|SE|AL|PE)$/i, '')
-                .trim();
-        },
-
-        findInText(value) {
-            const normalized = this.norm(value);
-            if (!normalized) return '';
-            const candidates = [];
-            for (const [alias, canonical] of this.aliasMap().entries()) {
-                const shortAlias = alias.length <= 3;
-                const pattern = shortAlias
-                    ? new RegExp(`(?:^|\\s)${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?=\\s|$)`, 'i')
-                    : new RegExp(`(?:^|\\b)${alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:\\b|$)`, 'i');
-                if (pattern.test(normalized)) candidates.push({ alias, canonical });
-            }
-            candidates.sort((a, b) => b.alias.length - a.alias.length);
-            return candidates[0]?.canonical || '';
-        },
-
-        canonicalFromCandidate(candidate, fallbackText = '') {
-            const direct = this.findInText(candidate);
-            if (direct) return direct;
-            const cleaned = EH.Utils.clean(candidate)
-                .replace(/^(?:da|do|de)\s+/i, '')
-                .replace(/^rodovi[aá]ria\s+(?:de|da|do)\s+/i, '')
-                .replace(/\s+(?:as|às)\s*$/i, '')
-                .replace(/[,.!?;:]+$/g, '')
-                .trim();
-            if (cleaned && cleaned.length <= 70) {
-                const canonical = this.canonicalize(cleaned);
-                if (canonical) return canonical;
-            }
-            return this.findInText(fallbackText);
-        }
-    };
-
-    // ============================================================
-    EH.TravelHistory = {
-        KEY: 'travelHistoryV1',
-        DELETED_KEY: 'travelHistoryDeletedV1',
-
-        normalizePlace(value) {
-            const canonical = EH.CityAliases?.canonicalize?.(value) || value;
-            return EH.Utils.normalize(canonical).replace(/\s+-\s+[A-Z]{2}$/i, '').trim();
-        },
-
-        displayPlace(value) {
-            const canonical = EH.CityAliases?.canonicalize?.(value) || value;
-            return EH.Utils.prettifyWords(EH.Utils.clean(canonical)).replace(/\s+-\s+[A-Z]{2}$/i, '').trim();
-        },
-
-        load() {
-            const rows = EH.Storage.get(this.KEY, []);
-            return Array.isArray(rows) ? rows.filter(row => row && Number(row.durationMinutes) > 0) : [];
-        },
-
-        save(rows) {
-            const safe = (Array.isArray(rows) ? rows : []).slice(-EH.Config.TRAVEL_HISTORY_LIMIT);
-            EH.Storage.set(this.KEY, safe);
-            return safe;
-        },
-
-        idFor(record) {
-            const raw = [
-                record.source || 'manual', record.whatsappGroup || '', record.originKey || '', record.destinationKey || '',
-                record.departureDateTime || '', record.arrivalDateTime || '', Math.round(Number(record.durationMinutes) || 0)
-            ].join('|');
-            let hash = 2166136261;
-            for (let i = 0; i < raw.length; i += 1) {
-                hash ^= raw.charCodeAt(i);
-                hash = Math.imul(hash, 16777619);
-            }
-            return `tr-${(hash >>> 0).toString(36)}`;
-        },
-
-        addRecords(records) {
-            const current = this.load();
-            const byId = new Map(current.map(row => [row.id, row]));
-            const deleted = new Set(EH.Storage.get(this.DELETED_KEY, []));
-            let added = 0;
-            for (const input of Array.isArray(records) ? records : []) {
-                const duration = Math.round(Number(input.durationMinutes) || 0);
-                const origin = this.displayPlace(input.origin);
-                const destination = this.displayPlace(input.destination);
-                if (!origin || !destination || origin === destination || duration < 3 || duration > EH.Config.TRAVEL_MAX_DURATION_MIN) continue;
-                const record = {
-                    ...input,
-                    origin,
-                    destination,
-                    originKey: this.normalizePlace(origin),
-                    destinationKey: this.normalizePlace(destination),
-                    durationMinutes: duration,
-                    source: input.source === 'whatsapp' ? 'whatsapp' : 'manual',
-                    whatsappGroup: EH.Utils.clean(input.whatsappGroup || ''),
-                    createdAt: Number(input.createdAt) || Date.now()
-                };
-                record.id = input.id || this.idFor(record);
-                if (deleted.has(record.id)) continue;
-                const existing = byId.get(record.id);
-                if (!existing) added += 1;
-                if (existing?.editedAt) {
-                    byId.set(record.id, { ...record, durationMinutes: existing.durationMinutes, editedAt: existing.editedAt });
-                } else {
-                    byId.set(record.id, record);
-                }
-            }
-            this.save(Array.from(byId.values()).sort((a, b) => Number(a.departureDateTime || 0) - Number(b.departureDateTime || 0)));
-            return added;
-        },
-
-        addTrip(points, meta = {}) {
-            const ordered = (Array.isArray(points) ? points : [])
-                .map(point => ({
-                    city: this.displayPlace(point.city),
-                    at: point.at instanceof Date ? point.at.getTime() : Number(point.at)
-                }))
-                .filter(point => point.city && Number.isFinite(point.at))
-                .sort((a, b) => a.at - b.at);
-            const records = [];
-            for (let i = 0; i < ordered.length - 1; i += 1) {
-                for (let j = i + 1; j < ordered.length; j += 1) {
-                    const minutes = Math.round((ordered[j].at - ordered[i].at) / 60000);
-                    if (minutes < 3 || minutes > EH.Config.TRAVEL_MAX_DURATION_MIN) continue;
-                    records.push({
-                        routeId: meta.routeId || meta.whatsappGroup || '',
-                        direction: `${this.normalizePlace(ordered[i].city)}>${this.normalizePlace(ordered[j].city)}`,
-                        origin: ordered[i].city,
-                        destination: ordered[j].city,
-                        departureDateTime: ordered[i].at,
-                        arrivalDateTime: ordered[j].at,
-                        durationMinutes: minutes,
-                        source: meta.source || 'manual',
-                        whatsappGroup: meta.whatsappGroup || ''
-                    });
-                }
-            }
-            return { records, added: this.addRecords(records) };
-        },
-
-        median(values) {
-            const sorted = [...values].sort((a, b) => a - b);
-            if (!sorted.length) return 0;
-            const mid = Math.floor(sorted.length / 2);
-            return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-        },
-
-        percentile(values, q) {
-            const sorted = [...values].sort((a, b) => a - b);
-            if (!sorted.length) return 0;
-            const pos = (sorted.length - 1) * Math.min(1, Math.max(0, q));
-            const lo = Math.floor(pos), hi = Math.ceil(pos);
-            if (lo === hi) return sorted[lo];
-            return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
-        },
-
-        stats(origin, destination, whatsappGroup = '') {
-            const o = this.normalizePlace(origin);
-            const d = this.normalizePlace(destination);
-            const group = EH.Utils.clean(whatsappGroup);
-            if (!o || !d) return null;
-            let rows = this.load().filter(row => row.originKey === o && row.destinationKey === d);
-            if (group) {
-                const exactOrGeneric = rows.filter(row => !row.whatsappGroup || row.whatsappGroup === group);
-                if (exactOrGeneric.length) rows = exactOrGeneric;
-            }
-            if (!rows.length) return null;
-
-            const raw = rows.map(row => Number(row.durationMinutes)).filter(v => v > 0 && v <= EH.Config.TRAVEL_MAX_DURATION_MIN);
-            if (!raw.length) return null;
-            const median = this.median(raw);
-            const deviations = raw.map(value => Math.abs(value - median));
-            const mad = this.median(deviations);
-            const threshold = raw.length >= 5 ? Math.max(20, mad * 3.5) : Number.POSITIVE_INFINITY;
-            let filteredRows = rows.filter(row => Math.abs(Number(row.durationMinutes) - median) <= threshold);
-            if (filteredRows.length < Math.min(3, rows.length)) filteredRows = rows;
-            let filtered = filteredRows.map(row => Number(row.durationMinutes)).sort((a, b) => a - b);
-            if (filtered.length >= 10) {
-                const trim = Math.max(1, Math.floor(filtered.length * 0.1));
-                filtered = filtered.slice(trim, filtered.length - trim);
-            }
-            const mean = filtered.reduce((sum, value) => sum + value, 0) / filtered.length;
-            const low = filtered.length >= 4 ? Math.min(this.percentile(filtered, .2), mean - 10) : Math.max(1, mean - 20);
-            const high = filtered.length >= 4 ? Math.max(this.percentile(filtered, .8), mean + 10) : mean + 20;
-            const confidence = raw.length >= 10 ? 'good' : raw.length >= 4 ? 'medium' : 'low';
-            return {
-                origin: this.displayPlace(origin),
-                destination: this.displayPlace(destination),
-                averageMinutes: Math.round(mean),
-                medianMinutes: Math.round(median),
-                lowMinutes: Math.round(low),
-                highMinutes: Math.round(high),
-                count: raw.length,
-                usedCount: filtered.length,
-                ignoredCount: raw.length - filtered.length,
-                confidence,
-                records: filteredRows.sort((a, b) => Number(b.departureDateTime || 0) - Number(a.departureDateTime || 0))
-            };
-        },
-
-        routeSummaries() {
-            const map = new Map();
-            for (const row of this.load()) {
-                const key = `${row.originKey}>${row.destinationKey}`;
-                if (!map.has(key)) map.set(key, { origin: row.origin, destination: row.destination });
-            }
-            return Array.from(map.values()).map(item => this.stats(item.origin, item.destination)).filter(Boolean)
-                .sort((a, b) => b.count - a.count || a.origin.localeCompare(b.origin));
-        },
-
-        updateDuration(id, minutes) {
-            const value = Math.round(Number(minutes) || 0);
-            if (value < 3 || value > EH.Config.TRAVEL_MAX_DURATION_MIN) return false;
-            const rows = this.load();
-            const row = rows.find(item => item.id === id);
-            if (!row) return false;
-            row.durationMinutes = value;
-            row.editedAt = Date.now();
-            this.save(rows);
-            return true;
-        },
-
-        remove(id) {
-            const rows = this.load();
-            const next = rows.filter(row => row.id !== id);
-            if (next.length === rows.length) return false;
-            this.save(next);
-            const deleted = new Set(EH.Storage.get(this.DELETED_KEY, []));
-            deleted.add(id);
-            EH.Storage.set(this.DELETED_KEY, Array.from(deleted).slice(-2000));
-            return true;
-        },
-
-        clear() {
-            this.save([]);
-            EH.Storage.set(this.DELETED_KEY, []);
-        },
-
-        knownPlaces() {
-            const values = [];
-            for (const row of this.load()) values.push(row.origin, row.destination);
-            for (const route of EH.Routes.getAll()) values.push(route.origem, route.destino);
-            const map = new Map();
-            values.filter(Boolean).forEach(value => {
-                const display = this.displayPlace(value);
-                const key = this.normalizePlace(display);
-                if (key && !map.has(key)) map.set(key, display);
-            });
-            return Array.from(map.values()).sort((a, b) => a.localeCompare(b, 'pt-BR'));
-        }
-    };
-
-    EH.WhatsAppRouteParser = {
-        normalizeClock(hour, minute = '00') {
-            const h = Number(hour), m = Number(minute);
-            if (!Number.isFinite(h) || h < 0 || h > 23 || !Number.isFinite(m) || m < 0 || m > 59) return '';
-            return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
-        },
-
-        extractAnyTime(text) {
-            const match = String(text || '').match(/\b([01]?\d|2[0-3])\s*(?::|h)\s*([0-5]\d)\s*h?\b/i);
-            return match ? this.normalizeClock(match[1], match[2]) : '';
-        },
-
-        extractRouteSchedule(text) {
-            const raw = String(text || '').trim();
-            let match = raw.match(/^\s*([01]?\d|2[0-3])\s*(?::\s*([0-5]\d))?\s*(?:h|hs|hrs|horas)\b/i);
-            if (!match) {
-                match = raw.match(/^\s*([01]?\d|2[0-3])\s*:\s*([0-5]\d)\s*h?\b/i);
-            }
-            return match ? this.normalizeClock(match[1], match[2] || '00') : '';
-        },
-
-        extractExplicitDepartureTime(text) {
-            const raw = String(text || '');
-            const action = '(?:saiu|saindo|partiu|sa[ií]da)';
-            const patterns = [
-                new RegExp(`${action}[\\s\\S]{0,90}?(?:\\b(?:as|às)\\b\\s*)?([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\b`, 'i'),
-                new RegExp(`\\b(?:as|às)\\b\\s*([01]?\\d|2[0-3])\\s*(?::|h)\\s*([0-5]\\d)\\s*h?\\b`, 'i')
-            ];
-            for (const pattern of patterns) {
-                const match = raw.match(pattern);
-                if (match) return this.normalizeClock(match[1], match[2]);
-            }
-            return '';
-        },
-
-        extractMessageTimestamp(message) {
-            const sources = [message?.time || '', message?.meta || ''];
-            for (const source of sources) {
-                const time = this.extractAnyTime(source);
-                if (time) return time;
-            }
-            return '';
-        },
-
-        extractDepartureCandidate(text) {
-            const raw = EH.Utils.clean(String(text || '').replace(/[–—|]+/g, ' '));
-            if (!raw) return '';
-            const patterns = [
-                /\b(?:saiu|saindo|partiu)\s+agora\s+(?:de|da|do)\s+(.+?)(?=\s+(?:as|às)\s*\d|\s+\d{1,2}\s*(?::|h)\s*\d{2}|$)/i,
-                /\b(?:saiu|saindo|partiu|sa[ií]da)\s+(?:de|da|do)\s+(.+?)(?=\s+(?:as|às)\s*\d|\s+\d{1,2}\s*(?::|h)\s*\d{2}|$)/i,
-                /\b(?:saiu|saindo|partiu)\s+(.+?)(?=\s+(?:as|às)\s*\d|\s+\d{1,2}\s*(?::|h)\s*\d{2}|$)/i
-            ];
-            for (const pattern of patterns) {
-                const match = raw.match(pattern);
-                if (!match?.[1]) continue;
-                const candidate = EH.Utils.clean(match[1])
-                    .replace(/\b(?:carro|motorista|sistema|seguindo|passageiros?)\b.*$/i, '')
-                    .trim();
-                // "saindo agora" sem cidade explícita não pode transformar
-                // "agora" em nome de cidade. Nesse caso o remetente pode ser
-                // usado como evidência operacional mais abaixo.
-                if (/^(?:agora|neste momento|já|ja)$/i.test(candidate)) continue;
-                if (candidate) return candidate;
-            }
-            return '';
-        },
-
-        isOperationalUpdate(text) {
-            return /\b(?:saiu|saindo|saindo agora|partiu|sa[ií]da|seguindo|passou|passando)\b/i.test(String(text || ''));
-        },
-
-        extractDirection(text, routeSchedule = '') {
-            let raw = EH.Utils.clean(text);
-            if (!raw) return { origin: '', destination: '', label: '' };
-            if (routeSchedule) {
-                raw = raw.replace(/^\s*([01]?\d|2[0-3])\s*(?::\s*[0-5]\d)?\s*(?:h|hs|hrs|horas)?\b\s*/i, '');
-            }
-            const stopWords = '(?=\\s+(?:carro|motorista|sistema|seguindo|saindo|saiu|partiu|sa[ií]da|passageiros?)\\b|$)';
-            const match = raw.match(new RegExp(`^(.{2,70}?)\\s+(?:x|×|→|a)\\s+(.{2,70}?)${stopWords}`, 'i'));
-            if (!match) return { origin: '', destination: '', label: '' };
-            const cleanPart = value => EH.Utils.clean(value)
-                .replace(/^[^\p{L}\d]+|[^\p{L}\d]+$/gu, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-            const originRaw = cleanPart(match[1]);
-            const destinationRaw = cleanPart(match[2]);
-            const origin = EH.CityAliases.canonicalFromCandidate(originRaw, originRaw);
-            const destination = EH.CityAliases.canonicalFromCandidate(destinationRaw, destinationRaw);
-            return {
-                origin,
-                destination,
-                label: origin && destination ? `${origin} → ${destination}` : ''
-            };
-        },
-
-        extractVehicle(text) {
-            const match = String(text || '').match(/\bcarro\s*(?:n[º°o.]?\s*)?(\d{2,6})\b/i);
-            return match?.[1] || '';
-        },
-
-        extractDriver(text) {
-            const match = String(text || '').match(/\bmotorista\s+([\p{L}'-]+(?:\s+[\p{L}'-]+){0,2})(?=\s+(?:sistema|seguindo|saindo|saiu|carro|passageiros?)\b|$)/iu);
-            return EH.Utils.clean(match?.[1] || '');
-        },
-
-        dateFromMeta(message, eventTime) {
-            const meta = `${message?.meta || ''} ${message?.time || ''}`;
-            const dateMatch = meta.match(/\b(\d{1,2})[\/.](\d{1,2})[\/.](\d{2,4})\b/);
-            const now = new Date();
-            let year = now.getFullYear(), month = now.getMonth(), day = now.getDate();
-            if (dateMatch) {
-                day = Number(dateMatch[1]);
-                month = Number(dateMatch[2]) - 1;
-                year = Number(dateMatch[3]);
-                if (year < 100) year += 2000;
-            }
-            const time = eventTime || this.extractMessageTimestamp(message);
-            if (!time) return null;
-            const [hour, minute] = time.split(':').map(Number);
-            const date = new Date(year, month, day, hour, minute, 0, 0);
-            return Number.isNaN(date.getTime()) ? null : date;
-        },
-
-        parseMessage(message) {
-            const text = EH.Utils.clean(message?.text || '');
-            if (!text || !this.isOperationalUpdate(text)) return null;
-
-            const routeSchedule = this.extractRouteSchedule(text);
-            const direction = this.extractDirection(text, routeSchedule);
-            const explicitTime = this.extractExplicitDepartureTime(text);
-            const messageTimestamp = this.extractMessageTimestamp(message);
-            const departureCandidate = this.extractDepartureCandidate(text);
-
-            let currentCity = EH.CityAliases.canonicalFromCandidate(departureCandidate, text);
-            let citySource = currentCity ? 'message' : '';
-            if (!currentCity) {
-                currentCity = EH.CityAliases.findInText(message?.sender || '');
-                if (currentCity) citySource = 'sender';
-            }
-            if (!currentCity) return null;
-
-            let actualDepartureTime = explicitTime;
-            let timeSource = explicitTime ? 'explicit_message' : '';
-            if (!actualDepartureTime && messageTimestamp && /\bsaindo\s+agora\b/i.test(text)) {
-                actualDepartureTime = messageTimestamp;
-                timeSource = 'whatsapp_timestamp';
-            } else if (!actualDepartureTime && messageTimestamp && this.isOperationalUpdate(text)) {
-                actualDepartureTime = messageTimestamp;
-                timeSource = 'whatsapp_timestamp';
-            }
-            if (!actualDepartureTime) return null;
-
-            // O horário inicial da linha (ex.: "11hrs") nunca substitui o horário
-            // operacional real. Só é utilizado como identificação da linha.
-            const date = this.dateFromMeta(message, actualDepartureTime);
-            if (!date) return null;
-
-            const confidence = explicitTime && citySource === 'message'
-                ? 'high'
-                : citySource === 'message'
-                    ? 'medium'
-                    : 'low';
-
-            return {
-                city: currentCity,
-                cityKey: EH.TravelHistory.normalizePlace(currentCity),
-                currentCity,
-                routeSchedule,
-                direction: direction.label,
-                directionOrigin: direction.origin,
-                directionDestination: direction.destination,
-                actualDepartureTime,
-                time: actualDepartureTime,
-                timeSource,
-                citySource,
-                at: date.getTime(),
-                text,
-                messageTime: message?.time || '',
-                sender: message?.sender || '',
-                vehicle: this.extractVehicle(text),
-                driver: this.extractDriver(text),
-                confidence
-            };
-        },
-
-        clusterTrips(events) {
-            const sorted = [...events].sort((a, b) => a.at - b.at);
-            const trips = [];
-            let current = [];
-            const flush = () => { if (current.length >= 2) trips.push(current); current = []; };
-            for (const event of sorted) {
-                const prev = current[current.length - 1];
-                if (prev) {
-                    const gap = (event.at - prev.at) / 60000;
-                    const totalSpan = current.length ? (event.at - current[0].at) / 60000 : 0;
-                    const repeatedEarlier = current.slice(0, -1).some(item => item.cityKey === event.cityKey);
-                    const routeRestart = current.length >= 2 && event.cityKey === current[0].cityKey && gap > 60;
-                    const directionChanged = Boolean(
-                        prev.direction && event.direction &&
-                        EH.Utils.normalize(prev.direction) !== EH.Utils.normalize(event.direction)
-                    );
-                    const scheduleChanged = Boolean(
-                        prev.routeSchedule && event.routeSchedule &&
-                        prev.routeSchedule !== event.routeSchedule &&
-                        gap > 45
-                    );
-                    if (gap > EH.Config.TRAVEL_TRIP_GAP_MIN || gap < -5 || totalSpan > EH.Config.TRAVEL_MAX_DURATION_MIN || routeRestart || directionChanged || scheduleChanged || (repeatedEarlier && gap > 90)) flush();
-                }
-                const last = current[current.length - 1];
-                if (last && last.cityKey === event.cityKey && (event.at - last.at) <= 45 * 60000) current[current.length - 1] = event;
-                else current.push(event);
-            }
-            flush();
-            return trips;
-        },
-
-        ingest(whatsappGroup, messages) {
-            const events = (Array.isArray(messages) ? messages : []).map(message => this.parseMessage(message)).filter(Boolean);
-            const trips = this.clusterTrips(events);
-            let added = 0;
-            for (const trip of trips) {
-                const routeLabel = trip.find(event => event.direction)?.direction || whatsappGroup;
-                added += EH.TravelHistory.addTrip(trip.map(event => ({ city: event.city, at: event.at })), {
-                    source: 'whatsapp',
-                    whatsappGroup,
-                    routeId: routeLabel || whatsappGroup
-                }).added;
-            }
-            return { events, trips, added };
-        }
-    };
-
-    EH.TravelEstimator = {
-        formatDuration(minutes) {
-            const total = Math.max(0, Math.round(Number(minutes) || 0));
-            const h = Math.floor(total / 60), m = total % 60;
-            if (!h) return `${m} min`;
-            if (!m) return `${h}h`;
-            return `${h}h${String(m).padStart(2, '0')}`;
-        },
-
-        formatClock(timestamp) {
-            const date = new Date(Number(timestamp));
-            if (Number.isNaN(date.getTime())) return '';
-            return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-        },
-
-        formatDateTime(timestamp) {
-            const date = new Date(Number(timestamp));
-            if (Number.isNaN(date.getTime())) return '';
-            return date.toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
-        },
-
-        localDateInput(timestamp = Date.now()) {
-            const date = new Date(Number(timestamp));
-            if (Number.isNaN(date.getTime())) return '';
-            return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
-        },
-
-        confidenceLabel(stats) {
-            if (!stats) return '⚠️ Sem histórico suficiente';
-            if (stats.confidence === 'good') return `🟢 Boa estimativa • ${stats.count} viagens`;
-            if (stats.confidence === 'medium') return `🟡 Estimativa aproximada • ${stats.count} viagens`;
-            return `⚠️ Pouco histórico • ${stats.count} ${stats.count === 1 ? 'viagem' : 'viagens'}`;
-        },
-
-        predict({ origin, destination, whatsappGroup = '', departureAt }) {
-            const start = departureAt instanceof Date ? departureAt.getTime() : Number(departureAt);
-            if (!Number.isFinite(start)) return { ok: false, reason: 'Informe uma saída real para calcular a previsão.' };
-            const stats = EH.TravelHistory.stats(origin, destination, whatsappGroup);
-            if (!stats) return { ok: false, reason: `Ainda não há histórico de ${origin} para ${destination}.` };
-            const eta = start + stats.averageMinutes * 60000;
-            const low = start + stats.lowMinutes * 60000;
-            const high = start + stats.highMinutes * 60000;
-            return { ok: true, origin, destination, whatsappGroup, departureAt: start, eta, low, high, stats };
-        },
-
-        formatPrediction(result) {
-            if (!result?.ok) return '';
-            return `Previsão de chegada em ${EH.TravelHistory.displayPlace(result.destination)}: aproximadamente *${this.formatClock(result.eta)}*.\n\nO ônibus saiu de ${EH.TravelHistory.displayPlace(result.origin)} às ${this.formatClock(result.departureAt)}.\n\nPode haver pequena variação no horário.`;
-        },
-
-        manualPoints(baseDate, rows) {
-            const dateMatch = String(baseDate || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
-            if (!dateMatch) throw new Error('Informe a data da viagem.');
-            const points = [];
-            let dayOffset = 0;
-            let previousMinutes = null;
-            for (const row of rows) {
-                const city = EH.TravelHistory.displayPlace(row.city);
-                const tm = String(row.time || '').match(/^(\d{1,2}):(\d{2})$/);
-                if (!city || !tm) continue;
-                const minutes = Number(tm[1]) * 60 + Number(tm[2]);
-                if (previousMinutes !== null && minutes < previousMinutes - 240) dayOffset += 1;
-                previousMinutes = minutes;
-                const at = new Date(Number(dateMatch[1]), Number(dateMatch[2]) - 1, Number(dateMatch[3]) + dayOffset, Number(tm[1]), Number(tm[2]), 0, 0).getTime();
-                points.push({ city, at, time: `${String(Number(tm[1])).padStart(2, '0')}:${tm[2]}` });
-            }
-            if (points.length < 2) throw new Error('Informe pelo menos duas cidades com horário.');
-            return points;
-        }
-    };
-
-    EH.BoardingStorage = {
-        KEY: 'boardingRemindersV1',
-        load() {
-            const rows = EH.Storage.get(this.KEY, []);
-            return Array.isArray(rows) ? rows : [];
-        },
-        save(rows) {
-            EH.Storage.set(this.KEY, Array.isArray(rows) ? rows : []);
-            return rows;
-        }
-    };
-
-    EH.NotificationManager = {
-        supported() {
-            return typeof Notification !== 'undefined';
-        },
-        async request() {
-            if (!this.supported()) return { ok: false, reason: 'Notificações não estão disponíveis neste navegador.' };
-            try {
-                const permission = await Notification.requestPermission();
-                const enabled = permission === 'granted';
-                EH.Config.BOARDING_BROWSER_NOTIFICATIONS = enabled;
-                EH.Storage.set('boardingBrowserNotifications', enabled);
-                return { ok: enabled, permission };
-            } catch (error) {
-                EH.Logger.warn('Permissão de notificação:', error);
-                return { ok: false, reason: 'O navegador não permitiu ativar notificações.' };
-            }
-        },
-        notify(title, body) {
-            if (!EH.Config.BOARDING_BROWSER_NOTIFICATIONS || !this.supported() || Notification.permission !== 'granted') return false;
-            try {
-                new Notification(title, { body, tag: `epass-boarding-${title}`, renotify: false });
-                return true;
-            } catch (error) {
-                EH.Logger.debug('Notificação de embarque não disponível:', error);
-                return false;
-            }
-        }
-    };
-
-    EH.BoardingReminders = {
-        lastTicketCandidate: null,
-        started: false,
-
-        parseOffsets(value) {
-            const source = Array.isArray(value) ? value : String(value || '').split(/[,;\s]+/);
-            const values = [...new Set(source.map(Number).filter(item => Number.isFinite(item) && item >= 5 && item <= 1440).map(item => Math.round(item)))];
-            return values.sort((a, b) => b - a);
-        },
-
-        parseDateTime(dateValue, timeValue) {
-            const dateText = EH.Utils.clean(dateValue);
-            const time = String(timeValue || '').match(/(\d{1,2}):(\d{2})/);
-            if (!time) return null;
-            let match = dateText.match(/^(\d{4})-(\d{2})-(\d{2})/);
-            if (!match) {
-                const br = dateText.match(/(\d{1,2})\/(\d{1,2})\/(\d{2,4})/);
-                if (br) match = [br[0], br[3].length === 2 ? `20${br[3]}` : br[3], br[2], br[1]];
-            }
-            if (!match) return null;
-            const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(time[1]), Number(time[2]), 0, 0);
-            return Number.isNaN(date.getTime()) ? null : date;
-        },
-
-        splitTicketDate(value) {
-            const text = EH.Utils.clean(value);
-            const d = text.match(/(\d{1,2}\/\d{1,2}\/\d{2,4})/);
-            const t = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-            let date = '';
-            if (d) {
-                const [day, month, yearRaw] = d[1].split('/');
-                const year = yearRaw.length === 2 ? `20${yearRaw}` : yearRaw;
-                date = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`;
-            }
-            const time = t ? `${String(Number(t[1])).padStart(2, '0')}:${t[2]}` : '';
-            return { date, time };
-        },
-
-        reminderKey(item) {
-            const ticket = EH.Utils.clean(item.ticketNumber || '');
-            if (ticket) return `ticket:${ticket}:${item.departureAt}`;
-            return [EH.Utils.normalize(item.passenger), EH.TravelHistory.normalizePlace(item.origin), EH.TravelHistory.normalizePlace(item.destination), item.departureAt].join('|');
-        },
-
-        list({ includeCompleted = true } = {}) {
-            return EH.BoardingStorage.load()
-                .filter(item => includeCompleted || item.status !== 'completed')
-                .sort((a, b) => Number(a.departureAt || 0) - Number(b.departureAt || 0));
-        },
-
-        upsert(input) {
-            const departureAt = input.departureAt instanceof Date ? input.departureAt.getTime() : Number(input.departureAt);
-            if (!Number.isFinite(departureAt)) return { ok: false, reason: 'Informe data e horário do embarque.' };
-            const item = {
-                id: input.id || `brd-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
-                passenger: EH.Utils.clean(input.passenger || ''),
-                chatTitle: EH.Utils.clean(input.chatTitle || ''),
-                phone: String(input.phone || '').replace(/\D/g, ''),
-                origin: EH.TravelHistory.displayPlace(input.origin),
-                destination: EH.TravelHistory.displayPlace(input.destination),
-                departureAt,
-                company: EH.Utils.clean(input.company || ''),
-                ticketNumber: EH.Utils.clean(input.ticketNumber || ''),
-                status: ['pending', 'notified', 'completed'].includes(input.status) ? input.status : 'pending',
-                remindMinutes: Math.min(1440, Math.max(5, Number(input.remindMinutes) || EH.Config.BOARDING_DEFAULT_REMIND_MINUTES)),
-                alertOffsets: this.parseOffsets(input.alertOffsets || input.remindOffsets || input.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS),
-                firedOffsets: Array.isArray(input.firedOffsets) ? input.firedOffsets.map(Number).filter(Number.isFinite) : [],
-                snoozeUntil: Number(input.snoozeUntil) || 0,
-                snoozeAlertedAt: Number(input.snoozeAlertedAt) || 0,
-                alertedAt: Number(input.alertedAt) || 0,
-                overdueAlertedAt: Number(input.overdueAlertedAt) || 0,
-                createdAt: Number(input.createdAt) || Date.now(),
-                updatedAt: Date.now()
-            };
-            if (!item.alertOffsets.length) item.alertOffsets = [item.remindMinutes];
-            item.remindMinutes = Math.max(...item.alertOffsets);
-            if (!item.passenger) item.passenger = item.chatTitle || 'Passageiro';
-            if (!item.origin || !item.destination) return { ok: false, reason: 'Informe origem e destino.' };
-            const rows = EH.BoardingStorage.load();
-            const key = this.reminderKey(item);
-            const duplicate = rows.find(row => row.id !== item.id && this.reminderKey(row) === key && row.status !== 'completed');
-            if (duplicate) return { ok: false, duplicate: true, existing: duplicate, reason: 'Este embarque já está na lista.' };
-            const index = rows.findIndex(row => row.id === item.id);
-            if (index >= 0) rows[index] = { ...rows[index], ...item };
-            else rows.push(item);
-            EH.BoardingStorage.save(rows);
-            EH.OperationPanel?.refreshBadge?.();
-            return { ok: true, item };
-        },
-
-        setStatus(id, status) {
-            const rows = EH.BoardingStorage.load();
-            const item = rows.find(row => row.id === id);
-            if (!item) return false;
-            item.status = status;
-            item.updatedAt = Date.now();
-            EH.BoardingStorage.save(rows);
-            EH.OperationPanel?.refreshBadge?.();
-            return true;
-        },
-
-        snooze(id, minutes = 30) {
-            const rows = EH.BoardingStorage.load();
-            const item = rows.find(row => row.id === id);
-            if (!item) return false;
-            item.snoozeUntil = Date.now() + Math.max(5, Number(minutes) || 30) * 60000;
-            item.snoozeAlertedAt = 0;
-            item.alertedAt = 0;
-            item.updatedAt = Date.now();
-            EH.BoardingStorage.save(rows);
-            EH.OperationPanel?.refreshBadge?.();
-            return true;
-        },
-
-        remove(id) {
-            const rows = EH.BoardingStorage.load();
-            const next = rows.filter(row => row.id !== id);
-            EH.BoardingStorage.save(next);
-            EH.OperationPanel?.refreshBadge?.();
-        },
-
-        setTicketCandidate(data) {
-            if (!data?.tickets?.length) return;
-            this.lastTicketCandidate = {
-                passenger: data.passenger || data.header || '',
-                seat: data.seat || '',
-                service: data.service || '',
-                tickets: data.tickets.map(ticket => ({ ...ticket })),
-                chatTitle: EH.WhatsAppBridge.getState().activeTitle || EH.WhatsAppDock?.currentState?.active?.title || '',
-                phone: EH.UI?.getPhone?.() || ''
-            };
-            EH.OperationPanel?.refreshBadge?.();
-        },
-
-        ticketPrefill(ticketIndex = 0) {
-            const candidate = this.lastTicketCandidate;
-            if (!candidate?.tickets?.length) return null;
-            const ticket = candidate.tickets[Math.max(0, Math.min(candidate.tickets.length - 1, ticketIndex))];
-            const dt = this.splitTicketDate(ticket.date || '');
-            return {
-                passenger: candidate.passenger,
-                chatTitle: candidate.chatTitle,
-                phone: candidate.phone || '',
-                origin: ticket.origin,
-                destination: ticket.destination,
-                date: dt.date,
-                time: dt.time,
-                company: candidate.service,
-                ticketNumber: ticket.number,
-                ticketOptions: candidate.tickets
-            };
-        },
-
-        dueItems(now = Date.now()) {
-            return this.list({ includeCompleted: false }).filter(item => {
-                if (item.departureAt <= now) return true;
-                if (item.snoozeUntil && now >= item.snoozeUntil) return true;
-                const offsets = this.parseOffsets(item.alertOffsets || item.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS);
-                const earliest = offsets.length ? item.departureAt - Math.max(...offsets) * 60000 : item.departureAt - EH.Config.BOARDING_DEFAULT_REMIND_MINUTES * 60000;
-                return now >= earliest;
-            });
-        },
-
-        checkDue() {
-            const now = Date.now();
-            const rows = EH.BoardingStorage.load();
-            let changed = false;
-            for (const item of rows) {
-                if (item.status === 'completed') continue;
-                const time = EH.TravelEstimator.formatClock(item.departureAt);
-                const body = `${time} — ${item.passenger}\n${item.origin} → ${item.destination}`;
-
-                if (now > item.departureAt) {
-                    if (!item.overdueAlertedAt) {
-                        item.overdueAlertedAt = now;
-                        changed = true;
-                        EH.Toast.warning(`⚠️ Embarque vencido — verificar: ${time} — ${item.passenger}`, 7000);
-                        EH.NotificationManager.notify('⚠️ Embarque vencido — verificar', body);
-                    }
-                    continue;
-                }
-
-                if (item.snoozeUntil && now >= item.snoozeUntil && !item.snoozeAlertedAt) {
-                    item.snoozeAlertedAt = now;
-                    item.snoozeUntil = 0;
-                    changed = true;
-                    EH.Toast.warning(`⏰ Embarque próximo: ${time} — ${item.passenger}`, 5200);
-                    EH.NotificationManager.notify('⏰ Embarque próximo', body);
-                    continue;
-                }
-
-                const offsets = this.parseOffsets(item.alertOffsets || item.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS);
-                const fired = new Set((item.firedOffsets || []).map(Number));
-                const eligible = offsets.filter(offset => now >= item.departureAt - offset * 60000 && !fired.has(offset));
-                if (!eligible.length) continue;
-                // Se o navegador ficou fechado e vários alertas venceram, registra todos,
-                // mas mostra uma única notificação (a mais próxima do embarque) para não gerar spam.
-                eligible.forEach(offset => fired.add(offset));
-                item.firedOffsets = Array.from(fired);
-                item.alertedAt = now;
-                changed = true;
-                const nearest = Math.min(...eligible);
-                EH.Toast.warning(`⏰ Embarque em ~${nearest} min: ${time} — ${item.passenger}`, 5200);
-                EH.NotificationManager.notify(`⏰ Embarque às ${time}`, `${item.passenger} — ${item.origin} → ${item.destination}`);
-            }
-            if (changed) EH.BoardingStorage.save(rows);
-            EH.OperationPanel?.refreshBadge?.();
-        },
-
-        scheduleNext() {
-            if (!this.started) return;
-            EH.Runtime.timeout('boarding-check', () => {
-                this.checkDue();
-                this.scheduleNext();
-            }, EH.Config.BOARDING_CHECK_MS);
-        },
-
-        init() {
-            if (this.started || EH.WhatsAppBridge.isWhatsAppHost()) return;
-            this.started = true;
-            this.checkDue();
-            this.scheduleNext();
-            EH.Runtime.on('boarding-focus', window, 'focus', () => this.checkDue());
-            EH.Runtime.on('boarding-visibility', document, 'visibilitychange', () => { if (!document.hidden) this.checkDue(); });
-        }
-    };
-
-    EH.OperationPanel = {
-        overlay: null,
-        launcher: null,
-        badge: null,
-        activeTab: 'travel',
-        lastAnalysis: null,
-        lastPrediction: null,
-
-        attachLauncher(button) {
-            this.launcher = button;
-            this.refreshBadge();
-        },
-
-        refreshBadge() {
-            if (!this.launcher) return;
-            const active = EH.BoardingReminders.list({ includeCompleted: false });
-            const due = EH.BoardingReminders.dueItems();
-            let badge = this.badge;
-            if (!badge) {
-                badge = document.createElement('span');
-                badge.className = 'eh-operation-badge';
-                this.badge = badge;
-                this.launcher.appendChild(badge);
-            }
-            badge.textContent = String(due.length || active.length || '');
-            badge.hidden = !active.length;
-            badge.classList.toggle('due', Boolean(due.length));
-            this.launcher.title = due.length
-                ? `${due.length} embarque(s) precisam de atenção`
-                : active.length ? `${active.length} embarque(s) pendente(s)` : 'Previsão de viagem e embarques';
-        },
-
-        chatOptions() {
-            const state = EH.WhatsAppDock?.currentState || EH.WhatsAppBridge.getUiState();
-            return Array.isArray(state?.chats) ? state.chats : [];
-        },
-
-        open(tab = 'travel', prefill = null) {
-            document.querySelector('#eh-operation-overlay')?.remove();
-            this.activeTab = tab === 'boarding' ? 'boarding' : 'travel';
-            const overlay = document.createElement('div');
-            overlay.className = 'eh-overlay';
-            overlay.id = 'eh-operation-overlay';
-            const modal = document.createElement('div');
-            modal.className = 'eh-modal eh-operation-modal';
-
-            const head = document.createElement('div');
-            head.className = 'eh-modal-head';
-            const title = document.createElement('div');
-            title.className = 'eh-modal-title';
-            title.textContent = 'Viagem / Embarques';
-            const close = document.createElement('button');
-            close.type = 'button'; close.className = 'eh-modal-close'; close.textContent = '✕';
-            head.append(title, close);
-
-            const tabs = document.createElement('div');
-            tabs.className = 'eh-operation-tabs';
-            const travelTab = document.createElement('button');
-            travelTab.type = 'button'; travelTab.textContent = 'Previsão';
-            const boardingTab = document.createElement('button');
-            boardingTab.type = 'button'; boardingTab.textContent = 'Embarques';
-            tabs.append(travelTab, boardingTab);
-
-            const content = document.createElement('div');
-            content.className = 'eh-modal-content eh-operation-content';
-            const travelPane = document.createElement('section');
-            travelPane.className = 'eh-operation-pane';
-            const boardingPane = document.createElement('section');
-            boardingPane.className = 'eh-operation-pane';
-            content.append(travelPane, boardingPane);
-
-            const switchTab = tabName => {
-                this.activeTab = tabName;
-                travelTab.classList.toggle('active', tabName === 'travel');
-                boardingTab.classList.toggle('active', tabName === 'boarding');
-                travelPane.hidden = tabName !== 'travel';
-                boardingPane.hidden = tabName !== 'boarding';
-            };
-            travelTab.addEventListener('click', () => switchTab('travel'));
-            boardingTab.addEventListener('click', () => switchTab('boarding'));
-            close.addEventListener('click', () => overlay.remove());
-            overlay.addEventListener('click', event => { if (event.target === overlay) overlay.remove(); });
-
-            this.renderTravel(travelPane);
-            this.renderBoarding(boardingPane, prefill);
-            switchTab(this.activeTab);
-            modal.append(head, tabs, content);
-            overlay.appendChild(modal);
-            document.body.appendChild(overlay);
-            this.overlay = overlay;
-        },
-
-        createField(labelText, type = 'text', value = '') {
-            const wrap = document.createElement('label');
-            wrap.className = 'eh-op-field';
-            const label = document.createElement('span');
-            label.textContent = labelText;
-            const input = document.createElement('input');
-            input.type = type;
-            input.value = value || '';
-            wrap.append(label, input);
-            return { wrap, input };
-        },
-
-        fillSelect(select, values, placeholder = 'Selecione…') {
-            select.innerHTML = '';
-            const empty = document.createElement('option');
-            empty.value = ''; empty.textContent = placeholder;
-            select.appendChild(empty);
-            values.forEach(value => {
-                const option = document.createElement('option');
-                option.value = value; option.textContent = value;
-                select.appendChild(option);
-            });
-        },
-
-        renderTravel(container) {
-            container.innerHTML = '';
-            const form = document.createElement('div');
-            form.className = 'eh-op-grid';
-            const groupWrap = document.createElement('label');
-            groupWrap.className = 'eh-op-field eh-op-span-2';
-            const groupLabel = document.createElement('span');
-            groupLabel.textContent = 'Grupo de referência';
-            const group = document.createElement('select');
-            this.fillSelect(group, this.chatOptions().map(chat => chat.title), 'Selecione o grupo…');
-            const activeTitle = EH.WhatsAppDock?.currentState?.active?.title || '';
-            if (activeTitle && Array.from(group.options).some(option => option.value === activeTitle)) group.value = activeTitle;
-            groupWrap.append(groupLabel, group);
-
-            const origin = this.createField('Origem');
-            const destination = this.createField('Destino');
-            const departure = this.createField('Saída manual (opcional)', 'datetime-local');
-            departure.wrap.classList.add('eh-op-span-2');
-            form.append(groupWrap, origin.wrap, destination.wrap, departure.wrap);
-
-            const listId = `eh-op-places-${Date.now()}`;
-            const datalist = document.createElement('datalist');
-            datalist.id = listId;
-            EH.TravelHistory.knownPlaces().forEach(place => {
-                const option = document.createElement('option'); option.value = place; datalist.appendChild(option);
-            });
-            origin.input.setAttribute('list', listId);
-            destination.input.setAttribute('list', listId);
-
-            const calculate = document.createElement('button');
-            calculate.type = 'button'; calculate.className = 'eh-op-primary'; calculate.textContent = 'Calcular previsão';
-            const result = document.createElement('div');
-            result.className = 'eh-op-result'; result.hidden = true;
-            const status = document.createElement('div');
-            status.className = 'eh-op-status';
-
-            calculate.addEventListener('click', async () => {
-                const from = EH.TravelHistory.displayPlace(origin.input.value);
-                const to = EH.TravelHistory.displayPlace(destination.input.value);
-                if (!from || !to) return EH.Toast.warning('Informe origem e destino.');
-                calculate.disabled = true;
-                status.textContent = '';
-                let departureAt = departure.input.value ? new Date(departure.input.value).getTime() : NaN;
-                let latest = null;
-                try {
-                    if (group.value) {
-                        status.textContent = 'Lendo somente o grupo selecionado…';
-                        const history = await EH.WhatsAppBridge.requestChatHistory(group.value);
-                        if (!history.ok) throw new Error(history.reason || 'Não foi possível ler o grupo.');
-                        const parsed = EH.WhatsAppRouteParser.ingest(group.value, history.messages || []);
-                        this.lastAnalysis = { group: group.value, ...parsed, at: Date.now() };
-                        const originKey = EH.TravelHistory.normalizePlace(from);
-                        latest = [...parsed.events].reverse().find(event => event.cityKey === originKey) || null;
-                        if (!Number.isFinite(departureAt) && latest) departureAt = latest.at;
-                        status.textContent = `${parsed.events.length} saída(s) reconhecida(s) • ${parsed.added} novo(s) tempo(s) aprendido(s)`;
-                    }
-                    if (!Number.isFinite(departureAt)) throw new Error(`Não encontrei uma saída recente de ${from}. Informe a saída manual.`);
-                    const prediction = EH.TravelEstimator.predict({ origin: from, destination: to, whatsappGroup: group.value, departureAt });
-                    if (!prediction.ok) throw new Error(prediction.reason);
-                    this.lastPrediction = prediction;
-                    result.hidden = false;
-                    result.innerHTML = '';
-                    const heading = document.createElement('strong');
-                    heading.textContent = `${EH.TravelHistory.displayPlace(to)} • ${EH.TravelEstimator.formatClock(prediction.eta)}`;
-                    const detail = document.createElement('div');
-                    detail.textContent = `Última saída: ${from} ${EH.TravelEstimator.formatClock(prediction.departureAt)} • médio ${EH.TravelEstimator.formatDuration(prediction.stats.averageMinutes)}`;
-                    const range = document.createElement('div');
-                    range.textContent = `Faixa provável: ${EH.TravelEstimator.formatClock(prediction.low)} às ${EH.TravelEstimator.formatClock(prediction.high)}`;
-                    const confidence = document.createElement('small');
-                    confidence.textContent = EH.TravelEstimator.confidenceLabel(prediction.stats);
-                    const copy = document.createElement('button');
-                    copy.type = 'button'; copy.className = 'eh-op-secondary'; copy.textContent = 'Copiar previsão';
-                    copy.addEventListener('click', async () => {
-                        await EH.Clipboard.copyText(EH.TravelEstimator.formatPrediction(prediction));
-                        EH.Toast.success('✓ Previsão copiada');
-                    });
-                    result.append(heading, detail, range, confidence, copy);
-                } catch (error) {
-                    result.hidden = false;
-                    result.textContent = error.message || 'Não foi possível calcular a previsão.';
-                } finally {
-                    calculate.disabled = false;
-                }
-            });
-
-            const manual = document.createElement('details');
-            manual.className = 'eh-op-details';
-            const manualSummary = document.createElement('summary');
-            manualSummary.textContent = 'Calculadora manual';
-            const manualBody = document.createElement('div');
-            manualBody.className = 'eh-op-details-body';
-            const dateField = this.createField('Data da viagem', 'date', EH.TravelEstimator.localDateInput());
-            const manualGroup = document.createElement('select');
-            this.fillSelect(manualGroup, this.chatOptions().map(chat => chat.title), 'Sem grupo / manual');
-            manualGroup.value = group.value || '';
-            const rowsWrap = document.createElement('div'); rowsWrap.className = 'eh-manual-rows';
-            const addRow = (city = '', time = '') => {
-                const row = document.createElement('div'); row.className = 'eh-manual-row';
-                const cityInput = document.createElement('input'); cityInput.placeholder = 'Cidade'; cityInput.value = city;
-                cityInput.setAttribute('list', listId);
-                const timeInput = document.createElement('input'); timeInput.type = 'time'; timeInput.value = time;
-                const remove = document.createElement('button'); remove.type = 'button'; remove.textContent = '×'; remove.title = 'Remover';
-                remove.addEventListener('click', () => row.remove());
-                row.append(cityInput, timeInput, remove); rowsWrap.appendChild(row);
-            };
-            addRow(); addRow(); addRow();
-            const manualActions = document.createElement('div'); manualActions.className = 'eh-op-inline';
-            const add = document.createElement('button'); add.type = 'button'; add.className = 'eh-op-secondary'; add.textContent = '+ Cidade';
-            add.addEventListener('click', () => addRow());
-            const save = document.createElement('button'); save.type = 'button'; save.className = 'eh-op-primary'; save.textContent = 'Salvar viagem';
-            const manualResult = document.createElement('div'); manualResult.className = 'eh-op-status';
-            save.addEventListener('click', () => {
-                try {
-                    const rows = Array.from(rowsWrap.querySelectorAll('.eh-manual-row')).map(row => ({
-                        city: row.querySelector('input:not([type="time"])')?.value || '',
-                        time: row.querySelector('input[type="time"]')?.value || ''
-                    }));
-                    const points = EH.TravelEstimator.manualPoints(dateField.input.value, rows);
-                    const stored = EH.TravelHistory.addTrip(points, { source: 'manual', whatsappGroup: manualGroup.value || '', routeId: manualGroup.value || 'manual' });
-                    const intervals = [];
-                    for (let i = 0; i < points.length - 1; i += 1) {
-                        intervals.push(`${points[i].city} → ${points[i + 1].city}: ${EH.TravelEstimator.formatDuration((points[i + 1].at - points[i].at) / 60000)}`);
-                    }
-                    const total = (points[points.length - 1].at - points[0].at) / 60000;
-                    manualResult.textContent = `${intervals.join(' • ')} • Total ${EH.TravelEstimator.formatDuration(total)} • ${stored.added} tempo(s) salvo(s)`;
-                    EH.Toast.success('✓ Tempos da viagem salvos');
-                } catch (error) {
-                    manualResult.textContent = error.message || 'Não foi possível salvar a viagem.';
-                }
-            });
-            manualActions.append(add, save);
-            manualBody.append(dateField.wrap, manualGroup, rowsWrap, manualActions, manualResult);
-            manual.append(manualSummary, manualBody);
-
-            const history = document.createElement('details');
-            history.className = 'eh-op-details';
-            const historySummary = document.createElement('summary'); historySummary.textContent = 'Histórico de tempos';
-            const historyBody = document.createElement('div'); historyBody.className = 'eh-op-details-body';
-            const renderHistory = () => {
-                historyBody.innerHTML = '';
-                const summaries = EH.TravelHistory.routeSummaries().slice(0, 40);
-                if (!summaries.length) { historyBody.textContent = 'Nenhum tempo histórico salvo ainda.'; return; }
-                summaries.forEach(summaryItem => {
-                    const details = document.createElement('details'); details.className = 'eh-history-route';
-                    const s = document.createElement('summary');
-                    s.textContent = `${summaryItem.origin} → ${summaryItem.destination} • ${EH.TravelEstimator.formatDuration(summaryItem.averageMinutes)} • ${summaryItem.count}`;
-                    const records = document.createElement('div'); records.className = 'eh-history-records';
-                    summaryItem.records.slice(0, 25).forEach(record => {
-                        const row = document.createElement('div'); row.className = 'eh-history-record';
-                        const label = document.createElement('span');
-                        label.textContent = `${EH.TravelEstimator.formatDateTime(record.departureDateTime)} • ${record.source === 'whatsapp' ? 'WhatsApp' : 'manual'}${record.whatsappGroup ? ` • ${record.whatsappGroup}` : ''}`;
-                        const minutes = document.createElement('input'); minutes.type = 'number'; minutes.min = '3'; minutes.max = String(EH.Config.TRAVEL_MAX_DURATION_MIN); minutes.value = String(record.durationMinutes); minutes.title = 'Minutos';
-                        const saveBtn = document.createElement('button'); saveBtn.type = 'button'; saveBtn.textContent = '✓'; saveBtn.title = 'Corrigir tempo';
-                        saveBtn.addEventListener('click', () => { if (EH.TravelHistory.updateDuration(record.id, minutes.value)) { EH.Toast.success('Tempo corrigido.'); renderHistory(); } });
-                        const del = document.createElement('button'); del.type = 'button'; del.textContent = '×'; del.title = 'Excluir registro';
-                        del.addEventListener('click', () => { EH.TravelHistory.remove(record.id); renderHistory(); });
-                        row.append(label, minutes, saveBtn, del); records.appendChild(row);
-                    });
-                    details.append(s, records); historyBody.appendChild(details);
-                });
-            };
-            history.addEventListener('toggle', () => { if (history.open) renderHistory(); });
-            history.append(historySummary, historyBody);
-
-            container.append(form, calculate, status, result, manual, history, datalist);
-        },
-
-        renderBoarding(container, prefill = null) {
-            container.innerHTML = '';
-            const top = document.createElement('div'); top.className = 'eh-op-inline';
-            const add = document.createElement('button'); add.type = 'button'; add.className = 'eh-op-primary'; add.textContent = 'Novo lembrete';
-            const ticketPrefill = prefill || EH.BoardingReminders.ticketPrefill();
-            const useTicket = document.createElement('button'); useTicket.type = 'button'; useTicket.className = 'eh-op-secondary'; useTicket.textContent = 'Usar último bilhete'; useTicket.disabled = !ticketPrefill;
-            top.append(add, useTicket);
-            const editor = document.createElement('div'); editor.className = 'eh-boarding-editor'; editor.hidden = true;
-            const list = document.createElement('div'); list.className = 'eh-boarding-list';
-            const completed = document.createElement('details'); completed.className = 'eh-op-details';
-            const completedSummary = document.createElement('summary'); completedSummary.textContent = 'Concluídos';
-            const completedBody = document.createElement('div'); completedBody.className = 'eh-op-details-body'; completed.append(completedSummary, completedBody);
-
-            const openEditor = data => this.renderReminderEditor(editor, data || {} , () => { editor.hidden = true; renderLists(); });
-            add.addEventListener('click', () => openEditor({ chatTitle: EH.WhatsAppBridge.getState().activeTitle || '' }));
-            useTicket.addEventListener('click', () => openEditor(ticketPrefill));
-
-            const renderCard = (item, target) => {
-                const card = document.createElement('div'); card.className = `eh-boarding-card ${item.status}`;
-                const now = Date.now();
-                if (item.departureAt < now && item.status !== 'completed') card.classList.add('overdue');
-                const head = document.createElement('div'); head.className = 'eh-boarding-head';
-                const title = document.createElement('strong');
-                const critical = new Date(item.departureAt).getHours() < 5;
-                title.textContent = `${critical ? '🌙 ' : ''}${EH.TravelEstimator.formatClock(item.departureAt)} — ${item.passenger}`;
-                const state = document.createElement('span'); state.textContent = item.status === 'notified' ? 'Avisado' : item.status === 'completed' ? 'Concluído' : (item.departureAt < now ? 'Vencido' : 'Pendente');
-                head.append(title, state);
-                const route = document.createElement('div'); route.textContent = `${item.origin} → ${item.destination} • ${EH.TravelEstimator.formatDateTime(item.departureAt)}`;
-                const actions = document.createElement('div'); actions.className = 'eh-op-inline compact';
-                const wa = document.createElement('button'); wa.type = 'button'; wa.textContent = 'WhatsApp'; wa.disabled = !item.chatTitle;
-                wa.addEventListener('click', async () => {
-                    if (!item.chatTitle) return;
-                    const stateNow = await EH.WhatsAppBridge.ensureReady({ requireConversation: false, verifyStale: true, context: 'embarque-conversa' });
-                    if (!stateNow.connected) return EH.WhatsAppBridge.notifyUnavailable(stateNow);
-                    EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: item.chatTitle }));
-                    EH.Toast.info('Abrindo conversa do passageiro…');
-                });
-                const notified = document.createElement('button'); notified.type = 'button'; notified.textContent = 'Avisado'; notified.disabled = item.status === 'completed';
-                notified.addEventListener('click', () => { EH.BoardingReminders.setStatus(item.id, 'notified'); renderLists(); });
-                const done = document.createElement('button'); done.type = 'button'; done.textContent = 'Concluir'; done.disabled = item.status === 'completed';
-                done.addEventListener('click', () => { EH.BoardingReminders.setStatus(item.id, 'completed'); renderLists(); });
-                const more = document.createElement('button'); more.type = 'button'; more.textContent = '⋯'; more.title = 'Mais ações';
-                more.addEventListener('click', () => {
-                    const action = prompt('Digite: adiar 30, editar ou excluir', 'adiar 30');
-                    if (!action) return;
-                    const delay = action.match(/adiar\s+(\d+)/i);
-                    if (delay) EH.BoardingReminders.snooze(item.id, Number(delay[1]));
-                    else if (/editar/i.test(action)) openEditor(item);
-                    else if (/excluir/i.test(action)) EH.BoardingReminders.remove(item.id);
-                    renderLists();
-                });
-                actions.append(wa, notified, done, more);
-                card.append(head, route, actions); target.appendChild(card);
-            };
-
-            const renderLists = () => {
-                list.innerHTML = ''; completedBody.innerHTML = '';
-                const rows = EH.BoardingReminders.list();
-                const active = rows.filter(item => item.status !== 'completed');
-                const doneRows = rows.filter(item => item.status === 'completed').slice(-20).reverse();
-                if (!active.length) {
-                    const empty = document.createElement('div'); empty.className = 'eh-op-empty'; empty.textContent = 'Nenhum embarque pendente.'; list.appendChild(empty);
-                } else active.forEach(item => renderCard(item, list));
-                if (!doneRows.length) completedBody.textContent = 'Nenhum embarque concluído.';
-                else doneRows.forEach(item => renderCard(item, completedBody));
-                this.refreshBadge();
-            };
-
-            const settings = document.createElement('details'); settings.className = 'eh-op-details';
-            const settingsSummary = document.createElement('summary'); settingsSummary.textContent = 'Configurações dos alertas';
-            const settingsBody = document.createElement('div'); settingsBody.className = 'eh-op-details-body';
-            const remind = this.createField('Alertas padrão em minutos (ex.: 180,120,60)', 'text', EH.Config.BOARDING_DEFAULT_ALERTS.join(','));
-            const notifications = document.createElement('button'); notifications.type = 'button'; notifications.className = 'eh-op-secondary'; notifications.textContent = 'Ativar notificações do navegador';
-            notifications.addEventListener('click', async () => {
-                const result = await EH.NotificationManager.request();
-                if (result.ok) EH.Toast.success('Notificações de embarque ativadas.');
-                else EH.Toast.warning(result.reason || 'Permissão de notificação não concedida.');
-            });
-            remind.input.addEventListener('change', () => {
-                const offsets = EH.BoardingReminders.parseOffsets(remind.input.value);
-                EH.Config.BOARDING_DEFAULT_ALERTS = offsets.length ? offsets : [120];
-                EH.Config.BOARDING_DEFAULT_REMIND_MINUTES = Math.max(...EH.Config.BOARDING_DEFAULT_ALERTS);
-                remind.input.value = EH.Config.BOARDING_DEFAULT_ALERTS.join(',');
-                EH.Storage.set('boardingDefaultAlerts', EH.Config.BOARDING_DEFAULT_ALERTS);
-                EH.Storage.set('boardingDefaultRemindMinutes', EH.Config.BOARDING_DEFAULT_REMIND_MINUTES);
-            });
-            settingsBody.append(remind.wrap, notifications); settings.append(settingsSummary, settingsBody);
-
-            container.append(top, editor, list, completed, settings);
-            renderLists();
-            if (prefill) openEditor(prefill);
-        },
-
-        renderReminderEditor(container, prefill, onSaved) {
-            container.innerHTML = ''; container.hidden = false;
-            const title = document.createElement('strong'); title.textContent = prefill?.id ? 'Editar embarque' : 'Novo embarque';
-            let data = { ...prefill };
-            if (Array.isArray(prefill?.ticketOptions) && prefill.ticketOptions.length > 1) {
-                const select = document.createElement('select');
-                prefill.ticketOptions.forEach((ticket, index) => {
-                    const option = document.createElement('option'); option.value = String(index); option.textContent = `${ticket.number || index + 1} • ${ticket.origin} → ${ticket.destination} • ${ticket.date}`; select.appendChild(option);
-                });
-                select.addEventListener('change', () => {
-                    const selected = EH.BoardingReminders.ticketPrefill(Number(select.value));
-                    if (selected) this.renderReminderEditor(container, selected, onSaved);
-                });
-                container.append(title, select);
-            } else container.appendChild(title);
-
-            const grid = document.createElement('div'); grid.className = 'eh-op-grid';
-            const passenger = this.createField('Passageiro', 'text', data.passenger || '');
-            const chat = this.createField('Conversa', 'text', data.chatTitle || EH.WhatsAppBridge.getState().activeTitle || '');
-            const origin = this.createField('Origem', 'text', data.origin || '');
-            const destination = this.createField('Destino', 'text', data.destination || '');
-            let dateValue = data.date || '', timeValue = data.time || '';
-            if (data.departureAt) {
-                const dt = new Date(data.departureAt);
-                dateValue = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
-                timeValue = `${String(dt.getHours()).padStart(2,'0')}:${String(dt.getMinutes()).padStart(2,'0')}`;
-            }
-            const date = this.createField('Data', 'date', dateValue);
-            const time = this.createField('Horário', 'time', timeValue);
-            const remind = this.createField('Alertas antes (min; ex. 180,120,60)', 'text', EH.BoardingReminders.parseOffsets(data.alertOffsets || data.remindMinutes || EH.Config.BOARDING_DEFAULT_ALERTS).join(','));
-            const ticket = this.createField('Bilhete / reserva', 'text', data.ticketNumber || '');
-            grid.append(passenger.wrap, chat.wrap, origin.wrap, destination.wrap, date.wrap, time.wrap, remind.wrap, ticket.wrap);
-            const actions = document.createElement('div'); actions.className = 'eh-op-inline';
-            const save = document.createElement('button'); save.type = 'button'; save.className = 'eh-op-primary'; save.textContent = 'Salvar lembrete';
-            const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'eh-op-secondary'; cancel.textContent = 'Cancelar';
-            save.addEventListener('click', () => {
-                const departure = EH.BoardingReminders.parseDateTime(date.input.value, time.input.value);
-                const result = EH.BoardingReminders.upsert({
-                    ...data,
-                    passenger: passenger.input.value,
-                    chatTitle: chat.input.value,
-                    origin: origin.input.value,
-                    destination: destination.input.value,
-                    departureAt: departure?.getTime(),
-                    remindMinutes: Math.max(...(EH.BoardingReminders.parseOffsets(remind.input.value).length ? EH.BoardingReminders.parseOffsets(remind.input.value) : [EH.Config.BOARDING_DEFAULT_REMIND_MINUTES])),
-                    alertOffsets: EH.BoardingReminders.parseOffsets(remind.input.value),
-                    ticketNumber: ticket.input.value
-                });
-                if (!result.ok) return EH.Toast.warning(result.reason || 'Não foi possível criar o lembrete.');
-                EH.Toast.success('✓ Lembrete de embarque salvo');
-                onSaved?.(result.item);
-            });
-            cancel.addEventListener('click', () => { container.hidden = true; });
-            actions.append(save, cancel); container.append(grid, actions);
-        }
-    };
-
-    // ============================================================
     // WHATSAPP INTEGRADO AO E-PASS
     // A aba já aberta do WhatsApp Web funciona como motor. Esta interface
     // lateral reproduz as conversas e envia comandos sem abrir nova aba/janela.
     // ============================================================
-    // ============================================================
-    // COMPOSER DE ATENDIMENTO
-    // Conteúdo gerado pelo E-Pass fica visível no painel integrado e só
-    // é enviado após confirmação explícita por Enter/botão Enviar.
-    // ============================================================
-    EH.WhatsAppComposer = {
-        current: null,
-
-        typeLabel(type) {
-            const labels = {
-                schedules: 'Horários',
-                seats: 'Poltronas',
-                reservation: 'Confirmação',
-                pix: 'PIX',
-                ticket: 'Bilhete',
-                qr: 'QR Code'
-            };
-            return labels[type] || 'Atendimento';
-        },
-
-        hasContent() {
-            const item = this.current;
-            return Boolean(item && (item.text || item.message2 || item.attachment?.dataUrl));
-        },
-
-        fingerprint(input) {
-            return [
-                input?.type || '',
-                input?.chatTitle || '',
-                input?.text || '',
-                input?.message2 || '',
-                input?.attachment?.filename || '',
-                String(input?.attachment?.dataUrl || '').slice(0, 80)
-            ].join('|');
-        },
-
-        prepare(input = {}, { replace = false, silent = false } = {}) {
-            const attachment = input.attachment?.dataUrl
-                ? {
-                    dataUrl: String(input.attachment.dataUrl),
-                    filename: String(input.attachment.filename || 'epass-atendimento.png'),
-                    mime: String(input.attachment.mime || 'image/png')
-                }
-                : null;
-            const next = {
-                id: `wa-compose-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                type: String(input.type || 'message'),
-                chatTitle: String(input.chatTitle || EH.WhatsAppBridge.getState().activeTitle || '').trim(),
-                text: String(input.text || ''),
-                message2: String(input.message2 || ''),
-                attachment,
-                createdAt: Date.now()
-            };
-            next.fingerprint = this.fingerprint(next);
-
-            if (this.hasContent() && !replace) {
-                if (this.current?.fingerprint === next.fingerprint) {
-                    EH.WhatsAppDock?.renderPrepared?.();
-                    return { ok: true, duplicate: true, item: this.current };
-                }
-                EH.Toast.warning('Já existe conteúdo preparado. Envie ou remova antes de preparar outro.');
-                EH.WhatsAppDock?.renderPrepared?.();
-                return { ok: false, blocked: true, item: this.current };
-            }
-
-            this.current = next;
-            EH.WhatsAppDock?.applyPreparedToInput?.();
-            EH.WhatsAppDock?.renderPrepared?.();
-            if (!silent) EH.Toast.success(`✓ ${this.typeLabel(next.type)} preparado no WhatsApp`);
-            return { ok: true, item: next };
-        },
-
-        clear({ keepInput = false } = {}) {
-            this.current = null;
-            if (!keepInput && EH.WhatsAppDock?.composer) EH.WhatsAppDock.composer.value = '';
-            EH.WhatsAppDock?.renderPrepared?.();
-            EH.WhatsAppDock?.refreshConnection?.();
-        },
-
-        get() {
-            return this.current ? { ...this.current, attachment: this.current.attachment ? { ...this.current.attachment } : null } : null;
-        }
-    };
-
     EH.WhatsAppDock = {
         root: null,
         chatList: null,
@@ -3100,12 +1426,6 @@
         imagePreviewImg: null,
         imagePreviewName: null,
         imageRemoveButton: null,
-        preparedWrap: null,
-        preparedTarget: null,
-        preparedImage: null,
-        preparedText: null,
-        preparedRemove: null,
-        pendingPreparedId: '',
 
         init() {
             if (this.root || EH.WhatsAppBridge.isWhatsAppHost() || !document.body) return;
@@ -3133,12 +1453,6 @@
 
             const chats = document.createElement('section');
             chats.className = 'eh-wa-chats';
-            const operation = document.createElement('button');
-            operation.type = 'button';
-            operation.className = 'eh-wa-operation';
-            operation.innerHTML = '<span>⏱</span><strong>Viagem / Embarques</strong>';
-            operation.addEventListener('click', () => EH.OperationPanel.open('travel'));
-            EH.OperationPanel.attachLauncher(operation);
             const search = document.createElement('input');
             search.type = 'search';
             search.className = 'eh-wa-search';
@@ -3147,7 +1461,7 @@
             search.addEventListener('input', () => this.renderChats());
             const list = document.createElement('div');
             list.className = 'eh-wa-chat-list';
-            chats.append(operation, search, list);
+            chats.append(search, list);
 
             const conversation = document.createElement('section');
             conversation.className = 'eh-wa-conversation';
@@ -3159,34 +1473,6 @@
             const messages = document.createElement('div');
             messages.className = 'eh-wa-messages';
             conversation.append(convHead, messages);
-
-            const prepared = document.createElement('section');
-            prepared.className = 'eh-wa-prepared';
-            prepared.hidden = true;
-            const preparedHead = document.createElement('div');
-            preparedHead.className = 'eh-wa-prepared-head';
-            const preparedLabel = document.createElement('strong');
-            preparedLabel.textContent = 'Preparado para envio';
-            const preparedTarget = document.createElement('span');
-            preparedTarget.textContent = 'Para: selecione uma conversa';
-            const preparedRemove = document.createElement('button');
-            preparedRemove.type = 'button';
-            preparedRemove.className = 'eh-wa-prepared-remove';
-            preparedRemove.title = 'Remover conteúdo preparado';
-            preparedRemove.setAttribute('aria-label', preparedRemove.title);
-            preparedRemove.textContent = '×';
-            preparedRemove.addEventListener('click', () => EH.WhatsAppComposer.clear());
-            preparedHead.append(preparedLabel, preparedTarget, preparedRemove);
-            const preparedBody = document.createElement('div');
-            preparedBody.className = 'eh-wa-prepared-body';
-            const preparedImage = document.createElement('img');
-            preparedImage.className = 'eh-wa-prepared-image';
-            preparedImage.alt = 'Imagem preparada';
-            preparedImage.hidden = true;
-            const preparedText = document.createElement('div');
-            preparedText.className = 'eh-wa-prepared-text';
-            preparedBody.append(preparedImage, preparedText);
-            prepared.append(preparedHead, preparedBody);
 
             const composerWrap = document.createElement('div');
             composerWrap.className = 'eh-wa-compose';
@@ -3236,7 +1522,7 @@
             handle.hidden = !this.collapsed;
             handle.addEventListener('click', () => this.setCollapsed(false));
 
-            root.append(head, chats, conversation, prepared, pastePreview, composerWrap);
+            root.append(head, chats, conversation, pastePreview, composerWrap);
             document.body.append(root, handle);
             this.root = root;
             this.handle = handle;
@@ -3252,14 +1538,8 @@
             this.imagePreviewImg = previewImg;
             this.imagePreviewName = previewName;
             this.imageRemoveButton = removeImage;
-            this.preparedWrap = prepared;
-            this.preparedTarget = preparedTarget;
-            this.preparedImage = preparedImage;
-            this.preparedText = preparedText;
-            this.preparedRemove = preparedRemove;
             this.applyLayout();
             this.render(EH.WhatsAppBridge.getUiState());
-            this.renderPrepared();
 
             if (typeof GM_addValueChangeListener === 'function') {
                 this.listenerId = GM_addValueChangeListener(EH.Storage.key('waUiState'), (_name, _oldValue, newValue) => {
@@ -3269,20 +1549,15 @@
                 this.ackListenerId = GM_addValueChangeListener(EH.Storage.key('waAck'), (_name, _oldValue, newValue) => {
                     const ack = EH.WhatsAppBridge.parseStored(newValue);
                     if (ack?.id && ack.id === this.pendingCommandId) {
-                        if (ack.ok) {
-                            if (this.pendingPreparedId && EH.WhatsAppComposer.current?.id === this.pendingPreparedId) {
-                                EH.WhatsAppComposer.clear();
-                            } else {
-                                if (this.pendingImage) this.clearPendingImage();
-                                if (this.composer) this.composer.value = '';
-                            }
-                            EH.Toast.success('✓ Enviado pelo WhatsApp');
+                        if (ack.ok && ack.imageSent) {
+                            this.clearPendingImage();
+                            if (this.composer) this.composer.value = '';
+                            EH.Toast.success('✓ Imagem enviada');
                         } else if (ack.imageAttached && !ack.imageSent) {
-                            EH.Toast.warning('A imagem foi anexada, mas o WhatsApp não confirmou o envio.');
-                        } else {
-                            EH.Toast.error('Não foi possível concluir o envio pelo WhatsApp.');
+                            EH.Toast.warning('A imagem foi anexada no WhatsApp, mas o envio automático não foi concluído. Confira a aba do WhatsApp Web.');
+                        } else if (!ack.ok) {
+                            EH.Toast.error('Não foi possível enviar a imagem pelo WhatsApp.');
                         }
-                        this.pendingPreparedId = '';
                         this.pendingCommandId = '';
                     }
                     setTimeout(() => this.requestSync(), 160);
@@ -3301,32 +1576,40 @@
         },
 
         refreshConnection() {
-            const connection = EH.WhatsAppBridge.getState();
-            const state = connection.state;
+            const connection = EH.WhatsAppBridge.getConnectionStatus();
+            const hasChat = Boolean(String(this.currentState?.active?.title || EH.WhatsAppBridge.getUiState()?.active?.title || '').trim());
+            const state = connection.connected ? (hasChat ? 'ready' : 'no-chat') : connection.state;
             this.root?.classList.remove('eh-wa-online', 'eh-wa-loading', 'eh-wa-disconnected', 'eh-wa-no-chat', 'eh-wa-ready');
             if (state === 'ready') this.root?.classList.add('eh-wa-online', 'eh-wa-ready');
             else if (state === 'no-chat') this.root?.classList.add('eh-wa-online', 'eh-wa-no-chat');
             else if (state === 'loading') this.root?.classList.add('eh-wa-loading');
             else this.root?.classList.add('eh-wa-disconnected');
 
-            if (this.statusEl) this.statusEl.textContent = connection.label;
-
-            // O campo pode receber texto/imagem assim que a sessão Web estiver conectada.
-            // O botão de envio só libera quando existe uma conversa selecionada.
-            if (this.composer) this.composer.disabled = !connection.connected;
-            if (this.sendButton) {
-                this.sendButton.disabled = !connection.readyToSend;
-                this.sendButton.title = EH.WhatsAppComposer.hasContent()
-                    ? 'Enviar conteúdo preparado'
-                    : (this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem');
+            if (this.statusEl) {
+                this.statusEl.textContent = state === 'ready'
+                    ? '🟢 WhatsApp conectado'
+                    : state === 'no-chat'
+                        ? '⚠️ Selecione uma conversa'
+                        : state === 'loading'
+                            ? '🟡 Conectando…'
+                            : '🔴 WhatsApp desconectado';
             }
-            return connection;
+            const canCompose = Boolean(connection.connected);
+            const canSend = Boolean(connection.connected && hasChat);
+            // Permite colar/preparar uma imagem antes de escolher a conversa;
+            // o envio continua bloqueado até existir um chat selecionado.
+            if (this.composer) this.composer.disabled = !canCompose;
+            if (this.sendButton) this.sendButton.disabled = !canSend;
+            if (this.sendButton) this.sendButton.title = this.pendingImage ? 'Enviar imagem' : 'Enviar mensagem';
+            return { ...connection, state, canSend };
         },
 
         requestSync() {
-            // Não bloqueie a própria tentativa de sincronização com base em um estado
-            // possivelmente antigo. O ACK do WhatsApp é que confirma a conexão real.
-            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'sync', target: 'web' }));
+            if (!EH.WhatsAppBridge.isOnline()) {
+                this.refreshConnection();
+                return;
+            }
+            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'sync' }));
         },
 
         render(state) {
@@ -3335,59 +1618,6 @@
             if (this.titleEl) this.titleEl.textContent = this.currentState.active?.title || 'Selecione uma conversa';
             this.renderChats();
             this.renderMessages();
-            this.renderPrepared();
-        },
-
-        renderPrepared() {
-            if (!this.preparedWrap) return;
-            const item = EH.WhatsAppComposer.get();
-            const has = Boolean(item && (item.text || item.message2 || item.attachment?.dataUrl));
-            this.preparedWrap.hidden = !has;
-            this.root?.classList.toggle('eh-wa-has-prepared', has);
-            if (!has) {
-                if (this.preparedImage) {
-                    this.preparedImage.hidden = true;
-                    this.preparedImage.removeAttribute('src');
-                }
-                if (this.preparedText) this.preparedText.textContent = '';
-                if (this.preparedTarget) this.preparedTarget.textContent = 'Para: selecione uma conversa';
-                this.refreshConnection();
-                return;
-            }
-            const target = item.chatTitle || this.currentState?.active?.title || EH.WhatsAppBridge.getState().activeTitle || '';
-            if (this.preparedTarget) this.preparedTarget.textContent = target ? `Para: ${target}` : 'Para: selecione uma conversa';
-            if (this.preparedImage) {
-                if (item.attachment?.dataUrl) {
-                    this.preparedImage.src = item.attachment.dataUrl;
-                    this.preparedImage.hidden = false;
-                } else {
-                    this.preparedImage.hidden = true;
-                    this.preparedImage.removeAttribute('src');
-                }
-            }
-            if (this.preparedText) {
-                const typeLabel = EH.WhatsAppComposer.typeLabel(item.type);
-                const preview = String(item.text || item.message2 || '').trim();
-                const second = item.message2 ? ' • 2 mensagens' : '';
-                this.preparedText.textContent = `${typeLabel}${second}${preview ? `\n${preview}` : ''}`;
-            }
-            this.refreshConnection();
-        },
-
-        applyPreparedToInput() {
-            const item = EH.WhatsAppComposer.get();
-            if (!item || !this.composer) return;
-            this.composer.value = String(item.text || '');
-            this.renderPrepared();
-        },
-
-        prepareContent(input, options = {}) {
-            const result = EH.WhatsAppComposer.prepare(input, options);
-            if (result.ok) {
-                EH.State.setPanel('right', true);
-                this.applyPreparedToInput();
-            }
-            return result;
         },
 
         renderChats() {
@@ -3536,96 +1766,27 @@
             }
         },
 
-        async selectChat(title) {
-            const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: false,
-                verifyStale: true,
-                context: 'selecionar-conversa'
-            });
-            if (!state.connected) {
-                EH.WhatsAppBridge.notifyUnavailable(state);
+        selectChat(title) {
+            if (!EH.WhatsAppBridge.isOnline()) {
+                EH.Toast.warning('O WhatsApp Web não está conectado. Abra a aba que você já usa e mantenha-a aberta.');
                 return;
             }
             EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'select_chat', chatTitle: title }));
             if (this.titleEl) this.titleEl.textContent = title;
-            if (EH.WhatsAppComposer.current && !EH.WhatsAppComposer.current.chatTitle) {
-                EH.WhatsAppComposer.current.chatTitle = title;
-                EH.WhatsAppComposer.current.fingerprint = EH.WhatsAppComposer.fingerprint(EH.WhatsAppComposer.current);
-                this.renderPrepared();
-            }
         },
 
-        async sendPrepared() {
-            const item = EH.WhatsAppComposer.get();
-            if (!item) return false;
-            const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: true,
-                verifyStale: true,
-                context: `composer-${item.type || 'atendimento'}`
-            });
-            const activeTitle = String(state.activeTitle || this.currentState?.active?.title || '').trim();
-            if (!state.connected || !activeTitle) {
-                EH.WhatsAppBridge.notifyUnavailable({ ...state, conversationSelected: Boolean(activeTitle), activeTitle });
-                return false;
-            }
-
-            const target = String(item.chatTitle || activeTitle).trim();
-            const editedText = String(this.composer?.value ?? item.text ?? '').trim();
-            let command;
-            if (item.attachment?.dataUrl) {
-                command = EH.WhatsAppBridge.makeCommand({
-                    action: 'send_image',
-                    chatTitle: target,
-                    message: editedText,
-                    imageDataUrl: item.attachment.dataUrl,
-                    filename: item.attachment.filename || 'epass-atendimento.png'
-                });
-            } else if (item.message2) {
-                command = EH.WhatsAppBridge.makeCommand({
-                    action: 'send_pair',
-                    chatTitle: target,
-                    message: editedText,
-                    message2: item.message2
-                });
-            } else if (editedText) {
-                command = EH.WhatsAppBridge.makeCommand({
-                    action: 'send_text',
-                    chatTitle: target,
-                    message: editedText
-                });
-            } else {
-                return false;
-            }
-
-            this.pendingCommandId = command.id;
-            this.pendingPreparedId = item.id;
-            EH.WhatsAppBridge.send(command);
-            EH.Toast.info(`Enviando ${EH.WhatsAppComposer.typeLabel(item.type).toLowerCase()}…`);
-            return true;
-        },
-
-        async sendCurrentMessage() {
-            if (EH.WhatsAppComposer.hasContent()) {
-                await this.sendPrepared();
-                return;
-            }
+        sendCurrentMessage() {
             const message = String(this.composer?.value || '').trim();
-            const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: true,
-                verifyStale: true,
-                context: this.pendingImage ? 'enviar-imagem' : 'enviar-texto'
-            });
-            const title = String(state.activeTitle || this.currentState?.active?.title || '').trim();
-
-            if (!state.connected || !title) {
-                EH.WhatsAppBridge.notifyUnavailable({
-                    ...state,
-                    conversationSelected: Boolean(title),
-                    activeTitle: title
-                });
+            const title = String(this.currentState?.active?.title || '').trim();
+            const connection = this.refreshConnection();
+            if (!title) {
+                EH.Toast.warning('Selecione uma conversa antes de enviar.');
                 return;
             }
-
+            if (!connection?.connected) {
+                EH.Toast.warning(connection?.state === 'loading' ? 'WhatsApp ainda está conectando.' : 'WhatsApp Web desconectado.');
+                return;
+            }
             if (this.pendingImage) {
                 const command = EH.WhatsAppBridge.makeCommand({
                     action: 'send_image',
@@ -3640,11 +1801,8 @@
                 return;
             }
             if (!message) return;
-            const command = EH.WhatsAppBridge.makeCommand({ action: 'send_text', chatTitle: title, message });
-            this.pendingCommandId = command.id;
-            EH.WhatsAppBridge.send(command);
+            EH.WhatsAppBridge.send(EH.WhatsAppBridge.makeCommand({ action: 'send_text', chatTitle: title, message }));
             this.composer.value = '';
-            EH.Toast.info('Enviando mensagem…');
         }
     };
 
@@ -3654,148 +1812,101 @@
     // ============================================================
     EH.Layout = {
         lastMetrics: null,
-        lastTopOffset: 0,
 
-        resolveProfile(viewportWidth, viewportHeight) {
-            const configured = String(EH.Config.INTERFACE_PROFILE || 'auto').toLowerCase();
-            if (configured === 'home' || configured === 'station') return configured;
-            const vw = Math.max(320, Number(viewportWidth) || window.innerWidth || 1366);
-            const vh = Math.max(400, Number(viewportHeight) || window.innerHeight || 768);
-            if (vw <= 1280 || vh <= 760) return 'station';
-            return 'home';
-        },
-
-        sizeMultiplier() {
-            const size = String(EH.Config.PANEL_SIZE || 'medium').toLowerCase();
-            if (size === 'small') return 0.9;
-            if (size === 'large') return 1.12;
-            return 1;
-        },
-
-        responsiveBases(viewportWidth, viewportHeight) {
+        responsiveBases(viewportWidth, leftZoom, rightZoom, leftOpen, rightOpen) {
             const vw = Math.max(320, Number(viewportWidth) || 1366);
-            const profile = this.resolveProfile(vw, viewportHeight);
-            const sizeMultiplier = this.sizeMultiplier();
+            let leftBase = vw <= 820 ? 176 : vw <= 1100 ? 194 : vw <= 1366 ? 214 : EH.Config.PANEL_WIDTH;
+            let rightBase = vw <= 820 ? 235 : vw <= 1100 ? 270 : vw <= 1366 ? 320 : EH.Config.WHATSAPP_DOCK_WIDTH;
 
-            let leftBase;
-            let rightBase;
-            if (profile === 'station') {
-                leftBase = vw <= 900 ? 176 : vw <= 1180 ? 188 : 198;
-                rightBase = vw <= 900 ? 238 : vw <= 1180 ? 255 : 274;
-            } else {
-                leftBase = vw >= 1700 ? 244 : vw >= 1440 ? 232 : EH.Config.PANEL_WIDTH;
-                rightBase = vw >= 1700 ? 390 : vw >= 1440 ? 372 : EH.Config.WHATSAPP_DOCK_WIDTH;
-            }
+            if (leftOpen && rightOpen) {
+                const desiredLeft = leftBase * leftZoom;
+                const desiredRight = rightBase * rightZoom;
+                const centralTarget = vw >= 1440 ? 620 : vw >= 1180 ? 520 : vw >= 980 ? 400 : EH.Config.CENTRAL_MIN_WIDTH;
+                const maxPanels = Math.max(120, vw - centralTarget);
+                const desiredTotal = desiredLeft + desiredRight;
+                if (desiredTotal > maxPanels) {
+                    const ratio = Math.max(0.35, maxPanels / desiredTotal);
+                    leftBase = Math.max(EH.Config.PANEL_MIN_BASE, Math.floor(leftBase * ratio));
+                    rightBase = Math.max(EH.Config.WHATSAPP_MIN_BASE, Math.floor(rightBase * ratio));
 
-            leftBase = Math.max(EH.Config.PANEL_MIN_BASE, Math.round(leftBase * sizeMultiplier));
-            rightBase = Math.max(EH.Config.WHATSAPP_MIN_BASE, Math.round(rightBase * sizeMultiplier));
-
-            // Em janela muito estreita, reduzir apenas os nossos painéis.
-            // A plataforma original nunca é redimensionada nem deslocada.
-            const maxVisualPanel = Math.max(170, Math.floor(vw * 0.46));
-            const leftZoom = Math.min(2, Math.max(0.75, Number(EH.Config.PANEL_ZOOM) || 1.5));
-            const rightZoom = Math.min(2, Math.max(0.75, Number(EH.Config.WHATSAPP_DOCK_ZOOM) || 1.1));
-            if (leftBase * leftZoom > maxVisualPanel) leftBase = Math.max(EH.Config.PANEL_MIN_BASE, Math.floor(maxVisualPanel / leftZoom));
-            if (rightBase * rightZoom > maxVisualPanel) rightBase = Math.max(EH.Config.WHATSAPP_MIN_BASE, Math.floor(maxVisualPanel / rightZoom));
-
-            return { leftBase, rightBase, profile, sizeMultiplier };
-        },
-
-        detectTopOffset() {
-            if (EH.WhatsAppBridge?.isWhatsAppHost?.()) return 0;
-            const candidates = [
-                document.querySelector('app-agente .block-header'),
-                document.querySelector('.container-agente .block-header'),
-                document.querySelector('.block-header')
-            ].filter(Boolean);
-            for (const element of candidates) {
-                const rect = element.getBoundingClientRect?.();
-                if (!rect) continue;
-                const top = Math.round(rect.top);
-                if (top >= 36 && top <= Math.min(260, window.innerHeight * 0.4)) {
-                    this.lastTopOffset = top;
-                    return top;
+                    // Em telas realmente estreitas, preservar o centro é mais importante
+                    // que manter as larguras-base de desktop. O zoom continua inalterado.
+                    const adjustedTotal = leftBase * leftZoom + rightBase * rightZoom;
+                    if (adjustedTotal > maxPanels && maxPanels > 160) {
+                        const secondRatio = maxPanels / adjustedTotal;
+                        leftBase = Math.max(88, Math.floor(leftBase * secondRatio));
+                        rightBase = Math.max(126, Math.floor(rightBase * secondRatio));
+                    }
                 }
             }
-            if (this.lastTopOffset >= 36) return this.lastTopOffset;
-            return Math.max(0, Number(EH.Config.PANEL_TOP_FALLBACK) || 86);
+
+            return { leftBase, rightBase };
         },
 
         sync() {
             EH.State?.load?.();
+            // clientWidth exclui a barra de rolagem vertical e corresponde ao espaço
+            // real usado por elementos fixed com left/right:0. Evita ~15px de sobreposição.
             const viewportWidth = Math.max(320, document.documentElement.clientWidth || window.innerWidth || 1366);
-            const viewportHeight = Math.max(400, document.documentElement.clientHeight || window.innerHeight || 768);
             const leftZoom = Math.min(2, Math.max(0.75, Number(EH.Config.PANEL_ZOOM) || 1.5));
             const rightZoom = Math.min(2, Math.max(0.75, Number(EH.Config.WHATSAPP_DOCK_ZOOM) || 1.1));
             const leftOpen = Boolean(EH.State?.isOpen?.('left') && EH.UI?.root);
             const rightOpen = Boolean(EH.State?.isOpen?.('right') && EH.WhatsAppDock?.root);
-            const { leftBase, rightBase, profile, sizeMultiplier } = this.responsiveBases(viewportWidth, viewportHeight);
-            const topOffset = this.detectTopOffset();
-            const bottomGap = Math.max(0, Number(EH.Config.PANEL_BOTTOM_GAP) || 0);
-            const usableHeight = Math.max(160, viewportHeight - topOffset - bottomGap);
+            const { leftBase, rightBase } = this.responsiveBases(viewportWidth, leftZoom, rightZoom, leftOpen, rightOpen);
+            const leftSpace = leftOpen ? Math.round(leftBase * leftZoom) : 0;
+            const rightSpace = rightOpen ? Math.round(rightBase * rightZoom) : 0;
             const root = document.documentElement;
+            const layoutActive = leftOpen || rightOpen;
 
-            // Classes existem somente para estilizar os componentes do próprio helper.
-            // Nenhuma delas modifica app-root, navbar, sidebar, formulários ou modais do E-Pass.
+            root.classList.toggle('eh-layout-managed', layoutActive);
             root.classList.toggle('eh-app-left-open', leftOpen);
             root.classList.toggle('eh-app-right-open', rightOpen);
             root.classList.toggle('eh-app-both-open', leftOpen && rightOpen);
             root.classList.toggle('eh-app-panels-closed', !leftOpen && !rightOpen);
-            root.dataset.ehProfile = profile;
-            root.dataset.ehPanelSize = String(EH.Config.PANEL_SIZE || 'medium');
+            root.classList.toggle('eh-layout-tight', layoutActive && (viewportWidth - leftSpace - rightSpace) < 380);
 
             root.style.setProperty('--eh-panel-base', `${leftBase}px`);
             root.style.setProperty('--eh-wa-base', `${rightBase}px`);
             root.style.setProperty('--eh-panel-zoom', String(leftZoom));
             root.style.setProperty('--eh-wa-zoom', String(rightZoom));
-            root.style.setProperty('--eh-left-top', `${topOffset / leftZoom}px`);
-            root.style.setProperty('--eh-right-top', `${topOffset / rightZoom}px`);
-            root.style.setProperty('--eh-left-logical-height', `${usableHeight / leftZoom}px`);
-            root.style.setProperty('--eh-right-logical-height', `${usableHeight / rightZoom}px`);
+            root.style.setProperty('--eh-left-logical-height', `${100 / leftZoom}vh`);
+            root.style.setProperty('--eh-right-logical-height', `${100 / rightZoom}vh`);
+            root.style.setProperty('--eh-left-active-space', `${leftSpace}px`);
+            root.style.setProperty('--eh-right-active-space', `${rightSpace}px`);
             root.style.setProperty('--eh-layout-transition', `${Math.max(0, Number(EH.Config.LAYOUT_TRANSITION_MS) || 180)}ms`);
 
             if (EH.UI?.root) {
                 EH.UI.root.classList.toggle('eh-collapsed', !leftOpen);
-                EH.UI.root.classList.toggle('eh-profile-station', profile === 'station');
-                EH.UI.root.classList.toggle('eh-profile-home', profile === 'home');
                 if (EH.UI.body) EH.UI.body.hidden = !leftOpen;
                 if (EH.UI.launcher) EH.UI.launcher.hidden = leftOpen;
             }
             if (EH.WhatsAppDock?.root) {
                 EH.WhatsAppDock.collapsed = !rightOpen;
                 EH.WhatsAppDock.root.classList.toggle('eh-wa-collapsed', !rightOpen);
-                EH.WhatsAppDock.root.classList.toggle('eh-profile-station', profile === 'station');
-                EH.WhatsAppDock.root.classList.toggle('eh-profile-home', profile === 'home');
                 if (EH.WhatsAppDock.handle) EH.WhatsAppDock.handle.hidden = rightOpen;
             }
 
             this.lastMetrics = {
                 viewportWidth,
-                viewportHeight,
                 leftOpen,
                 rightOpen,
                 leftZoom,
                 rightZoom,
                 leftBase,
                 rightBase,
-                profile,
-                panelSize: EH.Config.PANEL_SIZE,
-                sizeMultiplier,
-                topOffset,
-                usableHeight,
-                overlay: true
+                leftSpace,
+                rightSpace,
+                centralSpace: Math.max(0, viewportWidth - leftSpace - rightSpace)
             };
             return this.lastMetrics;
         },
 
         reset() {
             const root = document.documentElement;
-            ['eh-app-left-open', 'eh-app-right-open', 'eh-app-both-open', 'eh-app-panels-closed']
+            ['eh-layout-managed', 'eh-app-left-open', 'eh-app-right-open', 'eh-app-both-open', 'eh-app-panels-closed', 'eh-layout-tight']
                 .forEach(name => root.classList.remove(name));
-            ['--eh-panel-base', '--eh-wa-base', '--eh-panel-zoom', '--eh-wa-zoom', '--eh-left-top', '--eh-right-top', '--eh-left-logical-height', '--eh-right-logical-height', '--eh-layout-transition']
+            ['--eh-panel-base', '--eh-wa-base', '--eh-panel-zoom', '--eh-wa-zoom', '--eh-left-logical-height', '--eh-right-logical-height', '--eh-left-active-space', '--eh-right-active-space', '--eh-layout-transition']
                 .forEach(name => root.style.removeProperty(name));
-            delete root.dataset.ehProfile;
-            delete root.dataset.ehPanelSize;
             this.lastMetrics = null;
         }
     };
@@ -3807,21 +1918,23 @@
         inject() {
             GM_addStyle(`
                 :root {
-                    --eh-bg: #f6f7f9;
-                    --eh-bg-2: #ffffff;
-                    --eh-border: #d9dee7;
-                    --eh-text: #1f2937;
-                    --eh-muted: #6b7280;
-                    --eh-primary: #2f6fed;
-                    --eh-success: #2f9e69;
-                    --eh-warning: #d9941f;
-                    --eh-danger: #d94b55;
+                    --eh-bg: #17191f;
+                    --eh-bg-2: #20232b;
+                    --eh-border: #343946;
+                    --eh-text: #f4f6fa;
+                    --eh-muted: #aeb5c2;
+                    --eh-primary: #3d8bfd;
+                    --eh-success: #35b879;
+                    --eh-warning: #e7a83a;
+                    --eh-danger: #e35d6a;
                     --eh-wa-base: 360px;
                     --eh-panel-base: 228px;
                     --eh-panel-zoom: 1.5;
                     --eh-wa-zoom: 1.1;
                     --eh-left-logical-height: 66.6667vh;
                     --eh-right-logical-height: 90.9091vh;
+                    --eh-left-active-space: 0px;
+                    --eh-right-active-space: 0px;
                     --eh-layout-transition: 180ms;
                 }
 
@@ -3879,8 +1992,8 @@
                     background: #272b35;
                 }
                 #eh-root .eh-btn:disabled { opacity: .38; cursor: not-allowed; }
-                #eh-root .eh-btn.eh-primary { border-color: #2f6fed; background:#2f6fed; color:#fff; }
-                #eh-root .eh-btn.eh-success { border-color: #d9dee7; }
+                #eh-root .eh-btn.eh-primary { border-color: rgba(61, 139, 253, .48); }
+                #eh-root .eh-btn.eh-success { border-color: rgba(53, 184, 121, .48); }
                 #eh-root .eh-btn-icon { width: 18px; text-align: center; font-size: 13px; }
                 #eh-root .eh-status {
                     display: flex;
@@ -3905,9 +2018,9 @@
                 #eh-toast-area {
                     position: fixed;
                     z-index: 2147483647;
-                    top: 12px;
-                    right: 12px;
-                    width: min(300px, calc(100vw - 24px));
+                    top: 16px;
+                    right: 16px;
+                    width: min(360px, calc(100vw - 32px));
                     display: grid;
                     gap: 8px;
                     pointer-events: none;
@@ -3918,14 +2031,14 @@
                     display: flex;
                     align-items: flex-start;
                     gap: 9px;
-                    padding: 8px 10px;
-                    border: 1px solid #d9dee7;
-                    border-radius: 7px;
-                    background: #ffffff;
-                    color: #273142;
-                    box-shadow: 0 6px 20px rgba(16, 24, 40, .12);
+                    padding: 11px 12px;
+                    border: 1px solid #343946;
+                    border-radius: 10px;
+                    background: rgba(23, 25, 31, .97);
+                    color: #f4f6fa;
+                    box-shadow: 0 12px 34px rgba(0, 0, 0, .32);
                     pointer-events: auto;
-                    font-size: 10px;
+                    font-size: 12px;
                     line-height: 1.4;
                     animation: eh-in .18s ease-out;
                 }
@@ -3935,7 +2048,7 @@
                 .eh-toast.warning { border-left: 4px solid var(--eh-warning); }
                 .eh-toast.info { border-left: 4px solid var(--eh-primary); }
                 .eh-toast-text { flex: 1; user-select: text; }
-                .eh-toast-close { border: 0; background: transparent; color: #8b95a5; cursor: pointer; }
+                .eh-toast-close { border: 0; background: transparent; color: #aeb5c2; cursor: pointer; }
 
                 @keyframes eh-in {
                     from { opacity: 0; transform: translateY(-6px); }
@@ -4574,7 +2687,7 @@
                     position: fixed !important;
                     left: 0 !important;
                     right: auto !important;
-                    top: var(--eh-left-top, 0px) !important;
+                    top: 0 !important;
                     width: var(--eh-panel-base, 228px) !important;
                     height: var(--eh-left-logical-height, 100vh) !important;
                     zoom: var(--eh-panel-zoom, 1);
@@ -4593,12 +2706,12 @@
                 #eh-root .eh-panel {
                     height: 100%;
                     border: 0;
-                    border-right: 1px solid #d9dee7;
+                    border-right: 1px solid #2f3540;
                     border-radius: 0;
                     display: flex;
                     flex-direction: column;
-                    background: #f7f8fa;
-                    box-shadow: none;
+                    background: rgba(18, 21, 27, .985);
+                    box-shadow: 10px 0 28px rgba(0,0,0,.18);
                 }
                 #eh-root .eh-header {
                     min-height: 38px;
@@ -4609,44 +2722,34 @@
                     flex: 0 0 auto;
                     justify-content: flex-end;
                     gap: 3px;
-                    background: #ffffff;
-                    border-bottom: 1px solid #e2e6ec;
-                }
-                #eh-root .eh-panel-heading {
-                    flex: 1 1 auto;
-                    min-width: 0;
-                    padding-left: 4px;
-                    color: #273142;
-                    font-size: 10.5px;
-                    font-weight: 750;
-                    letter-spacing: .1px;
+                    background: #101319;
+                    border-bottom: 1px solid #292f39;
                 }
                 #eh-root .eh-body {
                     flex: 1 1 auto;
                     overflow-y: auto;
                     min-height: 0;
-                    padding: 7px;
-                    background: #f7f8fa;
+                    padding: 8px;
                     scrollbar-width: thin;
                 }
                 #eh-root .eh-panel-footer {
                     flex: 0 0 auto;
                     padding: 6px 8px;
-                    border-top: 1px solid #e2e6ec;
-                    background: #ffffff;
+                    border-top: 1px solid #292f39;
+                    background: #101319;
                 }
                 #eh-root .eh-flow-section {
                     margin: 0 0 7px;
-                    border: 1px solid #e0e4ea;
+                    border: 1px solid #2d3540;
                     border-radius: 7px;
-                    background: #ffffff;
+                    background: #151a21;
                     overflow: hidden;
                 }
                 #eh-root .eh-flow-section > summary {
                     padding: 6px 8px;
                     cursor: pointer;
                     list-style: none;
-                    color: #667085;
+                    color: #9ba6b7;
                     font-size: 8.5px;
                     font-weight: 850;
                     letter-spacing: .3px;
@@ -4656,8 +2759,30 @@
                 #eh-root .eh-flow-section > summary::after { content:'＋'; float:right; color:#778396; }
                 #eh-root .eh-flow-section[open] > summary::after { content:'−'; }
                 #eh-root .eh-flow-section .eh-steps { margin: 0; padding: 0 6px 6px; }
-                /* Os painéis são overlays independentes. Nenhuma regra desta seção
-                   redimensiona app-root, navbar, sidebar, formulários ou modais do E-Pass. */
+                html.eh-layout-managed app-root {
+                    display:block !important;
+                    width:calc(100% - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
+                    max-width:calc(100% - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
+                    min-width:0 !important;
+                    margin-left:var(--eh-left-active-space, 0px) !important;
+                    margin-right:0 !important;
+                    transition:width var(--eh-layout-transition, 180ms) ease, margin-left var(--eh-layout-transition, 180ms) ease;
+                }
+                html.eh-layout-managed app-root .navbar-fixed-top {
+                    left:var(--eh-left-active-space, 0px) !important;
+                    right:var(--eh-right-active-space, 0px) !important;
+                    width:auto !important;
+                }
+                html.eh-layout-managed app-root #left-sidebar {
+                    left:var(--eh-left-active-space, 0px) !important;
+                }
+                html.eh-layout-managed .container-agente { max-width:100% !important; min-width:0 !important; }
+                html.eh-layout-managed .swal2-container,
+                html.eh-layout-managed .nsm-overlay-open {
+                    left:var(--eh-left-active-space, 0px) !important;
+                    right:var(--eh-right-active-space, 0px) !important;
+                    width:auto !important;
+                }
 
                 #eh-launcher {
                     position: fixed;
@@ -4687,11 +2812,11 @@
                 }
                 #eh-launcher[hidden] { display:none !important; }
 
-                .eh-dock-title { margin: 8px 2px 5px; font-size: 8px; font-weight: 800; color: #667085; letter-spacing:.35px; text-transform:uppercase; }
+                .eh-dock-title { margin: 7px 1px 6px; font-size: 9px; font-weight: 900; color: #9ba6b7; letter-spacing:.45px; text-transform:uppercase; }
                 .eh-steps { display:grid; grid-template-columns:repeat(5,1fr); gap:3px; margin-bottom:8px; }
-                .eh-step { padding:4px 1px; border:1px solid #e2e6ec; border-radius:6px; text-align:center; color:#7b8494; font-size:7px; line-height:1.15; background:#f7f8fa; }
+                .eh-step { padding:4px 1px; border:1px solid #303743; border-radius:6px; text-align:center; color:#727d8f; font-size:7px; line-height:1.15; background:#181c23; }
                 .eh-step strong { display:block; font-size:10px; line-height:1.05; }
-                .eh-step.active { color:#245ab8; border-color:#9dbcf2; background:#eef4ff; }
+                .eh-step.active { color:#fff; border-color:#3d8bfd; background:#223654; }
                 .eh-whatsapp-row { display:grid; grid-template-columns:minmax(0,1fr) 48px 34px; gap:5px; margin-bottom:8px; }
                 .eh-dock-phone { width:100%; min-width:0; height:34px; padding:6px 8px; border:1px solid #343c48; border-radius:7px; background:#0e1116; color:#fff; font:inherit; font-size:10px; margin:0; }
                 .eh-wa-mode, .eh-wa-open { height:34px; border:1px solid #3b4655; border-radius:7px; background:#202630; color:#eef3fa; cursor:pointer; font:800 9px Arial,sans-serif; }
@@ -4699,24 +2824,24 @@
                 .eh-wa-mode:hover, .eh-wa-open:hover { border-color:#35b879; background:#25352e; }
                 .eh-wa-open { font-size:15px; }
                 .eh-quick-routes { display:grid; grid-template-columns:1fr 1fr; gap:5px; margin-bottom:8px; }
-                .eh-route-quick { width:100%; min-height:33px; padding:6px 7px; border:1px solid #dce1e8; border-radius:7px; background:#fff; color:#273142; cursor:pointer; font-size:9px; font-weight:700; line-height:1.25; text-align:left; }
-                .eh-route-quick:hover { border-color:#9dbcf2; background:#f5f8ff; }
-                .eh-route-quick.eh-route-running { border-color:#9bd4b7; background:#f0faf5; }
-                .eh-context-card { padding:8px; margin-bottom:8px; border:1px solid #dfe4ea; border-radius:8px; background:#fff; color:#5f6978; font-size:9.5px; line-height:1.42; }
-                .eh-context-card strong { display:block; margin-bottom:3px; color:#273142; font-size:10.5px; }
+                .eh-route-quick { width:100%; min-height:35px; padding:6px 7px; border:1px solid #323a46; border-radius:7px; background:#1c222b; color:#eef2f8; cursor:pointer; font-size:9px; font-weight:800; line-height:1.25; text-align:left; }
+                .eh-route-quick:hover { border-color:#3d8bfd; background:#222d3b; }
+                .eh-route-quick.eh-route-running { border-color:#35b879; background:#183329; }
+                .eh-context-card { padding:8px; margin-bottom:8px; border:1px solid #303743; border-radius:8px; background:#0f1217; color:#cfd6e2; font-size:9.5px; line-height:1.42; }
+                .eh-context-card strong { display:block; margin-bottom:3px; color:#fff; font-size:10.5px; }
                 .eh-context-actions { display:grid; gap:5px; margin-top:7px; }
-                .eh-context-btn { width:100%; min-height:31px; padding:6px 8px; border:1px solid #dce1e8; border-radius:7px; background:#fff; color:#273142; cursor:pointer; font-size:9.5px; font-weight:750; text-align:left; }
+                .eh-context-btn { width:100%; min-height:31px; padding:6px 8px; border:1px solid #3b4554; border-radius:7px; background:#20262f; color:#fff; cursor:pointer; font-size:9.5px; font-weight:800; text-align:left; }
                 .eh-context-more { margin-top:7px; border-top:1px solid #2c323c; padding-top:6px; }
                 .eh-context-more > summary { list-style:none; cursor:pointer; color:#98a3b3; font-size:8.5px; font-weight:800; }
                 .eh-context-more > summary::-webkit-details-marker { display:none; }
                 .eh-context-more > summary::after { content:'＋'; float:right; color:#738093; }
                 .eh-context-more[open] > summary::after { content:'−'; }
                 .eh-context-actions-secondary { margin-top:6px; }
-                .eh-context-btn.primary { border-color:#2f6fed; background:#2f6fed; color:#fff; }
-                .eh-context-btn.success { border-color:#cfd6df; background:#fff; color:#273142; }
+                .eh-context-btn.primary { border-color:#397bdd; background:#223957; }
+                .eh-context-btn.success { border-color:#2f9e69; background:#16382a; }
                 .eh-context-btn:disabled { opacity:.38; cursor:not-allowed; filter:grayscale(.25); }
                 .eh-pix-mini { display:block; width:128px; max-width:100%; margin:7px auto; border:4px solid #fff; border-radius:7px; background:#fff; }
-                .eh-tools-divider { height:1px; background:#e2e6ec; margin:8px 0 6px; }
+                .eh-tools-divider { height:1px; background:#2c323c; margin:8px 0 6px; }
                 #eh-root .eh-actions-primary { grid-template-columns:1fr 1fr; }
                 #eh-root .eh-actions-secondary { grid-template-columns:1fr 1fr; }
                 @media (max-width: 720px) {
@@ -4724,8 +2849,8 @@
                     #eh-launcher { top:auto; bottom:22%; }
                 }
 
-                .eh-more-tools { margin-top:6px; border:1px solid #e0e4ea; border-radius:7px; overflow:hidden; background:#fff; }
-                .eh-more-tools > summary { padding:7px 8px; cursor:pointer; color:#667085; font-size:9px; font-weight:800; list-style:none; }
+                .eh-more-tools { margin-top:6px; border:1px solid #2d3540; border-radius:7px; overflow:hidden; background:#151a21; }
+                .eh-more-tools > summary { padding:7px 8px; cursor:pointer; color:#aeb8c7; font-size:9px; font-weight:800; list-style:none; }
                 .eh-more-tools > summary::-webkit-details-marker { display:none; }
                 .eh-more-tools > summary::after { content:'＋'; float:right; color:#778396; }
                 .eh-more-tools[open] > summary::after { content:'−'; }
@@ -4736,18 +2861,18 @@
                 #eh-wa-dock {
                     position: fixed;
                     z-index: 2147482500;
-                    top: var(--eh-right-top, 0px);
+                    top: 0;
                     right: 0;
                     width: var(--eh-wa-base, 360px);
                     height: var(--eh-right-logical-height, 100vh);
                     zoom: var(--eh-wa-zoom, 1);
                     display: grid;
-                    grid-template-rows: 42px minmax(118px, 30%) minmax(0, 1fr) auto auto auto;
-                    border-left: 1px solid #d9dee2;
+                    grid-template-rows: 42px minmax(135px, 34%) minmax(0, 1fr) auto auto;
+                    border-left: 1px solid #26343a;
                     background: #efeae2;
                     color: #111b21;
                     font-family: "Segoe UI", Arial, sans-serif;
-                    box-shadow: none;
+                    box-shadow: -10px 0 30px rgba(0,0,0,.10);
                     overflow: hidden;
                 }
                 #eh-wa-dock.eh-wa-collapsed { display:none !important; }
@@ -4769,7 +2894,7 @@
                 .eh-wa-status-text { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#667781; font-size:9px; text-align:right; }
                 .eh-wa-collapse { width:28px; height:28px; border:0; border-radius:7px; background:transparent; color:#54656f; cursor:pointer; font-size:20px; line-height:1; }
                 .eh-wa-collapse:hover { background:#e3e7e9; }
-                .eh-wa-chats { min-height:0; display:grid; grid-template-rows:34px 42px minmax(0,1fr); border-bottom:1px solid #d8dedf; background:#fff; }
+                .eh-wa-chats { min-height:0; display:grid; grid-template-rows:42px minmax(0,1fr); border-bottom:1px solid #d8dedf; background:#fff; }
                 .eh-wa-search { width:calc(100% - 16px); height:30px; margin:6px 8px; padding:0 11px; border:0; border-radius:8px; outline:none; background:#f0f2f5; color:#111b21; font:11px "Segoe UI",Arial,sans-serif; }
                 .eh-wa-chat-list { min-height:0; overflow:auto; scrollbar-width:thin; }
                 .eh-wa-chat { width:100%; min-height:50px; display:grid; grid-template-columns:34px minmax(0,1fr) auto; align-items:center; gap:8px; padding:6px 9px; border:0; border-bottom:1px solid #f1f3f4; background:#fff; color:#111b21; cursor:pointer; text-align:left; }
@@ -4789,16 +2914,6 @@
                 .eh-wa-msg-sender { margin-bottom:2px; color:#008069; font-size:8px; font-weight:700; line-height:1.2; }
                 .eh-wa-msg.out .eh-wa-msg-sender { color:#49724a; text-align:right; }
                 .eh-wa-msg time { display:block; margin-top:3px; color:#667781; font-size:7px; text-align:right; }
-                .eh-wa-prepared { max-height:132px; overflow:auto; border-top:1px solid #d8dedf; background:#fff; }
-                .eh-wa-prepared[hidden] { display:none !important; }
-                .eh-wa-prepared-head { min-height:27px; display:grid; grid-template-columns:auto minmax(0,1fr) 24px; align-items:center; gap:6px; padding:4px 7px; border-bottom:1px solid #edf0f1; color:#54656f; }
-                .eh-wa-prepared-head strong { font-size:8.5px; color:#111b21; }
-                .eh-wa-prepared-head span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:8px; text-align:right; }
-                .eh-wa-prepared-remove { width:22px; height:22px; border:0; border-radius:50%; background:#eef1f2; color:#54656f; cursor:pointer; font-size:15px; line-height:1; }
-                .eh-wa-prepared-body { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:center; gap:7px; padding:6px 8px; }
-                .eh-wa-prepared-image { width:46px; height:46px; object-fit:cover; border-radius:5px; border:1px solid #d8dedf; background:#fff; }
-                .eh-wa-prepared-image[hidden] { display:none !important; }
-                .eh-wa-prepared-text { max-height:62px; overflow:hidden; color:#334047; font-size:8.5px; line-height:1.35; white-space:pre-wrap; overflow-wrap:anywhere; }
                 .eh-wa-paste-preview { position:relative; display:grid; grid-template-columns:48px minmax(0,1fr) 26px; align-items:center; gap:8px; padding:7px 8px; border-top:1px solid #d8dedf; background:#f7f9fa; }
                 .eh-wa-paste-preview[hidden] { display:none !important; }
                 .eh-wa-paste-preview img { width:48px; height:48px; object-fit:cover; border-radius:6px; background:#fff; border:1px solid #d8dedf; }
@@ -4815,81 +2930,6 @@
                 .eh-wa-empty-conversation { margin:auto; }
                 #eh-wa-handle { position:fixed; z-index:2147482499; right:0; top:46%; width:22px; height:54px; border:1px solid #cfd6d8; border-right:0; border-radius:8px 0 0 8px; background:#f0f2f5; color:#008069; cursor:pointer; font:800 20px Arial,sans-serif; box-shadow:-4px 0 12px rgba(0,0,0,.08); }
                 #eh-wa-handle[hidden] { display:none !important; }
-                .eh-wa-operation { position:relative; width:calc(100% - 16px); height:28px; margin:4px 8px 2px; display:flex; align-items:center; justify-content:center; gap:6px; border:1px solid #d8dedf; border-radius:7px; background:#fff; color:#34444d; cursor:pointer; font:600 10px "Segoe UI",Arial,sans-serif; }
-                .eh-wa-operation:hover { background:#f5f7f8; border-color:#b8c3c8; }
-                .eh-operation-badge { min-width:16px; height:16px; display:grid; place-items:center; padding:0 4px; border-radius:9px; background:#d9a321; color:#fff; font-size:8px; font-weight:800; }
-                .eh-operation-badge[hidden] { display:none !important; }
-                .eh-operation-badge.due { background:#d94b55; }
-
-                #eh-root.eh-profile-station .eh-body { padding:5px; }
-                #eh-root.eh-profile-station .eh-route-quick { min-height:29px; padding:5px 6px; }
-                #eh-root.eh-profile-station .eh-context-card { padding:6px; margin-bottom:6px; }
-                #eh-wa-dock.eh-profile-station { grid-template-rows:40px minmax(104px,26%) minmax(0,1fr) auto auto auto; }
-                #eh-wa-dock.eh-profile-station .eh-wa-chat { min-height:44px; padding:5px 7px; }
-                #eh-wa-dock.eh-profile-station .eh-wa-avatar { width:29px; height:29px; }
-                #eh-wa-dock.eh-profile-station .eh-wa-messages { padding:7px 6px 9px; }
-                #eh-wa-dock.eh-profile-station .eh-wa-prepared { max-height:104px; }
-                #eh-wa-dock.eh-profile-station .eh-wa-prepared-image { width:38px; height:38px; }
-                #eh-wa-dock.eh-profile-station .eh-wa-prepared-text { max-height:48px; }
-                .eh-operation-modal { width:min(720px,96vw); max-height:min(820px,94vh); }
-                .eh-operation-tabs { display:flex; gap:4px; padding:8px 12px 0; border-bottom:1px solid #e2e6ec; background:#fafbfc; }
-                .eh-operation-tabs button { padding:7px 11px; border:0; border-bottom:2px solid transparent; background:transparent; color:#667085; cursor:pointer; font-size:11px; font-weight:750; }
-                .eh-operation-tabs button.active { color:#2f6fed; border-bottom-color:#2f6fed; }
-                .eh-operation-content { max-height:calc(92vh - 104px); overflow:auto; }
-                .eh-operation-pane { display:grid; gap:10px; }
-                .eh-operation-pane[hidden] { display:none !important; }
-                .eh-op-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
-                .eh-op-span-2 { grid-column:1 / -1; }
-                .eh-op-field { min-width:0; display:grid; gap:4px; color:#667085; font-size:9px; font-weight:700; }
-                .eh-op-field input, .eh-op-field select, .eh-op-details-body select, .eh-boarding-editor select { width:100%; min-width:0; height:32px; padding:5px 8px; border:1px solid #dce1e8; border-radius:6px; background:#fff; color:#273142; font:10.5px "Segoe UI",Arial,sans-serif; outline:none; }
-                .eh-op-field input:focus, .eh-op-field select:focus { border-color:#8fb0ea; box-shadow:0 0 0 2px rgba(47,111,237,.08); }
-                .eh-op-primary, .eh-op-secondary { min-height:32px; padding:6px 10px; border:1px solid #d5dce5; border-radius:6px; background:#fff; color:#344054; cursor:pointer; font-size:10px; font-weight:750; }
-                .eh-op-primary { border-color:#2f6fed; background:#2f6fed; color:#fff; }
-                .eh-op-primary:disabled, .eh-op-secondary:disabled { opacity:.45; cursor:not-allowed; }
-                .eh-op-status { min-height:16px; color:#667085; font-size:9.5px; line-height:1.4; }
-                .eh-op-result { display:grid; gap:4px; padding:10px; border:1px solid #dbe3ee; border-radius:7px; background:#f8fafc; color:#344054; font-size:10px; line-height:1.4; }
-                .eh-op-result[hidden] { display:none !important; }
-                .eh-op-result strong { color:#1f2937; font-size:13px; }
-                .eh-op-result small { color:#667085; }
-                .eh-op-result button { justify-self:start; margin-top:4px; }
-                .eh-op-details { border:1px solid #e1e5eb; border-radius:7px; background:#fff; overflow:hidden; }
-                .eh-op-details > summary { padding:8px 10px; cursor:pointer; list-style:none; color:#475467; font-size:10px; font-weight:750; }
-                .eh-op-details > summary::-webkit-details-marker { display:none; }
-                .eh-op-details > summary::after { content:'＋'; float:right; color:#98a2b3; }
-                .eh-op-details[open] > summary::after { content:'−'; }
-                .eh-op-details-body { display:grid; gap:8px; padding:9px 10px 10px; border-top:1px solid #edf0f4; color:#667085; font-size:9.5px; }
-                .eh-op-inline { display:flex; align-items:center; flex-wrap:wrap; gap:6px; }
-                .eh-op-inline.compact button { min-height:26px; padding:4px 7px; border:1px solid #dce1e8; border-radius:5px; background:#fff; color:#475467; cursor:pointer; font-size:8.5px; }
-                .eh-manual-rows { display:grid; gap:5px; }
-                .eh-manual-row { display:grid; grid-template-columns:minmax(0,1fr) 100px 28px; gap:5px; }
-                .eh-manual-row input { min-width:0; height:30px; padding:4px 7px; border:1px solid #dce1e8; border-radius:6px; font-size:10px; }
-                .eh-manual-row button { border:0; background:#f1f3f5; border-radius:5px; color:#667085; cursor:pointer; }
-                .eh-history-route { border-top:1px solid #eef1f4; }
-                .eh-history-route:first-child { border-top:0; }
-                .eh-history-route > summary { padding:6px 0; cursor:pointer; color:#475467; font-size:9px; }
-                .eh-history-records { display:grid; gap:4px; padding-bottom:6px; }
-                .eh-history-record { display:grid; grid-template-columns:minmax(0,1fr) 58px 26px 26px; align-items:center; gap:4px; }
-                .eh-history-record span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-                .eh-history-record input { width:58px; height:26px; border:1px solid #dce1e8; border-radius:5px; font-size:9px; }
-                .eh-history-record button { height:26px; border:1px solid #dce1e8; border-radius:5px; background:#fff; cursor:pointer; }
-                .eh-boarding-editor { display:grid; gap:8px; padding:9px; border:1px solid #dbe3ee; border-radius:7px; background:#f8fafc; }
-                .eh-boarding-editor[hidden] { display:none !important; }
-                .eh-boarding-list { display:grid; gap:6px; }
-                .eh-boarding-card { display:grid; gap:4px; padding:8px 9px; border:1px solid #e0e5eb; border-left:3px solid #d7a62a; border-radius:7px; background:#fff; color:#475467; font-size:9px; }
-                .eh-boarding-card.pending { border-left-color:#d94b55; }
-                .eh-boarding-card.notified { border-left-color:#d7a62a; }
-                .eh-boarding-card.completed { border-left-color:#4da574; opacity:.72; }
-                .eh-boarding-card.overdue { border-left-color:#d94b55; background:#fff8f8; }
-                .eh-boarding-head { display:flex; align-items:center; justify-content:space-between; gap:8px; }
-                .eh-boarding-head strong { color:#273142; font-size:10px; }
-                .eh-boarding-head span { color:#667085; font-size:8px; }
-                .eh-op-empty { padding:14px; text-align:center; color:#98a2b3; font-size:10px; }
-                @media (max-width:680px) {
-                    .eh-op-grid { grid-template-columns:1fr; }
-                    .eh-op-span-2 { grid-column:auto; }
-                    .eh-operation-modal { width:98vw; }
-                }
-
 
             `);
         }
@@ -5391,7 +3431,7 @@
                 EH.Logger.debug('Não foi possível manter a imagem em memória:', error);
             }
             if (!window.isSecureContext) {
-                return { copied: false, reason: 'O E-Pass está em HTTP. A cópia binária de PNG é bloqueada pelo navegador; use “Preparar no WhatsApp” ou “Baixar PNG”.' };
+                return { copied: false, reason: 'O E-Pass está em HTTP. A cópia binária de PNG é bloqueada pelo navegador; use “Enviar ao WhatsApp” ou “Baixar PNG”.' };
             }
             if (!navigator.clipboard?.write || typeof ClipboardItem === 'undefined') {
                 return { copied: false, reason: 'Este navegador não oferece Clipboard API para imagens.' };
@@ -5414,6 +3454,9 @@
             return new Blob([bytes], { type: mime });
         },
 
+        openImageForNativeCopy() {
+            throw new Error('A cópia binária foi bloqueada. Use “Enviar ao WhatsApp” ou “Baixar PNG”.');
+        }
     };
 
     // ============================================================
@@ -6859,6 +4902,40 @@
             );
         },
 
+        stabilizeCaptureText(root) {
+            if (!root) return;
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+            const nodes = [];
+            let node;
+            while ((node = walker.nextNode())) {
+                const parent = node.parentElement;
+                if (!parent) continue;
+                if (/^(SCRIPT|STYLE|TEXTAREA|INPUT|SELECT|OPTION|SVG|PATH)$/i.test(parent.tagName)) continue;
+                if (!node.nodeValue || !/\S/.test(node.nodeValue)) continue;
+                nodes.push(node);
+            }
+
+            nodes.forEach(textNode => {
+                const value = String(textNode.nodeValue || '');
+                const parts = value.split(/(\s+)/).filter(Boolean);
+                if (parts.length < 2) return;
+
+                const fragment = document.createDocumentFragment();
+                parts.forEach(part => {
+                    if (/^\s+$/.test(part)) {
+                        const spacer = document.createElement('span');
+                        spacer.className = 'eh-ticket-space';
+                        spacer.setAttribute('aria-hidden', 'true');
+                        spacer.textContent = '\u00A0';
+                        fragment.appendChild(spacer);
+                    } else {
+                        fragment.appendChild(document.createTextNode(part));
+                    }
+                });
+                textNode.replaceWith(fragment);
+            });
+        },
+
         extractTicketData(card) {
             if (!card || !document.contains(card)) {
                 throw new Error('A passagem selecionada não está mais disponível na tela.');
@@ -6866,13 +4943,17 @@
 
             const headerElement = card.querySelector('.dados-passagem .col-12 h6')
                 || card.querySelector('.dados-passagem h6');
-            if (!headerElement) throw new Error('Não foi possível localizar os dados principais da passagem.');
+            if (!headerElement) {
+                throw new Error('Não foi possível localizar os dados principais da passagem.');
+            }
 
             const headerClone = headerElement.cloneNode(true);
             const badgeClone = headerClone.querySelector('.badge');
             const status = EH.Utils.clean(badgeClone?.textContent || '');
             badgeClone?.remove();
-            const header = EH.Utils.clean(headerClone.textContent).replace(/\s*-\s*$/, '').trim();
+            const header = EH.Utils.clean(headerClone.textContent)
+                .replace(/\s*-\s*$/, '')
+                .trim();
 
             const infoLines = Array.from(card.querySelectorAll('.dados-passagem .col-10 h6'))
                 .map(element => EH.Utils.clean(element.textContent))
@@ -6901,21 +4982,16 @@
                 })
                 .filter(ticket => ticket.number || ticket.firstLine || ticket.route);
 
-            if (!tickets.length) throw new Error('Os bilhetes não foram encontrados dentro da passagem selecionada.');
+            if (!tickets.length) {
+                throw new Error('Os bilhetes não foram encontrados dentro da passagem selecionada.');
+            }
 
             const summary = this.summary(card);
-            const passenger = header
-                .replace(/\s+-\s+[A-Z]{2}\s+X\s+.*$/i, '')
-                .replace(/\s+-\s+[^-]+\s+X\s+[^-]+$/i, '')
-                .trim();
             return {
                 header,
-                passenger,
                 status: status || summary.status || 'PASSAGEM',
                 seller,
                 soldAt,
-                seat: summary.seat || '',
-                service: summary.service || '',
                 tickets,
                 filename: `bilhete-${tickets[0]?.number || summary.ticket || Date.now()}.png`,
                 text: EH.Utils.clean(card.innerText || card.textContent || '')
@@ -7432,6 +5508,19 @@
             return canvas;
         },
 
+        removeActionColumn(tableClone) {
+            EH.Utils.all('button, .btn, [role="button"]', tableClone).forEach(element => element.remove());
+            EH.Utils.all('tr', tableClone).forEach(row => {
+                const cells = Array.from(row.children);
+                if (!cells.length) return;
+                const last = cells[cells.length - 1];
+                const normalized = EH.Utils.normalize(last.textContent);
+                if (!normalized || normalized.includes('ACAO') || normalized.includes('RESERVAR')) {
+                    last.remove();
+                }
+            });
+        },
+
         createShell() {
             EH.UI.root?.setAttribute('hidden', 'hidden');
             const shell = document.createElement('div');
@@ -7452,6 +5541,288 @@
         destroyShell(shell) {
             shell?.remove();
             EH.UI.root?.removeAttribute('hidden');
+        },
+
+        appendTitle(stage, title, subtitle) {
+            const header = document.createElement('div');
+            header.className = 'eh-capture-title';
+
+            const strong = document.createElement('strong');
+            strong.textContent = title;
+            header.appendChild(strong);
+
+            if (subtitle) {
+                const span = document.createElement('span');
+                span.textContent = subtitle;
+                header.appendChild(span);
+            }
+
+            stage.appendChild(header);
+        },
+
+        prepareHorarios(data) {
+            if (!data || !Array.isArray(data.horarios) || !data.horarios.length) {
+                throw new Error('Nenhum horário foi encontrado para montar a imagem.');
+            }
+
+            const { shell, stage } = this.createShell();
+            const route = [data.origem, data.destino].filter(Boolean).join(' → ') || 'Horários disponíveis';
+            const subtitle = data.data || '';
+            this.appendTitle(stage, route, subtitle);
+
+            const card = document.createElement('div');
+            card.className = 'eh-horarios-card';
+
+            const table = document.createElement('table');
+            table.className = 'eh-horarios-table';
+            table.setAttribute('aria-label', 'Horários disponíveis');
+
+            const colgroup = document.createElement('colgroup');
+            for (let index = 0; index < 4; index += 1) {
+                colgroup.appendChild(document.createElement('col'));
+            }
+
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+            ['Linha', 'Horário de saída', 'Horário de chegada', 'Valor'].forEach(label => {
+                const th = document.createElement('th');
+                th.scope = 'col';
+                th.textContent = label;
+                headerRow.appendChild(th);
+            });
+            thead.appendChild(headerRow);
+
+            const tbody = document.createElement('tbody');
+            data.horarios.forEach(item => {
+                const row = document.createElement('tr');
+
+                const departure = document.createElement('td');
+                const departureValue = document.createElement('span');
+                departureValue.className = 'eh-time-value';
+                departureValue.textContent = item.saida || '—';
+                departure.appendChild(departureValue);
+
+                const company = document.createElement('td');
+                const companyName = document.createElement('div');
+                companyName.className = 'eh-company-name';
+                companyName.textContent = EH.Utils.stabilizeDisplayText(item.linha || 'Linha não informada');
+                company.appendChild(companyName);
+                if (item.tipo) {
+                    const vehicleType = document.createElement('div');
+                    vehicleType.className = 'eh-vehicle-type';
+                    const typeLines = EH.Utils.formatVehicleTypeLines(item.tipo);
+                    (typeLines.length ? typeLines : [item.tipo]).forEach(line => {
+                        const lineNode = document.createElement('div');
+                        lineNode.className = 'eh-vehicle-type-line';
+                        lineNode.textContent = line;
+                        vehicleType.appendChild(lineNode);
+                    });
+                    company.appendChild(vehicleType);
+                }
+
+                const arrival = document.createElement('td');
+                const arrivalValue = document.createElement('span');
+                arrivalValue.className = 'eh-time-value';
+                arrivalValue.textContent = item.chegada || '—';
+                arrival.appendChild(arrivalValue);
+
+                const price = document.createElement('td');
+                const priceValue = document.createElement('span');
+                priceValue.className = 'eh-price-value';
+                priceValue.textContent = item.preco || 'Consultar';
+                price.appendChild(priceValue);
+
+                row.append(company, departure, arrival, price);
+                tbody.appendChild(row);
+            });
+
+            table.append(colgroup, thead, tbody);
+            card.appendChild(table);
+            stage.appendChild(card);
+
+            const footer = document.createElement('div');
+            footer.className = 'eh-capture-footer single';
+            const bullet = document.createElement('span');
+            bullet.className = 'eh-footer-bullet';
+            bullet.textContent = '';
+            const note = document.createElement('span');
+            note.className = 'eh-footer-text';
+            note.textContent = EH.Utils.stabilizeDisplayText('- Escolha seu horário após isso vou encaminhar as poltronas disponíveis');
+            footer.append(bullet, note);
+            stage.appendChild(footer);
+
+            return { shell, stage, filename: `horarios-${EH.Utils.safeFilePart(route)}.png` };
+        },
+
+        prepareReserva(data) {
+            const map = EH.Utils.first(EH.Selectors.MAPA_POLTRONAS);
+            if (!map) throw new Error('O mapa de poltronas não foi encontrado.');
+
+            const { shell, stage } = this.createShell();
+            this.appendTitle(
+                stage,
+                data.origemDestino || 'Mapa de poltronas',
+                [data.linha, data.horaSaida ? `Saída: ${data.horaSaida}` : ''].filter(Boolean).join(' • ')
+            );
+
+            const layout = document.createElement('div');
+            layout.className = 'eh-reserva-layout';
+
+            const mapCard = document.createElement('section');
+            mapCard.className = 'eh-reserva-map-card';
+
+            const mapTitle = document.createElement('h3');
+            mapTitle.className = 'eh-reserva-section-title';
+            mapTitle.textContent = 'Mapa de poltronas';
+
+            const mapWrap = document.createElement('div');
+            mapWrap.className = 'eh-reserva-map';
+            const mapClone = map.cloneNode(true);
+            EH.Utils.all('button', mapClone).forEach(button => {
+                button.tabIndex = -1;
+                button.style.pointerEvents = 'none';
+            });
+            mapWrap.appendChild(mapClone);
+            mapCard.append(mapTitle, mapWrap);
+
+            const summary = document.createElement('aside');
+            summary.className = 'eh-reserva-summary';
+
+            const createSection = titleText => {
+                const card = document.createElement('section');
+                card.className = 'eh-summary-card';
+                const title = document.createElement('h3');
+                title.className = 'eh-reserva-section-title';
+                title.textContent = titleText;
+                card.appendChild(title);
+                return card;
+            };
+
+            const appendInfo = (grid, label, value, extraClass = '') => {
+                if (!value) return;
+                const item = document.createElement('div');
+                item.className = 'eh-info-item';
+                const labelNode = document.createElement('span');
+                labelNode.className = 'eh-info-label';
+                labelNode.textContent = label;
+                const valueNode = document.createElement('span');
+                valueNode.className = `eh-info-value ${extraClass}`.trim();
+                valueNode.textContent = value;
+                item.append(labelNode, valueNode);
+                grid.appendChild(item);
+            };
+
+            const tripCard = createSection('Informações da viagem');
+            const infoGrid = document.createElement('div');
+            infoGrid.className = 'eh-info-grid';
+            appendInfo(infoGrid, 'Linha', data.linha || 'Não informada');
+            appendInfo(infoGrid, 'Horário de saída', data.horaSaida || 'Não informado');
+            appendInfo(infoGrid, 'Tipo de veículo', data.tipo || 'Não informado');
+            appendInfo(
+                infoGrid,
+                'Valor total',
+                data.valorTotalNum > 0 ? EH.Utils.formatMoney(data.valorTotalNum) : (data.valorParcial || 'Consultar'),
+                'money'
+            );
+            appendInfo(infoGrid, 'Tarifa', data.tarifa);
+            appendInfo(infoGrid, 'Taxa de embarque', data.taxa);
+            tripCard.appendChild(infoGrid);
+
+            const seatsCard = createSection('Situação das poltronas');
+            const stats = document.createElement('div');
+            stats.className = 'eh-seat-stats';
+
+            [
+                ['free', data.poltronasLivres.length, 'Livres'],
+                ['occupied', data.poltronasOcupadas.length, 'Ocupadas'],
+                ['reserved', data.poltronasReservadas.length, 'Reservadas'],
+                ['selected', data.poltronasSelecionadas.length, 'Selecionadas']
+            ].forEach(([className, amount, label]) => {
+                const stat = document.createElement('div');
+                stat.className = `eh-seat-stat ${className}`;
+                const strong = document.createElement('strong');
+                strong.textContent = String(amount);
+                const span = document.createElement('span');
+                span.textContent = label;
+                stat.append(strong, span);
+                stats.appendChild(stat);
+            });
+            seatsCard.appendChild(stats);
+
+            const formatSeatList = (values, limit = 36) => {
+                if (!Array.isArray(values) || !values.length) return '';
+                const shown = values.slice(0, limit);
+                const remaining = values.length - shown.length;
+                return `${shown.join(', ')}${remaining > 0 ? ` e mais ${remaining}` : ''}`;
+            };
+
+            const groups = document.createElement('div');
+            groups.className = 'eh-seat-groups';
+            [
+                ['Poltronas livres', data.poltronasLivres],
+                ['Poltronas selecionadas', data.poltronasSelecionadas],
+                ['Poltronas ocupadas', data.poltronasOcupadas],
+                ['Poltronas reservadas', data.poltronasReservadas]
+            ].forEach(([label, values]) => {
+                const group = document.createElement('div');
+                group.className = 'eh-seat-group';
+
+                const head = document.createElement('div');
+                head.className = 'eh-seat-group-head';
+                const headLabel = document.createElement('span');
+                headLabel.textContent = label;
+                const count = document.createElement('span');
+                count.textContent = String(values.length);
+                head.append(headLabel, count);
+
+                const list = document.createElement('div');
+                const listText = formatSeatList(values);
+                list.className = `eh-seat-list${listText ? '' : ' empty'}`;
+                list.textContent = listText || 'Nenhuma';
+
+                group.append(head, list);
+                groups.appendChild(group);
+            });
+            seatsCard.appendChild(groups);
+
+            const legendCard = createSection('Legenda do mapa');
+            const legend = document.createElement('div');
+            legend.className = 'eh-legend';
+            [
+                ['livre', 'Livre'],
+                ['ocupada', 'Ocupada'],
+                ['reservada', 'Reservada'],
+                ['selecionada', 'Selecionada']
+            ].forEach(([className, label]) => {
+                const item = document.createElement('div');
+                item.className = 'eh-legend-item';
+                const color = document.createElement('span');
+                color.className = `eh-legend-color ${className}`;
+                const text = document.createElement('span');
+                text.textContent = label;
+                item.append(color, text);
+                legend.appendChild(item);
+            });
+            legendCard.appendChild(legend);
+
+            summary.append(tripCard, seatsCard, legendCard);
+            layout.append(mapCard, summary);
+            stage.appendChild(layout);
+
+            const footer = document.createElement('div');
+            footer.className = 'eh-capture-footer';
+            const total = document.createElement('span');
+            total.innerHTML = `<strong>${data.poltronasLivres.length}</strong> poltronas livres de <strong>${data.totalPoltronas || 0}</strong>`;
+            const warning = document.createElement('span');
+            warning.textContent = 'A disponibilidade pode mudar até a conclusão da reserva.';
+            footer.append(total, warning);
+            stage.appendChild(footer);
+
+            return {
+                shell,
+                stage,
+                filename: `reserva-${EH.Utils.safeFilePart(data.origemDestino)}.png`
+            };
         },
 
         async render(prepared) {
@@ -7847,88 +6218,22 @@
 
         formatSummary(summary) {
             if (!summary?.cards?.length) return '';
-
-            const titleCase = value => {
-                const text = EH.Utils.clean(value);
-                if (!text) return '';
-                return text.toLocaleLowerCase('pt-BR')
-                    .replace(/(^|[\s/–—-])([\p{L}])/gu, (_m, lead, letter) => `${lead}${letter.toLocaleUpperCase('pt-BR')}`)
-                    .replace(/\b(Go|Mt|Df|To|Ba|Sp|Rj|Mg|Ma|Pi|Se|Al|Pe)\b/g, match => match.toUpperCase());
-            };
-            const valueOnly = (line, label) => EH.Utils.clean(String(line || '').replace(new RegExp(`^(?:${label})\\s*:\\s*`, 'i'), ''));
-            const prettyLocation = value => {
-                const raw = EH.Utils.clean(value);
-                if (!raw) return '';
-                const stateMatch = raw.match(/\s*-\s*([A-Z]{2})\s*$/i);
-                const cityRaw = stateMatch ? raw.slice(0, stateMatch.index).trim() : raw;
-                const canonical = EH.CityAliases?.canonicalize?.(cityRaw) || cityRaw;
-                const city = titleCase(canonical);
-                return `${city}${stateMatch ? ` - ${stateMatch[1].toUpperCase()}` : ''}`;
-            };
-            const parseRouteDate = routeDate => {
-                const raw = EH.Utils.clean(routeDate);
-                const dateMatch = raw.match(/\b(\d{2}\/\d{2}\/\d{4})\b/);
-                const timeMatch = raw.match(/\b([01]\d|2[0-3]):[0-5]\d\b/);
-                let routePart = raw;
-                if (dateMatch) routePart = routePart.slice(0, dateMatch.index).replace(/\s*-\s*$/, '').trim();
-                const routeMatch = routePart.match(/^(.*?)\s+(?:x|×|→)\s+(.*?)$/i);
-                return {
-                    origin: prettyLocation(routeMatch?.[1] || ''),
-                    destination: prettyLocation(routeMatch?.[2] || ''),
-                    date: dateMatch?.[1] || '',
-                    time: timeMatch?.[0] || ''
-                };
-            };
-
-            const parts = ['*CONFIRMAÇÃO DA VIAGEM 🚌*', ''];
+            const parts = ['*CONFIRMAÇÃO DA VIAGEM*', ''];
             summary.cards.forEach((card, index) => {
-                if (summary.cards.length > 1) {
-                    parts.push(`*Passagem ${index + 1}*`);
-                }
-
-                const trip = parseRouteDate(card.routeDate);
-                if (trip.origin && trip.destination) {
-                    parts.push(`${trip.origin} → ${trip.destination}`);
-                } else if (card.routeDate) {
-                    parts.push(titleCase(card.routeDate));
-                }
-                if (trip.date) parts.push(`📅 ${trip.date}`);
-                if (trip.time) parts.push(`🕐 ${trip.time}`);
-
-                parts.push('');
-                if (card.passenger) parts.push(`👤 Passageiro: ${titleCase(card.passenger)}`);
+                if (summary.cards.length > 1) parts.push(`*Passageiro ${index + 1}*`);
+                if (card.routeDate) parts.push(`🚌 ${card.routeDate}`);
+                if (card.vehicle) parts.push(`🪑 ${card.vehicle}`);
+                if (card.passenger) parts.push(`👤 Passageiro: ${card.passenger}`);
                 if (card.seat) parts.push(`💺 Poltrona: ${card.seat}`);
-
-                const tarifa = valueOnly(card.tarifa, 'TARIFA');
-                const taxa = valueOnly(card.taxa, 'TAXA DE EMBARQUE');
-                const pedagio = valueOnly(card.pedagio, 'PEDAGIO|PEDÁGIO');
-                const beneficio = valueOnly(card.beneficio, 'BENEFÍCIO|BENEFICIO');
-                const credito = valueOnly(card.credito, 'CRÉDITO|CREDITO');
-                const total = valueOnly(card.total, 'TOTAL');
-
+                if (card.tarifa) parts.push(`💰 ${card.tarifa}`);
+                if (card.taxa) parts.push(card.taxa);
+                if (card.pedagio) parts.push(card.pedagio);
+                if (card.beneficio && !/R\$\s*0[,.]00/.test(card.beneficio)) parts.push(card.beneficio);
+                if (card.credito && !/R\$\s*0[,.]00/.test(card.credito)) parts.push(card.credito);
+                if (card.total) parts.push(`*${card.total}*`);
                 parts.push('');
-                if (tarifa) parts.push(`💰 Tarifa: ${tarifa}`);
-                if (taxa) parts.push(`Taxa de embarque: ${taxa}`);
-                if (pedagio) parts.push(`Pedágio: ${pedagio}`);
-                if (beneficio && !/R\$\s*0[,.]00/.test(beneficio)) parts.push(`Benefício: ${beneficio}`);
-                if (credito && !/R\$\s*0[,.]00/.test(credito)) parts.push(`Crédito: ${credito}`);
-                if (total) {
-                    parts.push('');
-                    parts.push(`*Total: ${total}*`);
-                }
-                if (index < summary.cards.length - 1) parts.push('', '—', '');
             });
-
-            const instruction = EH.Messages.get('resumo');
-            if (instruction) {
-                parts.push('');
-                const lines = instruction
-                    .replace(/\.\s+(?=Se\b)/i, '.\n')
-                    .split(/\n+/)
-                    .map(line => line.trim())
-                    .filter(Boolean);
-                parts.push(...lines);
-            }
+            parts.push(EH.Messages.get('resumo'));
             return parts.join('\n').replace(/\n{3,}/g, '\n\n').trim();
         },
 
@@ -8062,6 +6367,8 @@
             ].join('\n');
         },
 
+        formatPixInfo() { return this.formatPixInstruction(); },
+        formatPix() { return this.formatPixInstruction(); },
 
         formatPixMonospace(pix = this.parsePix()) {
             const payload = this.payload(pix);
@@ -8185,6 +6492,15 @@
             EH.UI?.renderAutomation?.('pagamento');
         },
 
+        openQr(pix = this.parsePix()) {
+            try {
+                const url = this.getQrDataUrl(pix);
+                const win = window.open(url, '_blank');
+                if (!win) EH.Toast.warning('O navegador bloqueou a abertura do QR Code.');
+            } catch (error) {
+                EH.Toast.error(`Não foi possível gerar o QR Code. ${error.message || ''}`.trim());
+            }
+        }
     };
 
     // ============================================================
@@ -8221,10 +6537,6 @@
             header.className = 'eh-header';
             header.title = 'Atendimento rápido';
 
-            const heading = document.createElement('strong');
-            heading.className = 'eh-panel-heading';
-            heading.textContent = 'Passagens';
-
             const toggle = document.createElement('button');
             toggle.type = 'button';
             toggle.className = 'eh-icon-btn';
@@ -8243,7 +6555,7 @@
                 this.showSettings();
             });
 
-            header.append(heading, toggle, settings);
+            header.append(toggle, settings);
 
             const body = document.createElement('div');
             body.className = 'eh-body';
@@ -8260,7 +6572,7 @@
 
             const quickTitle = document.createElement('div');
             quickTitle.className = 'eh-dock-title';
-            quickTitle.textContent = 'Rotas';
+            quickTitle.textContent = 'Rotas rápidas';
             const quickRoutes = document.createElement('div');
             quickRoutes.className = 'eh-quick-routes';
 
@@ -8271,17 +6583,17 @@
             divider.className = 'eh-tools-divider';
             const toolsTitle = document.createElement('div');
             toolsTitle.className = 'eh-dock-title';
-            toolsTitle.textContent = 'Ações';
+            toolsTitle.textContent = 'Ferramentas';
 
             const actions = document.createElement('div');
             actions.className = 'eh-actions eh-actions-primary';
 
-            const horarios = this.createButton('🗓️', 'HORÁRIOS', '', () => this.captureAction('pesquisa'));
-            const reserva = this.createButton('💺', 'POLTRONAS', '', () => this.captureAction('reserva'));
-            const bilhete = this.createButton('🎫', 'BILHETE', '', () => EH.Tickets.activateSelection());
+            const horarios = this.createButton('🗓️', 'HORÁRIOS', 'eh-primary', () => this.captureAction('pesquisa'));
+            const reserva = this.createButton('💺', 'RESERVA', 'eh-success', () => this.captureAction('reserva'));
+            const bilhete = this.createButton('🎫', 'BILHETE', 'eh-primary', () => EH.Tickets.activateSelection());
             const rotas = this.createButton('🧭', 'ROTAS', '', () => this.showRoutes());
             const historico = this.createButton('🕘', 'HISTÓRICO', '', () => this.showHistory());
-            const enviar = this.createButton('📤', 'ENVIAR', '', () => this.showSend());
+            const enviar = this.createButton('📤', 'ENVIAR', 'eh-success', () => this.showSend());
             const resumo = this.createButton('📋', 'RESUMO', 'eh-primary', () => this.copyCurrentSummary());
             const detalhes = this.createButton('📄', 'DETALHES', '', () => this.copyCurrentDetails());
 
@@ -8299,7 +6611,7 @@
             const more = document.createElement('details');
             more.className = 'eh-more-tools';
             const moreSummary = document.createElement('summary');
-            moreSummary.textContent = 'Mais';
+            moreSummary.textContent = 'Mais opções';
             const secondaryActions = document.createElement('div');
             secondaryActions.className = 'eh-actions eh-actions-secondary';
             secondaryActions.append(rotas, historico, enviar, detalhes);
@@ -8320,7 +6632,7 @@
             const flowSection = document.createElement('details');
             flowSection.className = 'eh-flow-section';
             const flowSummary = document.createElement('summary');
-            flowSummary.textContent = 'Fluxo';
+            flowSummary.textContent = 'Fluxo do atendimento';
             flowSection.append(flowSummary, steps);
 
             body.append(flowSection, quickTitle, quickRoutes, context, divider, toolsTitle, actions, more);
@@ -8361,9 +6673,21 @@
 
             this.applyDockLayout(!collapsed);
             this.refreshWhatsAppConnection();
-            // ACKs de envio são tratados pelo WhatsAppDock, que é a única
-            // camada responsável pelo composer integrado.
-
+            if (typeof GM_addValueChangeListener === 'function' && !this.waAckListener) {
+                this.waAckListener = GM_addValueChangeListener(EH.Storage.key('waAck'), (_name, _oldValue, newValue) => {
+                    const ack = EH.WhatsAppBridge.parseStored(newValue);
+                    if (!ack?.id || ack.id !== this.lastWaCommandId) return;
+                    if (this.lastWaCommandHasImage) {
+                        if (ack.imageAttached) EH.Toast.success('Imagem preparada na conversa do WhatsApp integrado. Confira e envie.');
+                        else EH.Toast.warning('A conversa está selecionada, mas o WhatsApp Web não aceitou o anexo automático da imagem.');
+                    } else if (this.lastWaCommandPurpose === 'pix') {
+                        if (ack.ok) EH.Toast.success('PIX enviado: código em mensagem separada para facilitar a cópia.');
+                        else EH.Toast.error('Não foi possível enviar o PIX pelo WhatsApp integrado.');
+                    }
+                    this.lastWaCommandPurpose = '';
+                    this.refreshWhatsAppConnection();
+                });
+            }
         },
 
         setPanelOpen(open) {
@@ -8414,20 +6738,21 @@
             return String(this.phoneInput?.value || EH.Storage.get('currentPhone', '') || '').replace(/\D/g, '');
         },
 
+        // Mantido por compatibilidade interna. O WhatsApp não abre mais popup.
+        openWhatsAppCompactWindow() {
+            EH.Toast.info('O WhatsApp agora fica integrado na lateral do E-Pass.');
+            return null;
+        },
 
         async openWhatsApp(message = '', options = {}) {
+            let phone = EH.Config.WHATSAPP_MODE === 'app'
+                ? this.getPhone()
+                : String(options.phone || '').replace(/\D/g, '');
+            if (phone && !phone.startsWith('55')) phone = `55${phone}`;
             const imageDataUrl = String(options.imageDataUrl || '');
             const filename = String(options.filename || 'epass-atendimento.png');
-            const forceWeb = options.bridgeOnly === true;
-            const currentWebState = EH.WhatsAppBridge.getState();
 
-            // Preserve o modo App do Windows como fallback. No modo Web, o conteúdo
-            // é sempre entregue ao composer integrado e nunca é disparado sozinho.
-            const useApp = !forceWeb && EH.Config.WHATSAPP_MODE === 'app' && !currentWebState.connected;
-            let phone = useApp ? this.getPhone() : '';
-            if (phone && !phone.startsWith('55')) phone = `55${phone}`;
-
-            if (useApp) {
+            if (EH.Config.WHATSAPP_MODE === 'app') {
                 if (imageDataUrl) {
                     try {
                         const blob = EH.Clipboard.dataUrlToBlob(imageDataUrl);
@@ -8446,45 +6771,38 @@
                 document.body.appendChild(link);
                 link.click();
                 link.remove();
-                return { mode: 'app', connected: true, readyToSend: true };
+                return { mode: 'app', connected: true };
             }
 
-            const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: false,
-                verifyStale: true,
-                context: imageDataUrl ? 'preparar-imagem' : 'preparar-mensagem'
-            });
-            if (!state.connected) {
-                EH.WhatsAppBridge.notifyUnavailable(state);
-                return { mode: 'web', connected: false, readyToSend: false, state };
+            if (!EH.WhatsAppBridge.isOnline()) {
+                EH.Toast.warning('WhatsApp Web desconectado. Mantenha a aba do WhatsApp Web que você já usa aberta.');
+                return { mode: 'web', connected: false };
             }
 
-            const typeMap = { pesquisa: 'schedules', reserva: 'seats', bilhete: 'ticket' };
-            const prepared = EH.WhatsAppDock?.prepareContent?.({
-                type: options.type || typeMap[options.captureType] || 'message',
-                chatTitle: state.activeTitle || '',
-                text: String(message || ''),
-                attachment: imageDataUrl ? {
-                    dataUrl: imageDataUrl,
-                    filename,
-                    mime: 'image/png'
-                } : null
-            }, {
-                replace: options.replace === true,
-                silent: options.silent === true
-            });
+            const state = EH.WhatsAppBridge.getUiState();
+            const activeTitle = String(state?.active?.title || '').trim();
+            if (!phone && !activeTitle) {
+                EH.Toast.warning('Selecione primeiro a conversa do cliente no WhatsApp integrado à direita.');
+                return { mode: 'web', connected: false, missingChat: true };
+            }
 
-            return {
-                mode: 'web',
-                connected: true,
-                readyToSend: Boolean(state.readyToSend),
-                prepared: Boolean(prepared?.ok),
-                missingChat: !state.conversationSelected,
-                state
-            };
+            const command = EH.WhatsAppBridge.makeCommand({
+                action: 'prepare',
+                phone,
+                chatTitle: phone ? '' : activeTitle,
+                message,
+                imageDataUrl,
+                filename,
+                target: 'web'
+            });
+            EH.WhatsAppBridge.send(command);
+            this.lastWaCommandId = command.id;
+            this.lastWaCommandHasImage = Boolean(imageDataUrl);
+            this.lastWaCommandPurpose = '';
+            return { mode: 'web', connected: true, commandId: command.id };
         },
 
-        async sendPixPairToWhatsApp(pix) {
+        sendPixPairToWhatsApp(pix) {
             const payload = EH.Payment.payload(pix);
             if (!payload) {
                 EH.Toast.warning('⚠️ Código PIX não encontrado.');
@@ -8495,28 +6813,29 @@
                 EH.Toast.warning(`⚠️ O código PIX parece incompleto ou inválido. ${validation.reason || ''}`.trim());
                 return null;
             }
-
-            const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: true,
-                verifyStale: true,
-                context: 'preparar-pix'
-            });
-            if (!state.readyToSend) {
-                EH.WhatsAppBridge.notifyUnavailable(state);
+            if (EH.Config.WHATSAPP_MODE !== 'web' || !EH.WhatsAppBridge.isOnline()) {
+                EH.Toast.warning('WhatsApp Web integrado não está conectado.');
                 return null;
             }
-
-            const prepared = EH.WhatsAppDock?.prepareContent?.({
-                type: 'pix',
-                chatTitle: state.activeTitle,
-                text: EH.Payment.formatPixInstruction(pix),
-                // A segunda mensagem contém SOMENTE o payload original.
-                message2: payload
-            });
-            if (prepared?.ok) {
-                EH.Toast.info('PIX preparado no painel. Confira e pressione Enviar.');
+            const activeTitle = String(EH.WhatsAppBridge.getUiState()?.active?.title || '').trim();
+            if (!activeTitle) {
+                EH.Toast.warning('Selecione primeiro a conversa do cliente no WhatsApp à direita.');
+                return null;
             }
-            return prepared;
+            const command = EH.WhatsAppBridge.makeCommand({
+                action: 'send_pair',
+                chatTitle: activeTitle,
+                message: EH.Payment.formatPixInstruction(pix),
+                // Mensagem 2 contém SOMENTE o payload original, sem prefixos/sufixos.
+                message2: payload,
+                target: 'web'
+            });
+            EH.WhatsAppBridge.send(command);
+            this.lastWaCommandId = command.id;
+            this.lastWaCommandHasImage = false;
+            this.lastWaCommandPurpose = 'pix';
+            EH.Toast.info('Enviando instrução e PIX em mensagens separadas…');
+            return command;
         },
 
         async sendPixQrToWhatsApp(pix) {
@@ -8533,35 +6852,41 @@
                 EH.Toast.error(`Não foi possível gerar o QR Code. ${error.message || ''}`.trim());
                 return null;
             }
-            return EH.WhatsAppDock?.prepareContent?.({
-                type: 'qr',
-                text: '',
-                chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
-                attachment: { dataUrl: imageDataUrl, filename: 'PIX-QR-CODE.png', mime: 'image/png' }
+            const result = await this.openWhatsApp('', {
+                imageDataUrl,
+                filename: 'PIX-QR-CODE.png',
+                allowCurrentChat: true,
+                bridgeOnly: true
             });
+            if (result?.connected) EH.Toast.success('✅ QR Code preparado no WhatsApp');
+            return result;
         },
 
-        async sendPixMonospaceToWhatsApp(pix) {
+        sendPixMonospaceToWhatsApp(pix) {
             const payload = EH.Payment.payload(pix);
             const validation = pix?.validation || EH.Payment.validatePix(payload);
             if (!payload || !validation.valid) {
                 EH.Toast.warning('O PIX precisa estar válido antes do envio.');
                 return null;
             }
-            const state = await EH.WhatsAppBridge.ensureReady({
-                requireConversation: true,
-                verifyStale: true,
-                context: 'preparar-pix-mono'
-            });
-            if (!state.readyToSend) {
-                EH.WhatsAppBridge.notifyUnavailable(state);
+            if (EH.Config.WHATSAPP_MODE !== 'web' || !EH.WhatsAppBridge.isOnline()) {
+                EH.Toast.warning('WhatsApp Web integrado não está conectado.');
                 return null;
             }
-            return EH.WhatsAppDock?.prepareContent?.({
-                type: 'pix',
-                chatTitle: state.activeTitle,
-                text: EH.Payment.formatPixMonospace(pix)
+            const activeTitle = String(EH.WhatsAppBridge.getUiState()?.active?.title || '').trim();
+            if (!activeTitle) {
+                EH.Toast.warning('Selecione primeiro a conversa do cliente no WhatsApp à direita.');
+                return null;
+            }
+            const command = EH.WhatsAppBridge.makeCommand({
+                action: 'send_text',
+                chatTitle: activeTitle,
+                message: EH.Payment.formatPixMonospace(pix),
+                target: 'web'
             });
+            EH.WhatsAppBridge.send(command);
+            EH.Toast.info('Enviando PIX em formato monoespaçado…');
+            return command;
         },
 
         contextButton(label, cls, handler) {
@@ -8594,12 +6919,12 @@
                 title.textContent = '1. Horários';
                 const recent = this.lastCaptureState?.type === 'pesquisa' && (Date.now() - this.lastCaptureState.createdAt) < 90000;
                 info.textContent = recent
-                    ? 'Horários prontos.'
-                    : 'Escolha uma rota ou gere a captura.';
+                    ? 'Horários prontos. Use a conversa selecionada no WhatsApp à direita.'
+                    : 'Clique numa rota rápida: o E-Pass preenche, pesquisa e gera a imagem automaticamente.';
                 actions.append(this.contextButton('🗓️ Gerar horários agora', 'primary', () => this.captureAction('pesquisa')));
             } else if (page === 'reserva') {
                 title.textContent = '2. Poltronas';
-                info.textContent = 'Gere o mapa de poltronas.';
+                info.textContent = 'Gere o mapa e use a conversa selecionada no WhatsApp integrado à direita.';
                 actions.append(this.contextButton('💺 Gerar poltronas', 'primary', () => this.captureAction('reserva')));
             } else if (page === 'pagamento') {
                 const summary = EH.Payment.parseSummary();
@@ -8625,7 +6950,7 @@
                     }
 
                     const sendPix = this.contextButton('💬 ENVIAR PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
-                    const copyPix = this.contextButton('📋 Copiar código PIX', '', () => EH.Payment.copyPixCode(pix));
+                    const copyPix = this.contextButton('📋 Copiar código PIX', 'success', () => EH.Payment.copyPixCode(pix));
                     [sendPix, copyPix].forEach(btn => { btn.disabled = !validation.valid; });
                     actions.append(sendPix, copyPix);
                     this.contextBox.append(title, info, actions);
@@ -8655,34 +6980,26 @@
                     return;
                 }
                 title.textContent = '3. Confirmar compra';
-                info.textContent = summary?.cards?.length ? `${summary.cards[0].passenger || 'Passageiro'} • ${summary.cards[0].seat ? `poltrona ${summary.cards[0].seat}` : 'confira os dados'}` : 'Resumo ainda não encontrado.';
+                info.textContent = summary?.cards?.length ? `${summary.cards[0].passenger || 'Passageiro'} • ${summary.cards[0].seat ? `poltrona ${summary.cards[0].seat}` : 'confira os dados'}` : 'Resumo da compra ainda não encontrado.';
                 const msg = EH.Payment.formatSummary(summary);
                 actions.append(
                     this.contextButton('📋 Copiar confirmação', 'primary', async () => { if (!msg) return EH.Toast.warning('Resumo não encontrado.'); await EH.Clipboard.copyText(msg); EH.Toast.success('✓ Confirmação copiada'); }),
-                    this.contextButton('💬 Preparar no WhatsApp', '', () => {
+                    this.contextButton('💬 Preparar no WhatsApp', '', async () => {
                         if (!msg) return EH.Toast.warning('Resumo não encontrado.');
-                        EH.WhatsAppDock?.prepareContent?.({
-                            type: 'reservation',
-                            text: msg,
-                            chatTitle: EH.WhatsAppBridge.getState().activeTitle || ''
-                        });
+                        const result = await this.openWhatsApp(msg, { allowCurrentChat: true, bridgeOnly: true });
+                        if (result?.connected) EH.Toast.success('Confirmação preparada no WhatsApp.');
                     }),
                     this.contextButton('✅ Cliente confirmou → Gerar PIX', 'success', () => EH.Payment.clientConfirmed())
                 );
             } else if (page === 'passagens') {
                 title.textContent = '5. Bilhete';
-                info.textContent = 'Escolha o bilhete correto.';
+                info.textContent = 'Pesquise o CPF e escolha a passagem correta. O WhatsApp permanece ao lado durante todo o atendimento.';
                 actions.append(this.contextButton('🎫 Escolher bilhete', 'primary', () => EH.Tickets.activateSelection()));
             } else {
                 title.textContent = 'Atendimento';
-                const waState = EH.WhatsAppBridge.getState();
-                info.textContent = waState.state === 'ready'
-                    ? 'WhatsApp conectado.'
-                    : waState.state === 'no-chat'
-                        ? 'Selecione uma conversa.'
-                        : waState.state === 'loading'
-                            ? 'Conectando ao WhatsApp…'
-                            : 'WhatsApp desconectado.';
+                info.textContent = EH.WhatsAppBridge.isOnline()
+                    ? 'WhatsApp conectado à direita. Escolha uma conversa e inicie o atendimento.'
+                    : 'Mantenha a aba do WhatsApp Web que você já usa aberta para aparecer aqui na lateral.';
             }
             this.contextBox.append(title, info);
             if (actions.children.length) this.contextBox.append(actions);
@@ -8821,19 +7138,17 @@
                     summary,
                     createdAt: Date.now()
                 };
-                EH.BoardingReminders.setTicketCandidate(prepared.data);
 
-                const waPreparedResult = EH.WhatsAppDock?.prepareContent?.({
-                    type: 'ticket',
-                    text: message,
-                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
-                    attachment: {
-                        dataUrl,
+                let waPrepared = false;
+                if (EH.Config.WHATSAPP_MODE === 'web' && EH.WhatsAppBridge.isOnline() && EH.WhatsAppBridge.getUiState()?.active?.title) {
+                    const waResult = await this.openWhatsApp(message, {
+                        imageDataUrl: dataUrl,
                         filename: prepared.filename || 'bilhete-epass.png',
-                        mime: 'image/png'
-                    }
-                }, { silent: true });
-                const waPrepared = Boolean(waPreparedResult?.ok);
+                        bridgeOnly: true,
+                        allowCurrentChat: true
+                    });
+                    waPrepared = Boolean(waResult?.connected);
+                }
 
                 this.showPreview({
                     blob,
@@ -8850,8 +7165,8 @@
                 });
 
                 if (autoCopy.copied) EH.Toast.success('✓ Bilhete copiado');
-                else if (waPrepared) EH.Toast.success('Bilhete preparado no painel do WhatsApp.');
-                else EH.Toast.warning('Bilhete capturado. O navegador bloqueou o PNG no clipboard; use “Preparar no WhatsApp” ou “Baixar PNG”.', 5200);
+                else if (waPrepared) EH.Toast.success('Bilhete preparado no WhatsApp integrado.');
+                else EH.Toast.warning('Bilhete capturado. O navegador bloqueou o PNG no clipboard; use “Enviar ao WhatsApp” ou “Baixar PNG”.', 5200);
             } catch (error) {
                 if (prepared?.shell) EH.Capture.destroyShell(prepared.shell);
                 EH.Logger.error('Falha na captura da passagem:', error);
@@ -8913,19 +7228,23 @@
                     createdAt: Date.now()
                 };
 
-                // O conteúdo é preparado no composer integrado, mas nunca enviado
-                // automaticamente. A conversa atual fica registrada como destino.
-                const waPreparedResult = EH.WhatsAppDock?.prepareContent?.({
-                    type: page === 'pesquisa' ? 'schedules' : 'seats',
-                    text: message,
-                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
-                    attachment: {
-                        dataUrl,
-                        filename: capture.prepared.filename || `${page}-epass.png`,
-                        mime: 'image/png'
+                // Quando existe uma conversa ativa no WhatsApp integrado, a própria captura
+                // pode ser preparada nela. Isso é o fallback principal do E-Pass em HTTP,
+                // onde o navegador bloqueia o PNG binário no clipboard.
+                let waPrepared = false;
+                if (EH.Config.WHATSAPP_MODE === 'web' && EH.WhatsAppBridge.isOnline() && EH.WhatsAppBridge.getUiState()?.active?.title) {
+                    try {
+                        const waResult = await this.openWhatsApp(message, {
+                            imageDataUrl: dataUrl,
+                            filename: capture.prepared.filename || `${page}-epass.png`,
+                            bridgeOnly: true,
+                            allowCurrentChat: true
+                        });
+                        waPrepared = Boolean(waResult?.connected);
+                    } catch (error) {
+                        EH.Logger.warn('Não foi possível preparar a imagem no WhatsApp:', error);
                     }
-                }, { silent: true });
-                const waPrepared = Boolean(waPreparedResult?.ok);
+                }
 
                 const shouldShowPreview = opts.showPreview === true || (opts.showPreview === 'ifFailed' && !autoCopy.copied && !waPrepared);
                 if (shouldShowPreview) {
@@ -8948,10 +7267,10 @@
                     EH.Toast.success('✓ Imagem copiada');
                 } else if (waPrepared) {
                     EH.Toast.success(opts.automatic
-                        ? 'Horários prontos no painel do WhatsApp. Confira e pressione Enviar.'
-                        : 'Conteúdo preparado no painel do WhatsApp.');
+                        ? 'Horários prontos e imagem preparada no WhatsApp integrado.'
+                        : 'Imagem preparada no WhatsApp integrado.');
                 } else {
-                    EH.Toast.warning('Imagem criada, mas o navegador bloqueou o PNG no clipboard. Use “Preparar no WhatsApp” ou “Baixar PNG”.', 5600);
+                    EH.Toast.warning('Imagem criada, mas o navegador bloqueou o PNG no clipboard. Use “Enviar ao WhatsApp” ou “Baixar PNG”.', 5600);
                     if (!shouldShowPreview) {
                         this.showPreview({ blob, dataUrl, summaryText, detailsText, text: detailsText, message, filename: capture.prepared.filename, captureType: page, historyId: history?.id || '', copied: false, reason: autoCopy.reason || '' });
                     }
@@ -9296,7 +7615,7 @@
             phoneField.className = 'eh-field';
             phoneField.style.marginTop = '12px';
             const phoneLabel = document.createElement('label');
-            phoneLabel.textContent = 'Telefone do cliente (somente modo App)';
+            phoneLabel.textContent = 'Telefone/WhatsApp do cliente';
             const phone = document.createElement('input');
             phone.type = 'tel';
             phone.placeholder = 'Ex.: (64) 99999-9999';
@@ -9341,25 +7660,20 @@
             openWhats.className = 'eh-modal-btn success';
             openWhats.textContent = '📤 Preparar no WhatsApp';
             openWhats.addEventListener('click', async () => {
-                const webState = EH.WhatsAppBridge.getState();
-                const appFallback = EH.Config.WHATSAPP_MODE === 'app' && !webState.connected;
-                if (appFallback) {
-                    let digits = phone.value.replace(/\D/g, '');
-                    if (digits.length === 10 || digits.length === 11) digits = `55${digits}`;
-                    if (digits.length < 12) {
-                        EH.Toast.warning('Informe o telefone com DDD para usar o WhatsApp do Windows.');
-                        phone.focus();
-                        return;
-                    }
-                    this.phoneInput.value = digits.startsWith('55') ? digits.slice(2) : digits;
-                    EH.Storage.set('currentPhone', this.phoneInput.value);
+                let digits = phone.value.replace(/\D/g, '');
+                if (digits.length === 10 || digits.length === 11) digits = `55${digits}`;
+                if (digits.length < 12) {
+                    EH.Toast.warning('Informe o telefone com DDD.');
+                    phone.focus();
+                    return;
                 }
-                const result = await this.openWhatsApp(finalMessage(), {
+                this.phoneInput.value = digits.startsWith('55') ? digits.slice(2) : digits;
+                EH.Storage.set('currentPhone', this.phoneInput.value);
+                const message = finalMessage();
+                await this.openWhatsApp(message, {
                     imageDataUrl: entry.dataUrl,
-                    filename: entry.filename || 'epass-atendimento.png',
-                    captureType: entry.type
+                    filename: entry.filename || 'epass-atendimento.png'
                 });
-                if (result?.prepared) EH.Toast.success('✓ Atendimento preparado no painel do WhatsApp');
             });
 
             const imageButton = document.createElement('button');
@@ -9370,7 +7684,7 @@
                 const blob = EH.Clipboard.dataUrlToBlob(entry.dataUrl);
                 const result = await EH.Clipboard.copyImageAnyContext(blob);
                 if (result.copied) EH.Toast.success('✓ Imagem copiada');
-                else EH.Toast.error(result.reason || 'O navegador bloqueou a cópia do PNG. Use o composer do WhatsApp ou baixe a imagem.', 5200);
+                else EH.Toast.error(result.reason || 'O navegador bloqueou a cópia do PNG. Use o envio ao WhatsApp ou baixe a imagem.', 5200);
             });
 
             const copyMessage = document.createElement('button');
@@ -9465,8 +7779,8 @@
                     note.textContent = 'Cole no WhatsApp com Ctrl + V.';
                     EH.Toast.success('✓ Imagem copiada');
                 } else {
-                    note.textContent = result.reason || 'O navegador bloqueou a cópia binária. Use “Preparar no WhatsApp” ou “Baixar PNG”.';
-                    EH.Toast.error('Não foi possível copiar o PNG. Use “Preparar no WhatsApp” ou “Baixar PNG”.', 5200);
+                    note.textContent = result.reason || 'O navegador bloqueou a cópia binária. Use “Enviar ao WhatsApp” ou “Baixar PNG”.';
+                    EH.Toast.error('Não foi possível copiar o PNG. Use “Enviar ao WhatsApp” ou “Baixar PNG”.', 5200);
                 }
             });
 
@@ -9497,15 +7811,11 @@
             const sendWhatsApp = document.createElement('button');
             sendWhatsApp.type = 'button';
             sendWhatsApp.className = 'eh-modal-btn success';
-            sendWhatsApp.textContent = '💬 Preparar no WhatsApp';
-            sendWhatsApp.addEventListener('click', () => {
-                const result = EH.WhatsAppDock?.prepareContent?.({
-                    type: captureType === 'pesquisa' ? 'schedules' : captureType === 'reserva' ? 'seats' : captureType === 'bilhete' ? 'ticket' : 'message',
-                    text: automaticMessage,
-                    chatTitle: EH.WhatsAppBridge.getState().activeTitle || '',
-                    attachment: { dataUrl, filename: filename || 'epass.png', mime: 'image/png' }
-                });
-                if (result?.ok) close();
+            sendWhatsApp.textContent = '💬 Enviar ao WhatsApp';
+            sendWhatsApp.disabled = !(EH.Config.WHATSAPP_MODE === 'web' && EH.WhatsAppBridge.isOnline() && EH.WhatsAppBridge.getUiState()?.active?.title);
+            sendWhatsApp.addEventListener('click', async () => {
+                const result = await this.openWhatsApp(automaticMessage, { imageDataUrl: dataUrl, filename, allowCurrentChat: true, bridgeOnly: true });
+                if (result?.connected) EH.Toast.success('Imagem preparada no WhatsApp integrado.');
             });
 
             const send = document.createElement('button');
@@ -9533,16 +7843,6 @@
                 }
             });
 
-            const reminder = document.createElement('button');
-            reminder.type = 'button';
-            reminder.className = 'eh-modal-btn';
-            reminder.textContent = '⏰ Lembrar embarque';
-            reminder.hidden = captureType !== 'bilhete' || !EH.BoardingReminders.lastTicketCandidate;
-            reminder.addEventListener('click', () => {
-                close();
-                EH.OperationPanel.open('boarding', EH.BoardingReminders.ticketPrefill());
-            });
-
             const closeBottom = document.createElement('button');
             closeBottom.type = 'button';
             closeBottom.className = 'eh-modal-btn';
@@ -9555,7 +7855,7 @@
                 if (event.target === overlay) close();
             });
 
-            actions.append(copySummary, copyImage, sendWhatsApp, download, send, copyText, reminder, closeBottom);
+            actions.append(copySummary, copyImage, sendWhatsApp, download, send, copyText, closeBottom);
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
@@ -9647,24 +7947,6 @@
             waZoomInput.value = String(Math.round(EH.Config.WHATSAPP_DOCK_ZOOM * 100));
             waZoomField.append(waZoomLabel, waZoomInput);
 
-            const profileField = document.createElement('div');
-            profileField.className = 'eh-field';
-            const profileLabel = document.createElement('label');
-            profileLabel.textContent = 'Perfil da interface';
-            const profileSelect = document.createElement('select');
-            profileSelect.innerHTML = '<option value="auto">Automático</option><option value="home">PC de Casa</option><option value="station">PC da Rodoviária</option>';
-            profileSelect.value = EH.Config.INTERFACE_PROFILE;
-            profileField.append(profileLabel, profileSelect);
-
-            const panelSizeField = document.createElement('div');
-            panelSizeField.className = 'eh-field';
-            const panelSizeLabel = document.createElement('label');
-            panelSizeLabel.textContent = 'Largura dos painéis';
-            const panelSizeSelect = document.createElement('select');
-            panelSizeSelect.innerHTML = '<option value="small">Pequeno</option><option value="medium">Médio</option><option value="large">Grande</option>';
-            panelSizeSelect.value = EH.Config.PANEL_SIZE;
-            panelSizeField.append(panelSizeLabel, panelSizeSelect);
-
             const ticketWidthField = document.createElement('div');
             ticketWidthField.className = 'eh-field';
             const ticketWidthLabel = document.createElement('label');
@@ -9687,7 +7969,7 @@
             whatsappSelect.value = EH.Config.WHATSAPP_MODE;
             whatsappField.append(whatsappLabel, whatsappSelect);
 
-            grid.append(profileField, panelSizeField, feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField, whatsappField);
+            grid.append(feeField, feeFieldGoiania, feeFieldBarra, feeFieldAragarcas, feeFieldSaoLuis, scaleField, panelZoomField, waZoomField, ticketWidthField, whatsappField);
 
             const checkWrap = document.createElement('label');
             checkWrap.className = 'eh-check';
@@ -9745,7 +8027,7 @@
 
             const help = document.createElement('div');
             help.className = 'eh-help-box';
-            help.textContent = 'O perfil Automático adapta somente os painéis do helper à tela disponível; a plataforma E-Pass não é deslocada nem redimensionada. Zoom padrão: painel E-Pass 150% e WhatsApp 110%. As preferências ficam salvas separadamente em cada navegador.';
+            help.textContent = 'As configurações ficam salvas separadamente em cada navegador. Zoom padrão: painel E-Pass 150% e WhatsApp 110%. Para imagens, o script só considera sucesso quando o PNG binário entra no clipboard. Em HTTP, o navegador pode bloquear isso; nesse caso use o envio direto ao WhatsApp integrado ou Baixar PNG. No computador de casa selecione APP; no trabalho selecione WEB.';
 
             content.append(grid, checkWrap, autoCopyWrap, autoRouteWrap, messageSection, msgHorarios, msgReserva, msgBilhete, msgResumo, msgPix, help);
 
@@ -9773,8 +8055,6 @@
                 EH.Config.TICKET_CAPTURE_WIDTH = ticketWidth;
                 EH.Config.PANEL_ZOOM = panelZoom;
                 EH.Config.WHATSAPP_DOCK_ZOOM = whatsappDockZoom;
-                EH.Config.INTERFACE_PROFILE = ['home', 'station'].includes(profileSelect.value) ? profileSelect.value : 'auto';
-                EH.Config.PANEL_SIZE = ['small', 'large'].includes(panelSizeSelect.value) ? panelSizeSelect.value : 'medium';
                 EH.Config.APLICAR_TAXAS_ORIGEM = check.checked;
                 EH.Config.AUTO_COPY_IMAGES = autoCopyCheck.checked;
                 EH.Config.AUTO_ROUTE_CAPTURE = autoRouteCheck.checked;
@@ -9792,8 +8072,6 @@
                 EH.Storage.set('ticketCaptureWidth', ticketWidth);
                 EH.Storage.set('panelZoom', panelZoom);
                 EH.Storage.set('whatsappDockZoom', whatsappDockZoom);
-                EH.Storage.set('interfaceProfile', EH.Config.INTERFACE_PROFILE);
-                EH.Storage.set('panelSize', EH.Config.PANEL_SIZE);
                 EH.Storage.set('aplicarTaxasOrigem', check.checked);
                 EH.Storage.set('autoCopyImages', autoCopyCheck.checked);
                 EH.Storage.set('autoRouteCapture', autoRouteCheck.checked);
@@ -9804,15 +8082,13 @@
                 const savedTicketWidth = Number(EH.Storage.get('ticketCaptureWidth', 0));
                 const savedPanelZoom = Number(EH.Storage.get('panelZoom', 0));
                 const savedWaZoom = Number(EH.Storage.get('whatsappDockZoom', 0));
-                const savedProfile = String(EH.Storage.get('interfaceProfile', 'auto'));
-                const savedPanelSize = String(EH.Storage.get('panelSize', 'medium'));
                 const savedTaxes = EH.Storage.get('taxasOrigem', null);
                 const savedAutoTax = Boolean(EH.Storage.get('aplicarTaxasOrigem', false));
                 const savedMessages = EH.Storage.get('messages', null);
                 const savedWaMode = EH.Storage.get('whatsappMode', 'web');
                 const savedAutoCopy = Boolean(EH.Storage.get('autoCopyImages', false));
                 const savedAutoRoute = Boolean(EH.Storage.get('autoRouteCapture', false));
-                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedProfile === EH.Config.INTERFACE_PROFILE && savedPanelSize === EH.Config.PANEL_SIZE && savedAutoTax === check.checked && savedWaMode === EH.Config.WHATSAPP_MODE && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
+                const savedCorrectly = savedTaxes && savedMessages && savedScale === scale && savedTicketWidth === ticketWidth && Math.abs(savedPanelZoom - panelZoom) < 0.001 && Math.abs(savedWaZoom - whatsappDockZoom) < 0.001 && savedAutoTax === check.checked && savedWaMode === EH.Config.WHATSAPP_MODE && savedAutoCopy === autoCopyCheck.checked && savedAutoRoute === autoRouteCheck.checked;
 
                 if (!savedCorrectly) {
                     EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
@@ -9888,7 +8164,6 @@
             if (this.observer || !document.body) return;
             const update = EH.Utils.debounce(() => {
                 const page = EH.Pages.update();
-                EH.Layout?.sync?.();
                 if (page !== 'passagens' && EH.Tickets.active) EH.Tickets.clearSelection();
             }, EH.Config.APP_OBSERVER_DEBOUNCE_MS);
 
@@ -9930,7 +8205,6 @@
             EH.Style.inject();
             EH.Toast.init();
             EH.UI.init();
-            EH.BoardingReminders.init();
             EH.WhatsAppDock.init();
             EH.Layout.sync();
             EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => EH.Layout.sync(), 140));
