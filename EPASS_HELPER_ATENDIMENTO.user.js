@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.45.0
-// @description  Atendimento E-Pass com WhatsApp formatado, PIX sequencial e painel contextual
+// @version      5.46.0
+// @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.45.0',
+        VERSION: '5.46.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -1574,6 +1574,15 @@
         imagePreviewImg: null,
         imagePreviewName: null,
         imageRemoveButton: null,
+        organizer: null,
+        organizerClient: null,
+        organizerStage: null,
+        organizerRoute: null,
+        organizerPassenger: null,
+        organizerSeat: null,
+        organizerValue: null,
+        organizerPayment: null,
+        whatsappTools: null,
 
         init() {
             if (this.root || EH.WhatsAppBridge.isWhatsAppHost() || !document.body) return;
@@ -1587,17 +1596,46 @@
             head.className = 'eh-wa-dock-head';
             const brand = document.createElement('div');
             brand.className = 'eh-wa-brand';
-            brand.innerHTML = '<span class="eh-wa-status-dot"></span><strong>WhatsApp</strong>';
+            brand.innerHTML = '<span class="eh-wa-status-dot"></span><strong>Conversa atual</strong>';
             const status = document.createElement('span');
             status.className = 'eh-wa-status-text';
             status.textContent = 'conectando…';
             const collapse = document.createElement('button');
             collapse.type = 'button';
             collapse.className = 'eh-wa-collapse';
-            collapse.title = 'Recolher WhatsApp';
+            collapse.title = 'Recolher conversa atual';
             collapse.textContent = '›';
             collapse.addEventListener('click', () => this.setCollapsed(true));
             head.append(brand, status, collapse);
+
+            const organizer = document.createElement('section');
+            organizer.className = 'eh-conversation-organizer';
+            const organizerEyebrow = document.createElement('div');
+            organizerEyebrow.className = 'eh-conversation-eyebrow';
+            organizerEyebrow.textContent = 'LEMBRETE DO ATENDIMENTO';
+            const organizerClient = document.createElement('strong');
+            organizerClient.className = 'eh-conversation-client';
+            organizerClient.textContent = 'Nenhuma conversa selecionada';
+            const organizerGrid = document.createElement('div');
+            organizerGrid.className = 'eh-conversation-grid';
+            const makeOrganizerItem = (label, key) => {
+                const item = document.createElement('div');
+                item.className = `eh-conversation-item eh-conversation-${key}`;
+                const small = document.createElement('small');
+                small.textContent = label;
+                const value = document.createElement('span');
+                value.textContent = '—';
+                item.append(small, value);
+                organizerGrid.appendChild(item);
+                return value;
+            };
+            const organizerStage = makeOrganizerItem('Etapa', 'stage');
+            const organizerRoute = makeOrganizerItem('Rota', 'route');
+            const organizerPassenger = makeOrganizerItem('Passageiro', 'passenger');
+            const organizerSeat = makeOrganizerItem('Poltrona', 'seat');
+            const organizerValue = makeOrganizerItem('Valor', 'value');
+            const organizerPayment = makeOrganizerItem('Pagamento', 'payment');
+            organizer.append(organizerEyebrow, organizerClient, organizerGrid);
 
             const chats = document.createElement('section');
             chats.className = 'eh-wa-chats';
@@ -1665,12 +1703,21 @@
             const handle = document.createElement('button');
             handle.id = 'eh-wa-handle';
             handle.type = 'button';
-            handle.title = 'Expandir WhatsApp';
+            handle.title = 'Expandir conversa atual';
             handle.textContent = '‹';
             handle.hidden = !this.collapsed;
             handle.addEventListener('click', () => this.setCollapsed(false));
 
-            root.append(head, chats, conversation, pastePreview, composerWrap);
+            const whatsappTools = document.createElement('details');
+            whatsappTools.className = 'eh-wa-tools';
+            const whatsappToolsSummary = document.createElement('summary');
+            whatsappToolsSummary.textContent = 'WhatsApp integrado';
+            const whatsappToolsBody = document.createElement('div');
+            whatsappToolsBody.className = 'eh-wa-tools-body';
+            whatsappToolsBody.append(chats, conversation, pastePreview, composerWrap);
+            whatsappTools.append(whatsappToolsSummary, whatsappToolsBody);
+
+            root.append(head, organizer, whatsappTools);
             document.body.append(root, handle);
             this.root = root;
             this.handle = handle;
@@ -1686,6 +1733,15 @@
             this.imagePreviewImg = previewImg;
             this.imagePreviewName = previewName;
             this.imageRemoveButton = removeImage;
+            this.organizer = organizer;
+            this.organizerClient = organizerClient;
+            this.organizerStage = organizerStage;
+            this.organizerRoute = organizerRoute;
+            this.organizerPassenger = organizerPassenger;
+            this.organizerSeat = organizerSeat;
+            this.organizerValue = organizerValue;
+            this.organizerPayment = organizerPayment;
+            this.whatsappTools = whatsappTools;
             this.applyLayout();
             this.render(EH.WhatsAppBridge.getUiState());
 
@@ -1764,8 +1820,64 @@
             this.currentState = state || { chats: [], active: null, messages: [] };
             this.refreshConnection();
             if (this.titleEl) this.titleEl.textContent = this.currentState.active?.title || 'Selecione uma conversa';
+            this.renderOrganizer();
             this.renderChats();
             this.renderMessages();
+        },
+
+        renderOrganizer(page = EH.Pages?.detect?.() || 'desconhecida') {
+            if (!this.organizer) return;
+            const activeTitle = String(this.currentState?.active?.title || EH.WhatsAppBridge.getUiState()?.active?.title || '').trim();
+            const stageLabels = {
+                pesquisa: 'Horários',
+                reserva: 'Poltronas',
+                confirmacao: 'Confirmação',
+                pagamento: 'Pagamento',
+                passagens: 'Bilhete',
+                requisicao: 'Requisição',
+                desconhecida: 'Aguardando'
+            };
+
+            let route = '';
+            let passenger = '';
+            let seat = '';
+            let value = '';
+            let payment = '';
+
+            try {
+                if (page === 'pesquisa') {
+                    const data = EH.Parser?.parsePesquisa?.();
+                    route = [data?.origem, data?.destino].filter(Boolean).join(' → ');
+                } else if (page === 'reserva') {
+                    const data = EH.Parser?.parseReserva?.();
+                    route = String(data?.origemDestino || '').trim();
+                } else if (page === 'confirmacao' || page === 'pagamento') {
+                    const card = EH.Payment?.parseSummary?.()?.cards?.[0];
+                    if (card) {
+                        route = String(card.routeDate || '').trim();
+                        passenger = String(card.passenger || '').trim();
+                        seat = String(card.seat || '').trim();
+                        value = String(card.total || card.tarifa || '').trim();
+                    }
+                    if (page === 'pagamento') payment = EH.Payment?.parsePix?.() ? 'PIX' : 'A definir';
+                } else if (page === 'passagens') {
+                    const sale = EH.SaleContext?.loadSale?.();
+                    const active = Array.isArray(sale?.passengers)
+                        ? sale.passengers.find(item => item.id === sale.activePassengerId) || sale.passengers[0]
+                        : null;
+                    passenger = String(active?.name || '').trim();
+                }
+            } catch (error) {
+                EH.Logger.debug('Resumo visual da conversa indisponível:', error);
+            }
+
+            if (this.organizerClient) this.organizerClient.textContent = activeTitle || 'Nenhuma conversa selecionada';
+            if (this.organizerStage) this.organizerStage.textContent = stageLabels[page] || 'Atendimento';
+            if (this.organizerRoute) this.organizerRoute.textContent = route || '—';
+            if (this.organizerPassenger) this.organizerPassenger.textContent = passenger || '—';
+            if (this.organizerSeat) this.organizerSeat.textContent = seat || '—';
+            if (this.organizerValue) this.organizerValue.textContent = value || '—';
+            if (this.organizerPayment) this.organizerPayment.textContent = payment || '—';
         },
 
         renderChats() {
@@ -1955,72 +2067,69 @@
     };
 
     // ============================================================
-    // LAYOUT / ZOOM DOS PAINÉIS
-    // Estado -> classes/CSS variables. Nenhum ajuste cumulativo no E-Pass.
+    // LAYOUT VISUAL DOS PAINÉIS — OVERLAYS INDEPENDENTES
+    // Nunca redimensiona, desloca ou altera elementos originais do E-Pass.
     // ============================================================
     EH.Layout = {
         lastMetrics: null,
 
         responsiveBases(viewportWidth, leftZoom, rightZoom, leftOpen, rightOpen) {
             const vw = Math.max(320, Number(viewportWidth) || 1366);
-            let leftBase = vw <= 820 ? 176 : vw <= 1100 ? 194 : vw <= 1366 ? 214 : EH.Config.PANEL_WIDTH;
-            let rightBase = vw <= 820 ? 235 : vw <= 1100 ? 270 : vw <= 1366 ? 320 : EH.Config.WHATSAPP_DOCK_WIDTH;
+            const safeLeftZoom = Math.min(2, Math.max(0.75, Number(leftZoom) || 1));
+            const safeRightZoom = Math.min(2, Math.max(0.75, Number(rightZoom) || 1));
 
-            if (leftOpen && rightOpen) {
-                const desiredLeft = leftBase * leftZoom;
-                const desiredRight = rightBase * rightZoom;
-                const centralTarget = vw >= 1440 ? 620 : vw >= 1180 ? 520 : vw >= 980 ? 400 : EH.Config.CENTRAL_MIN_WIDTH;
-                const maxPanels = Math.max(120, vw - centralTarget);
-                const desiredTotal = desiredLeft + desiredRight;
-                if (desiredTotal > maxPanels) {
-                    const ratio = Math.max(0.35, maxPanels / desiredTotal);
-                    leftBase = Math.max(EH.Config.PANEL_MIN_BASE, Math.floor(leftBase * ratio));
-                    rightBase = Math.max(EH.Config.WHATSAPP_MIN_BASE, Math.floor(rightBase * ratio));
+            // O zoom salvo continua influenciando o tamanho, mas sem usar CSS zoom,
+            // evitando efeitos colaterais de posicionamento em elementos fixed.
+            const leftBase = vw >= 1500 ? 232 : vw >= 1180 ? 214 : 202;
+            const rightBase = vw >= 1500 ? 266 : vw >= 1180 ? 242 : 224;
+            let leftWidth = Math.round(Math.min(370, Math.max(278, leftBase * safeLeftZoom)));
+            let rightWidth = Math.round(Math.min(310, Math.max(238, rightBase * safeRightZoom)));
 
-                    // Em telas realmente estreitas, preservar o centro é mais importante
-                    // que manter as larguras-base de desktop. O zoom continua inalterado.
-                    const adjustedTotal = leftBase * leftZoom + rightBase * rightZoom;
-                    if (adjustedTotal > maxPanels && maxPanels > 160) {
-                        const secondRatio = maxPanels / adjustedTotal;
-                        leftBase = Math.max(88, Math.floor(leftBase * secondRatio));
-                        rightBase = Math.max(126, Math.floor(rightBase * secondRatio));
-                    }
-                }
-            }
+            const edge = vw <= 760 ? 10 : 14;
+            const gap = vw <= 760 ? 8 : 12;
+            const available = Math.max(280, vw - edge * 2);
+            leftWidth = Math.min(leftWidth, available);
+            rightWidth = Math.min(rightWidth, available);
 
-            return { leftBase, rightBase };
+            const sideBySide = Boolean(
+                leftOpen && rightOpen
+                && vw >= 1120
+                && (leftWidth + rightWidth + gap + edge * 2) <= vw
+            );
+
+            return { leftBase, rightBase, leftWidth, rightWidth, edge, gap, sideBySide };
         },
 
         sync() {
             EH.State?.load?.();
-            // clientWidth exclui a barra de rolagem vertical e corresponde ao espaço
-            // real usado por elementos fixed com left/right:0. Evita ~15px de sobreposição.
             const viewportWidth = Math.max(320, document.documentElement.clientWidth || window.innerWidth || 1366);
+            const viewportHeight = Math.max(480, document.documentElement.clientHeight || window.innerHeight || 768);
             const leftZoom = Math.min(2, Math.max(0.75, Number(EH.Config.PANEL_ZOOM) || 1.5));
             const rightZoom = Math.min(2, Math.max(0.75, Number(EH.Config.WHATSAPP_DOCK_ZOOM) || 1.1));
             const leftOpen = Boolean(EH.State?.isOpen?.('left') && EH.UI?.root);
             const rightOpen = Boolean(EH.State?.isOpen?.('right') && EH.WhatsAppDock?.root);
-            const { leftBase, rightBase } = this.responsiveBases(viewportWidth, leftZoom, rightZoom, leftOpen, rightOpen);
-            const leftSpace = leftOpen ? Math.round(leftBase * leftZoom) : 0;
-            const rightSpace = rightOpen ? Math.round(rightBase * rightZoom) : 0;
+            const metrics = this.responsiveBases(viewportWidth, leftZoom, rightZoom, leftOpen, rightOpen);
             const root = document.documentElement;
-            const layoutActive = leftOpen || rightOpen;
 
-            root.classList.toggle('eh-layout-managed', layoutActive);
-            root.classList.toggle('eh-app-left-open', leftOpen);
-            root.classList.toggle('eh-app-right-open', rightOpen);
-            root.classList.toggle('eh-app-both-open', leftOpen && rightOpen);
+            // Limpa vestígios do layout antigo que deslocava a plataforma.
+            ['eh-layout-managed', 'eh-app-left-open', 'eh-app-right-open', 'eh-app-both-open', 'eh-layout-tight']
+                .forEach(name => root.classList.remove(name));
+            ['--eh-left-active-space', '--eh-right-active-space', '--eh-left-logical-height', '--eh-right-logical-height']
+                .forEach(name => root.style.removeProperty(name));
+
+            root.classList.toggle('eh-overlay-side-by-side', metrics.sideBySide);
+            root.classList.toggle('eh-overlay-stacked', Boolean(leftOpen && rightOpen && !metrics.sideBySide));
+            root.classList.toggle('eh-overlay-main-open', leftOpen);
+            root.classList.toggle('eh-overlay-conversation-open', rightOpen);
             root.classList.toggle('eh-app-panels-closed', !leftOpen && !rightOpen);
-            root.classList.toggle('eh-layout-tight', layoutActive && (viewportWidth - leftSpace - rightSpace) < 380);
 
-            root.style.setProperty('--eh-panel-base', `${leftBase}px`);
-            root.style.setProperty('--eh-wa-base', `${rightBase}px`);
-            root.style.setProperty('--eh-panel-zoom', String(leftZoom));
-            root.style.setProperty('--eh-wa-zoom', String(rightZoom));
-            root.style.setProperty('--eh-left-logical-height', `${100 / leftZoom}vh`);
-            root.style.setProperty('--eh-right-logical-height', `${100 / rightZoom}vh`);
-            root.style.setProperty('--eh-left-active-space', `${leftSpace}px`);
-            root.style.setProperty('--eh-right-active-space', `${rightSpace}px`);
+            root.style.setProperty('--eh-panel-width', `${metrics.leftWidth}px`);
+            root.style.setProperty('--eh-conversation-width', `${metrics.rightWidth}px`);
+            root.style.setProperty('--eh-overlay-edge', `${metrics.edge}px`);
+            root.style.setProperty('--eh-overlay-gap', `${metrics.gap}px`);
+            root.style.setProperty('--eh-overlay-top', `${viewportWidth <= 760 ? 58 : 72}px`);
+            root.style.setProperty('--eh-overlay-main-height', `${Math.min(680, Math.max(390, Math.round(viewportHeight * (metrics.sideBySide ? 0.72 : 0.56))))}px`);
+            root.style.setProperty('--eh-overlay-conversation-height', `${Math.min(500, Math.max(230, Math.round(viewportHeight * (metrics.sideBySide ? 0.48 : 0.34))))}px`);
             root.style.setProperty('--eh-layout-transition', `${Math.max(0, Number(EH.Config.LAYOUT_TRANSITION_MS) || 180)}ms`);
 
             if (EH.UI?.root) {
@@ -2036,25 +2145,33 @@
 
             this.lastMetrics = {
                 viewportWidth,
+                viewportHeight,
                 leftOpen,
                 rightOpen,
                 leftZoom,
                 rightZoom,
-                leftBase,
-                rightBase,
-                leftSpace,
-                rightSpace,
-                centralSpace: Math.max(0, viewportWidth - leftSpace - rightSpace)
+                ...metrics,
+                // Compatibilidade com diagnósticos antigos: nenhum espaço é retirado do E-Pass.
+                leftSpace: 0,
+                rightSpace: 0,
+                centralSpace: viewportWidth
             };
             return this.lastMetrics;
         },
 
         reset() {
             const root = document.documentElement;
-            ['eh-layout-managed', 'eh-app-left-open', 'eh-app-right-open', 'eh-app-both-open', 'eh-app-panels-closed', 'eh-layout-tight']
-                .forEach(name => root.classList.remove(name));
-            ['--eh-panel-base', '--eh-wa-base', '--eh-panel-zoom', '--eh-wa-zoom', '--eh-left-logical-height', '--eh-right-logical-height', '--eh-left-active-space', '--eh-right-active-space', '--eh-layout-transition']
-                .forEach(name => root.style.removeProperty(name));
+            [
+                'eh-layout-managed', 'eh-app-left-open', 'eh-app-right-open', 'eh-app-both-open',
+                'eh-layout-tight', 'eh-overlay-side-by-side', 'eh-overlay-stacked',
+                'eh-overlay-main-open', 'eh-overlay-conversation-open', 'eh-app-panels-closed'
+            ].forEach(name => root.classList.remove(name));
+            [
+                '--eh-panel-width', '--eh-conversation-width', '--eh-overlay-edge', '--eh-overlay-gap',
+                '--eh-overlay-top', '--eh-overlay-main-height', '--eh-overlay-conversation-height',
+                '--eh-layout-transition', '--eh-left-active-space', '--eh-right-active-space',
+                '--eh-left-logical-height', '--eh-right-logical-height'
+            ].forEach(name => root.style.removeProperty(name));
             this.lastMetrics = null;
         }
     };
@@ -2907,30 +3024,6 @@
                 #eh-root .eh-flow-section > summary::after { content:'＋'; float:right; color:#778396; }
                 #eh-root .eh-flow-section[open] > summary::after { content:'−'; }
                 #eh-root .eh-flow-section .eh-steps { margin: 0; padding: 0 6px 6px; }
-                html.eh-layout-managed app-root {
-                    display:block !important;
-                    width:calc(100% - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
-                    max-width:calc(100% - var(--eh-left-active-space, 0px) - var(--eh-right-active-space, 0px)) !important;
-                    min-width:0 !important;
-                    margin-left:var(--eh-left-active-space, 0px) !important;
-                    margin-right:0 !important;
-                    transition:width var(--eh-layout-transition, 180ms) ease, margin-left var(--eh-layout-transition, 180ms) ease;
-                }
-                html.eh-layout-managed app-root .navbar-fixed-top {
-                    left:var(--eh-left-active-space, 0px) !important;
-                    right:var(--eh-right-active-space, 0px) !important;
-                    width:auto !important;
-                }
-                html.eh-layout-managed app-root #left-sidebar {
-                    left:var(--eh-left-active-space, 0px) !important;
-                }
-                html.eh-layout-managed .container-agente { max-width:100% !important; min-width:0 !important; }
-                html.eh-layout-managed .swal2-container,
-                html.eh-layout-managed .nsm-overlay-open {
-                    left:var(--eh-left-active-space, 0px) !important;
-                    right:var(--eh-right-active-space, 0px) !important;
-                    width:auto !important;
-                }
 
                 #eh-launcher {
                     position: fixed;
@@ -3234,6 +3327,298 @@
                 #eh-root .eh-btn.eh-primary { border-color:#6ba3e8; }
                 #eh-root .eh-btn.eh-success { border-color:#6dc99a; }
 
+                /* =========================================================
+                   v5.46 — WORKSPACE FLUTUANTE / E-PASS INTACTO
+                   Somente #eh-root, #eh-wa-dock e seus lançadores.
+                   ========================================================= */
+                #eh-root {
+                    position: fixed !important;
+                    top: var(--eh-overlay-top, 72px) !important;
+                    right: var(--eh-overlay-edge, 14px) !important;
+                    bottom: auto !important;
+                    left: auto !important;
+                    width: min(var(--eh-panel-width, 322px), calc(100vw - (var(--eh-overlay-edge, 14px) * 2))) !important;
+                    height: var(--eh-overlay-main-height, 620px) !important;
+                    max-height: calc(100vh - var(--eh-overlay-top, 72px) - var(--eh-overlay-edge, 14px)) !important;
+                    zoom: 1 !important;
+                    transform: none !important;
+                    z-index: 2147483000;
+                    pointer-events: auto;
+                    filter: none;
+                }
+                #eh-root.eh-collapsed {
+                    transform: translateX(calc(100% + 28px)) !important;
+                    opacity: 0;
+                    pointer-events: none;
+                }
+                #eh-root .eh-panel {
+                    height: 100%;
+                    overflow: hidden;
+                    border: 1px solid #d9e1ea;
+                    border-radius: 15px;
+                    background: rgba(248, 250, 252, .985);
+                    box-shadow: 0 16px 44px rgba(26, 44, 72, .18), 0 2px 8px rgba(26, 44, 72, .08);
+                    backdrop-filter: blur(10px);
+                }
+                #eh-root .eh-header {
+                    min-height: 54px;
+                    padding: 8px 9px 8px 12px;
+                    justify-content: space-between;
+                    gap: 10px;
+                    border-bottom: 1px solid #dce3eb;
+                    background: linear-gradient(180deg, #ffffff 0%, #f4f7fa 100%);
+                }
+                #eh-root .eh-panel-brand {
+                    min-width: 0;
+                    display: grid;
+                    gap: 2px;
+                    line-height: 1.05;
+                }
+                #eh-root .eh-panel-brand span {
+                    color: #758397;
+                    font-size: 7.5px;
+                    font-weight: 900;
+                    letter-spacing: .8px;
+                }
+                #eh-root .eh-panel-brand strong {
+                    color: #1f3046;
+                    font-size: 13px;
+                    font-weight: 900;
+                    letter-spacing: -.15px;
+                }
+                #eh-root .eh-header-actions {
+                    display: flex;
+                    align-items: center;
+                    gap: 3px;
+                    flex: 0 0 auto;
+                }
+                #eh-root .eh-icon-btn {
+                    width: 29px;
+                    height: 29px;
+                    border-radius: 8px;
+                    color: #536276;
+                }
+                #eh-root .eh-icon-btn:hover { background: #e7edf4; color: #1f3046; }
+                #eh-root .eh-body {
+                    padding: 9px;
+                    background: transparent;
+                }
+                #eh-root .eh-panel-footer {
+                    padding: 7px 9px;
+                    border-top: 1px solid #e0e6ed;
+                    background: rgba(244, 247, 250, .96);
+                }
+                #eh-root .eh-context-card {
+                    border-color: #d7e0ea;
+                    border-radius: 11px;
+                    box-shadow: 0 3px 12px rgba(35, 58, 88, .05);
+                }
+                #eh-root .eh-context-btn,
+                #eh-root .eh-route-quick,
+                #eh-root .eh-btn { border-radius: 9px; }
+                #eh-root .eh-context-btn.primary {
+                    box-shadow: 0 4px 12px rgba(50, 127, 220, .16);
+                }
+                #eh-root .eh-more-tools,
+                #eh-root .eh-flow-section { border-radius: 10px; }
+
+                #eh-launcher {
+                    left: auto !important;
+                    right: 0 !important;
+                    top: 82px !important;
+                    width: 20px;
+                    height: 52px;
+                    border: 1px solid #cbd5e1;
+                    border-right: 0;
+                    border-left: 1px solid #cbd5e1;
+                    border-radius: 9px 0 0 9px;
+                    background: rgba(255,255,255,.9);
+                    color: #315b88;
+                    box-shadow: -4px 4px 14px rgba(31,48,70,.12);
+                    opacity: .6;
+                }
+                #eh-launcher:hover, #eh-launcher:focus-visible {
+                    width: 28px;
+                    opacity: 1;
+                    background: #fff;
+                }
+
+                /* Conversa atual: visual secundário e complementar. */
+                #eh-wa-dock {
+                    position: fixed !important;
+                    top: var(--eh-overlay-top, 72px) !important;
+                    right: calc(var(--eh-overlay-edge, 14px) + var(--eh-panel-width, 322px) + var(--eh-overlay-gap, 12px)) !important;
+                    bottom: auto !important;
+                    left: auto !important;
+                    width: min(var(--eh-conversation-width, 270px), calc(100vw - (var(--eh-overlay-edge, 14px) * 2))) !important;
+                    height: auto !important;
+                    max-height: var(--eh-overlay-conversation-height, 420px) !important;
+                    zoom: 1 !important;
+                    display: flex;
+                    flex-direction: column;
+                    border: 1px solid #d8e0e6;
+                    border-radius: 14px;
+                    background: rgba(250, 252, 252, .985);
+                    color: #24313a;
+                    box-shadow: 0 14px 36px rgba(30, 49, 62, .13), 0 2px 7px rgba(30, 49, 62, .07);
+                    overflow: hidden;
+                    font-family: Inter, "Segoe UI", Arial, sans-serif;
+                }
+                #eh-wa-dock.eh-wa-collapsed { display: none !important; }
+                .eh-wa-dock-head {
+                    min-height: 47px;
+                    padding: 7px 7px 7px 11px;
+                    background: linear-gradient(180deg, #fbfdfd 0%, #f1f5f5 100%);
+                    border-bottom: 1px solid #dce4e5;
+                }
+                .eh-wa-brand { color: #25343d; font-size: 11px; font-family: Inter, "Segoe UI", Arial, sans-serif; }
+                .eh-wa-brand strong { font-weight: 900; }
+                .eh-wa-status-text { font-size: 8px; color: #74828a; }
+                .eh-wa-collapse { color: #61747b; }
+                .eh-wa-collapse:hover { background: #e8eeee; }
+
+                .eh-conversation-organizer {
+                    display: grid;
+                    gap: 8px;
+                    padding: 11px;
+                    background: #fff;
+                }
+                .eh-conversation-eyebrow {
+                    color: #829097;
+                    font-size: 7.5px;
+                    font-weight: 900;
+                    letter-spacing: .7px;
+                }
+                .eh-conversation-client {
+                    display: block;
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                    color: #152932;
+                    font-size: 12px;
+                    font-weight: 900;
+                }
+                .eh-conversation-grid {
+                    display: grid;
+                    grid-template-columns: repeat(2, minmax(0, 1fr));
+                    gap: 6px;
+                }
+                .eh-conversation-item {
+                    min-width: 0;
+                    display: grid;
+                    gap: 2px;
+                    padding: 7px 8px;
+                    border: 1px solid #e3e9eb;
+                    border-radius: 9px;
+                    background: #f8fafb;
+                }
+                .eh-conversation-item small {
+                    color: #849198;
+                    font-size: 7px;
+                    font-weight: 850;
+                    text-transform: uppercase;
+                    letter-spacing: .3px;
+                }
+                .eh-conversation-item span {
+                    overflow: hidden;
+                    text-overflow: ellipsis;
+                    white-space: nowrap;
+                    color: #34464f;
+                    font-size: 8.5px;
+                    font-weight: 750;
+                }
+                .eh-conversation-route { grid-column: 1 / -1; }
+                .eh-conversation-route span { white-space: normal; line-height: 1.28; }
+
+                .eh-wa-tools {
+                    min-height: 0;
+                    border-top: 1px solid #e2e8e9;
+                    background: #f7f9f9;
+                }
+                .eh-wa-tools > summary {
+                    position: relative;
+                    list-style: none;
+                    cursor: pointer;
+                    padding: 9px 30px 9px 11px;
+                    color: #66777e;
+                    font-size: 8.5px;
+                    font-weight: 850;
+                    letter-spacing: .2px;
+                }
+                .eh-wa-tools > summary::-webkit-details-marker { display: none; }
+                .eh-wa-tools > summary::after {
+                    content: '＋';
+                    position: absolute;
+                    right: 11px;
+                    top: 50%;
+                    transform: translateY(-50%);
+                    color: #829096;
+                    font-size: 12px;
+                }
+                .eh-wa-tools[open] > summary::after { content: '−'; }
+                .eh-wa-tools-body {
+                    min-height: 0;
+                    max-height: calc(var(--eh-overlay-conversation-height, 420px) - 190px);
+                    display: grid;
+                    grid-template-rows: minmax(110px, 30%) minmax(150px, 1fr) auto auto;
+                    overflow: hidden;
+                    border-top: 1px solid #e0e7e8;
+                }
+                .eh-wa-tools:not([open]) .eh-wa-tools-body { display: none !important; }
+                .eh-wa-chats { min-height: 110px; }
+                .eh-wa-conversation { min-height: 150px; }
+
+                #eh-wa-handle {
+                    top: 142px;
+                    right: calc(var(--eh-overlay-edge, 14px) + var(--eh-panel-width, 322px) + var(--eh-overlay-gap, 12px) - 1px);
+                    width: 20px;
+                    height: 48px;
+                    border-radius: 8px 0 0 8px;
+                    background: rgba(248,251,251,.96);
+                    color: #24836f;
+                    opacity: .72;
+                }
+                #eh-wa-handle:hover { opacity: 1; }
+                html:not(.eh-overlay-main-open) #eh-wa-dock {
+                    right: var(--eh-overlay-edge, 14px) !important;
+                }
+                html:not(.eh-overlay-main-open) #eh-wa-handle {
+                    right: 0;
+                }
+
+                /* Em telas menores, os overlays ficam empilhados no mesmo canto.
+                   A plataforma permanece com 100% da largura original. */
+                html.eh-overlay-stacked #eh-root {
+                    top: var(--eh-overlay-top, 72px) !important;
+                    right: var(--eh-overlay-edge, 14px) !important;
+                }
+                html.eh-overlay-stacked #eh-wa-dock {
+                    top: auto !important;
+                    right: var(--eh-overlay-edge, 14px) !important;
+                    bottom: var(--eh-overlay-edge, 14px) !important;
+                    max-height: var(--eh-overlay-conversation-height, 280px) !important;
+                }
+                html.eh-overlay-stacked #eh-wa-handle {
+                    top: auto;
+                    right: 0;
+                    bottom: 82px;
+                }
+                html.eh-overlay-stacked .eh-wa-tools-body {
+                    max-height: calc(var(--eh-overlay-conversation-height, 280px) - 175px);
+                }
+
+                @media (max-width: 760px) {
+                    #eh-root,
+                    #eh-wa-dock {
+                        right: 10px !important;
+                        max-width: calc(100vw - 20px) !important;
+                    }
+                    #eh-root { height: min(54vh, 520px) !important; }
+                    #eh-wa-dock { max-height: min(32vh, 280px) !important; }
+                    .eh-conversation-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+                    .eh-conversation-route { grid-column: 1 / -1; }
+                }
+
             `);
         }
     };
@@ -3316,6 +3701,7 @@
             EH.SaleCpfs?.captureFromDom?.();
             EH.RequisitionManager?.scanDom?.();
             EH.UI.updateState(page);
+            EH.WhatsAppDock?.renderOrganizer?.(page);
             return page;
         }
     };
@@ -8148,10 +8534,11 @@
         init() {
             if (document.querySelector('#eh-root')) return;
 
-            const firstDrawerUse = !EH.Storage.get('drawer523Initialized', false);
-            if (firstDrawerUse) {
-                EH.Storage.set('collapsed', true);
-                EH.Storage.set('drawer523Initialized', true);
+            const firstOverlayUse = !EH.Storage.get('overlay546Initialized', false);
+            if (firstOverlayUse) {
+                EH.Storage.set('collapsed', false);
+                EH.Storage.set('waDockCollapsed', false);
+                EH.Storage.set('overlay546Initialized', true);
             }
             // O estado persistente é lido uma única vez e passa a ser a fonte de verdade.
             EH.State.loaded = false;
@@ -8168,12 +8555,19 @@
             header.className = 'eh-header';
             header.title = 'Atendimento rápido';
 
+            const panelBrand = document.createElement('div');
+            panelBrand.className = 'eh-panel-brand';
+            panelBrand.innerHTML = '<span>E-PASS HELPER</span><strong>Atendimento</strong>';
+
+            const headerActions = document.createElement('div');
+            headerActions.className = 'eh-header-actions';
+
             const toggle = document.createElement('button');
             toggle.type = 'button';
             toggle.className = 'eh-icon-btn';
             toggle.title = 'Recolher painel';
             toggle.setAttribute('aria-label', toggle.title);
-            toggle.textContent = '‹';
+            toggle.textContent = '›';
 
             const settings = document.createElement('button');
             settings.type = 'button';
@@ -8186,7 +8580,8 @@
                 this.showSettings();
             });
 
-            header.append(toggle, settings);
+            headerActions.append(settings, toggle);
+            header.append(panelBrand, headerActions);
 
             const body = document.createElement('div');
             body.className = 'eh-body';
@@ -8277,7 +8672,7 @@
             const launcher = document.createElement('button');
             launcher.type = 'button';
             launcher.id = 'eh-launcher';
-            launcher.textContent = '›';
+            launcher.textContent = '‹';
             launcher.title = 'Abrir atendimento rápido (Alt+A)';
             launcher.setAttribute('aria-label', launcher.title);
             launcher.hidden = !collapsed;
