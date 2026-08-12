@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.41.0
-// @description  Fluxo essencial E-Pass + WhatsApp: horários, poltronas, confirmação, PIX e bilhete
+// @version      5.42.0
+// @description  Venda atual, passageiros, busca de bilhetes por CPF e captura dupla para WhatsApp
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.41.0',
+        VERSION: '5.42.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -2968,6 +2968,161 @@
                 #eh-wa-handle { position:fixed; z-index:2147482499; right:0; top:46%; width:22px; height:54px; border:1px solid #cfd6d8; border-right:0; border-radius:8px 0 0 8px; background:#f0f2f5; color:#008069; cursor:pointer; font:800 20px Arial,sans-serif; box-shadow:-4px 0 12px rgba(0,0,0,.08); }
                 #eh-wa-handle[hidden] { display:none !important; }
 
+                /* v5.42 — central operacional compacta da venda atual */
+                #eh-root .eh-sale-host[hidden] { display:none !important; }
+                #eh-root .eh-sale-host { margin-bottom:8px; }
+                #eh-root .eh-sale-summary,
+                #eh-root .eh-sale-cpfs {
+                    border:1px solid #d9e0e8;
+                    border-radius:9px;
+                    background:#ffffff;
+                    color:#26313f;
+                    box-shadow:0 2px 8px rgba(28,45,68,.05);
+                }
+                #eh-root .eh-sale-summary { padding:8px; }
+                #eh-root .eh-sale-summary-head {
+                    display:flex;
+                    justify-content:space-between;
+                    align-items:baseline;
+                    gap:8px;
+                    padding-bottom:6px;
+                    border-bottom:1px solid #edf0f4;
+                }
+                #eh-root .eh-sale-summary-head strong { color:#1f2a37; font-size:10.5px; }
+                #eh-root .eh-sale-summary-head span { color:#6d7786; font-size:8.5px; white-space:nowrap; }
+                #eh-root .eh-sale-summary-row {
+                    padding:5px 1px 0;
+                    color:#394555;
+                    font-size:9.5px;
+                    line-height:1.3;
+                }
+                #eh-root .eh-sale-summary-actions {
+                    display:grid;
+                    grid-template-columns:1fr 1fr;
+                    gap:5px;
+                    margin-top:7px;
+                }
+                #eh-root .eh-sale-cpfs {
+                    display:grid;
+                    gap:5px;
+                    margin-top:7px;
+                    padding:7px;
+                }
+                #eh-root .eh-sale-block-title {
+                    color:#657183;
+                    font-size:8.5px;
+                    font-weight:900;
+                    letter-spacing:.25px;
+                    text-transform:uppercase;
+                }
+                #eh-root .eh-sale-passenger-row {
+                    display:grid;
+                    grid-template-columns:minmax(0,1fr) 58px;
+                    align-items:center;
+                    gap:6px;
+                    padding:6px;
+                    border:1px solid #edf0f4;
+                    border-radius:7px;
+                    background:#f8fafc;
+                }
+                #eh-root .eh-sale-passenger-text { min-width:0; display:grid; gap:2px; }
+                #eh-root .eh-sale-passenger-text strong {
+                    overflow:hidden;
+                    text-overflow:ellipsis;
+                    white-space:nowrap;
+                    color:#253142;
+                    font-size:9.5px;
+                    margin:0;
+                }
+                #eh-root .eh-sale-passenger-text small { color:#788393; font-size:8px; }
+
+                /* Seleção contextual na tela Passagens: aparece somente quando solicitada. */
+                .eh-ticket-batch-bar {
+                    position:sticky;
+                    z-index:2147483190;
+                    top:6px;
+                    display:flex;
+                    align-items:center;
+                    gap:8px;
+                    width:min(720px, calc(100% - 16px));
+                    margin:8px auto 12px;
+                    padding:8px 10px;
+                    border:1px solid #cfd8e4;
+                    border-radius:9px;
+                    background:rgba(255,255,255,.98);
+                    box-shadow:0 8px 22px rgba(26,46,74,.12);
+                    color:#26313f;
+                    font:700 11px "Segoe UI",Arial,sans-serif;
+                }
+                .eh-ticket-batch-status { flex:1; min-width:0; }
+                .eh-ticket-batch-capture,
+                .eh-ticket-batch-cancel {
+                    min-height:32px;
+                    padding:6px 10px;
+                    border:1px solid #c7d0db;
+                    border-radius:7px;
+                    background:#fff;
+                    color:#314052;
+                    cursor:pointer;
+                    font:800 10px "Segoe UI",Arial,sans-serif;
+                }
+                .eh-ticket-batch-capture { border-color:#2878df; background:#2878df; color:#fff; }
+                .eh-ticket-batch-capture:disabled { opacity:.4; cursor:not-allowed; }
+                .eh-ticket-selected {
+                    outline:3px solid #2f80df !important;
+                    outline-offset:-3px;
+                    box-shadow:0 0 0 5px rgba(47,128,223,.13) !important;
+                }
+
+                /* Paleta mais neutra no helper; não altera elementos da plataforma E-Pass. */
+                #eh-root { color:#273142; }
+                #eh-root .eh-panel {
+                    border-right-color:#d8dee7;
+                    background:#f5f7f9;
+                    box-shadow:8px 0 24px rgba(25,43,68,.11);
+                }
+                #eh-root .eh-header,
+                #eh-root .eh-panel-footer { border-color:#dfe4ea; background:#eef1f4; }
+                #eh-root .eh-icon-btn { color:#465365; }
+                #eh-root .eh-flow-section,
+                #eh-root .eh-more-tools {
+                    border-color:#dde3ea;
+                    background:#ffffff;
+                }
+                #eh-root .eh-flow-section > summary,
+                #eh-root .eh-more-tools > summary,
+                .eh-dock-title { color:#687487; }
+                .eh-step { border-color:#e0e5eb; background:#fff; color:#7c8795; }
+                .eh-step.active { border-color:#2f80df; background:#eaf3ff; color:#215ea8; }
+                .eh-route-quick {
+                    border-color:#dce2e9;
+                    background:#ffffff;
+                    color:#29384a;
+                }
+                .eh-route-quick:hover { border-color:#2f80df; background:#f3f8ff; }
+                .eh-context-card {
+                    border-color:#d9e0e8;
+                    background:#ffffff;
+                    color:#445064;
+                }
+                .eh-context-card strong { color:#243143; }
+                .eh-context-btn {
+                    border-color:#d7dee7;
+                    background:#f7f9fb;
+                    color:#2d3a4b;
+                }
+                .eh-context-btn.primary { border-color:#2f77d8; background:#327fdc; color:#fff; }
+                .eh-context-btn.success { border-color:#2e9a68; background:#e9f7ef; color:#20714e; }
+                .eh-tools-divider { background:#dfe4ea; }
+                #eh-root .eh-btn {
+                    border-color:#dbe1e8;
+                    background:#ffffff;
+                    color:#2f3b4d;
+                }
+                #eh-root .eh-btn:hover:not(:disabled) { border-color:#2f80df; background:#f4f8fd; }
+                #eh-root .eh-btn.eh-primary { border-color:#6ba3e8; }
+                #eh-root .eh-btn.eh-success { border-color:#6dc99a; }
+
             `);
         }
     };
@@ -4789,12 +4944,15 @@
     })();
 
     // ============================================================
-    // CPFs TEMPORÁRIOS DA VENDA
-    // Mantidos apenas em sessionStorage para agilizar a busca do bilhete.
+    // VENDA ATUAL / MEMÓRIA TEMPORÁRIA DE PASSAGEIROS
+    // Evolução do antigo SaleCpfs: existe uma única fonte de verdade em
+    // sessionStorage, agora com nome, nascimento, estado do bilhete e vínculo.
     // ============================================================
-    EH.SaleCpfs = {
-        KEY: 'epassHelper.saleCpfs.v1',
+    EH.SaleContext = {
+        KEY: 'epassHelper.currentSale.v2',
+        LEGACY_KEY: 'epassHelper.saleCpfs.v1',
         started: false,
+        searchBusy: false,
 
         normalizeCpf(value) {
             return String(value || '').replace(/\D/g, '').slice(0, 11);
@@ -4806,179 +4964,399 @@
             return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}-${digits.slice(9)}`;
         },
 
-        currentSaleKey() {
-            const cards = Array.from(document.querySelectorAll('.card.cadastro-passageiro, .cadastro-passageiro'));
-            if (!cards.length) return '';
-            return cards.map(card => {
-                const header = EH.Utils.clean(card.querySelector('.card-header, h5')?.textContent || '');
-                const body = EH.Utils.clean(card.querySelector('.card-body')?.textContent || '');
-                const seat = body.match(/N[ÚU]MERO DA POLTRONA\s*:\s*([\w-]+)/i)?.[1] || '';
-                return `${header}|${seat}`;
-            }).join('||');
+        maskCpfPublic(value) {
+            const digits = this.normalizeCpf(value);
+            if (digits.length !== 11) return 'CPF não identificado';
+            return `***.***.***-${digits.slice(9)}`;
         },
 
-        readPayload() {
+        newSale() {
+            const now = Date.now();
+            return {
+                id: `sale-${now}-${Math.random().toString(36).slice(2, 8)}`,
+                createdAt: now,
+                updatedAt: now,
+                status: 'active',
+                paymentType: null,
+                activePassengerId: null,
+                passengers: []
+            };
+        },
+
+        normalizePassenger(item = {}) {
+            const cpf = this.normalizeCpf(item.cpf);
+            return {
+                id: item.id || (cpf ? `p-${cpf}` : `p-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`),
+                cpf,
+                name: EH.Utils.clean(item.name || ''),
+                birthDate: EH.Utils.clean(item.birthDate || ''),
+                requestCode: EH.Utils.clean(item.requestCode || ''),
+                requestStatus: EH.Utils.clean(item.requestStatus || ''),
+                ticketStatus: item.ticketStatus || 'pending',
+                tickets: Array.isArray(item.tickets) ? item.tickets.slice(0, 12) : [],
+                createdAt: Number(item.createdAt || item.at || Date.now()),
+                updatedAt: Number(item.updatedAt || item.at || Date.now())
+            };
+        },
+
+        migrateLegacy() {
+            try {
+                if (sessionStorage.getItem(this.KEY)) return;
+                const legacy = JSON.parse(sessionStorage.getItem(this.LEGACY_KEY) || 'null');
+                if (!legacy?.savedAt || !Array.isArray(legacy.items)) return;
+                const sale = this.newSale();
+                sale.createdAt = Number(legacy.savedAt) || Date.now();
+                sale.passengers = legacy.items
+                    .map(item => this.normalizePassenger(item))
+                    .filter(item => item.cpf.length === 11);
+                if (sale.passengers.length) sessionStorage.setItem(this.KEY, JSON.stringify(sale));
+                sessionStorage.removeItem(this.LEGACY_KEY);
+            } catch (error) {
+                EH.Logger.warn('Não foi possível migrar a memória temporária da venda.');
+            }
+        },
+
+        loadSale() {
+            this.migrateLegacy();
             try {
                 const parsed = JSON.parse(sessionStorage.getItem(this.KEY) || 'null');
-                if (!parsed?.savedAt || !Array.isArray(parsed.items)) return null;
-                if ((Date.now() - Number(parsed.savedAt)) > EH.Config.SALE_CPF_TTL_MS) {
+                if (!parsed || !Array.isArray(parsed.passengers)) return this.newSale();
+                const lastActivity = Number(parsed.updatedAt || parsed.createdAt || 0);
+                if (lastActivity && (Date.now() - lastActivity) > EH.Config.SALE_CPF_TTL_MS) {
                     sessionStorage.removeItem(this.KEY);
-                    return null;
+                    return this.newSale();
                 }
-                return parsed;
+                return {
+                    ...this.newSale(),
+                    ...parsed,
+                    passengers: parsed.passengers
+                        .map(item => this.normalizePassenger(item))
+                        .filter(item => item.cpf.length === 11)
+                };
             } catch (error) {
-                EH.Logger.warn('Não foi possível ler os CPFs temporários da venda:', error);
-                return null;
+                EH.Logger.warn('Não foi possível ler a venda atual.');
+                return this.newSale();
             }
+        },
+
+        saveSale(sale) {
+            const next = {
+                ...sale,
+                updatedAt: Date.now(),
+                passengers: (sale?.passengers || [])
+                    .map(item => this.normalizePassenger(item))
+                    .filter(item => item.cpf.length === 11)
+            };
+            try {
+                if (!next.passengers.length) sessionStorage.removeItem(this.KEY);
+                else sessionStorage.setItem(this.KEY, JSON.stringify(next));
+            } catch (error) {
+                EH.Logger.warn('Não foi possível salvar a venda atual.');
+            }
+            EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
+            return next;
         },
 
         load() {
-            try {
-                const parsed = this.readPayload();
-                if (!parsed) return [];
-                return parsed.items
-                    .map(item => ({ cpf: this.normalizeCpf(item.cpf), name: EH.Utils.clean(item.name || ''), at: Number(item.at || 0) }))
-                    .filter(item => item.cpf.length === 11);
-            } catch (error) {
-                EH.Logger.warn('Não foi possível ler os CPFs temporários da venda:', error);
-                return [];
-            }
+            return this.loadSale().passengers;
         },
 
-        save(items, saleKey = '') {
-            const clean = [];
-            const seen = new Set();
-            (items || []).forEach(item => {
-                const cpf = this.normalizeCpf(item?.cpf);
-                if (cpf.length !== 11 || seen.has(cpf)) return;
-                seen.add(cpf);
-                clean.push({ cpf, name: EH.Utils.clean(item?.name || ''), at: Number(item?.at || Date.now()) });
-            });
-            try {
-                if (!clean.length) sessionStorage.removeItem(this.KEY);
-                else {
-                    const previous = this.readPayload();
-                    sessionStorage.setItem(this.KEY, JSON.stringify({
-                        savedAt: Date.now(),
-                        saleKey: saleKey || previous?.saleKey || '',
-                        items: clean
-                    }));
-                }
-            } catch (error) {
-                EH.Logger.warn('Não foi possível guardar os CPFs temporários da venda:', error);
-            }
-            return clean;
+        findPassengerByCpf(cpf) {
+            const digits = this.normalizeCpf(cpf);
+            return this.load().find(item => item.cpf === digits) || null;
         },
 
-        captureCard(card, saleKey = '') {
-            if (!card) return false;
-            const cpfInput = card.querySelector('input[formcontrolname="cpf"], input[placeholder*="CPF" i]');
-            const nameInput = card.querySelector('input[formcontrolname="nome"], input[placeholder*="NOME" i]');
-            const cpf = this.normalizeCpf(cpfInput?.value || '');
-            if (cpf.length !== 11) return false;
-            const name = EH.Utils.clean(nameInput?.value || '');
-            const items = this.load();
-            const existing = items.find(item => item.cpf === cpf);
-            if (existing) {
-                if (name) existing.name = name;
-                existing.at = Date.now();
+        getActivePassenger() {
+            const sale = this.loadSale();
+            return sale.passengers.find(item => item.id === sale.activePassengerId) || null;
+        },
+
+        setActivePassenger(passengerId) {
+            const sale = this.loadSale();
+            if (!sale.passengers.some(item => item.id === passengerId)) return null;
+            sale.activePassengerId = passengerId;
+            return this.saveSale(sale);
+        },
+
+        upsertPassenger(data = {}) {
+            const cpf = this.normalizeCpf(data.cpf);
+            if (cpf.length !== 11) return null;
+            const sale = this.loadSale();
+            let passenger = sale.passengers.find(item => item.cpf === cpf);
+            let changed = false;
+            if (!passenger) {
+                passenger = this.normalizePassenger({ ...data, cpf });
+                sale.passengers.push(passenger);
+                changed = true;
             } else {
-                items.push({ cpf, name, at: Date.now() });
+                const nextName = data.name ? EH.Utils.clean(data.name) : passenger.name;
+                const nextBirthDate = data.birthDate ? EH.Utils.clean(data.birthDate) : passenger.birthDate;
+                if (nextName !== passenger.name) {
+                    passenger.name = nextName;
+                    changed = true;
+                }
+                if (nextBirthDate !== passenger.birthDate) {
+                    passenger.birthDate = nextBirthDate;
+                    changed = true;
+                }
+                if (changed) passenger.updatedAt = Date.now();
             }
-            this.save(items, saleKey);
+            if (changed) this.saveSale(sale);
+            return passenger;
+        },
+
+        fieldValue(card, selectors = []) {
+            for (const selector of selectors) {
+                const element = card?.querySelector?.(selector);
+                if (element && 'value' in element && String(element.value || '').trim()) return String(element.value || '').trim();
+            }
+            return '';
+        },
+
+        captureCard(card) {
+            if (!card) return false;
+            const cpf = this.fieldValue(card, [
+                'input[formcontrolname="cpf"]',
+                'input[formcontrolname*="cpf" i]',
+                'input[placeholder*="CPF" i]'
+            ]);
+            const digits = this.normalizeCpf(cpf);
+            if (digits.length !== 11) return false;
+            const name = this.fieldValue(card, [
+                'input[formcontrolname="nome"]',
+                'input[formcontrolname*="nome" i]',
+                'input[placeholder*="NOME" i]'
+            ]);
+            const birthDate = this.fieldValue(card, [
+                'input[formcontrolname="data_nascimento"]',
+                'input[formcontrolname*="nascimento" i]',
+                'input[placeholder*="NASC" i]',
+                'input[aria-label*="NASC" i]'
+            ]);
+            this.upsertPassenger({ cpf: digits, name, birthDate });
             return true;
         },
 
         captureFromDom() {
             const cards = Array.from(document.querySelectorAll('.card.cadastro-passageiro, .cadastro-passageiro'));
             if (!cards.length) return false;
-            const saleKey = this.currentSaleKey();
-            const previous = this.readPayload();
-            if (saleKey && previous?.saleKey && previous.saleKey !== saleKey) {
-                try { sessionStorage.removeItem(this.KEY); } catch (error) {}
-            }
             let changed = false;
-            cards.forEach(card => { changed = this.captureCard(card, saleKey) || changed; });
+            cards.forEach(card => { changed = this.captureCard(card) || changed; });
             return changed;
         },
 
         clear() {
-            try { sessionStorage.removeItem(this.KEY); } catch (error) {}
+            try {
+                sessionStorage.removeItem(this.KEY);
+                sessionStorage.removeItem(this.LEGACY_KEY);
+            } catch (error) {}
+            EH.Tickets?.clearSelection?.();
+            EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
             EH.UI?.renderAutomation?.(EH.Pages?.detect?.() || 'desconhecida');
         },
 
         setNativeValue(input, value) {
-            if (!input) return;
-            const descriptor = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+            if (!input) return false;
+            const prototype = input instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+            const descriptor = Object.getOwnPropertyDescriptor(prototype, 'value');
             if (descriptor?.set) descriptor.set.call(input, value);
             else input.value = value;
             input.dispatchEvent(new Event('input', { bubbles: true }));
             input.dispatchEvent(new Event('change', { bubbles: true }));
+            input.dispatchEvent(new Event('blur', { bubbles: true }));
+            return true;
+        },
+
+        findSearchButton(input) {
+            const form = input?.closest('form');
+            const root = form || EH.Utils.first(EH.Selectors.PASSAGENS_ROOT) || document.body;
+            const candidates = Array.from(root.querySelectorAll('button, input[type="submit"]'));
+            return candidates.find(el => {
+                if (el.disabled) return false;
+                const label = EH.Utils.normalize(el.textContent || el.value || el.title || el.getAttribute('aria-label') || '');
+                return /PESQUISAR|BUSCAR|CONSULTAR/.test(label) || String(el.type || '').toLowerCase() === 'submit';
+            }) || null;
+        },
+
+        navigateToPassagens() {
+            const anchor = document.querySelector('a[routerlink="/vendas/passagens"], a[href$="/vendas/passagens"]');
+            if (anchor) {
+                anchor.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                return true;
+            }
+            const base = location.pathname.includes('/epass/') ? '/epass/vendas/passagens' : '/vendas/passagens';
+            location.assign(base);
+            return true;
         },
 
         async searchTicket(item) {
+            if (this.searchBusy) {
+                EH.Toast.warning('Aguarde a busca atual terminar antes de pesquisar outro passageiro.');
+                return;
+            }
             const cpf = this.normalizeCpf(item?.cpf);
             if (cpf.length !== 11) return EH.Toast.warning('CPF temporário inválido.');
             const input = EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT);
-            if (!input) return EH.Toast.warning('Abra a tela de Bilhetes/Passagens para fazer a busca.');
-            const form = input.closest('form');
-            this.setNativeValue(input, this.maskCpf(cpf));
-            input.focus();
-            await EH.Utils.sleep(120);
-            const button = form ? Array.from(form.querySelectorAll('button, input[type="submit"]')).find(el => !el.disabled && (String(el.type || '').toLowerCase() === 'submit' || /PESQUISAR|BUSCAR|CONSULTAR/.test(EH.Utils.normalize(el.textContent || el.value || el.title || '')))) : null;
-            if (button) button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-            else if (form?.requestSubmit) form.requestSubmit();
-            else form?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
-            EH.Tickets?.clearSelection?.();
-            EH.Toast.info(`Buscando bilhete de ${item?.name || this.maskCpf(cpf)}…`);
+            if (!input) return EH.Toast.warning('Abra a tela de Passagens para fazer a busca.');
+
+            this.searchBusy = true;
+            EH.UI?.renderAutomation?.('passagens');
+            try {
+                const sale = this.loadSale();
+                const passenger = sale.passengers.find(p => p.cpf === cpf);
+                if (passenger) {
+                    sale.activePassengerId = passenger.id;
+                    passenger.ticketStatus = 'searching';
+                    this.saveSale(sale);
+                }
+
+                EH.Tickets?.clearSelection?.();
+                const beforeSignature = EH.Tickets?.cardsSignature?.() || '';
+                this.setNativeValue(input, this.maskCpf(cpf));
+                input.focus();
+                await EH.Utils.sleep(80);
+                input.blur();
+
+                const button = this.findSearchButton(input);
+                const form = input.closest('form');
+                if (button) button.click();
+                else if (form?.requestSubmit) form.requestSubmit();
+                else form?.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+
+                EH.Toast.info(`Buscando bilhete de ${item?.name || this.maskCpfPublic(cpf)}…`);
+                const found = await EH.Utils.waitFor(() => {
+                    const cards = EH.Tickets?.findCards?.() || [];
+                    if (!cards.length) return null;
+                    const signature = EH.Tickets?.cardsSignature?.(cards) || '';
+                    if (!signature) return null;
+                    if (!beforeSignature || signature !== beforeSignature) return cards;
+                    return null;
+                }, 9000, 220);
+
+                const refreshed = this.loadSale();
+                const current = refreshed.passengers.find(p => p.cpf === cpf);
+                if (current) {
+                    current.ticketStatus = found?.length ? 'found' : 'pending';
+                    this.saveSale(refreshed);
+                }
+
+                if (found?.length) {
+                    EH.Toast.success(`${found.length} passagem(ns) encontrada(s). Selecione até 2 para capturar.`);
+                    EH.Tickets.activateSelection();
+                } else {
+                    EH.Toast.warning('A busca foi executada, mas nenhuma passagem nova apareceu dentro do tempo esperado.');
+                }
+            } finally {
+                this.searchBusy = false;
+                EH.UI?.renderAutomation?.('passagens');
+            }
+        },
+
+        markTicketCaptured(passengerId, ticketItems = []) {
+            const sale = this.loadSale();
+            const passenger = sale.passengers.find(item => item.id === passengerId);
+            if (!passenger) return;
+            const existing = new Map((passenger.tickets || []).map(item => [String(item.number || item.id || ''), item]));
+            ticketItems.forEach(item => {
+                const key = String(item.number || item.id || `${item.origin || ''}|${item.destination || ''}|${item.date || ''}`);
+                if (!key) return;
+                existing.set(key, {
+                    id: key,
+                    number: EH.Utils.clean(item.number || ''),
+                    date: EH.Utils.clean(item.date || ''),
+                    origin: EH.Utils.clean(item.origin || ''),
+                    destination: EH.Utils.clean(item.destination || ''),
+                    capturedAt: Date.now()
+                });
+            });
+            passenger.tickets = Array.from(existing.values()).slice(0, 12);
+            passenger.ticketStatus = 'captured';
+            passenger.updatedAt = Date.now();
+            this.saveSale(sale);
+        },
+
+        statusIcon(passenger) {
+            if (passenger.ticketStatus === 'captured') return '✅';
+            if (passenger.ticketStatus === 'searching') return '🔎';
+            if (passenger.ticketStatus === 'found') return '☑️';
+            return '⏳';
         },
 
         renderBlock() {
-            const items = this.load();
-            if (!items.length) return null;
+            const sale = this.loadSale();
+            if (!sale.passengers.length) return null;
             const block = document.createElement('div');
             block.className = 'eh-sale-cpfs';
-            block.style.display = 'grid';
-            block.style.gap = '6px';
-            block.style.marginTop = '8px';
 
             const label = document.createElement('div');
-            label.style.fontWeight = '700';
-            label.style.fontSize = '12px';
-            label.textContent = 'CPFs desta venda';
+            label.className = 'eh-sale-block-title';
+            label.textContent = 'Bilhetes desta venda';
             block.appendChild(label);
 
-            items.forEach((item, index) => {
+            sale.passengers.forEach((item, index) => {
                 const row = document.createElement('div');
-                row.style.display = 'grid';
-                row.style.gridTemplateColumns = '1fr auto';
-                row.style.gap = '6px';
-                row.style.alignItems = 'center';
+                row.className = 'eh-sale-passenger-row';
+
                 const text = document.createElement('div');
-                text.style.minWidth = '0';
-                text.style.fontSize = '11px';
-                const name = item.name || `Passageiro ${index + 1}`;
+                text.className = 'eh-sale-passenger-text';
                 const strong = document.createElement('strong');
-                strong.textContent = name;
-                const cpfText = document.createElement('span');
-                cpfText.textContent = this.maskCpf(item.cpf);
-                text.append(strong, document.createElement('br'), cpfText);
+                strong.textContent = `${this.statusIcon(item)} ${item.name || `Passageiro ${index + 1}`}`;
+                const cpfText = document.createElement('small');
+                cpfText.textContent = this.maskCpfPublic(item.cpf);
+                text.append(strong, cpfText);
+
                 const button = document.createElement('button');
                 button.type = 'button';
                 button.className = 'eh-context-btn primary';
-                button.textContent = 'Buscar';
+                button.textContent = item.ticketStatus === 'searching' ? 'Buscando…' : 'Buscar';
+                button.disabled = this.searchBusy || item.ticketStatus === 'searching';
                 button.addEventListener('click', () => this.searchTicket(item));
                 row.append(text, button);
                 block.appendChild(row);
             });
-
-            const clear = document.createElement('button');
-            clear.type = 'button';
-            clear.className = 'eh-context-btn';
-            clear.textContent = 'Limpar CPFs desta venda';
-            clear.addEventListener('click', () => this.clear());
-            block.appendChild(clear);
             return block;
+        },
+
+        renderSaleCard() {
+            const sale = this.loadSale();
+            if (!sale.passengers.length) return null;
+            const wrap = document.createElement('div');
+            wrap.className = 'eh-sale-summary';
+
+            const captured = sale.passengers.filter(item => item.ticketStatus === 'captured').length;
+            const pending = sale.passengers.length - captured;
+            const header = document.createElement('div');
+            header.className = 'eh-sale-summary-head';
+            header.innerHTML = `<strong>Venda atual</strong><span>${sale.passengers.length} passageiro${sale.passengers.length === 1 ? '' : 's'} • ${pending} pendente${pending === 1 ? '' : 's'}</span>`;
+            wrap.appendChild(header);
+
+            sale.passengers.forEach((item, index) => {
+                const row = document.createElement('div');
+                row.className = 'eh-sale-summary-row';
+                row.textContent = `${this.statusIcon(item)} ${item.name || `Passageiro ${index + 1}`}`;
+                wrap.appendChild(row);
+            });
+
+            const actions = document.createElement('div');
+            actions.className = 'eh-sale-summary-actions';
+            if (!EH.Tickets?.isPassagensPage?.()) {
+                const passagens = document.createElement('button');
+                passagens.type = 'button';
+                passagens.className = 'eh-context-btn primary';
+                passagens.textContent = '🎫 Ir para Passagens';
+                passagens.addEventListener('click', () => this.navigateToPassagens());
+                actions.appendChild(passagens);
+            }
+            const finish = document.createElement('button');
+            finish.type = 'button';
+            finish.className = 'eh-context-btn';
+            finish.textContent = '✓ Finalizar venda';
+            finish.addEventListener('click', () => {
+                if (confirm('Finalizar esta venda e apagar os passageiros temporários?')) this.clear();
+            });
+            actions.appendChild(finish);
+            wrap.appendChild(actions);
+            return wrap;
         },
 
         init() {
@@ -4987,16 +5365,21 @@
             const capture = event => {
                 const target = event.target;
                 if (!(target instanceof HTMLInputElement)) return;
-                if (!target.matches('input[formcontrolname="cpf"], input[formcontrolname="nome"]')) return;
+                if (!target.matches('input[formcontrolname*="cpf" i], input[formcontrolname*="nome" i], input[formcontrolname*="nascimento" i], input[placeholder*="CPF" i], input[placeholder*="NOME" i], input[placeholder*="NASC" i]')) return;
                 const card = target.closest('.card.cadastro-passageiro, .cadastro-passageiro');
                 if (!card) return;
-                this.captureCard(card, this.currentSaleKey());
+                this.captureCard(card);
             };
-            EH.Runtime.on('sale-cpf-input', document, 'input', capture, true);
-            EH.Runtime.on('sale-cpf-change', document, 'change', capture, true);
+            EH.Runtime.on('sale-context-input', document, 'input', capture, true);
+            EH.Runtime.on('sale-context-change', document, 'change', capture, true);
+            EH.Runtime.on('sale-context-blur', document, 'blur', capture, true);
             this.captureFromDom();
         }
     };
+
+    // Alias de compatibilidade: o restante do script continua usando o mesmo
+    // módulo que antes se chamava SaleCpfs, sem criar um segundo armazenamento.
+    EH.SaleCpfs = EH.SaleContext;
 
     // ============================================================
     // PASSAGENS EMITIDAS — SELEÇÃO E CAPTURA DO CARTÃO ORIGINAL
@@ -5004,6 +5387,8 @@
     EH.Tickets = {
         active: false,
         cards: [],
+        selected: new Set(),
+        bar: null,
 
         isPassagensPage() {
             return location.pathname.includes('/vendas/passagens') || Boolean(
@@ -5084,17 +5469,89 @@
             return { raw, status, value, seat, service, ticket };
         },
 
+        cardsSignature(cards = this.findCards()) {
+            return (cards || []).map(card => {
+                const raw = EH.Utils.clean(card?.innerText || card?.textContent || '');
+                const tickets = Array.from(raw.matchAll(/N[º°O]?\s*:\s*(\d+)/gi)).map(match => match[1]).join(',');
+                const route = raw.match(/Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*([^\n]+)/i);
+                return `${tickets}|${route?.[1] || ''}|${route?.[2] || ''}`;
+            }).join('||');
+        },
+
         clearSelection() {
             this.active = false;
+            this.selected.clear();
+            this.bar?.remove?.();
+            this.bar = null;
             document.querySelectorAll('.eh-ticket-pick-btn').forEach(button => button.remove());
-            document.querySelectorAll('.eh-ticket-choice').forEach(card => {
-                card.classList.remove('eh-ticket-choice');
+            document.querySelectorAll('.eh-ticket-choice, .eh-ticket-selected').forEach(card => {
+                card.classList.remove('eh-ticket-choice', 'eh-ticket-selected');
                 if (card.dataset.ehTicketOldPosition !== undefined) {
                     card.style.position = card.dataset.ehTicketOldPosition;
                     delete card.dataset.ehTicketOldPosition;
                 }
             });
             this.cards = [];
+        },
+
+        updateSelectionBar() {
+            if (!this.bar) return;
+            const count = this.selected.size;
+            const status = this.bar.querySelector('.eh-ticket-batch-status');
+            const capture = this.bar.querySelector('.eh-ticket-batch-capture');
+            if (status) status.textContent = count ? `${count} selecionado${count === 1 ? '' : 's'}` : 'Selecione 1 ou 2 bilhetes';
+            if (capture) {
+                capture.disabled = count < 1 || count > 2;
+                capture.textContent = count === 2 ? '📸 Capturar os 2' : '📸 Capturar selecionado';
+            }
+        },
+
+        renderSelectionBar(root) {
+            this.bar?.remove?.();
+            const bar = document.createElement('div');
+            bar.className = 'eh-ticket-batch-bar';
+
+            const status = document.createElement('span');
+            status.className = 'eh-ticket-batch-status';
+            status.textContent = 'Selecione 1 ou 2 bilhetes';
+
+            const capture = document.createElement('button');
+            capture.type = 'button';
+            capture.className = 'eh-ticket-batch-capture';
+            capture.disabled = true;
+            capture.textContent = '📸 Capturar selecionado';
+            capture.addEventListener('click', () => this.captureSelected());
+
+            const cancel = document.createElement('button');
+            cancel.type = 'button';
+            cancel.className = 'eh-ticket-batch-cancel';
+            cancel.textContent = 'Cancelar';
+            cancel.addEventListener('click', () => this.clearSelection());
+
+            bar.append(status, capture, cancel);
+            const host = root || EH.Utils.first(EH.Selectors.PASSAGENS_ROOT) || document.body;
+            host.prepend(bar);
+            this.bar = bar;
+            return bar;
+        },
+
+        toggleCard(card, button) {
+            if (!card) return;
+            const already = this.selected.has(card);
+            if (already) {
+                this.selected.delete(card);
+                card.classList.remove('eh-ticket-selected');
+                if (button) button.textContent = '☐ Selecionar';
+            } else {
+                if (this.selected.size >= 2) {
+                    EH.Toast.warning('Selecione no máximo dois bilhetes por captura.');
+                    return;
+                }
+                this.selected.add(card);
+                card.classList.add('eh-ticket-selected');
+                if (button) button.textContent = '☑ Selecionado';
+            }
+            this.updateSelectionBar();
         },
 
         activateSelection() {
@@ -5113,6 +5570,8 @@
             this.clearSelection();
             this.active = true;
             this.cards = cards;
+            const root = EH.Utils.first(EH.Selectors.PASSAGENS_ROOT) || cards[0]?.parentElement;
+            this.renderSelectionBar(root);
 
             cards.forEach((card, index) => {
                 const computed = getComputedStyle(card).position;
@@ -5126,11 +5585,11 @@
                 button.className = 'eh-ticket-pick-btn';
                 button.title = [summary.status, summary.value, summary.seat ? `Poltrona ${summary.seat}` : '']
                     .filter(Boolean).join(' • ');
-                button.textContent = `📸 CAPTURAR ESTA ${index + 1}`;
+                button.textContent = '☐ Selecionar';
                 button.addEventListener('click', event => {
                     event.preventDefault();
                     event.stopPropagation();
-                    EH.UI.captureTicketCard(card);
+                    this.toggleCard(card, button);
                 });
                 card.appendChild(button);
             });
@@ -5138,10 +5597,45 @@
             cards[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
             EH.Toast.info(
                 cards.length === 1
-                    ? 'Uma passagem encontrada. Clique em “CAPTURAR ESTA”.'
-                    : `${cards.length} passagens encontradas. Clique em “CAPTURAR ESTA” na passagem correta.`,
+                    ? 'Uma passagem encontrada. Selecione e capture.'
+                    : `${cards.length} passagens encontradas. Selecione até duas para juntar lado a lado.`,
                 6000
             );
+        },
+
+        selectedCards() {
+            return Array.from(this.selected).filter(card => document.contains(card));
+        },
+
+        flattenSelectedTickets(cards = this.selectedCards()) {
+            const passenger = EH.SaleContext?.getActivePassenger?.() || null;
+            const items = (cards || []).map(card => {
+                const data = this.extractTicketData(card);
+                return {
+                    passengerId: passenger?.id || null,
+                    cpf: passenger?.cpf || '',
+                    data,
+                    tickets: data.tickets.slice(),
+                    ticket: data.tickets[0] || null
+                };
+            });
+            if (!items.length) throw new Error('Nenhum bilhete selecionado foi encontrado.');
+            if (items.length > 2) {
+                throw new Error('Selecione no máximo dois cartões de passagem por captura.');
+            }
+            return items;
+        },
+
+        async captureSelected() {
+            const cards = this.selectedCards();
+            if (!cards.length) return EH.Toast.warning('Selecione pelo menos um bilhete.');
+            try {
+                const items = this.flattenSelectedTickets(cards);
+                await EH.UI.captureTicketSelection(items);
+            } catch (error) {
+                EH.Logger.error('Falha na captura selecionada:', error);
+                EH.Toast.error(error.message || 'Não foi possível capturar os bilhetes.');
+            }
         },
 
         stabilizeCaptureText(root) {
@@ -6291,6 +6785,35 @@
             return canvas;
         },
 
+        combineTicketCanvases(canvases = []) {
+            const items = (canvases || []).filter(canvas => canvas?.width && canvas?.height);
+            if (!items.length) throw new Error('Nenhuma imagem de bilhete foi gerada.');
+            if (items.length === 1) return items[0];
+
+            const gap = 24;
+            const padding = 20;
+            const width = items.reduce((sum, canvas) => sum + canvas.width, 0)
+                + gap * (items.length - 1)
+                + padding * 2;
+            const height = Math.max(...items.map(canvas => canvas.height)) + padding * 2;
+
+            const combined = document.createElement('canvas');
+            combined.width = width;
+            combined.height = height;
+            const ctx = combined.getContext('2d', { alpha: false });
+            ctx.fillStyle = '#f4f6f8';
+            ctx.fillRect(0, 0, width, height);
+
+            let x = padding;
+            items.forEach(canvas => {
+                ctx.fillStyle = '#ffffff';
+                ctx.fillRect(x - 1, padding - 1, canvas.width + 2, canvas.height + 2);
+                ctx.drawImage(canvas, x, padding);
+                x += canvas.width + gap;
+            });
+            return combined;
+        },
+
         async renderTicket(prepared) {
             const { shell, data, width } = prepared;
             try {
@@ -6872,6 +7395,10 @@
             const quickRoutes = document.createElement('div');
             quickRoutes.className = 'eh-quick-routes';
 
+            const saleBox = document.createElement('div');
+            saleBox.className = 'eh-sale-host';
+            saleBox.hidden = true;
+
             const context = document.createElement('div');
             context.className = 'eh-context-card';
 
@@ -6931,7 +7458,7 @@
             flowSummary.textContent = 'Fluxo do atendimento';
             flowSection.append(flowSummary, steps);
 
-            body.append(flowSection, quickTitle, quickRoutes, context, divider, toolsTitle, actions, more);
+            body.append(flowSection, saleBox, quickTitle, quickRoutes, context, divider, toolsTitle, actions, more);
             panel.append(header, body, footer);
             root.appendChild(panel);
 
@@ -6955,8 +7482,10 @@
             this.steps = steps;
             this.phoneInput = phone;
             this.quickRoutes = quickRoutes;
+            this.saleBox = saleBox;
             this.contextBox = context;
             this.renderQuickRoutes();
+            this.renderSaleSummary(EH.Pages?.detect?.() || 'desconhecida');
 
             toggle.addEventListener('click', event => {
                 event.stopPropagation();
@@ -7212,6 +7741,18 @@
             return btn;
         },
 
+        renderSaleSummary(page) {
+            if (!this.saleBox) return;
+            this.saleBox.innerHTML = '';
+            const card = EH.SaleContext?.renderSaleCard?.();
+            if (!card) {
+                this.saleBox.hidden = true;
+                return;
+            }
+            this.saleBox.hidden = false;
+            this.saleBox.appendChild(card);
+        },
+
         renderAutomation(page) {
             if (!this.steps || !this.contextBox) return;
             const active = EH.Workflow.infer(page);
@@ -7279,13 +7820,13 @@
                     this.contextButton('✅ Cliente confirmou → Gerar PIX', 'success', () => EH.Payment.clientConfirmed())
                 );
             } else if (page === 'passagens') {
-                title.textContent = '5. Bilhete';
-                const savedCpfs = EH.SaleCpfs.load();
-                info.textContent = savedCpfs.length
-                    ? 'Use um CPF desta venda para localizar o bilhete com um clique.'
-                    : 'Digite o CPF ou faça uma venda nesta sessão para o CPF aparecer aqui.';
-                const cpfBlock = EH.SaleCpfs.renderBlock();
-                actions.append(this.contextButton('🎫 Escolher bilhete encontrado', 'primary', () => EH.Tickets.activateSelection()));
+                title.textContent = '5. Bilhetes desta venda';
+                const passengers = EH.SaleContext.load();
+                info.textContent = passengers.length
+                    ? 'Busque um passageiro por vez. Depois selecione 1 ou 2 bilhetes para capturar.'
+                    : 'Faça uma venda nesta sessão ou pesquise um CPF manualmente.';
+                const cpfBlock = EH.SaleContext.renderBlock();
+                actions.append(this.contextButton('🎫 Selecionar 1 ou 2 bilhetes', 'primary', () => EH.Tickets.activateSelection()));
                 this.contextBox.append(title, info);
                 if (cpfBlock) this.contextBox.appendChild(cpfBlock);
                 this.contextBox.append(actions);
@@ -7339,6 +7880,7 @@
                         : isPassagens
                             ? 'Pesquisa de passagens'
                             : 'Aguardando pesquisa';
+            this.renderSaleSummary(page);
             this.renderAutomation(page);
             if (isPagamento) EH.Payment.handlePixReady().catch(() => {});
         },
@@ -7456,6 +7998,105 @@
                 if (prepared?.shell) EH.Capture.destroyShell(prepared.shell);
                 EH.Logger.error('Falha na captura da passagem:', error);
                 EH.Toast.error(error.message || 'Não foi possível capturar a passagem.', 5200);
+            } finally {
+                this.setBusy(false);
+            }
+        },
+
+        async captureTicketSelection(items = []) {
+            const selectedItems = Array.isArray(items) ? items.slice(0, 2) : [];
+            if (!selectedItems.length) {
+                EH.Toast.warning('Selecione pelo menos um bilhete.');
+                return;
+            }
+
+            try {
+                this.setBusy(true, selectedItems.length === 2 ? 'Juntando dois bilhetes…' : 'Capturando bilhete…');
+                const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
+                const canvases = selectedItems.map(item => EH.Capture.renderTicketCanvas(item.data, width));
+                const canvas = EH.Capture.combineTicketCanvases(canvases);
+                const blob = await EH.Clipboard.canvasToBlob(canvas);
+                const dataUrl = canvas.toDataURL('image/png', 1);
+                const ticketNumbers = selectedItems
+                    .flatMap(item => (item.data?.tickets || []).map(ticket => EH.Utils.clean(ticket?.number || '')))
+                    .filter(Boolean);
+                const filenameParts = selectedItems
+                    .map(item => EH.Utils.clean(item.data?.tickets?.[0]?.number || ''))
+                    .filter(Boolean);
+                const filename = filenameParts.length
+                    ? `bilhetes-${filenameParts.join('-')}.png`
+                    : `bilhetes-${Date.now()}.png`;
+                EH.Clipboard.rememberImage(dataUrl, filename);
+
+                let autoCopy = EH.Config.AUTO_COPY_IMAGES
+                    ? await EH.Clipboard.tryAutoCopyImage(Promise.resolve(blob))
+                    : { copied: false, reason: 'Cópia automática desativada.' };
+                if (!autoCopy.copied && EH.Config.AUTO_COPY_IMAGES) {
+                    autoCopy = await EH.Clipboard.finishAutoCopy(autoCopy);
+                }
+
+                const message = EH.Messages.get('bilhete');
+                const activePassenger = EH.SaleContext?.getActivePassenger?.() || null;
+                const passengerName = activePassenger?.name || '';
+                const summary = selectedItems.length === 2
+                    ? `2 bilhetes${passengerName ? ` • ${passengerName}` : ''}`
+                    : `Bilhete${ticketNumbers[0] ? ` ${ticketNumbers[0]}` : ''}${passengerName ? ` • ${passengerName}` : ''}`;
+                const details = selectedItems
+                    .map(item => EH.Utils.clean(item.data?.text || ''))
+                    .filter(Boolean)
+                    .join('\n\n');
+
+                const history = EH.History.add({
+                    type: 'bilhete',
+                    dataUrl,
+                    message,
+                    text: details,
+                    filename,
+                    summary
+                });
+                this.lastCaptureState = {
+                    type: 'bilhete',
+                    copied: Boolean(autoCopy.copied),
+                    dataUrl,
+                    historyId: history?.id || '',
+                    message,
+                    summary,
+                    createdAt: Date.now()
+                };
+
+                const byPassenger = new Map();
+                selectedItems.forEach(item => {
+                    if (!item.passengerId) return;
+                    if (!byPassenger.has(item.passengerId)) byPassenger.set(item.passengerId, []);
+                    byPassenger.get(item.passengerId).push(...(item.data?.tickets || []));
+                });
+                byPassenger.forEach((tickets, passengerId) => {
+                    EH.SaleContext?.markTicketCaptured?.(passengerId, tickets);
+                });
+
+                this.showPreview({
+                    blob,
+                    dataUrl,
+                    text: details,
+                    summaryText: details,
+                    detailsText: details,
+                    message,
+                    filename,
+                    captureType: 'bilhete',
+                    historyId: history?.id || '',
+                    copied: Boolean(autoCopy.copied),
+                    reason: autoCopy.reason || ''
+                });
+
+                EH.Tickets.clearSelection();
+                if (autoCopy.copied) {
+                    EH.Toast.success(selectedItems.length === 2 ? '✓ Dois bilhetes unidos e copiados' : '✓ Bilhete copiado');
+                } else {
+                    EH.Toast.success(selectedItems.length === 2 ? '✓ Dois bilhetes unidos lado a lado' : '✓ Bilhete capturado');
+                }
+            } catch (error) {
+                EH.Logger.error('Falha ao montar os bilhetes selecionados:', error);
+                EH.Toast.error(error.message || 'Não foi possível capturar os bilhetes.');
             } finally {
                 this.setBusy(false);
             }
