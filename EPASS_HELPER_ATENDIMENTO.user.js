@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.42.0
-// @description  Venda atual, passageiros, busca de bilhetes por CPF e captura dupla para WhatsApp
+// @version      5.43.0
+// @description  Venda atual + requisições de prefeitura com ida/volta, códigos por trecho e reutilização na emissão
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.42.0',
+        VERSION: '5.43.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -64,6 +64,8 @@
             pix: 'Copie o código completo acima e cole no aplicativo do seu banco.'
         },
         SALE_CPF_TTL_MS: 6 * 60 * 60 * 1000,
+        REQUISITION_TTL_MS: 365 * 24 * 60 * 60 * 1000,
+        REQUISITION_ACTIVE_TTL_MS: 3 * 60 * 60 * 1000,
         TAXAS_ORIGEM: {
             IPORA: 3.83,
             GOIANIA: 0,
@@ -149,7 +151,16 @@
         PIX_QR: ['ngx-smart-modal[identifier="modalPixQrCode"] .qrCodeImg', '.modalPixQrCode.nsm-dialog-open .qrCodeImg'],
         PIX_VALOR: ['ngx-smart-modal[identifier="modalPixQrCode"] .pixValor strong', '.modalPixQrCode.nsm-dialog-open .pixValor strong'],
         PIX_EXPIRA: ['ngx-smart-modal[identifier="modalPixQrCode"] .pixExpiraEm strong', '.modalPixQrCode.nsm-dialog-open .pixExpiraEm strong'],
-        PIX_CODIGO: ['#pixCopiaEColaContent']
+        PIX_CODIGO: ['#pixCopiaEColaContent'],
+        REQUISITION_FORM_ROOT: ['app-solicitacao-requisicoes-prefeitura'],
+        REQUISITION_INFO_ARRAY: ['app-solicitacao-requisicoes-prefeitura [formarrayname="info"]'],
+        REQUISITION_LIST_ROOT: ['app-solicitacoes'],
+        REQUISITION_CODE_MODAL: [
+            'ngx-smart-modal[identifier="modalCodigoPrefeitura"] .nsm-dialog-open',
+            '.modalCodigoPrefeitura.nsm-dialog-open'
+        ],
+        REQUISITION_CODE_INPUT: ['input[formcontrolname="codigoRequisicao"]'],
+        REQUISITION_ID_INPUT: ['input[formcontrolname="idRequisicao"]']
     };
 
     // ============================================================
@@ -3187,6 +3198,7 @@
                 EH.Logger.debug('Página detectada:', page);
             }
             EH.SaleCpfs?.captureFromDom?.();
+            EH.RequisitionManager?.scanDom?.();
             EH.UI.updateState(page);
             return page;
         }
@@ -5380,6 +5392,687 @@
     // Alias de compatibilidade: o restante do script continua usando o mesmo
     // módulo que antes se chamava SaleCpfs, sem criar um segundo armazenamento.
     EH.SaleCpfs = EH.SaleContext;
+
+    // ============================================================
+    // REQUISIÇÕES DE PREFEITURA — PASSAGEIRO + IDA/VOLTA + CÓDIGO POR TRECHO
+    // Persistência local via GM storage. Não cria uma segunda memória de venda:
+    // a venda atual continua em EH.SaleContext/sessionStorage; requisições ficam
+    // separadas porque podem ser aprovadas posteriormente.
+    // ============================================================
+    EH.RequisitionManager = {
+        STORAGE_KEY: 'requisitionsV1',
+        ACTIVE_KEY: 'epassHelper.activeRequisitionEmission.v1',
+        started: false,
+        pendingNumeroLogico: '',
+        lastModalFingerprint: '',
+
+        normalizeCpf(value) {
+            return EH.SaleContext.normalizeCpf(value);
+        },
+
+        normalizeName(value) {
+            return EH.Utils.normalize(value);
+        },
+
+        normalizeBirthDate(value) {
+            const raw = EH.Utils.clean(value || '');
+            if (!raw) return '';
+            let match = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if (match) return `${match[1]}-${match[2]}-${match[3]}`;
+            match = raw.match(/^(\d{2})[\/.-](\d{2})[\/.-](\d{4})$/);
+            if (match) return `${match[3]}-${match[2]}-${match[1]}`;
+            return raw;
+        },
+
+        displayBirthDate(value) {
+            const normalized = this.normalizeBirthDate(value);
+            const match = normalized.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            return match ? `${match[3]}/${match[2]}/${match[1]}` : normalized;
+        },
+
+        normalizeCity(value) {
+            return EH.Utils.normalize(value)
+                .replace(/\s*-\s*[A-Z]{2}\s*$/, '')
+                .replace(/\s+/g, ' ')
+                .trim();
+        },
+
+        cleanMarket(value) {
+            return EH.Utils.clean(String(value || '').replace(/\u00a0/g, ' '));
+        },
+
+        parseMarket(value) {
+            const mercadoCompleto = this.cleanMarket(value);
+            if (!mercadoCompleto) return { mercadoCompleto: '', origem: '', destino: '' };
+            const match = mercadoCompleto.match(/^(.*?)\s+-\s+(.*)$/);
+            if (!match) return { mercadoCompleto, origem: '', destino: '' };
+            const origem = EH.Utils.clean(match[1]);
+            let destino = EH.Utils.clean(match[2]);
+            const serviceSuffix = /\s+(?:CONVENCIONAL(?:\s+COM\s+SANITARIO)?|EXECUTIVO(?:\s+COM\s+SANITARIO)?|SEMI[\s-]?LEITO(?:\s+COM\s+SANITARIO)?|SEMILEITO(?:\s+COM\s+SANITARIO)?|LEITO(?:\s+CAMA)?(?:\s+COM\s+SANITARIO)?|CAMA(?:\s+TOTAL)?|PREMIUM|DUPLO\s+DECK|DD)\s*$/i;
+            destino = destino.replace(serviceSuffix, '').trim();
+            return { mercadoCompleto, origem, destino };
+        },
+
+        sameRoute(aOrigem, aDestino, bOrigem, bDestino) {
+            const aO = this.normalizeCity(aOrigem);
+            const aD = this.normalizeCity(aDestino);
+            const bO = this.normalizeCity(bOrigem);
+            const bD = this.normalizeCity(bDestino);
+            return Boolean(aO && aD && bO && bD && aO === bO && aD === bD);
+        },
+
+        legMatchesRoute(leg, origem, destino) {
+            if (!leg || !origem || !destino) return false;
+            if (this.sameRoute(leg.origem, leg.destino, origem, destino)) return true;
+            const full = EH.Utils.normalize(leg.mercadoCompleto || '');
+            const wantedOrigin = this.normalizeCity(origem);
+            const wantedDestination = this.normalizeCity(destino);
+            if (!full || !wantedOrigin || !wantedDestination) return false;
+            const dash = full.indexOf('-');
+            if (dash < 0) return false;
+            const left = this.normalizeCity(full.slice(0, dash));
+            const right = full.slice(dash + 1).trim();
+            return left === wantedOrigin && right.startsWith(wantedDestination);
+        },
+
+        selectedNgValue(element) {
+            return this.cleanMarket(element?.querySelector?.('.ng-value-label')?.textContent || '');
+        },
+
+        normalizeLeg(item = {}) {
+            const parsed = this.parseMarket(item.mercadoCompleto || item.mercado || '');
+            return {
+                tipo: item.tipo === 'volta' ? 'volta' : 'ida',
+                mercadoCompleto: parsed.mercadoCompleto || this.cleanMarket(item.mercadoCompleto || item.mercado || ''),
+                origem: EH.Utils.clean(item.origem || parsed.origem || ''),
+                destino: EH.Utils.clean(item.destino || parsed.destino || ''),
+                codigo: EH.Utils.clean(item.codigo || ''),
+                updatedAt: Number(item.updatedAt || Date.now())
+            };
+        },
+
+        normalizePassenger(item = {}) {
+            return {
+                cpf: this.normalizeCpf(item.cpf),
+                nome: EH.Utils.clean(item.nome || item.name || ''),
+                dataNascimento: this.normalizeBirthDate(item.dataNascimento || item.birthDate || ''),
+                legs: (Array.isArray(item.legs) ? item.legs : Array.isArray(item.mercados) ? item.mercados : [])
+                    .map(leg => this.normalizeLeg(leg))
+                    .filter(leg => leg.mercadoCompleto || (leg.origem && leg.destino))
+            };
+        },
+
+        normalizeRequest(item = {}) {
+            const now = Date.now();
+            return {
+                id: item.id || `req-${now}-${Math.random().toString(36).slice(2, 8)}`,
+                numeroLogico: EH.Utils.clean(item.numeroLogico || ''),
+                prefeitura: EH.Utils.clean(item.prefeitura || ''),
+                secretaria: EH.Utils.clean(item.secretaria || ''),
+                contrato: EH.Utils.clean(item.contrato || ''),
+                status: EH.Utils.clean(item.status || 'pending'),
+                passengers: (Array.isArray(item.passengers) ? item.passengers : [])
+                    .map(passenger => this.normalizePassenger(passenger))
+                    .filter(passenger => passenger.cpf.length === 11),
+                createdAt: Number(item.createdAt || now),
+                updatedAt: Number(item.updatedAt || now)
+            };
+        },
+
+        loadStore() {
+            const raw = EH.Storage.get(this.STORAGE_KEY, { version: 1, items: [] });
+            const limit = Date.now() - EH.Config.REQUISITION_TTL_MS;
+            const items = (Array.isArray(raw?.items) ? raw.items : [])
+                .map(item => this.normalizeRequest(item))
+                .filter(item => item.passengers.length && item.updatedAt >= limit);
+            if ((raw?.items || []).length !== items.length) this.saveStore(items);
+            return items;
+        },
+
+        saveStore(items) {
+            const normalized = (items || [])
+                .map(item => this.normalizeRequest(item))
+                .filter(item => item.passengers.length)
+                .sort((a, b) => b.updatedAt - a.updatedAt)
+                .slice(0, 80);
+            EH.Storage.set(this.STORAGE_KEY, { version: 1, updatedAt: Date.now(), items: normalized });
+            EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
+            return normalized;
+        },
+
+        requestFingerprint(request) {
+            const people = (request.passengers || []).map(passenger => {
+                const legs = (passenger.legs || []).map(leg => `${leg.tipo}:${EH.Utils.normalize(leg.mercadoCompleto)}`).sort().join('|');
+                return `${passenger.cpf}:${this.normalizeName(passenger.nome)}:${passenger.dataNascimento}:${legs}`;
+            }).sort().join('||');
+            return [
+                EH.Utils.normalize(request.prefeitura),
+                EH.Utils.normalize(request.secretaria),
+                EH.Utils.normalize(request.contrato),
+                people
+            ].join('::');
+        },
+
+        mergePassengerData(previous = [], incoming = []) {
+            const byCpf = new Map((previous || []).map(passenger => [this.normalizeCpf(passenger.cpf), passenger]));
+            return (incoming || []).map(passenger => {
+                const nextPassenger = this.normalizePassenger(passenger);
+                const oldPassenger = byCpf.get(nextPassenger.cpf);
+                if (!oldPassenger) return nextPassenger;
+                nextPassenger.legs = (nextPassenger.legs || []).map(leg => {
+                    const oldLeg = (oldPassenger.legs || []).find(candidate => {
+                        const exact = EH.Utils.normalize(candidate.mercadoCompleto) === EH.Utils.normalize(leg.mercadoCompleto);
+                        return exact || this.sameRoute(candidate.origem, candidate.destino, leg.origem, leg.destino);
+                    });
+                    if (oldLeg?.codigo && !leg.codigo) leg.codigo = oldLeg.codigo;
+                    if (oldLeg?.updatedAt) leg.updatedAt = Math.max(Number(leg.updatedAt || 0), Number(oldLeg.updatedAt || 0));
+                    return leg;
+                });
+                return nextPassenger;
+            });
+        },
+
+        upsertRequest(request) {
+            const next = this.normalizeRequest(request);
+            if (!next.passengers.length) return null;
+            const items = this.loadStore();
+            const fingerprint = this.requestFingerprint(next);
+            const now = Date.now();
+            let existing = next.numeroLogico
+                ? items.find(item => item.numeroLogico === next.numeroLogico)
+                : items.find(item => {
+                    if (item.numeroLogico || item.status === 'approved') return false;
+                    if (this.requestFingerprint(item) !== fingerprint) return false;
+                    return (now - Number(item.updatedAt || 0)) <= (2 * 60 * 1000);
+                });
+            if (existing) {
+                existing.prefeitura = next.prefeitura || existing.prefeitura;
+                existing.secretaria = next.secretaria || existing.secretaria;
+                existing.contrato = next.contrato || existing.contrato;
+                existing.numeroLogico = next.numeroLogico || existing.numeroLogico;
+                if (existing.status !== 'approved') existing.status = next.status || existing.status;
+                existing.passengers = this.mergePassengerData(existing.passengers, next.passengers);
+                existing.updatedAt = now;
+                this.saveStore(items);
+                return existing;
+            }
+            next.createdAt = now;
+            next.updatedAt = now;
+            items.unshift(next);
+            this.saveStore(items);
+            return next;
+        },
+
+        captureRequestForm() {
+            const root = EH.Utils.first(EH.Selectors.REQUISITION_FORM_ROOT);
+            if (!root) return null;
+            const form = root.querySelector('form');
+            const info = root.querySelector('[formarrayname="info"]');
+            if (!form || !info) return null;
+
+            const prefeitura = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_prefeitura"]'));
+            const secretaria = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_secretaria"]'));
+            const contrato = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_contrato"]'));
+            const passengers = [];
+            const cpfInputs = Array.from(info.querySelectorAll('input[formcontrolname="cpf"][id^="cpf_"]'));
+
+            cpfInputs.forEach((cpfInput, position) => {
+                const indexMatch = String(cpfInput.id || '').match(/_(\d+)$/);
+                const index = indexMatch ? indexMatch[1] : String(position);
+                const cpf = this.normalizeCpf(cpfInput.value);
+                if (cpf.length !== 11) return;
+                const nome = EH.Utils.clean(root.querySelector(`#nome_${index}[formcontrolname="nome"]`)?.value || '');
+                const dataNascimento = this.normalizeBirthDate(root.querySelector(`#data_nascimento_${index}[formcontrolname="data_nascimento"]`)?.value || '');
+                const idaEl = root.querySelector(`#id_mercado_ida_${index}[formcontrolname="id_mercado_ida"]`);
+                const voltaEl = root.querySelector(`#id_mercado_volta_${index}[formcontrolname="id_mercado_volta"]`);
+                const switchEl = root.querySelector(`#tem_volta${index}[formcontrolname="tem_volta"]`);
+                const temVolta = String(switchEl?.querySelector('button[role="switch"]')?.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+                const legs = [];
+                const idaText = this.selectedNgValue(idaEl);
+                if (idaText) legs.push(this.normalizeLeg({ tipo: 'ida', mercadoCompleto: idaText }));
+                const voltaText = this.selectedNgValue(voltaEl);
+                if (temVolta && voltaText) legs.push(this.normalizeLeg({ tipo: 'volta', mercadoCompleto: voltaText }));
+                passengers.push({ cpf, nome, dataNascimento, legs });
+            });
+
+            if (!passengers.length) return null;
+            const saved = this.upsertRequest({ prefeitura, secretaria, contrato, status: 'pending', passengers });
+            passengers.forEach(passenger => {
+                EH.SaleContext?.upsertPassenger?.({ cpf: passenger.cpf, name: passenger.nome, birthDate: passenger.dataNascimento });
+            });
+            if (saved) EH.Toast.success(`Requisição salva: ${passengers.length} passageiro${passengers.length === 1 ? '' : 's'}.`);
+            return saved;
+        },
+
+        parseRequestSummaryBlock(block) {
+            if (!block) return null;
+            const text = EH.Utils.clean(block.textContent || '');
+            const marketEl = block.querySelector('h5 span.font-weight-bold') || Array.from(block.querySelectorAll('span')).find(el => /\s-\s/.test(el.textContent || ''));
+            const mercadoCompleto = this.cleanMarket(marketEl?.textContent || text.replace(/^.*?MERCADO:\s*/i, '').split(/PASSAGEIRO:/i)[0]);
+            const nameMatch = text.match(/PASSAGEIRO\s*:\s*(.*?)\s+DATA DE NASCIMENTO\s*:/i);
+            const birthMatch = text.match(/DATA DE NASCIMENTO\s*:\s*(\d{2}[\/.-]\d{2}[\/.-]\d{4}|\d{4}-\d{2}-\d{2})/i);
+            const parsedMarket = this.parseMarket(mercadoCompleto);
+            return {
+                nome: EH.Utils.clean(nameMatch?.[1] || ''),
+                dataNascimento: this.normalizeBirthDate(birthMatch?.[1] || ''),
+                ...parsedMarket
+            };
+        },
+
+        requestContainsSummary(request, blocks) {
+            return (blocks || []).every(block => {
+                return (request.passengers || []).some(passenger => {
+                    if (block.nome && this.normalizeName(passenger.nome) !== this.normalizeName(block.nome)) return false;
+                    if (block.dataNascimento && passenger.dataNascimento !== block.dataNascimento) return false;
+                    return (passenger.legs || []).some(leg => {
+                        if (EH.Utils.normalize(leg.mercadoCompleto) === EH.Utils.normalize(block.mercadoCompleto)) return true;
+                        return this.legMatchesRoute(leg, block.origem, block.destino);
+                    });
+                });
+            });
+        },
+
+        numeroLogicoFromCard(root) {
+            const text = EH.Utils.clean(root?.textContent || '');
+            return EH.Utils.clean(text.match(/N[ÚU]MERO\s+L[ÓO]GICO\s*:\s*([A-Z0-9.-]+)/i)?.[1] || '');
+        },
+
+        scanRequestCards() {
+            const app = EH.Utils.first(EH.Selectors.REQUISITION_LIST_ROOT);
+            if (!app) return 0;
+            const cards = Array.from(app.querySelectorAll('.dados-passagem')).filter(card => /REQUISICAO\s+PREFEITURA|REQUISIÇÃO\s+PREFEITURA/i.test(card.textContent || ''));
+            if (!cards.length) return 0;
+            const items = this.loadStore();
+            let changed = 0;
+            cards.forEach(card => {
+                const numeroLogico = this.numeroLogicoFromCard(card);
+                if (!numeroLogico) return;
+                const blocks = Array.from(card.querySelectorAll('.mt-4.border-top')).map(block => this.parseRequestSummaryBlock(block)).filter(Boolean);
+                if (!blocks.length) return;
+                const exact = items.filter(item => item.numeroLogico === numeroLogico);
+                const candidates = exact.length ? exact : items.filter(item => !item.numeroLogico && this.requestContainsSummary(item, blocks));
+                if (candidates.length !== 1) return;
+                const request = candidates[0];
+                const statusText = EH.Utils.normalize(card.textContent || '');
+                const nextStatus = statusText.includes('SOLICITACAO ANALISADA') ? 'analyzed' : request.status;
+                if (request.numeroLogico !== numeroLogico || request.status !== nextStatus) {
+                    request.numeroLogico = numeroLogico;
+                    request.status = nextStatus;
+                    request.updatedAt = Date.now();
+                    changed += 1;
+                }
+            });
+            if (changed) this.saveStore(items);
+            return changed;
+        },
+
+        findCodeButtonContext(element) {
+            const card = element?.closest?.('.dados-passagem');
+            return card ? this.numeroLogicoFromCard(card) : '';
+        },
+
+        parseCodeBlock(codeElement) {
+            const block = codeElement?.closest?.('.border-bottom') || codeElement?.parentElement?.parentElement;
+            if (!block) return null;
+            const mercadoCompleto = this.cleanMarket(block.querySelector('[id="nome_mercado"]')?.textContent || '');
+            const nome = EH.Utils.clean(block.querySelector('[id="passageiro"]')?.textContent || '');
+            const dataNascimento = this.normalizeBirthDate(block.querySelector('[id="data_nascimento"]')?.textContent || '');
+            const codigo = EH.Utils.clean(codeElement.textContent || '');
+            if (!mercadoCompleto || !nome || !dataNascimento || !codigo) return null;
+            return { nome, dataNascimento, codigo, ...this.parseMarket(mercadoCompleto) };
+        },
+
+        findCodeTargets(items, block) {
+            const targets = [];
+            let requests = Array.isArray(items) ? items : [];
+            if (this.pendingNumeroLogico) {
+                const exactLogical = requests.filter(request => request.numeroLogico === this.pendingNumeroLogico);
+                requests = exactLogical.length ? exactLogical : requests.filter(request => !request.numeroLogico);
+            }
+            requests.forEach(request => {
+                (request.passengers || []).forEach(passenger => {
+                    if (this.normalizeName(passenger.nome) !== this.normalizeName(block.nome)) return;
+                    if (passenger.dataNascimento !== block.dataNascimento) return;
+                    (passenger.legs || []).forEach(leg => {
+                        const exactMarket = EH.Utils.normalize(leg.mercadoCompleto) === EH.Utils.normalize(block.mercadoCompleto);
+                        if (!exactMarket && !this.legMatchesRoute(leg, block.origem, block.destino)) return;
+                        targets.push({ request, passenger, leg });
+                    });
+                });
+            });
+            return targets;
+        },
+
+        captureCodeModal() {
+            const modal = EH.Utils.first(EH.Selectors.REQUISITION_CODE_MODAL);
+            if (!modal) return 0;
+            const blocks = Array.from(modal.querySelectorAll('[id^="codigoPrefeitura-"]'))
+                .map(element => this.parseCodeBlock(element))
+                .filter(Boolean);
+            if (!blocks.length) return 0;
+            const fingerprint = blocks.map(block => `${EH.Utils.normalize(block.mercadoCompleto)}|${this.normalizeName(block.nome)}|${block.dataNascimento}|${block.codigo}`).join('||');
+            if (fingerprint === this.lastModalFingerprint) return 0;
+            this.lastModalFingerprint = fingerprint;
+
+            const items = this.loadStore();
+            let updated = 0;
+            let ambiguous = 0;
+            blocks.forEach(block => {
+                const targets = this.findCodeTargets(items, block);
+                if (targets.length !== 1) {
+                    ambiguous += 1;
+                    return;
+                }
+                const { request, leg } = targets[0];
+                if (this.pendingNumeroLogico && !request.numeroLogico) request.numeroLogico = this.pendingNumeroLogico;
+                if (leg.codigo !== block.codigo || leg.mercadoCompleto !== block.mercadoCompleto) {
+                    leg.codigo = block.codigo;
+                    leg.mercadoCompleto = block.mercadoCompleto;
+                    const parsed = this.parseMarket(block.mercadoCompleto);
+                    leg.origem = parsed.origem || leg.origem;
+                    leg.destino = parsed.destino || leg.destino;
+                    leg.updatedAt = Date.now();
+                    request.updatedAt = Date.now();
+                    updated += 1;
+                }
+            });
+
+            items.forEach(request => {
+                const legs = request.passengers.flatMap(passenger => passenger.legs || []);
+                if (legs.length && legs.every(leg => leg.codigo)) request.status = 'approved';
+            });
+            if (updated) {
+                this.saveStore(items);
+                EH.Toast.success(`${updated} código${updated === 1 ? '' : 's'} de requisição associado${updated === 1 ? '' : 's'} ao trecho correto.`);
+            }
+            if (ambiguous) EH.Toast.warning('Há código de requisição que não pôde ser associado com segurança. Nenhum passageiro foi escolhido automaticamente.');
+            return updated;
+        },
+
+        parseRouteText(value) {
+            let raw = EH.Utils.clean(value || '');
+            if (!raw) return null;
+            raw = raw.replace(/\s+-\s+\d{2}\/\d{2}\/\d{4}(?:\s+\d{1,2}:\d{2})?.*$/, '').trim();
+            let match = raw.match(/^(.*?)\s+[xX×]\s+(.*?)$/);
+            if (!match) match = raw.match(/^(.*?)\s+→\s+(.*?)$/);
+            if (!match) return null;
+            return { origem: EH.Utils.clean(match[1]), destino: EH.Utils.clean(match[2]) };
+        },
+
+        routeFromEmissionCard(card) {
+            const badge = card?.querySelector?.('.card-header .badge');
+            const parsed = this.parseRouteText(badge?.textContent || '');
+            if (parsed) return parsed;
+            const route = EH.Workflow?.route;
+            if (route?.origem && route?.destino) return { origem: route.origem, destino: route.destino };
+            return null;
+        },
+
+        findEmissionCards() {
+            return Array.from(document.querySelectorAll('.card.cadastro-passageiro, .cadastro-passageiro'));
+        },
+
+        chooseEmissionCard(cpf) {
+            const cards = this.findEmissionCards();
+            if (!cards.length) return null;
+            const active = document.activeElement?.closest?.('.card.cadastro-passageiro, .cadastro-passageiro');
+            if (active && cards.includes(active)) return active;
+            const same = cards.find(card => this.normalizeCpf(card.querySelector('input[formcontrolname="cpf"]')?.value || '') === cpf);
+            if (same) return same;
+            const empty = cards.find(card => !this.normalizeCpf(card.querySelector('input[formcontrolname="cpf"]')?.value || ''));
+            if (empty) return empty;
+            return cards.length === 1 ? cards[0] : null;
+        },
+
+        setActiveEmission(value) {
+            try {
+                if (!value) sessionStorage.removeItem(this.ACTIVE_KEY);
+                else sessionStorage.setItem(this.ACTIVE_KEY, JSON.stringify({ ...value, updatedAt: Date.now() }));
+            } catch (error) {}
+        },
+
+        getActiveEmission() {
+            try {
+                const value = JSON.parse(sessionStorage.getItem(this.ACTIVE_KEY) || 'null');
+                if (!value?.cpf || (Date.now() - Number(value.updatedAt || 0)) > EH.Config.REQUISITION_ACTIVE_TTL_MS) {
+                    sessionStorage.removeItem(this.ACTIVE_KEY);
+                    return null;
+                }
+                return value;
+            } catch (error) {
+                return null;
+            }
+        },
+
+        codeCandidates(cpf, origem, destino) {
+            const digits = this.normalizeCpf(cpf);
+            const candidates = [];
+            this.loadStore().forEach(request => {
+                request.passengers.forEach(passenger => {
+                    if (passenger.cpf !== digits) return;
+                    passenger.legs.forEach(leg => {
+                        if (!this.legMatchesRoute(leg, origem, destino)) return;
+                        candidates.push({ request, passenger, leg });
+                    });
+                });
+            });
+            return candidates;
+        },
+
+        async usePassenger(requestId, cpf) {
+            const request = this.loadStore().find(item => item.id === requestId);
+            const passenger = request?.passengers?.find(item => item.cpf === this.normalizeCpf(cpf));
+            if (!request || !passenger) return EH.Toast.warning('Passageiro da requisição não encontrado.');
+            const card = this.chooseEmissionCard(passenger.cpf);
+            if (!card) return EH.Toast.warning('Abra os dados do passageiro ou deixe um cadastro vazio para usar esta requisição.');
+
+            const cpfInput = card.querySelector('input[formcontrolname="cpf"]');
+            const nameInput = card.querySelector('input[formcontrolname="nome"]');
+            const birthInput = card.querySelector('input[formcontrolname="data_nascimento"]');
+            const missing = [];
+            if (!cpfInput) missing.push('CPF');
+            if (!nameInput) missing.push('Nome');
+            if (!birthInput) missing.push('Data de nascimento');
+            if (missing.length) return EH.Toast.warning(`Não encontrei o campo ${missing.join(', ')}.`);
+
+            cpfInput.focus();
+            EH.SaleContext.setNativeValue(cpfInput, EH.SaleContext.maskCpf(passenger.cpf));
+            EH.SaleContext.setNativeValue(nameInput, passenger.nome);
+            EH.SaleContext.setNativeValue(birthInput, passenger.dataNascimento);
+            await EH.Utils.sleep(100);
+
+            const validCpf = this.normalizeCpf(cpfInput.value) === passenger.cpf;
+            const validName = !passenger.nome || this.normalizeName(nameInput.value) === this.normalizeName(passenger.nome);
+            const validBirth = !passenger.dataNascimento || this.normalizeBirthDate(birthInput.value) === passenger.dataNascimento;
+            if (!validCpf || !validName || !validBirth) return EH.Toast.error('O E-Pass não reconheceu todos os dados da passageira. O preenchimento foi interrompido.');
+
+            const route = this.routeFromEmissionCard(card);
+            let matched = null;
+            if (route) {
+                const candidates = this.codeCandidates(passenger.cpf, route.origem, route.destino);
+                if (candidates.length === 1) matched = candidates[0];
+            }
+            this.setActiveEmission({
+                requestId: request.id,
+                numeroLogico: request.numeroLogico,
+                cpf: passenger.cpf,
+                nome: passenger.nome,
+                origem: route?.origem || '',
+                destino: route?.destino || '',
+                tipo: matched?.leg?.tipo || '',
+                codigo: matched?.leg?.codigo || ''
+            });
+            EH.SaleContext.upsertPassenger({ cpf: passenger.cpf, name: passenger.nome, birthDate: passenger.dataNascimento });
+            EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
+            if (!route) return EH.Toast.success('Passageira preenchida. A rota ainda não foi identificada para selecionar o código.');
+            if (matched?.leg?.codigo) return EH.Toast.success(`Passageira preenchida. Código da ${matched.leg.tipo} disponível para esta rota.`);
+            if (matched) return EH.Toast.warning('Passageira preenchida, mas este trecho ainda está aguardando código.');
+            return EH.Toast.warning('Passageira preenchida. Não encontrei um único trecho compatível com a rota atual.');
+        },
+
+        paymentRoute() {
+            const summary = EH.Payment?.parseSummary?.();
+            const raw = summary?.cards?.[0]?.routeDate || '';
+            const parsed = this.parseRouteText(raw);
+            if (parsed) return parsed;
+            const active = this.getActiveEmission();
+            return active?.origem && active?.destino ? { origem: active.origem, destino: active.destino } : null;
+        },
+
+        resolvePaymentMatch() {
+            const active = this.getActiveEmission();
+            if (!active?.cpf) return { match: null, reason: 'Nenhuma passageira de requisição está ativa nesta emissão.' };
+            const route = this.paymentRoute();
+            if (!route?.origem || !route?.destino) return { match: null, reason: 'A rota atual não pôde ser identificada com segurança.' };
+            if (active.origem && active.destino && !this.sameRoute(active.origem, active.destino, route.origem, route.destino)) {
+                return { match: null, reason: 'A rota do pagamento é diferente da requisição ativa.' };
+            }
+            const candidates = this.codeCandidates(active.cpf, route.origem, route.destino);
+            if (candidates.length !== 1) {
+                return { match: null, reason: candidates.length ? 'Existe mais de uma requisição compatível. Selecione manualmente.' : 'Não encontrei requisição compatível com passageira e rota.' };
+            }
+            if (!candidates[0].leg.codigo) return { match: candidates[0], reason: 'Este trecho ainda está aguardando código.' };
+            return { match: candidates[0], reason: '' };
+        },
+
+        async fillPaymentCode() {
+            const input = EH.Utils.first(EH.Selectors.REQUISITION_CODE_INPUT);
+            if (!input) return EH.Toast.warning('O campo Código da requisição não está disponível nesta forma de pagamento.');
+            const resolved = this.resolvePaymentMatch();
+            if (!resolved.match?.leg?.codigo) return EH.Toast.warning(resolved.reason || 'Código não encontrado.');
+            const code = resolved.match.leg.codigo;
+            input.focus();
+            EH.SaleContext.setNativeValue(input, code);
+            await EH.Utils.sleep(120);
+            if (EH.Utils.clean(input.value) !== code) return EH.Toast.error('O E-Pass não manteve o código preenchido.');
+            const active = this.getActiveEmission() || {};
+            this.setActiveEmission({ ...active, requestId: resolved.match.request.id, numeroLogico: resolved.match.request.numeroLogico, tipo: resolved.match.leg.tipo, codigo: code });
+            EH.Toast.success(`Código da ${resolved.match.leg.tipo} preenchido para a rota atual.`);
+            return true;
+        },
+
+        async copyLegCode(code) {
+            const value = EH.Utils.clean(code || '');
+            if (!value) return EH.Toast.warning('Este trecho ainda não possui código.');
+            await EH.Clipboard.copyText(value);
+            EH.Toast.success('Código da requisição copiado.');
+        },
+
+        renderCard() {
+            const requests = this.loadStore();
+            if (!requests.length) return null;
+            const block = document.createElement('div');
+            block.className = 'eh-sale-cpfs';
+            const title = document.createElement('div');
+            title.className = 'eh-sale-block-title';
+            title.textContent = 'Requisições';
+            block.appendChild(title);
+
+            const codeInput = EH.Utils.first(EH.Selectors.REQUISITION_CODE_INPUT);
+            if (codeInput) {
+                const resolved = this.resolvePaymentMatch();
+                const status = document.createElement('div');
+                status.className = 'eh-sale-passenger-row';
+                const text = document.createElement('div');
+                text.className = 'eh-sale-passenger-text';
+                const strong = document.createElement('strong');
+                strong.textContent = resolved.match?.leg?.codigo ? '🟢 Requisição encontrada' : '🟡 Requisição';
+                const small = document.createElement('small');
+                small.textContent = resolved.match
+                    ? `${resolved.match.leg.origem} → ${resolved.match.leg.destino}${resolved.match.leg.codigo ? ' • código disponível' : ' • aguardando código'}`
+                    : resolved.reason;
+                text.append(strong, small);
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = 'eh-context-btn primary';
+                button.textContent = 'Preencher';
+                button.disabled = !resolved.match?.leg?.codigo;
+                button.addEventListener('click', () => this.fillPaymentCode());
+                status.append(text, button);
+                block.appendChild(status);
+            }
+
+            const canUsePassenger = this.findEmissionCards().length > 0;
+            const rendered = new Set();
+            requests.slice(0, 12).forEach(request => {
+                request.passengers.forEach((passenger, index) => {
+                    const key = `${request.id}|${passenger.cpf}`;
+                    if (rendered.has(key)) return;
+                    rendered.add(key);
+                    const row = document.createElement('div');
+                    row.className = 'eh-sale-passenger-row';
+                    const text = document.createElement('div');
+                    text.className = 'eh-sale-passenger-text';
+                    const allCoded = passenger.legs.length && passenger.legs.every(leg => leg.codigo);
+                    const strong = document.createElement('strong');
+                    strong.textContent = `${allCoded ? '🟢' : '🟡'} ${passenger.nome || `Passageiro ${index + 1}`}`;
+                    const identity = document.createElement('small');
+                    identity.textContent = `${EH.SaleContext.maskCpfPublic(passenger.cpf)}${passenger.dataNascimento ? ` • ${this.displayBirthDate(passenger.dataNascimento)}` : ''}`;
+                    text.append(strong, identity);
+                    passenger.legs.forEach(leg => {
+                        const line = document.createElement('small');
+                        line.textContent = `${leg.tipo.toUpperCase()} • ${leg.origem || '?'} → ${leg.destino || '?'} • ${leg.codigo ? '🟢 código' : '🟡 aguardando'}`;
+                        text.appendChild(line);
+                    });
+                    const use = document.createElement('button');
+                    use.type = 'button';
+                    use.className = 'eh-context-btn primary';
+                    use.textContent = 'Usar';
+                    use.disabled = !canUsePassenger;
+                    use.title = canUsePassenger ? 'Preencher CPF, nome e nascimento na emissão' : 'Disponível quando os dados do passageiro estiverem abertos';
+                    use.addEventListener('click', () => this.usePassenger(request.id, passenger.cpf));
+                    row.append(text, use);
+                    block.appendChild(row);
+
+                    const coded = passenger.legs.filter(leg => leg.codigo);
+                    if (coded.length) {
+                        const actions = document.createElement('div');
+                        actions.className = 'eh-sale-summary-actions';
+                        coded.slice(0, 2).forEach(leg => {
+                            const copy = document.createElement('button');
+                            copy.type = 'button';
+                            copy.className = 'eh-context-btn';
+                            copy.textContent = `Copiar ${leg.tipo}`;
+                            copy.addEventListener('click', () => this.copyLegCode(leg.codigo));
+                            actions.appendChild(copy);
+                        });
+                        block.appendChild(actions);
+                    }
+                });
+            });
+            return block;
+        },
+
+        scanDom() {
+            if (EH.WhatsAppBridge.isWhatsAppHost()) return;
+            this.scanRequestCards();
+            this.captureCodeModal();
+        },
+
+        init() {
+            if (this.started || EH.WhatsAppBridge.isWhatsAppHost()) return;
+            this.started = true;
+            const beforeClick = event => {
+                const button = event.target?.closest?.('button');
+                if (!button) return;
+                const label = EH.Utils.normalize(button.textContent || button.title || '');
+                if (button.closest('app-solicitacao-requisicoes-prefeitura') && button.type === 'submit' && label.includes('ENVIAR SOLICITACAO')) {
+                    this.captureRequestForm();
+                    return;
+                }
+                if (button.closest('app-solicitacoes') && label.includes('CODIGO DA REQUISICAO')) {
+                    this.pendingNumeroLogico = this.findCodeButtonContext(button);
+                    this.lastModalFingerprint = '';
+                }
+            };
+            const beforeSubmit = event => {
+                if (event.target?.closest?.('app-solicitacao-requisicoes-prefeitura')) this.captureRequestForm();
+            };
+            EH.Runtime.on('requisition-click', document, 'click', beforeClick, true);
+            EH.Runtime.on('requisition-submit', document, 'submit', beforeSubmit, true);
+            this.scanDom();
+        }
+    };
 
     // ============================================================
     // PASSAGENS EMITIDAS — SELEÇÃO E CAPTURA DO CARTÃO ORIGINAL
@@ -7744,13 +8437,15 @@
         renderSaleSummary(page) {
             if (!this.saleBox) return;
             this.saleBox.innerHTML = '';
-            const card = EH.SaleContext?.renderSaleCard?.();
-            if (!card) {
+            const saleCard = EH.SaleContext?.renderSaleCard?.();
+            const requisitionCard = EH.RequisitionManager?.renderCard?.();
+            if (!saleCard && !requisitionCard) {
                 this.saleBox.hidden = true;
                 return;
             }
             this.saleBox.hidden = false;
-            this.saleBox.appendChild(card);
+            if (saleCard) this.saleBox.appendChild(saleCard);
+            if (requisitionCard) this.saleBox.appendChild(requisitionCard);
         },
 
         renderAutomation(page) {
@@ -9114,6 +9809,7 @@
             EH.Toast.init();
             EH.UI.init();
             EH.SaleCpfs.init();
+            EH.RequisitionManager.init();
             EH.WhatsAppDock.init();
             EH.Layout.sync();
             EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => EH.Layout.sync(), 140));
