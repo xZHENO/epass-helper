@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.46.0
+// @version      5.48.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.46.0',
+        VERSION: '5.48.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -1285,14 +1285,22 @@
             }
         },
 
-        async sendIntegratedWhatsAppText(message, timeout = 10000) {
+        async sendIntegratedWhatsAppText(message, timeout = 10000, options = {}) {
             const text = this.outboundText(message);
             if (!text) return false;
 
             // O histórico renderiza *negrito*, _itálico_, ~tachado~ e `monoespaçado`
             // sem necessariamente manter os marcadores no texto visível. Eles são removidos
             // SOMENTE para a comparação; a mensagem enviada continua intacta.
-            const comparable = value => this.outboundText(value).replace(/[*_~`]/g, '');
+            // Para o fluxo do PIX, o WhatsApp também pode compactar linhas em branco no histórico.
+            // O modo renderedHistory é usado apenas como critério de confirmação e NÃO altera o texto enviado.
+            const renderedHistory = options?.renderedHistory === true;
+            const comparable = value => {
+                const normalized = this.outboundText(value).replace(/[*_~`]/g, '');
+                return renderedHistory
+                    ? normalized.replace(/\s+/g, ' ').trim()
+                    : normalized;
+            };
             const expectedHistoryText = comparable(text);
             const beforeMessages = this.collectActiveConversation().messages;
             const beforeIds = new Set(beforeMessages.map(item => item.id));
@@ -1464,7 +1472,9 @@
                 return;
             }
 
-            if (command.chatTitle) {
+            // O PIX deve ser enviado somente na conversa que já está selecionada.
+            // Para as demais ações, mantém o comportamento existente de seleção por título.
+            if (command.chatTitle && action !== 'send_pix_pair') {
                 await this.selectChatByTitle(command.chatTitle);
             }
 
@@ -1474,10 +1484,37 @@
             if (action === 'send_text') {
                 ok = await this.sendIntegratedWhatsAppText(command.message || '');
             } else if (action === 'send_pix_pair') {
-                // Sequência obrigatória: instrução confirmada no histórico → PIX puro.
-                ok = await this.sendIntegratedWhatsAppText(command.message || '');
-                if (ok && command.message2) {
-                    ok = await this.sendIntegratedWhatsAppText(command.message2 || '');
+                // PIX: nunca trocar de conversa automaticamente. O título enviado serve apenas
+                // para confirmar que a conversa atual continua sendo a mesma do clique no E-Pass.
+                const expectedTitle = String(command.chatTitle || '').trim();
+                const currentTitle = String(this.collectActiveConversation()?.active?.title || '').trim();
+                if (!currentTitle || (expectedTitle && currentTitle !== expectedTitle)) {
+                    EH.Logger.warn('Envio do PIX cancelado: a conversa atual do WhatsApp mudou antes do envio.');
+                    ok = false;
+                } else {
+                    // 1) Envia a orientação e só continua após composer vazio + nova mensagem no histórico.
+                    // renderedHistory tolera apenas diferenças VISUAIS de espaços/quebras do WhatsApp.
+                    ok = await this.sendIntegratedWhatsAppText(
+                        command.message || '',
+                        10000,
+                        { renderedHistory: true }
+                    );
+
+                    // 2) Checkpoint explícito antes do PIX: o campo deve estar disponível e vazio.
+                    if (ok && command.message2) {
+                        const composerReady = await this.waitForComposer(5000);
+                        if (!composerReady || this.composerText(composerReady)) {
+                            EH.Logger.warn('Envio do PIX interrompido: o composer não ficou livre após a orientação.');
+                            ok = false;
+                        } else {
+                            // Segunda mensagem: SOMENTE o payload recebido do E-Pass.
+                            ok = await this.sendIntegratedWhatsAppText(
+                                command.message2 || '',
+                                10000,
+                                { renderedHistory: true }
+                            );
+                        }
+                    }
                 }
             } else if (action === 'send_pair') {
                 ok = await this.sendIntegratedWhatsAppText(command.message || '');
@@ -6365,28 +6402,92 @@
             const request = this.loadStore().find(item => item.id === requestId);
             const passenger = request?.passengers?.find(item => item.cpf === this.normalizeCpf(cpf));
             if (!request || !passenger) return EH.Toast.warning('Passageiro da requisição não encontrado.');
-            const card = this.chooseEmissionCard(passenger.cpf);
-            if (!card) return EH.Toast.warning('Abra os dados do passageiro ou deixe um cadastro vazio para usar esta requisição.');
 
-            const cpfInput = card.querySelector('input[formcontrolname="cpf"]');
-            const nameInput = card.querySelector('input[formcontrolname="nome"]');
-            const birthInput = card.querySelector('input[formcontrolname="data_nascimento"]');
-            const missing = [];
-            if (!cpfInput) missing.push('CPF');
-            if (!nameInput) missing.push('Nome');
-            if (!birthInput) missing.push('Data de nascimento');
-            if (missing.length) return EH.Toast.warning(`Não encontrei o campo ${missing.join(', ')}.`);
+            const initialCard = this.chooseEmissionCard(passenger.cpf);
+            if (!initialCard) return EH.Toast.warning('Abra os dados do passageiro ou deixe um cadastro vazio para usar esta requisição.');
+
+            // ETAPA 1: o CPF é o único dado preenchido ANTES da consulta do E-Pass.
+            // Nome e nascimento só são tratados depois que a plataforma retorna o passageiro.
+            const cpfInput = initialCard.querySelector('input[formcontrolname="cpf"]');
+            if (!cpfInput) return EH.Toast.warning('Não encontrei o campo CPF nos dados do passageiro.');
 
             cpfInput.focus();
             EH.SaleContext.setNativeValue(cpfInput, EH.SaleContext.maskCpf(passenger.cpf));
-            EH.SaleContext.setNativeValue(nameInput, passenger.nome);
-            EH.SaleContext.setNativeValue(birthInput, passenger.dataNascimento);
-            await EH.Utils.sleep(100);
 
-            const validCpf = this.normalizeCpf(cpfInput.value) === passenger.cpf;
-            const validName = !passenger.nome || this.normalizeName(nameInput.value) === this.normalizeName(passenger.nome);
-            const validBirth = !passenger.dataNascimento || this.normalizeBirthDate(birthInput.value) === passenger.dataNascimento;
-            if (!validCpf || !validName || !validBirth) return EH.Toast.error('O E-Pass não reconheceu todos os dados da passageira. O preenchimento foi interrompido.');
+            // Aguarda o Angular manter o CPF e liberar a ação de busca. Não depende de timeout fixo
+            // para concluir o fluxo; a condição real é o CPF reconhecido + botão disponível.
+            const readyToSearch = await EH.Utils.waitFor(() => {
+                if (this.normalizeCpf(cpfInput.value) !== passenger.cpf) return null;
+                const button = EH.SaleContext.findSearchButton(cpfInput);
+                return button && !button.disabled ? button : null;
+            }, 5000, 100);
+
+            if (!readyToSearch) {
+                return EH.Toast.error('O E-Pass não reconheceu o CPF ou não liberou o botão Buscar.');
+            }
+
+            const searchButton = readyToSearch;
+            searchButton.click();
+            EH.Toast.info(`Buscando ${passenger.nome || EH.SaleContext.maskCpfPublic(passenger.cpf)} no E-Pass…`);
+
+            // A conclusão da consulta é detectada pelo resultado real: o cartão continua com o CPF
+            // consultado e o campo Nome passa a conter um passageiro retornado pelo E-Pass.
+            // Se o Angular recriar o cartão durante a consulta, procuramos novamente pelo mesmo CPF.
+            const lookup = await EH.Utils.waitFor(() => {
+                const currentCard = this.findEmissionCards().find(candidate => {
+                    const input = candidate.querySelector('input[formcontrolname="cpf"]');
+                    return this.normalizeCpf(input?.value || '') === passenger.cpf;
+                }) || (initialCard.isConnected ? initialCard : null);
+                if (!currentCard) return null;
+
+                const currentCpf = currentCard.querySelector('input[formcontrolname="cpf"]');
+                if (this.normalizeCpf(currentCpf?.value || '') !== passenger.cpf) return null;
+
+                const currentName = currentCard.querySelector('input[formcontrolname="nome"]');
+                const returnedName = EH.Utils.clean(currentName?.value || '');
+                if (!currentName || !returnedName) return null;
+
+                return {
+                    card: currentCard,
+                    cpfInput: currentCpf,
+                    nameInput: currentName,
+                    birthInput: currentCard.querySelector('input[formcontrolname="data_nascimento"]'),
+                    returnedName
+                };
+            }, 10000, 180);
+
+            if (!lookup) {
+                // Mantém o CPF preenchido para permitir continuidade/manual sem apagar dados.
+                return EH.Toast.warning('A busca pelo CPF foi executada, mas o E-Pass não retornou o nome do passageiro dentro do tempo esperado.');
+            }
+
+            const { card, nameInput, birthInput } = lookup;
+
+            // Somente AGORA, depois da busca, o nome confiável salvo na requisição pode corrigir
+            // capitalização ou divergências retornadas pelo cadastro do E-Pass.
+            if (passenger.nome && EH.Utils.clean(nameInput.value || '') !== passenger.nome) {
+                EH.SaleContext.setNativeValue(nameInput, passenger.nome);
+            }
+
+            // Nascimento é opcional. Em horários/empresas em que o campo não existe, segue normal.
+            if (birthInput && passenger.dataNascimento) {
+                EH.SaleContext.setNativeValue(birthInput, passenger.dataNascimento);
+                if (this.normalizeBirthDate(birthInput.value) !== passenger.dataNascimento) {
+                    // Alguns campos textuais usam DD/MM/AAAA; tenta esse formato sem criar
+                    // dependência do campo nem interferir quando o input é type=date.
+                    EH.SaleContext.setNativeValue(birthInput, this.displayBirthDate(passenger.dataNascimento));
+                }
+            }
+
+            const validCpf = this.normalizeCpf(card.querySelector('input[formcontrolname="cpf"]')?.value || '') === passenger.cpf;
+            const finalNameInput = card.querySelector('input[formcontrolname="nome"]');
+            const validName = !passenger.nome || (finalNameInput && this.normalizeName(finalNameInput.value) === this.normalizeName(passenger.nome));
+            const finalBirthInput = card.querySelector('input[formcontrolname="data_nascimento"]');
+            const validBirth = !finalBirthInput || !passenger.dataNascimento || this.normalizeBirthDate(finalBirthInput.value) === passenger.dataNascimento;
+
+            if (!validCpf || !validName || !validBirth) {
+                return EH.Toast.error('O E-Pass não manteve os dados corrigidos da passageira. O preenchimento foi interrompido.');
+            }
 
             const route = this.routeFromEmissionCard(card);
             let matched = null;
@@ -6398,18 +6499,23 @@
                 requestId: request.id,
                 numeroLogico: request.numeroLogico,
                 cpf: passenger.cpf,
-                nome: passenger.nome,
+                nome: passenger.nome || EH.Utils.clean(nameInput.value || ''),
                 origem: route?.origem || '',
                 destino: route?.destino || '',
                 tipo: matched?.leg?.tipo || '',
                 codigo: matched?.leg?.codigo || ''
             });
-            EH.SaleContext.upsertPassenger({ cpf: passenger.cpf, name: passenger.nome, birthDate: passenger.dataNascimento });
+            EH.SaleContext.upsertPassenger({
+                cpf: passenger.cpf,
+                name: passenger.nome || EH.Utils.clean(nameInput.value || ''),
+                birthDate: passenger.dataNascimento || (birthInput ? this.normalizeBirthDate(birthInput.value) : '')
+            });
             EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
-            if (!route) return EH.Toast.success('Passageira preenchida. A rota ainda não foi identificada para selecionar o código.');
-            if (matched?.leg?.codigo) return EH.Toast.success(`Passageira preenchida. Código da ${matched.leg.tipo} disponível para esta rota.`);
-            if (matched) return EH.Toast.warning('Passageira preenchida, mas este trecho ainda está aguardando código.');
-            return EH.Toast.warning('Passageira preenchida. Não encontrei um único trecho compatível com a rota atual.');
+
+            if (!route) return EH.Toast.success('Passageira localizada e preenchida. A rota ainda não foi identificada para selecionar o código.');
+            if (matched?.leg?.codigo) return EH.Toast.success(`Passageira localizada e preenchida. Código da ${matched.leg.tipo} disponível para esta rota.`);
+            if (matched) return EH.Toast.warning('Passageira localizada e preenchida, mas este trecho ainda está aguardando código.');
+            return EH.Toast.warning('Passageira localizada e preenchida. Não encontrei um único trecho compatível com a rota atual.');
         },
 
         paymentRoute() {
@@ -6519,9 +6625,9 @@
                     const use = document.createElement('button');
                     use.type = 'button';
                     use.className = 'eh-context-btn primary';
-                    use.textContent = 'Usar';
+                    use.textContent = 'Usar passageira';
                     use.disabled = !canUsePassenger;
-                    use.title = canUsePassenger ? 'Preencher CPF, nome e nascimento na emissão' : 'Disponível quando os dados do passageiro estiverem abertos';
+                    use.title = canUsePassenger ? 'Preencher CPF, buscar no E-Pass e completar os dados depois da consulta' : 'Disponível quando os dados do passageiro estiverem abertos';
                     use.addEventListener('click', () => this.usePassenger(request.id, passenger.cpf));
                     row.append(text, use);
                     block.appendChild(row);
@@ -8816,13 +8922,15 @@
             return { mode: 'web', connected: true, commandId: command.id };
         },
 
-        sendPixPairToWhatsApp(pix) {
+        sendPixPairToWhatsApp() {
+            // Captura novamente no EXATO momento do clique para nunca reutilizar PIX de uma venda anterior.
+            const pix = EH.Payment.parsePix();
             const payload = EH.Payment.payload(pix);
-            if (!payload) {
-                EH.Toast.warning('⚠️ Código PIX não encontrado.');
+            if (!pix || !payload) {
+                EH.Toast.warning('⚠️ Código PIX atual não encontrado no E-Pass.');
                 return null;
             }
-            const validation = pix?.validation || EH.Payment.validatePix(payload);
+            const validation = pix.validation || EH.Payment.validatePix(payload);
             if (!validation.valid) {
                 EH.Toast.warning(`⚠️ O código PIX parece incompleto ou inválido. ${validation.reason || ''}`.trim());
                 return null;
@@ -8987,7 +9095,7 @@
                     if (!validation.valid && validation.reason) statusLines.push(validation.reason);
                     info.textContent = statusLines.join('\n');
 
-                    const sendPix = this.contextButton('💬 Enviar PIX', 'primary', () => this.sendPixPairToWhatsApp(pix));
+                    const sendPix = this.contextButton('💬 Enviar PIX', 'primary', () => this.sendPixPairToWhatsApp());
                     const copyPix = this.contextButton('📋 Copiar PIX', 'success', () => EH.Payment.copyPixCode(pix));
                     [sendPix, copyPix].forEach(btn => { btn.disabled = !validation.valid; });
                     actions.append(sendPix, copyPix);
