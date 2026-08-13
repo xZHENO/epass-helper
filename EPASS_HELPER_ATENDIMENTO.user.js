@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.52.0
+// @version      5.53.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.52.0',
+        VERSION: '5.53.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -65,6 +65,17 @@
         FINANCE_SHOW_CAIXA_SUMMARY: true,
         FINANCE_ASK_COMPANY_MERCH: true,
         FINANCE_CONFIRM_DELETE: true,
+        OPERATION_CARS_ENABLED: true,
+        OPERATION_CITY: { city: 'ARENOPOLIS', uf: 'GO' },
+        OPERATION_AGENCY_CODE: '287',
+        OPERATION_SORT_BY_SEAT: true,
+        OPERATION_HIGHLIGHT_NEXT: true,
+        OPERATION_ROUTINES: [
+            { id: 'carro-1', order: 1, label: 'Barra do Garças → Goiânia', origin: 'BARRA DO GARCAS', destination: 'GOIANIA', lineDeparture: '07:30', arenopolisTime: '10:00', companyHints: [] },
+            { id: 'carro-2', order: 2, label: 'Goiânia → Barra do Garças', origin: 'GOIANIA', destination: 'BARRA DO GARCAS', lineDeparture: '07:00', arenopolisTime: '13:00', companyHints: ['JO', 'JOTAMAR'] },
+            { id: 'carro-3', order: 3, label: 'Barra do Garças → Goiânia', origin: 'BARRA DO GARCAS', destination: 'GOIANIA', lineDeparture: '12:00', arenopolisTime: '14:30', companyHints: [] },
+            { id: 'carro-4', order: 4, label: 'Goiânia → Cuiabá', origin: 'GOIANIA', destination: 'CUIABA', lineDeparture: '', arenopolisTime: '17:00', companyHints: ['MA', 'EXPRESSO MAIA'] }
+        ],
         CENTRAL_MIN_WIDTH: 280,
         LAYOUT_TRANSITION_MS: 180,
         APP_OBSERVER_DEBOUNCE_MS: 420,
@@ -192,7 +203,13 @@
         COMISSOES_VALUE: '.item-values',
         COMISSOES_ORIGINAL_VALUE: '.item-valor-original',
         COMISSOES_DATE: '.date',
-        COMISSOES_COMPANY: '.sublinhado'
+        COMISSOES_COMPANY: '.sublinhado',
+
+        // Mapa de Viagem / Mapa do Carro — confirmado nos HTMLs reais.
+        MAPA_VIAGEM_MODAL: [
+            'ngx-smart-modal[identifier="modalMapaViagem"] .nsm-dialog-open',
+            '.nsm-dialog.modalMapaViagem.nsm-dialog-open'
+        ]
     };
 
     // ============================================================
@@ -4010,6 +4027,7 @@
             EH.SaleCpfs?.captureFromDom?.();
             EH.RequisitionManager?.scanDom?.();
             EH.UI.updateState(page);
+            EH.OperationCars?.onPageUpdate?.(page);
             EH.WhatsAppDock?.renderOrganizer?.(page);
             if ((page === 'caixa' || page === 'comissoes') && EH.Config.FINANCE_AUTO_REGISTER) {
                 const now = Date.now();
@@ -9945,6 +9963,895 @@
     };
 
     // ============================================================
+    // PAINEL OPERACIONAL DOS CARROS — v5.53
+    // Lê SOMENTE o Mapa de Viagem real do E-Pass e cria um resumo local.
+    // Não altera o mapa, a venda, o financeiro ou qualquer dado oficial.
+    // ============================================================
+    EH.OperationCars = {
+        MAPS_KEY: 'operationCars.maps.v1',
+        ATTENDED_KEY: 'operationCars.attended.v1',
+        lastDomSignature: '',
+        stylesInjected: false,
+        started: false,
+
+        normalize(value) {
+            return EH.Utils.normalize(value || '');
+        },
+
+        todayKey(date = new Date()) {
+            const y = date.getFullYear();
+            const m = String(date.getMonth() + 1).padStart(2, '0');
+            const d = String(date.getDate()).padStart(2, '0');
+            return `${y}-${m}-${d}`;
+        },
+
+        brDateToKey(value) {
+            const match = String(value || '').match(/(\d{2})\/(\d{2})\/(\d{4})/);
+            return match ? `${match[3]}-${match[2]}-${match[1]}` : '';
+        },
+
+        minutes(value) {
+            const match = String(value || '').match(/(\d{1,2}):(\d{2})/);
+            return match ? Number(match[1]) * 60 + Number(match[2]) : null;
+        },
+
+        timeFromDateTime(value) {
+            const match = String(value || '').match(/\b(\d{2}):(\d{2})(?::\d{2})?\b/);
+            return match ? `${match[1]}:${match[2]}` : '';
+        },
+
+        formatUpdatedAt(timestamp) {
+            if (!timestamp) return '';
+            const date = new Date(Number(timestamp));
+            if (Number.isNaN(date.getTime())) return '';
+            return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+        },
+
+        parseLocation(value) {
+            const raw = EH.Utils.clean(value || '');
+            const normalized = this.normalize(raw);
+            const match = normalized.match(/^(.*?)\s*-\s*([A-Z]{2})(?:\s*-\s*([A-Z0-9]+))?$/);
+            if (!match) return { raw, city: normalized, uf: '', code: '' };
+            return {
+                raw,
+                city: EH.Utils.clean(match[1]),
+                uf: match[2],
+                code: match[3] || ''
+            };
+        },
+
+        targetCity() {
+            return {
+                city: this.normalize(EH.Config.OPERATION_CITY?.city || 'ARENOPOLIS'),
+                uf: this.normalize(EH.Config.OPERATION_CITY?.uf || 'GO'),
+                agencyCode: String(EH.Config.OPERATION_AGENCY_CODE || '287')
+            };
+        },
+
+        isTargetLocation(location) {
+            const target = this.targetCity();
+            const parsed = typeof location === 'string' ? this.parseLocation(location) : (location || {});
+            return this.normalize(parsed.city) === target.city && this.normalize(parsed.uf) === target.uf;
+        },
+
+        isAgencyLocation(location) {
+            const target = this.targetCity();
+            const parsed = typeof location === 'string' ? this.parseLocation(location) : (location || {});
+            return this.isTargetLocation(parsed) && String(parsed.code || '') === target.agencyCode;
+        },
+
+        shortLocation(location) {
+            const parsed = typeof location === 'string' ? this.parseLocation(location) : (location || {});
+            const city = EH.Utils.clean(parsed.city || parsed.raw || '');
+            const uf = EH.Utils.clean(parsed.uf || '');
+            return [city, uf].filter(Boolean).join(' - ');
+        },
+
+        parseLine(value) {
+            const raw = EH.Utils.clean(value || '');
+            const normalized = this.normalize(raw);
+            const route = normalized.match(/^(.+?)\s+X\s+(.+)$/i);
+            if (!route) {
+                return { raw, code: '', origin: this.parseLocation(''), destination: this.parseLocation('') };
+            }
+            let left = EH.Utils.clean(route[1]);
+            const right = EH.Utils.clean(route[2]);
+            let code = '';
+            // As linhas reais possuem códigos como 901929600, MTTO0034019 e 02-079-00.
+            // A rota da tabela de pesquisa não possui esse prefixo. Só separamos como código
+            // quando o primeiro bloco contém ao menos um dígito.
+            const codeMatch = left.match(/^([A-Z0-9-]*\d[A-Z0-9-]*)\s*-\s*(.+)$/i);
+            if (codeMatch) {
+                code = codeMatch[1];
+                left = codeMatch[2];
+            }
+            return {
+                raw,
+                code,
+                origin: this.parseLocation(left),
+                destination: this.parseLocation(right)
+            };
+        },
+
+        metadataFromCard(card) {
+            const body = card?.querySelector?.('.body') || card;
+            const text = String(body?.innerText || body?.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+            const service = EH.Utils.clean(text.match(/Servi[cç]o:\s*([^\s]+)(?=\s+Data do Servi[cç]o:|$)/i)?.[1] || '');
+            const dateMatch = text.match(/Data do Servi[cç]o:\s*(\d{2}\/\d{2}\/\d{4})\s*-\s*Hor[aá]rio:\s*(\d{2}:\d{2}:\d{2})/i);
+            const lineRaw = EH.Utils.clean(text.match(/Linha:\s*(.+)$/i)?.[1] || '');
+            const agency = EH.Utils.clean(text.match(/Ag[eê]ncia:\s*(.*?)(?=\s+Servi[cç]o:|$)/i)?.[1] || '');
+            return {
+                service,
+                serviceDateBr: dateMatch?.[1] || '',
+                serviceDate: this.brDateToKey(dateMatch?.[1] || ''),
+                lineDeparture: dateMatch?.[2] ? dateMatch[2].slice(0, 5) : '',
+                line: this.parseLine(lineRaw),
+                agency,
+                raw: text
+            };
+        },
+
+        tableHeaders(table) {
+            return Array.from(table?.querySelectorAll?.('thead th') || []).map(th => this.normalize(th.textContent));
+        },
+
+        tableType(table) {
+            const headers = this.tableHeaders(table);
+            if (headers.includes('NOME') && headers.some(v => v.includes('BILHETE')) && headers.includes('POLTRONA') && headers.includes('ORIGEM') && headers.includes('DESTINO')) return 'passengers';
+            if (headers.includes('LOCALIDADE') && headers.includes('EMBARQUE') && headers.includes('DESEMBARQUE') && headers.some(v => v.includes('SALDO'))) return 'localities';
+            return '';
+        },
+
+        parsePassengers(table) {
+            const headers = this.tableHeaders(table);
+            const indexOf = patterns => headers.findIndex(header => patterns.some(pattern => header.includes(pattern)));
+            const idx = {
+                name: indexOf(['NOME']),
+                ticket: indexOf(['BILHETE']),
+                cpf: indexOf(['CPF']),
+                seat: indexOf(['POLTRONA']),
+                origin: indexOf(['ORIGEM']),
+                destination: indexOf(['DESTINO'])
+            };
+            return Array.from(table?.querySelectorAll?.('tbody tr') || []).map((row, rowIndex) => {
+                const cells = Array.from(row.querySelectorAll('td')).map(td => EH.Utils.clean(td.textContent));
+                if (!cells.length) return null;
+                return {
+                    rowIndex,
+                    name: idx.name >= 0 ? cells[idx.name] || '' : '',
+                    ticket: idx.ticket >= 0 ? cells[idx.ticket] || '' : '',
+                    cpf: idx.cpf >= 0 ? String(cells[idx.cpf] || '').replace(/\D/g, '') : '',
+                    seat: idx.seat >= 0 ? cells[idx.seat] || '' : '',
+                    origin: this.parseLocation(idx.origin >= 0 ? cells[idx.origin] || '' : ''),
+                    destination: this.parseLocation(idx.destination >= 0 ? cells[idx.destination] || '' : '')
+                };
+            }).filter(Boolean);
+        },
+
+        parseLocalities(table) {
+            const headers = this.tableHeaders(table);
+            const indexOf = patterns => headers.findIndex(header => patterns.some(pattern => header.includes(pattern)));
+            const idx = {
+                locality: indexOf(['LOCALIDADE']),
+                board: indexOf(['EMBARQUE']),
+                alight: indexOf(['DESEMBARQUE']),
+                balance: indexOf(['SALDO'])
+            };
+            return Array.from(table?.querySelectorAll?.('tbody tr') || []).map((row, order) => {
+                const cells = Array.from(row.querySelectorAll('td')).map(td => EH.Utils.clean(td.textContent));
+                if (!cells.length) return null;
+                const number = value => {
+                    const parsed = Number(String(value || '').replace(/[^\d-]/g, ''));
+                    return Number.isFinite(parsed) ? parsed : 0;
+                };
+                return {
+                    order,
+                    location: this.parseLocation(idx.locality >= 0 ? cells[idx.locality] || '' : ''),
+                    board: number(idx.board >= 0 ? cells[idx.board] : 0),
+                    alight: number(idx.alight >= 0 ? cells[idx.alight] : 0),
+                    balance: number(idx.balance >= 0 ? cells[idx.balance] : 0)
+                };
+            }).filter(Boolean);
+        },
+
+        currentSearchLocation(selector) {
+            const text = EH.Utils.text(EH.Utils.first(selector));
+            return this.parseLocation(text);
+        },
+
+        searchRowForService(service, serviceDate) {
+            const tables = Array.from(document.querySelectorAll('table'));
+            const table = tables.find(candidate => {
+                const headers = this.tableHeaders(candidate);
+                return headers.includes('SERVICO') && headers.some(v => v.includes('HORARIO DE SAIDA')) && headers.includes('LINHA');
+            });
+            if (!table) return null;
+            const rows = Array.from(table.querySelectorAll('tbody tr'));
+            for (const row of rows) {
+                const cells = Array.from(row.querySelectorAll('td'));
+                if (EH.Utils.clean(cells[0]?.textContent || '') !== String(service || '')) continue;
+                const departure = EH.Utils.clean(cells[1]?.textContent || '');
+                const departureDate = this.brDateToKey(departure);
+                if (serviceDate && departureDate && departureDate !== serviceDate) continue;
+                const lineCell = cells[2];
+                if (!lineCell) continue;
+                const badge = EH.Utils.clean(lineCell.querySelector('.badge')?.textContent || '');
+                const clone = lineCell.cloneNode(true);
+                clone.querySelector('.badge')?.remove();
+                const routeRaw = EH.Utils.clean(clone.textContent || '');
+                return {
+                    service: String(service || ''),
+                    departure,
+                    departureDate,
+                    operationalTime: this.timeFromDateTime(departure),
+                    companyCode: badge,
+                    companyName: EH.Config.LINHAS?.[badge] || badge,
+                    route: this.parseLine(routeRaw),
+                    searchOrigin: this.currentSearchLocation(EH.Selectors.ORIGEM),
+                    searchDestination: this.currentSearchLocation(EH.Selectors.DESTINO)
+                };
+            }
+            return null;
+        },
+
+        findMapSections(modal) {
+            const body = modal?.querySelector?.('.nsm-body') || modal;
+            if (!body) return [];
+            const sections = [];
+            let current = null;
+
+            Array.from(body.children || []).forEach(child => {
+                const text = EH.Utils.clean(child.textContent || '');
+                const isMetadata = child.matches?.('.card') && /SERVI[CÇ]O\s*:/i.test(this.normalize(text)) && /DATA DO SERVI[CÇ]O\s*:/i.test(this.normalize(text));
+                if (isMetadata) {
+                    if (current) sections.push(current);
+                    current = { metadata: this.metadataFromCard(child), passengerTable: null, localityTable: null };
+                    return;
+                }
+                if (!current) return;
+                const table = child.matches?.('table') ? child : child.querySelector?.('table');
+                if (!table) return;
+                const type = this.tableType(table);
+                if (type === 'passengers' && !current.passengerTable) current.passengerTable = table;
+                else if (type === 'localities' && !current.localityTable) current.localityTable = table;
+            });
+            if (current) sections.push(current);
+
+            // Fallback para pequenas alterações estruturais do modal Angular.
+            if (!sections.length) {
+                const metadataCards = Array.from(modal.querySelectorAll('.card')).filter(card => {
+                    const normalized = this.normalize(card.textContent || '');
+                    return normalized.includes('SERVICO:') && normalized.includes('DATA DO SERVICO:') && normalized.includes('LINHA:');
+                });
+                const tables = Array.from(modal.querySelectorAll('table'));
+                metadataCards.forEach((card, index) => {
+                    const nextCard = metadataCards[index + 1];
+                    const after = tables.filter(table => Boolean(card.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING));
+                    const inRange = nextCard ? after.filter(table => Boolean(table.compareDocumentPosition(nextCard) & Node.DOCUMENT_POSITION_FOLLOWING)) : after;
+                    sections.push({
+                        metadata: this.metadataFromCard(card),
+                        passengerTable: inRange.find(table => this.tableType(table) === 'passengers') || null,
+                        localityTable: inRange.find(table => this.tableType(table) === 'localities') || null
+                    });
+                });
+            }
+            return sections.filter(section => section.metadata?.service);
+        },
+
+        sortPassengers(items = []) {
+            const result = items.slice();
+            if (!EH.Config.OPERATION_SORT_BY_SEAT) return result;
+            return result.sort((a, b) => {
+                const seatA = Number(String(a.seat || '').match(/\d+/)?.[0] || 9999);
+                const seatB = Number(String(b.seat || '').match(/\d+/)?.[0] || 9999);
+                return seatA - seatB || String(a.name || '').localeCompare(String(b.name || ''), 'pt-BR');
+            });
+        },
+
+        targetSummary(passengers = [], localities = [], searchContext = null) {
+            const boarders = this.sortPassengers(passengers.filter(item => this.isTargetLocation(item.origin)));
+            const alighters = this.sortPassengers(passengers.filter(item => this.isTargetLocation(item.destination)));
+            const targetRows = localities.filter(item => this.isTargetLocation(item.location));
+            const summaryBoard = targetRows.reduce((sum, item) => sum + Number(item.board || 0), 0);
+            const summaryAlight = targetRows.reduce((sum, item) => sum + Number(item.alight || 0), 0);
+            const targetIsSearchOrigin = this.isTargetLocation(searchContext?.searchOrigin);
+            const targetIsSearchDestination = this.isTargetLocation(searchContext?.searchDestination);
+            const targetRelevant = Boolean(targetRows.length || boarders.length || alighters.length || targetIsSearchOrigin || targetIsSearchDestination);
+            const board = targetRows.length ? summaryBoard : (targetRelevant ? boarders.length : null);
+            const alight = targetRows.length ? summaryAlight : (targetRelevant ? alighters.length : null);
+            const agencyRows = targetRows.filter(item => this.isAgencyLocation(item.location));
+            const agencyBoardOfficial = agencyRows.reduce((sum, item) => sum + Number(item.board || 0), 0);
+            const agencyAlightOfficial = agencyRows.reduce((sum, item) => sum + Number(item.alight || 0), 0);
+            const agencyBoard = agencyRows.length ? agencyBoardOfficial : boarders.filter(item => this.isAgencyLocation(item.origin)).length;
+            const agencyAlight = agencyRows.length ? agencyAlightOfficial : alighters.filter(item => this.isAgencyLocation(item.destination)).length;
+
+            let balance = null;
+            let balanceSource = '';
+            let arrivalBalance = null;
+            if (targetRows.length) {
+                const indexes = localities.map((item, index) => this.isTargetLocation(item.location) ? index : -1).filter(index => index >= 0);
+                const contiguous = indexes.every((index, position) => position === 0 || index === indexes[position - 1] + 1);
+                if (contiguous) {
+                    balance = Number(localities[indexes[indexes.length - 1]]?.balance);
+                    balanceSource = 'epass';
+                } else {
+                    const firstIndex = indexes[0];
+                    const previousBalance = firstIndex > 0 ? Number(localities[firstIndex - 1]?.balance) : 0;
+                    if (Number.isFinite(previousBalance) && Number.isFinite(Number(board)) && Number.isFinite(Number(alight))) {
+                        balance = previousBalance + Number(board) - Number(alight);
+                        balanceSource = 'recomposto';
+                    }
+                }
+                if (!Number.isFinite(balance) || balance < 0 || balance > 250) {
+                    balance = null;
+                    balanceSource = '';
+                }
+                if (balance !== null && board !== null && alight !== null) {
+                    arrivalBalance = balance - Number(board) + Number(alight);
+                    if (!Number.isFinite(arrivalBalance) || arrivalBalance < 0) arrivalBalance = null;
+                }
+            }
+
+            return {
+                targetRelevant,
+                board,
+                alight,
+                balance,
+                arrivalBalance,
+                balanceSource,
+                agencyBoard,
+                agencyAlight,
+                boarders,
+                alighters,
+                targetRows,
+                countsMatchPassengers: board === null || alight === null ? null : (Number(board) === boarders.length && Number(alight) === alighters.length)
+            };
+        },
+
+        buildRecord(section) {
+            const meta = section.metadata;
+            const passengers = section.passengerTable ? this.parsePassengers(section.passengerTable) : [];
+            const localities = section.localityTable ? this.parseLocalities(section.localityTable) : [];
+            const searchContext = this.searchRowForService(meta.service, meta.serviceDate);
+            const target = this.targetSummary(passengers, localities, searchContext);
+            const keyParts = [meta.serviceDate, meta.service, meta.line?.code || this.normalize(meta.line?.raw), searchContext?.operationalTime || meta.lineDeparture].filter(Boolean);
+            return {
+                mapKey: keyParts.join('|'),
+                date: meta.serviceDate,
+                service: meta.service,
+                lineCode: meta.line?.code || '',
+                lineRaw: meta.line?.raw || '',
+                lineOrigin: meta.line?.origin || null,
+                lineDestination: meta.line?.destination || null,
+                lineDeparture: meta.lineDeparture || '',
+                companyCode: searchContext?.companyCode || '',
+                companyName: searchContext?.companyName || '',
+                operationalTime: searchContext?.operationalTime || '',
+                searchRouteRaw: searchContext?.route?.raw || '',
+                searchRouteOrigin: searchContext?.route?.origin || null,
+                searchRouteDestination: searchContext?.route?.destination || null,
+                searchOrigin: searchContext?.searchOrigin || null,
+                searchDestination: searchContext?.searchDestination || null,
+                target,
+                updatedAt: Date.now()
+            };
+        },
+
+        parseCurrentMap() {
+            const modal = EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
+            if (!modal) return [];
+            return this.findMapSections(modal)
+                .map(section => this.buildRecord(section))
+                .filter(record => record.date && record.service);
+        },
+
+        mapSignature(records = []) {
+            return records.map(record => {
+                const target = record.target || {};
+                const tickets = [...(target.boarders || []), ...(target.alighters || [])].map(item => item.ticket).filter(Boolean).sort().join(',');
+                return [record.mapKey, target.board, target.alight, target.balance, tickets].join('~');
+            }).join('||');
+        },
+
+        loadMaps() {
+            const records = EH.Storage.get(this.MAPS_KEY, []);
+            return Array.isArray(records) ? records : [];
+        },
+
+        saveMaps(newRecords = []) {
+            const existing = this.loadMaps();
+            const map = new Map(existing.map(item => [String(item.mapKey || ''), item]));
+            newRecords.forEach(record => {
+                if (!record?.mapKey) return;
+                map.set(record.mapKey, record);
+            });
+            const minDate = new Date();
+            minDate.setDate(minDate.getDate() - 7);
+            const minKey = this.todayKey(minDate);
+            const records = Array.from(map.values())
+                .filter(item => !item.date || item.date >= minKey)
+                .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
+                .slice(0, 40);
+            EH.Storage.set(this.MAPS_KEY, records);
+            return records;
+        },
+
+        loadAttended() {
+            const today = this.todayKey();
+            const stored = EH.Storage.get(this.ATTENDED_KEY, null);
+            if (!stored || stored.date !== today || !Array.isArray(stored.ids)) return { date: today, ids: [] };
+            return { date: today, ids: stored.ids.slice() };
+        },
+
+        setAttended(routineId, value = true) {
+            const state = this.loadAttended();
+            const ids = new Set(state.ids);
+            if (value) ids.add(routineId);
+            else ids.delete(routineId);
+            EH.Storage.set(this.ATTENDED_KEY, { date: state.date, ids: Array.from(ids) });
+            this.render();
+        },
+
+        routineMinutes(routine) {
+            return this.minutes(routine?.arenopolisTime);
+        },
+
+        diffMinutes(a, b) {
+            const x = this.minutes(a);
+            const y = this.minutes(b);
+            return x === null || y === null ? null : Math.abs(x - y);
+        },
+
+        routePointMatches(location, expected) {
+            return this.normalize(location?.city || '') === this.normalize(expected || '');
+        },
+
+        matchScore(routine, record) {
+            if (!routine || !record || record.date !== this.todayKey()) return -999;
+            let score = 0;
+            if (record.target?.targetRelevant) score += 4;
+            if (record.target?.targetRows?.length) score += 4;
+
+            const operationalDiff = this.diffMinutes(record.operationalTime, routine.arenopolisTime);
+            if (operationalDiff !== null) {
+                if (operationalDiff <= 10) score += 12;
+                else if (operationalDiff <= 60) score += 5;
+                else if (operationalDiff <= 100) score += 2;
+            }
+
+            const lineDepartureDiff = this.diffMinutes(record.lineDeparture, routine.lineDeparture);
+            if (lineDepartureDiff !== null && lineDepartureDiff <= 35) score += 4;
+
+            if (this.routePointMatches(record.searchRouteOrigin, routine.origin)) score += 5;
+            if (this.routePointMatches(record.searchRouteDestination, routine.destination)) score += 7;
+            if (this.routePointMatches(record.lineOrigin, routine.origin)) score += 3;
+            if (this.routePointMatches(record.lineDestination, routine.destination)) score += 3;
+
+            const hints = (routine.companyHints || []).map(value => this.normalize(value));
+            if (hints.length) {
+                const companyValues = [record.companyCode, record.companyName].map(value => this.normalize(value));
+                if (companyValues.some(value => hints.includes(value))) score += 4;
+            }
+            return score;
+        },
+
+        bestMapForRoutine(routine) {
+            const candidates = this.loadMaps()
+                .filter(record => record.date === this.todayKey())
+                .map(record => ({ record, score: this.matchScore(routine, record) }))
+                .filter(item => item.score >= 8)
+                .sort((a, b) => b.score - a.score || Number(b.record.updatedAt || 0) - Number(a.record.updatedAt || 0));
+            return candidates[0]?.record || null;
+        },
+
+        routinesState() {
+            const routines = (EH.Config.OPERATION_ROUTINES || []).slice().sort((a, b) => Number(a.order || 0) - Number(b.order || 0));
+            const attended = new Set(this.loadAttended().ids);
+            const now = new Date();
+            const nowMinutes = now.getHours() * 60 + now.getMinutes();
+            const future = routines.filter(routine => !attended.has(routine.id) && Number(this.routineMinutes(routine)) >= nowMinutes - 30);
+            const next = future[0] || null;
+            return routines.map(routine => ({
+                routine,
+                attended: attended.has(routine.id),
+                next: Boolean(next && next.id === routine.id),
+                predictedPassed: !attended.has(routine.id) && this.routineMinutes(routine) !== null && this.routineMinutes(routine) < nowMinutes - 30,
+                map: this.bestMapForRoutine(routine)
+            }));
+        },
+
+        scanCurrentMap({ quiet = false } = {}) {
+            const records = this.parseCurrentMap();
+            if (!records.length) {
+                if (!quiet) EH.Toast.warning('Abra o “Mapa de Viagem” do carro e aguarde os dados aparecerem.');
+                return { found: false, updated: false, records: [] };
+            }
+            const signature = this.mapSignature(records);
+            if (signature === this.lastDomSignature) {
+                if (!quiet) EH.Toast.info('Este mapa já está atualizado no Helper.');
+                return { found: true, updated: false, records };
+            }
+            this.lastDomSignature = signature;
+            this.saveMaps(records);
+            this.render();
+            if (!quiet) {
+                const targetRecord = records.find(record => record.target?.targetRelevant) || records[0];
+                const target = targetRecord?.target || {};
+                const boardText = target.board === null || target.board === undefined ? '—' : target.board;
+                const alightText = target.alight === null || target.alight === undefined ? '—' : target.alight;
+                EH.Toast.success(`Mapa atualizado • Arenópolis: ↑ ${boardText} • ↓ ${alightText}`);
+            }
+            return { found: true, updated: true, records };
+        },
+
+        seatLabel(value) {
+            const text = EH.Utils.clean(value || '—');
+            const number = Number(String(text).match(/\d+/)?.[0]);
+            return Number.isFinite(number) ? String(number).padStart(2, '0') : text;
+        },
+
+        passengerRoute(item) {
+            return `${this.shortLocation(item?.origin)} → ${this.shortLocation(item?.destination)}`;
+        },
+
+        showPassengers(routine, kind = 'board') {
+            const record = this.bestMapForRoutine(routine);
+            const target = record?.target;
+            if (!record || !target) {
+                EH.Toast.warning('O mapa deste carro ainda não foi atualizado.');
+                return;
+            }
+            const items = kind === 'alight' ? (target.alighters || []) : (target.boarders || []);
+            const titleText = kind === 'alight' ? 'DESEMBARQUES — ARENÓPOLIS' : 'EMBARQUES — ARENÓPOLIS';
+            document.querySelector('#eh-operation-passengers-modal')?.remove();
+
+            const overlay = document.createElement('div');
+            overlay.id = 'eh-operation-passengers-modal';
+            overlay.className = 'eh-overlay eh-operation-overlay';
+            const modal = document.createElement('div');
+            modal.className = 'eh-modal eh-operation-modal';
+            const head = document.createElement('div');
+            head.className = 'eh-modal-head';
+            const headText = document.createElement('div');
+            headText.style.flex = '1';
+            const title = document.createElement('div');
+            title.className = 'eh-modal-title';
+            title.textContent = titleText;
+            const note = document.createElement('div');
+            note.className = 'eh-modal-note';
+            const agencyCount = kind === 'alight' ? target.agencyAlight : target.agencyBoard;
+            note.textContent = `${routine.arenopolisTime} • ${routine.label} • Total: ${items.length} • Agência ${this.targetCity().agencyCode}: ${agencyCount}`;
+            headText.append(title, note);
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'eh-modal-close';
+            close.textContent = '×';
+            head.append(headText, close);
+
+            const content = document.createElement('div');
+            content.className = 'eh-modal-content eh-operation-passenger-list';
+            if (!items.length) {
+                const empty = document.createElement('div');
+                empty.className = 'eh-operation-empty';
+                empty.textContent = kind === 'alight' ? 'Nenhum desembarque em Arenópolis neste mapa.' : 'Nenhum embarque em Arenópolis neste mapa.';
+                content.appendChild(empty);
+            } else {
+                items.forEach(item => {
+                    const row = document.createElement('div');
+                    row.className = 'eh-operation-passenger';
+                    const seat = document.createElement('strong');
+                    seat.className = 'eh-operation-seat';
+                    seat.textContent = this.seatLabel(item.seat);
+                    const info = document.createElement('div');
+                    info.className = 'eh-operation-passenger-info';
+                    const name = document.createElement('strong');
+                    name.textContent = item.name || 'Passageiro';
+                    const route = document.createElement('small');
+                    route.textContent = this.passengerRoute(item);
+                    info.append(name, route);
+                    if ((kind === 'board' && this.isAgencyLocation(item.origin)) || (kind === 'alight' && this.isAgencyLocation(item.destination))) {
+                        const agency = document.createElement('span');
+                        agency.className = 'eh-operation-agency-badge';
+                        agency.textContent = `Ag. ${this.targetCity().agencyCode}`;
+                        info.appendChild(agency);
+                    }
+                    row.append(seat, info);
+                    content.appendChild(row);
+                });
+            }
+
+            const footer = document.createElement('div');
+            footer.className = 'eh-modal-actions';
+            const closeBottom = document.createElement('button');
+            closeBottom.type = 'button';
+            closeBottom.className = 'eh-modal-btn';
+            closeBottom.textContent = 'Fechar';
+            footer.appendChild(closeBottom);
+            modal.append(head, content, footer);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+            const dismiss = () => overlay.remove();
+            close.addEventListener('click', dismiss);
+            closeBottom.addEventListener('click', dismiss);
+            overlay.addEventListener('click', event => { if (event.target === overlay) dismiss(); });
+        },
+
+        showDayCars() {
+            document.querySelector('#eh-operation-day-modal')?.remove();
+            const states = this.routinesState();
+            const overlay = document.createElement('div');
+            overlay.id = 'eh-operation-day-modal';
+            overlay.className = 'eh-overlay eh-operation-overlay';
+            const modal = document.createElement('div');
+            modal.className = 'eh-modal eh-operation-modal';
+            const head = document.createElement('div');
+            head.className = 'eh-modal-head';
+            const titleWrap = document.createElement('div');
+            titleWrap.style.flex = '1';
+            const title = document.createElement('div');
+            title.className = 'eh-modal-title';
+            title.textContent = 'CARROS DE HOJE';
+            const note = document.createElement('div');
+            note.className = 'eh-modal-note';
+            note.textContent = 'Horários são referências operacionais em Arenópolis; “Atendido” é marcado manualmente.';
+            titleWrap.append(title, note);
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'eh-modal-close';
+            close.textContent = '×';
+            head.append(titleWrap, close);
+            const content = document.createElement('div');
+            content.className = 'eh-modal-content eh-operation-day-list';
+
+            states.forEach(state => {
+                const { routine, map } = state;
+                const row = document.createElement('div');
+                row.className = `eh-operation-day-row ${state.next ? 'is-next' : ''} ${state.attended ? 'is-attended' : ''}`;
+                const status = document.createElement('div');
+                status.className = 'eh-operation-day-status';
+                status.textContent = state.attended ? '✓' : state.next ? '▶' : '○';
+                const info = document.createElement('div');
+                info.className = 'eh-operation-day-info';
+                const top = document.createElement('strong');
+                top.textContent = `${routine.arenopolisTime} • ${routine.label}`;
+                const metrics = document.createElement('small');
+                if (map?.target) {
+                    const t = map.target;
+                    metrics.textContent = `↓ ${t.alight ?? '—'}   ↑ ${t.board ?? '—'}   🚌 ${t.balance ?? '—'}${map.service ? ` • Serviço ${map.service}` : ''}`;
+                } else {
+                    metrics.textContent = state.attended ? 'Atendido • mapa não salvo' : 'Mapa ainda não atualizado';
+                }
+                info.append(top, metrics);
+                const action = document.createElement('button');
+                action.type = 'button';
+                action.className = 'eh-modal-btn';
+                action.textContent = state.attended ? 'Desmarcar' : '✓ Atendido';
+                action.addEventListener('click', () => {
+                    this.setAttended(routine.id, !state.attended);
+                    overlay.remove();
+                    this.showDayCars();
+                });
+                row.append(status, info, action);
+                content.appendChild(row);
+            });
+
+            const footer = document.createElement('div');
+            footer.className = 'eh-modal-actions';
+            const update = document.createElement('button');
+            update.type = 'button';
+            update.className = 'eh-modal-btn primary';
+            update.textContent = '↻ Atualizar pelo mapa aberto';
+            update.addEventListener('click', () => this.scanCurrentMap({ quiet: false }));
+            const closeBottom = document.createElement('button');
+            closeBottom.type = 'button';
+            closeBottom.className = 'eh-modal-btn';
+            closeBottom.textContent = 'Fechar';
+            footer.append(update, closeBottom);
+            modal.append(head, content, footer);
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+            const dismiss = () => overlay.remove();
+            close.addEventListener('click', dismiss);
+            closeBottom.addEventListener('click', dismiss);
+            overlay.addEventListener('click', event => { if (event.target === overlay) dismiss(); });
+        },
+
+        render() {
+            const host = EH.UI?.operationBox;
+            if (!host || !EH.Config.OPERATION_CARS_ENABLED) {
+                if (host) host.hidden = true;
+                return;
+            }
+            host.hidden = false;
+            host.innerHTML = '';
+            const states = this.routinesState();
+            const pending = states.filter(item => !item.attended);
+            const current = states.find(item => item.next) || pending[pending.length - 1] || states[states.length - 1];
+            if (!current) return;
+            const { routine, map } = current;
+            const target = map?.target || null;
+
+            const head = document.createElement('div');
+            head.className = 'eh-operation-head';
+            const eyebrow = document.createElement('span');
+            eyebrow.textContent = current.next
+                ? 'OPERAÇÃO • PRÓXIMO DA ROTINA'
+                : current.predictedPassed && !current.attended
+                    ? 'OPERAÇÃO • HORÁRIO PREVISTO JÁ PASSOU'
+                    : 'OPERAÇÃO • ROTINA DO DIA';
+            const heading = document.createElement('div');
+            heading.className = 'eh-operation-heading';
+            const time = document.createElement('strong');
+            time.textContent = routine.arenopolisTime;
+            const route = document.createElement('span');
+            route.textContent = routine.label;
+            heading.append(time, route);
+            head.append(eyebrow, heading);
+
+            const metrics = document.createElement('div');
+            metrics.className = 'eh-operation-metrics';
+            const metricButton = (kind, label, value) => {
+                const button = document.createElement('button');
+                button.type = 'button';
+                button.className = `eh-operation-metric ${kind}`;
+                button.disabled = !target;
+                const labelNode = document.createElement('span');
+                labelNode.textContent = label;
+                const valueNode = document.createElement('strong');
+                valueNode.textContent = value === null || value === undefined ? '—' : String(value);
+                button.append(labelNode, valueNode);
+                return button;
+            };
+            const board = metricButton('board', '↑ Embarques', target?.board);
+            const alight = metricButton('alight', '↓ Desembarques', target?.alight);
+            const balance = document.createElement('div');
+            balance.className = 'eh-operation-metric balance';
+            const balanceLabel = document.createElement('span');
+            balanceLabel.textContent = '🚌 Após Arenópolis';
+            const balanceValue = document.createElement('strong');
+            balanceValue.textContent = target?.balance === null || target?.balance === undefined ? '—' : String(target.balance);
+            balance.append(balanceLabel, balanceValue);
+            metrics.append(board, alight, balance);
+            if (target) {
+                board.addEventListener('click', () => this.showPassengers(routine, 'board'));
+                alight.addEventListener('click', () => this.showPassengers(routine, 'alight'));
+            }
+
+            const meta = document.createElement('div');
+            meta.className = 'eh-operation-meta';
+            if (map) {
+                const parts = [];
+                if (map.service) parts.push(`Serviço ${map.service}`);
+                const updated = this.formatUpdatedAt(map.updatedAt);
+                if (updated) parts.push(`Atualizado às ${updated}`);
+                if (target?.balanceSource === 'recomposto') parts.push('saldo recomposto pelos movimentos da cidade');
+                if (target?.countsMatchPassengers === false) parts.push('⚠ conferir quantidades');
+                meta.textContent = parts.join(' • ');
+            } else {
+                meta.textContent = 'Mapa ainda não atualizado • abra o Mapa de Viagem quando estiver disponível.';
+            }
+
+            const agency = document.createElement('div');
+            agency.className = 'eh-operation-agency';
+            if (target) {
+                agency.textContent = `Agência ${this.targetCity().agencyCode}: ↑ ${target.agencyBoard ?? '—'} • ↓ ${target.agencyAlight ?? '—'}`;
+            } else {
+                agency.textContent = `Agência ${this.targetCity().agencyCode}: aguardando mapa`;
+            }
+
+            const actions = document.createElement('div');
+            actions.className = 'eh-operation-actions';
+            const update = document.createElement('button');
+            update.type = 'button';
+            update.className = 'eh-context-btn';
+            update.textContent = '↻ Atualizar pelo mapa';
+            update.addEventListener('click', () => this.scanCurrentMap({ quiet: false }));
+            const attended = document.createElement('button');
+            attended.type = 'button';
+            attended.className = 'eh-context-btn primary';
+            attended.textContent = '✓ Atendido';
+            attended.addEventListener('click', () => {
+                this.setAttended(routine.id, true);
+                EH.Toast.success(`${routine.arenopolisTime} marcado como atendido.`);
+            });
+            const all = document.createElement('button');
+            all.type = 'button';
+            all.className = 'eh-context-btn';
+            all.textContent = 'Carros de hoje ›';
+            all.addEventListener('click', () => this.showDayCars());
+            actions.append(update, attended, all);
+
+            const upcoming = document.createElement('div');
+            upcoming.className = 'eh-operation-upcoming';
+            const upcomingStates = states.filter(item => !item.attended && item.routine.id !== routine.id).slice(0, 2);
+            if (upcomingStates.length) {
+                const label = document.createElement('span');
+                label.textContent = 'PRÓXIMOS';
+                upcoming.appendChild(label);
+                upcomingStates.forEach(item => {
+                    const line = document.createElement('small');
+                    line.textContent = `${item.routine.arenopolisTime} • ${item.routine.label}`;
+                    upcoming.appendChild(line);
+                });
+            }
+
+            host.append(head, metrics, agency, meta, actions);
+            if (upcoming.children.length) host.appendChild(upcoming);
+        },
+
+        injectStyles() {
+            if (this.stylesInjected) return;
+            this.stylesInjected = true;
+            GM_addStyle(`
+                #eh-root .eh-operation-host {
+                    display:grid; gap:7px; margin:7px 0 8px; padding:9px;
+                    border:1px solid #d9e2e8; border-radius:10px; background:#fbfcfd;
+                    color:#26313f; box-shadow:0 2px 8px rgba(28,45,68,.045);
+                }
+                #eh-root .eh-operation-host[hidden] { display:none !important; }
+                #eh-root .eh-operation-head { display:grid; gap:4px; }
+                #eh-root .eh-operation-head > span { color:#718092; font-size:7.5px; font-weight:900; letter-spacing:.38px; }
+                #eh-root .eh-operation-heading { display:flex; align-items:baseline; gap:7px; min-width:0; }
+                #eh-root .eh-operation-heading strong { color:#1f2b39; font-size:17px; line-height:1; }
+                #eh-root .eh-operation-heading span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#3e4b5c; font-size:9.5px; font-weight:800; }
+                #eh-root .eh-operation-metrics { display:grid; grid-template-columns:1fr 1fr 1.18fr; gap:5px; }
+                #eh-root .eh-operation-metric { min-width:0; min-height:47px; display:grid; align-content:center; gap:3px; padding:6px; border:1px solid #e1e7ec; border-radius:8px; background:#fff; color:#5c6878; text-align:left; }
+                #eh-root button.eh-operation-metric { cursor:pointer; font:inherit; }
+                #eh-root button.eh-operation-metric:hover:not(:disabled) { border-color:#b9cad8; background:#f7fafc; }
+                #eh-root button.eh-operation-metric:disabled { cursor:default; opacity:.72; }
+                #eh-root .eh-operation-metric span { font-size:7.6px; font-weight:800; line-height:1.2; }
+                #eh-root .eh-operation-metric strong { color:#253142; font-size:14px; line-height:1; }
+                #eh-root .eh-operation-metric.balance strong { color:#176f5b; }
+                #eh-root .eh-operation-agency { color:#657386; font-size:8px; font-weight:750; }
+                #eh-root .eh-operation-meta { color:#7a8695; font-size:7.7px; line-height:1.35; }
+                #eh-root .eh-operation-actions { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; }
+                #eh-root .eh-operation-actions .eh-context-btn { min-width:0; padding:6px 4px; font-size:7.8px; }
+                #eh-root .eh-operation-upcoming { display:grid; gap:2px; padding-top:5px; border-top:1px solid #edf1f4; }
+                #eh-root .eh-operation-upcoming > span { color:#7d8997; font-size:7.3px; font-weight:900; letter-spacing:.3px; }
+                #eh-root .eh-operation-upcoming small { color:#526071; font-size:8px; line-height:1.3; }
+
+                .eh-operation-modal { width:min(720px, 94vw); }
+                .eh-operation-passenger-list, .eh-operation-day-list { display:grid; gap:7px; }
+                .eh-operation-passenger { display:grid; grid-template-columns:48px minmax(0,1fr); gap:10px; align-items:start; padding:10px; border:1px solid #e2e7ed; border-radius:9px; background:#fafbfd; }
+                .eh-operation-seat { display:flex; align-items:center; justify-content:center; min-height:38px; border-radius:8px; background:#edf3f7; color:#1e3448; font-size:17px; }
+                .eh-operation-passenger-info { min-width:0; display:grid; gap:3px; }
+                .eh-operation-passenger-info > strong { color:#202b38; font-size:12px; }
+                .eh-operation-passenger-info small { color:#697687; font-size:10px; }
+                .eh-operation-agency-badge { width:max-content; padding:2px 6px; border-radius:999px; background:#eaf5f0; color:#27725f; font-size:9px; font-weight:800; }
+                .eh-operation-empty { padding:18px; border:1px dashed #d9e0e7; border-radius:9px; color:#718092; text-align:center; font-size:11px; }
+                .eh-operation-day-row { display:grid; grid-template-columns:22px minmax(0,1fr) auto; align-items:center; gap:8px; padding:9px; border:1px solid #e2e7ed; border-radius:9px; background:#fbfcfd; }
+                .eh-operation-day-row.is-next { border-color:#9fc5b7; background:#f4faf7; }
+                .eh-operation-day-row.is-attended { opacity:.7; }
+                .eh-operation-day-status { font-size:15px; font-weight:900; color:#517064; }
+                .eh-operation-day-info { min-width:0; display:grid; gap:3px; }
+                .eh-operation-day-info strong { color:#26313f; font-size:11px; }
+                .eh-operation-day-info small { color:#748091; font-size:9.5px; line-height:1.35; }
+                @media (max-width: 720px) {
+                    #eh-root .eh-operation-metrics { grid-template-columns:1fr 1fr; }
+                    #eh-root .eh-operation-metric.balance { grid-column:1 / -1; }
+                    #eh-root .eh-operation-actions { grid-template-columns:1fr; }
+                    .eh-operation-day-row { grid-template-columns:22px minmax(0,1fr); }
+                    .eh-operation-day-row > button { grid-column:1 / -1; }
+                }
+            `);
+        },
+
+        onPageUpdate() {
+            const modal = EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
+            if (modal) this.scanCurrentMap({ quiet: true });
+            this.render();
+        },
+
+        init() {
+            if (this.started || EH.WhatsAppBridge.isWhatsAppHost()) return;
+            this.started = true;
+            this.injectStyles();
+            this.render();
+            EH.Runtime.interval('operation-cars-clock', () => this.render(), 30000);
+        }
+    };
+
+    // ============================================================
     // INTERFACE
     // ============================================================
     EH.UI = {
@@ -10033,6 +10940,10 @@
             const context = document.createElement('div');
             context.className = 'eh-context-card';
 
+            const operationBox = document.createElement('div');
+            operationBox.className = 'eh-operation-host';
+            operationBox.hidden = true;
+
             const divider = document.createElement('div');
             divider.className = 'eh-tools-divider';
             const toolsTitle = document.createElement('div');
@@ -10089,7 +11000,7 @@
             flowSummary.textContent = 'Fluxo do atendimento';
             flowSection.append(flowSummary, steps);
 
-            body.append(flowSection, context, saleBox, quickTitle, quickRoutes, divider, toolsTitle, actions, more);
+            body.append(flowSection, context, operationBox, saleBox, quickTitle, quickRoutes, divider, toolsTitle, actions, more);
             panel.append(header, body, footer);
             root.appendChild(panel);
 
@@ -10116,6 +11027,7 @@
             this.quickRoutes = quickRoutes;
             this.saleBox = saleBox;
             this.contextBox = context;
+            this.operationBox = operationBox;
             this.flowSection = flowSection;
             this.toolsDivider = divider;
             this.toolsTitle = toolsTitle;
@@ -12296,6 +13208,7 @@
             EH.Style.inject();
             EH.Toast.init();
             EH.UI.init();
+            EH.OperationCars.init();
             EH.SaleCpfs.init();
             EH.RequisitionManager.init();
             EH.WhatsAppDock.init();
