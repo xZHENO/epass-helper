@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.57.1
+// @version      5.58.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -34,10 +34,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.57.1',
+        VERSION: '5.58.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 4,
+        STORAGE_SCHEMA_VERSION: 5,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -83,13 +83,14 @@
         SYNC_SUPABASE_KEY: '',
         SYNC_SUPABASE_EMAIL: '',
         SYNC_INTERVAL_MS: 60000,
-        OPERATION_SERVICES: [
-            { service: '6147', name: 'Goiânia → Cuiabá', operationalTime: '11:00', attends: true,  observation: '',             lineCode: 'MTTO0034019' },
-            { service: '6319', name: 'Goiânia → Barra do Garças', operationalTime: '07:00', attends: true,  observation: '',             lineCode: '901929600' },
-            { service: '744',  name: 'Goiânia → Barra do Garças', operationalTime: '21:30', attends: false, observation: 'Apenas consulta', lineCode: '02-084-00' },
-            { service: '6320', name: 'Barra do Garças → Goiânia', operationalTime: '07:30', attends: true,  observation: '',             lineCode: '901929600' },
-            { service: '745',  name: 'Barra do Garças → Goiânia', operationalTime: '12:00', attends: true,  observation: '',             lineCode: 'GOMT0034001' },
-            { service: '6183', name: 'Cuiabá → Goiânia', operationalTime: '12:00', attends: false, observation: '1º andar',      lineCode: 'MTTO0034019' }
+        // Rotina operacional: horário/nome são configuração; SERVIÇO é sempre dado detectado do dia.
+        OPERATION_TIME_TOLERANCE_MINUTES: 20,
+        OPERATION_ROUTINES: [
+            { id: 'gyn-barra-0700', name: 'Goiânia → Barra do Garças', operationalTime: '07:00', active: true, originHint: 'GOIANIA', destinationHint: 'BARRA DO GARCAS', companyHint: '', lineHint: '' },
+            { id: 'barra-gyn-0730', name: 'Barra do Garças → Goiânia', operationalTime: '07:30', active: true, originHint: 'BARRA DO GARCAS', destinationHint: 'GOIANIA', companyHint: '', lineHint: '' },
+            { id: 'gyn-cuiaba-1100', name: 'Goiânia → Cuiabá', operationalTime: '11:00', active: true, originHint: 'GOIANIA', destinationHint: 'CUIABA', companyHint: '', lineHint: '' },
+            { id: 'barra-gyn-1200', name: 'Barra do Garças → Goiânia', operationalTime: '12:00', active: true, originHint: 'BARRA DO GARCAS', destinationHint: 'GOIANIA', companyHint: '', lineHint: '' },
+            { id: 'gyn-barra-2130', name: 'Goiânia → Barra do Garças', operationalTime: '21:30', active: true, originHint: 'GOIANIA', destinationHint: 'BARRA DO GARCAS', companyHint: '', lineHint: '' }
         ],
         CENTRAL_MIN_WIDTH: 280,
         LAYOUT_TRANSITION_MS: 180,
@@ -331,11 +332,12 @@
             EH.Config.FINANCE_ASK_COMPANY_MERCH = Boolean(this.get('financeAskCompanyMerch', EH.Config.FINANCE_ASK_COMPANY_MERCH));
             EH.Config.FINANCE_CONFIRM_DELETE = Boolean(this.get('financeConfirmDelete', EH.Config.FINANCE_CONFIRM_DELETE));
 
-            // Operação / Carros — preferências locais. O número do Serviço é o identificador principal.
+            // Operação / Carros — horário/nome são configuração; Serviço é dado detectado do dia.
             EH.Config.OPERATION_CARS_ENABLED = Boolean(this.get('operationCarsEnabled', EH.Config.OPERATION_CARS_ENABLED));
             EH.Config.OPERATION_AGENCY_CODE = String(this.get('operationAgencyCode', EH.Config.OPERATION_AGENCY_CODE) || '287').replace(/\D/g, '') || '287';
             EH.Config.OPERATION_SORT_BY_SEAT = Boolean(this.get('operationSortBySeat', EH.Config.OPERATION_SORT_BY_SEAT));
             EH.Config.OPERATION_DOCK_ENABLED = Boolean(this.get('operationDockEnabled', EH.Config.OPERATION_DOCK_ENABLED));
+            EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = Math.min(90, Math.max(0, Number(this.get('operationTimeToleranceMinutes', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES)) || 20));
             EH.Config.REMINDER_CREATE_AFTER_TICKET = Boolean(this.get('reminderCreateAfterTicket', EH.Config.REMINDER_CREATE_AFTER_TICKET));
             EH.Config.REMINDER_ASK_AFTER_TICKET = Boolean(this.get('reminderAskAfterTicket', EH.Config.REMINDER_ASK_AFTER_TICKET));
             EH.Config.REMINDER_MASK_CPF = Boolean(this.get('reminderMaskCpf', EH.Config.REMINDER_MASK_CPF));
@@ -345,25 +347,30 @@
             EH.Config.SYNC_SUPABASE_URL = String(this.get('syncSupabaseUrl', EH.Config.SYNC_SUPABASE_URL) || '').trim();
             EH.Config.SYNC_SUPABASE_KEY = String(this.get('syncSupabaseKey', EH.Config.SYNC_SUPABASE_KEY) || '').trim();
             EH.Config.SYNC_SUPABASE_EMAIL = String(this.get('syncSupabaseEmail', EH.Config.SYNC_SUPABASE_EMAIL) || '').trim();
-            const savedOperationServices = this.get('operationServices', null);
-            if (Array.isArray(savedOperationServices) && savedOperationServices.length) {
-                const defaultsByService = new Map((EH.ConfigDefaults?.OPERATION_SERVICES || []).map(item => [String(item.service || ''), item]));
+
+            const savedRoutines = this.get('operationRoutines', null);
+            if (Array.isArray(savedRoutines) && savedRoutines.length) {
                 const used = new Set();
-                const normalized = savedOperationServices.map((item, index) => {
-                    const service = String(item?.service || '').replace(/\D/g, '');
-                    if (!service || used.has(service)) return null;
-                    used.add(service);
-                    const fallback = defaultsByService.get(service) || EH.ConfigDefaults?.OPERATION_SERVICES?.[index] || {};
+                const normalized = savedRoutines.map((item, index) => {
+                    const fallback = EH.ConfigDefaults?.OPERATION_ROUTINES?.[index] || {};
+                    const time = EH.Utils.clean(item?.operationalTime || fallback.operationalTime || '');
+                    const name = EH.Utils.clean(item?.name || fallback.name || '');
+                    const rawId = EH.Utils.clean(item?.id || '') || `${time}-${name}-${index}`;
+                    const id = EH.Utils.normalize(rawId).replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || `rotina-${index + 1}`;
+                    const uniqueId = used.has(id) ? `${id}-${index + 1}` : id;
+                    used.add(uniqueId);
                     return {
-                        service,
-                        name: EH.Utils.clean(item?.name || fallback.name || `Serviço ${service}`),
-                        operationalTime: EH.Utils.clean(item?.operationalTime || fallback.operationalTime || ''),
-                        attends: item?.attends !== undefined ? Boolean(item.attends) : Boolean(fallback.attends),
-                        observation: EH.Utils.clean(item?.observation || fallback.observation || ''),
-                        lineCode: EH.Utils.clean(item?.lineCode || fallback.lineCode || '')
+                        id: uniqueId,
+                        name: name || `Carro ${index + 1}`,
+                        operationalTime: /^\d{1,2}:\d{2}$/.test(time) ? time.padStart(5, '0') : '',
+                        active: item?.active !== undefined ? Boolean(item.active) : (fallback.active !== undefined ? Boolean(fallback.active) : true),
+                        originHint: EH.Utils.clean(item?.originHint || fallback.originHint || ''),
+                        destinationHint: EH.Utils.clean(item?.destinationHint || fallback.destinationHint || ''),
+                        companyHint: EH.Utils.clean(item?.companyHint || fallback.companyHint || ''),
+                        lineHint: EH.Utils.clean(item?.lineHint || fallback.lineHint || '')
                     };
-                }).filter(Boolean);
-                if (normalized.length) EH.Config.OPERATION_SERVICES = normalized;
+                }).filter(item => item.operationalTime && item.name);
+                if (normalized.length) EH.Config.OPERATION_ROUTINES = normalized;
             }
 
             EH.Config.DEBUG = Boolean(this.get('debug', EH.Config.DEBUG));
@@ -372,14 +379,14 @@
 
 
     // ============================================================
-    // VERSIONAMENTO DOS DADOS — v5.57
+    // VERSIONAMENTO DOS DADOS — v5.58
     // O namespace de dados é estável e NÃO depende da versão do script.
     // Migrações são sempre não destrutivas.
     // ============================================================
     EH.StorageSchema = {
         META_KEY: 'storage.meta.v1',
         BACKUP_PREFIX: 'storage.backup.pre_v',
-        CURRENT_VERSION: Number(EH.Config.STORAGE_SCHEMA_VERSION || 4),
+        CURRENT_VERSION: Number(EH.Config.STORAGE_SCHEMA_VERSION || 5),
 
         listNames() {
             try {
@@ -460,6 +467,34 @@
             if (changed) EH.Storage.set(key, next);
         },
 
+        migrateOperationRoutines() {
+            if (Array.isArray(EH.Storage.get('operationRoutines', null)) && EH.Storage.get('operationRoutines', []).length) return;
+            const old = EH.Storage.get('operationServices', []);
+            const source = Array.isArray(old) ? old : [];
+            const preferred = source.filter(item => Boolean(item?.attends) || String(item?.operationalTime || '') === '21:30');
+            const defaults = JSON.parse(JSON.stringify(EH.ConfigDefaults?.OPERATION_ROUTINES || []));
+            const parseName = value => {
+                const parts = String(value || '').split(/\s*[→>-]\s*/).map(v => EH.Utils.clean(v)).filter(Boolean);
+                return { origin: parts[0] || '', destination: parts[1] || '' };
+            };
+            const migrated = defaults.map(def => {
+                const match = preferred.find(item => String(item?.operationalTime || '') === String(def.operationalTime || '')
+                    && EH.Utils.normalize(item?.name || '') === EH.Utils.normalize(def.name || ''));
+                if (!match) return def;
+                const route = parseName(match.name);
+                return {
+                    ...def,
+                    name: EH.Utils.clean(match.name || def.name),
+                    operationalTime: EH.Utils.clean(match.operationalTime || def.operationalTime),
+                    active: true,
+                    originHint: route.origin || def.originHint,
+                    destinationHint: route.destination || def.destinationHint
+                };
+            });
+            EH.Storage.set('operationRoutines', migrated);
+            EH.Storage.set('operationTimeToleranceMinutes', Number(EH.Config.OPERATION_TIME_TOLERANCE_MINUTES || 20));
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -469,6 +504,7 @@
             // Migrações incrementais: somente acrescentam/normalizam campos.
             this.migratePanels();
             this.migrateReminders();
+            this.migrateOperationRoutines();
 
             const next = {
                 schemaVersion: this.CURRENT_VERSION,
@@ -490,7 +526,7 @@
                 'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
                 'financeAskCompanyMerch','financeConfirmDelete',
                 'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
-                'operationDockEnabled','operationServices',
+                'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes',
                 'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
                 'reminderHighlightToday','panelManager.v1',
                 'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail'
@@ -534,7 +570,7 @@
                 'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
                 'financeAskCompanyMerch','financeConfirmDelete',
                 'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
-                'operationDockEnabled','operationServices',
+                'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes',
                 'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
                 'reminderHighlightToday','panelManager.v1',
                 'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail'
@@ -2559,7 +2595,7 @@
     };
 
     // ============================================================
-    // GERENCIADOR DE PAINÉIS — v5.56
+    // GERENCIADOR DE PAINÉIS — v5.58
     // Movimento/fixação independentes. Nunca altera app-root do E-Pass.
     // ============================================================
     EH.PanelManager = {
@@ -2588,10 +2624,15 @@
                 : key === 'whatsapp'
                     ? { minW: 240, maxW: 560, minH: 240, maxH: 900 }
                     : { minW: 260, maxW: 600, minH: 300, maxH: 900 };
+            const coordinate = (candidate, fallbackValue) => {
+                if (candidate === null || candidate === undefined || candidate === '') return fallbackValue ?? null;
+                const n = Number(candidate);
+                return Number.isFinite(n) ? n : (fallbackValue ?? null);
+            };
             return {
                 mode,
-                x: Number.isFinite(Number(value.x)) ? Number(value.x) : fallback.x,
-                y: Number.isFinite(Number(value.y)) ? Number(value.y) : fallback.y,
+                x: coordinate(value.x, fallback.x),
+                y: coordinate(value.y, fallback.y),
                 width: Math.min(limits.maxW, Math.max(limits.minW, Number(value.width) || fallback.width)),
                 height: Math.min(limits.maxH, Math.max(limits.minH, Number(value.height) || fallback.height)),
                 zoom: Math.min(150, Math.max(75, Number(value.zoom) || fallback.zoom)),
@@ -2733,7 +2774,17 @@
                 grip.setAttribute('aria-hidden', 'true');
                 el.appendChild(grip);
             }
-            grip.hidden = !this.get(key).allowResize;
+            const cfg = this.get(key);
+            grip.hidden = !cfg.allowResize;
+            const mode = String(cfg.mode || 'automatic');
+            const anchorRight = mode === 'right' || mode === 'top-right' || mode === 'bottom-right';
+            const anchorBottom = mode === 'bottom' || mode === 'bottom-left' || mode === 'bottom-right';
+            // A alça fica no canto oposto ao ponto fixo para o painel crescer para dentro da tela.
+            grip.style.setProperty(anchorRight ? 'left' : 'right', '2px', 'important');
+            grip.style.setProperty(anchorRight ? 'right' : 'left', 'auto', 'important');
+            grip.style.setProperty(anchorBottom ? 'top' : 'bottom', '2px', 'important');
+            grip.style.setProperty(anchorBottom ? 'bottom' : 'top', 'auto', 'important');
+            grip.style.setProperty('cursor', anchorRight === anchorBottom ? 'nwse-resize' : 'nesw-resize', 'important');
             return grip;
         },
 
@@ -2803,9 +2854,34 @@
 
             this.applyContentZoom(key, zoom);
 
-            // Automatic mantém o layout aprovado para Atendimento/WhatsApp.
+            // AUTOMATIC separa posicionamento de dimensão.
+            // - dynamic=true: conserva o layout responsivo aprovado do painel.
+            // - dynamic=false: respeita largura/altura manuais sem trocar o modo/dock.
+            // Uma posição x/y só é aplicada quando foi realmente gravada por um ARRASTE válido.
             if (cfg.mode === 'automatic' && key !== 'operation') {
-                ['top','left','right','bottom','width','height','max-height','max-width'].forEach(prop => el.style.removeProperty(prop));
+                if (cfg.dynamic) {
+                    ['width','height','max-height','max-width'].forEach(prop => el.style.removeProperty(prop));
+                } else {
+                    this.setImportant(el, 'width', `${Math.min(cfg.width, viewportW - edge * 2)}px`);
+                    this.setImportant(el, 'height', `${Math.min(cfg.height, viewportH - edge * 2)}px`);
+                    this.setImportant(el, 'max-height', `${viewportH - edge * 2}px`);
+                    this.setImportant(el, 'max-width', `${viewportW - edge * 2}px`);
+                }
+                const hasManualPosition = cfg.x !== null && cfg.y !== null
+                    && Number.isFinite(Number(cfg.x)) && Number.isFinite(Number(cfg.y));
+                if (hasManualPosition) {
+                    const rect = el.getBoundingClientRect();
+                    const w = Math.max(1, rect.width || (cfg.dynamic ? width : cfg.width));
+                    const h = Math.max(1, rect.height || (cfg.dynamic ? height : cfg.height));
+                    const x = Math.min(viewportW - w - edge, Math.max(edge, Number(cfg.x)));
+                    const y = Math.min(viewportH - h - edge, Math.max(edge, Number(cfg.y)));
+                    this.setImportant(el, 'left', `${Math.round(x)}px`);
+                    this.setImportant(el, 'top', `${Math.round(y)}px`);
+                    this.setImportant(el, 'right', 'auto');
+                    this.setImportant(el, 'bottom', 'auto');
+                } else {
+                    ['top','left','right','bottom'].forEach(prop => el.style.removeProperty(prop));
+                }
                 this.ensureResizeGrip(key);
                 this.applyHandle(key);
                 return;
@@ -2822,13 +2898,25 @@
             let y = edge;
             switch (cfg.mode) {
                 case 'free':
-                    x = Math.min(viewportW - w - edge, Math.max(edge, Number(cfg.x) || edge));
-                    y = Math.min(viewportH - h - edge, Math.max(edge, Number(cfg.y) || edge));
+                    x = Math.min(viewportW - w - edge, Math.max(edge, Number.isFinite(Number(cfg.x)) ? Number(cfg.x) : edge));
+                    y = Math.min(viewportH - h - edge, Math.max(edge, Number.isFinite(Number(cfg.y)) ? Number(cfg.y) : edge));
                     break;
-                case 'left': x = edge; y = Math.max(edge, Math.round((viewportH - h) / 2)); break;
-                case 'right': x = viewportW - w - edge; y = Math.max(edge, Math.round((viewportH - h) / 2)); break;
-                case 'top': x = Math.max(edge, Math.round((viewportW - w) / 2)); y = edge; break;
-                case 'bottom': x = Math.max(edge, Math.round((viewportW - w) / 2)); y = viewportH - h - edge; break;
+                case 'left':
+                    x = edge;
+                    y = Math.min(viewportH - h - edge, Math.max(edge, Number.isFinite(Number(cfg.y)) ? Number(cfg.y) : Math.round((viewportH - h) / 2)));
+                    break;
+                case 'right':
+                    x = viewportW - w - edge;
+                    y = Math.min(viewportH - h - edge, Math.max(edge, Number.isFinite(Number(cfg.y)) ? Number(cfg.y) : Math.round((viewportH - h) / 2)));
+                    break;
+                case 'top':
+                    x = Math.min(viewportW - w - edge, Math.max(edge, Number.isFinite(Number(cfg.x)) ? Number(cfg.x) : Math.round((viewportW - w) / 2)));
+                    y = edge;
+                    break;
+                case 'bottom':
+                    x = Math.min(viewportW - w - edge, Math.max(edge, Number.isFinite(Number(cfg.x)) ? Number(cfg.x) : Math.round((viewportW - w) / 2)));
+                    y = viewportH - h - edge;
+                    break;
                 case 'top-left': x = edge; y = edge; break;
                 case 'top-right': x = viewportW - w - edge; y = edge; break;
                 case 'bottom-left': x = edge; y = viewportH - h - edge; break;
@@ -2845,6 +2933,28 @@
             this.applyHandle(key);
         },
 
+        validateStored() {
+            const raw = EH.Storage.get(this.KEY, null);
+            if (!raw || typeof raw !== 'object') return this.load();
+            const next = { ...raw };
+            let changed = false;
+            ['main','whatsapp','operation'].forEach(key => {
+                const before = raw[key] && typeof raw[key] === 'object' ? raw[key] : {};
+                const cfg = this.normalizePanel(key, before);
+                const edge = 6;
+                const width = cfg.dynamic ? this.dynamicSize(key).width : cfg.width;
+                const height = cfg.dynamic ? this.dynamicSize(key).height : cfg.height;
+                const maxX = Math.max(edge, Math.max(320, window.innerWidth || 1366) - Math.min(width, window.innerWidth - edge * 2) - edge);
+                const maxY = Math.max(edge, Math.max(480, window.innerHeight || 768) - Math.min(height, window.innerHeight - edge * 2) - edge);
+                if (cfg.x !== null) cfg.x = Math.round(Math.min(maxX, Math.max(edge, Number(cfg.x))));
+                if (cfg.y !== null) cfg.y = Math.round(Math.min(maxY, Math.max(edge, Number(cfg.y))));
+                next[key] = cfg;
+                if (JSON.stringify(cfg) !== JSON.stringify(before)) changed = true;
+            });
+            if (changed) EH.Storage.set(this.KEY, next);
+            return next;
+        },
+
         applyAll() {
             ['main', 'whatsapp', 'operation'].forEach(key => this.apply(key));
         },
@@ -2854,40 +2964,99 @@
             if (!header || this.bound.has(header)) return;
             this.bound.add(header);
             header.classList.add('eh-drag-handle');
+            const threshold = 7;
+            const blockedSelector = 'button, input, select, textarea, a, label, [role="button"], [contenteditable="true"], .eh-panel-resize-grip';
+
             header.addEventListener('pointerdown', event => {
                 if (event.button !== 0) return;
-                if (!this.get(key).allowDrag) return;
-                if (event.target?.closest?.('button, input, select, textarea, a, [role="button"]')) return;
+                const cfg = this.get(key);
+                if (!cfg.allowDrag) return;
+                if (event.target?.closest?.(blockedSelector)) return;
                 const el = this.element(key);
                 if (!el) return;
                 const rect = el.getBoundingClientRect();
-                this.update(key, { mode: 'free', x: rect.left, y: rect.top, dynamic: false, width: rect.width, height: rect.height });
-                this.drag = { key, pointerId: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
-                header.setPointerCapture?.(event.pointerId);
-                document.documentElement.classList.add('eh-panel-dragging');
-                event.preventDefault();
+                this.drag = {
+                    key,
+                    pointerId: event.pointerId,
+                    startX: event.clientX,
+                    startY: event.clientY,
+                    currentX: event.clientX,
+                    currentY: event.clientY,
+                    dx: event.clientX - rect.left,
+                    dy: event.clientY - rect.top,
+                    startRect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
+                    cfg: { ...cfg },
+                    started: false
+                };
+                try { header.setPointerCapture?.(event.pointerId); } catch (error) {}
             });
+
             header.addEventListener('pointermove', event => {
-                if (!this.drag || this.drag.key !== key || this.drag.pointerId !== event.pointerId) return;
+                const drag = this.drag;
+                if (!drag || drag.key !== key || drag.pointerId !== event.pointerId) return;
+                drag.currentX = event.clientX;
+                drag.currentY = event.clientY;
+                const deltaX = event.clientX - drag.startX;
+                const deltaY = event.clientY - drag.startY;
+                if (!drag.started) {
+                    if (Math.hypot(deltaX, deltaY) < threshold) return;
+                    drag.started = true;
+                    document.documentElement.classList.add('eh-panel-dragging');
+                }
+
                 const el = this.element(key);
                 if (!el) return;
-                const rect = el.getBoundingClientRect();
+                const rect = drag.startRect;
                 const edge = 6;
-                const x = Math.min(window.innerWidth - rect.width - edge, Math.max(edge, event.clientX - this.drag.dx));
-                const y = Math.min(window.innerHeight - rect.height - edge, Math.max(edge, event.clientY - this.drag.dy));
-                this.setImportant(el, 'left', `${x}px`);
-                this.setImportant(el, 'top', `${y}px`);
+                const maxX = Math.max(edge, window.innerWidth - rect.width - edge);
+                const maxY = Math.max(edge, window.innerHeight - rect.height - edge);
+                const mode = String(drag.cfg.mode || 'automatic');
+                let x = Math.min(maxX, Math.max(edge, event.clientX - drag.dx));
+                let y = Math.min(maxY, Math.max(edge, event.clientY - drag.dy));
+
+                // MOVE altera somente posição. Tamanho, zoom, modo dinâmico e lado fixado permanecem intactos.
+                if (mode === 'left' || mode === 'right') {
+                    x = rect.left;
+                } else if (mode === 'top' || mode === 'bottom') {
+                    y = rect.top;
+                } else if (mode === 'top-left' || mode === 'top-right' || mode === 'bottom-left' || mode === 'bottom-right') {
+                    // Cantos fixos não são convertidos silenciosamente em modo livre.
+                    return;
+                }
+
+                this.setImportant(el, 'left', `${Math.round(x)}px`);
+                this.setImportant(el, 'top', `${Math.round(y)}px`);
                 this.setImportant(el, 'right', 'auto');
                 this.setImportant(el, 'bottom', 'auto');
+                event.preventDefault();
             });
+
             const finish = event => {
-                if (!this.drag || this.drag.key !== key) return;
-                const el = this.element(key);
-                const rect = el?.getBoundingClientRect?.();
-                if (rect) this.update(key, { mode: 'free', x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height), dynamic: false });
+                const drag = this.drag;
+                if (!drag || drag.key !== key) return;
                 this.drag = null;
                 document.documentElement.classList.remove('eh-panel-dragging');
                 try { header.releasePointerCapture?.(event.pointerId); } catch (error) {}
+                if (!drag.started) return; // clique normal: ZERO alterações.
+
+                const el = this.element(key);
+                const rect = el?.getBoundingClientRect?.();
+                if (!rect) return;
+                const mode = String(drag.cfg.mode || 'automatic');
+                const patch = {};
+                if (mode === 'left' || mode === 'right') {
+                    patch.y = Math.round(rect.top);
+                } else if (mode === 'top' || mode === 'bottom') {
+                    patch.x = Math.round(rect.left);
+                } else if (mode === 'automatic') {
+                    // O modo automático pode receber uma posição manual sem alterar tamanho/zoom/dinâmico.
+                    patch.x = Math.round(rect.left);
+                    patch.y = Math.round(rect.top);
+                } else if (mode === 'free') {
+                    patch.x = Math.round(rect.left);
+                    patch.y = Math.round(rect.top);
+                }
+                if (Object.keys(patch).length) this.update(key, patch);
             };
             header.addEventListener('pointerup', finish);
             header.addEventListener('pointercancel', finish);
@@ -2941,8 +3110,11 @@
             const grip = this.ensureResizeGrip(key);
             if (!grip || this.resizeBound.has(grip)) return;
             this.resizeBound.add(grip);
+            const threshold = 4;
             grip.addEventListener('pointerdown', event => {
-                if (event.button !== 0 || !this.get(key).allowResize) return;
+                if (event.button !== 0) return;
+                const cfg = this.get(key);
+                if (!cfg.allowResize) return;
                 const el = this.element(key);
                 if (!el) return;
                 const rect = el.getBoundingClientRect();
@@ -2954,49 +3126,75 @@
                     startW: rect.width,
                     startH: rect.height,
                     startLeft: rect.left,
-                    startTop: rect.top
+                    startTop: rect.top,
+                    cfg: { ...cfg },
+                    started: false
                 };
-                grip.setPointerCapture?.(event.pointerId);
-                document.documentElement.classList.add('eh-panel-resizing');
-                event.preventDefault();
+                try { grip.setPointerCapture?.(event.pointerId); } catch (error) {}
                 event.stopPropagation();
             });
+
             grip.addEventListener('pointermove', event => {
-                if (!this.resize || this.resize.key !== key || this.resize.pointerId !== event.pointerId) return;
+                const resize = this.resize;
+                if (!resize || resize.key !== key || resize.pointerId !== event.pointerId) return;
+                const dx = event.clientX - resize.startX;
+                const dy = event.clientY - resize.startY;
+                if (!resize.started) {
+                    if (Math.hypot(dx, dy) < threshold) return;
+                    resize.started = true;
+                    document.documentElement.classList.add('eh-panel-resizing');
+                }
                 const el = this.element(key);
                 if (!el) return;
                 const limits = this.limits(key);
-                const maxW = Math.min(limits.maxW, window.innerWidth - this.resize.startLeft - 6);
-                const maxH = Math.min(limits.maxH, window.innerHeight - this.resize.startTop - 6);
-                const width = Math.min(maxW, Math.max(limits.minW, this.resize.startW + (event.clientX - this.resize.startX)));
-                const height = Math.min(maxH, Math.max(limits.minH, this.resize.startH + (event.clientY - this.resize.startY)));
+                const mode = String(resize.cfg.mode || 'automatic');
+                const anchorRight = mode === 'right' || mode === 'top-right' || mode === 'bottom-right';
+                const anchorBottom = mode === 'bottom' || mode === 'bottom-left' || mode === 'bottom-right';
+                const widthDelta = anchorRight ? -dx : dx;
+                const heightDelta = anchorBottom ? -dy : dy;
+                const horizontalRoom = anchorRight
+                    ? resize.startLeft + resize.startW - 6
+                    : window.innerWidth - resize.startLeft - 6;
+                const verticalRoom = anchorBottom
+                    ? resize.startTop + resize.startH - 6
+                    : window.innerHeight - resize.startTop - 6;
+                const maxW = Math.max(limits.minW, Math.min(limits.maxW, horizontalRoom));
+                const maxH = Math.max(limits.minH, Math.min(limits.maxH, verticalRoom));
+                const width = Math.min(maxW, Math.max(limits.minW, resize.startW + widthDelta));
+                const height = Math.min(maxH, Math.max(limits.minH, resize.startH + heightDelta));
                 this.setImportant(el, 'width', `${Math.round(width)}px`);
                 this.setImportant(el, 'height', `${Math.round(height)}px`);
+                if (anchorRight) this.setImportant(el, 'left', `${Math.round(resize.startLeft + resize.startW - width)}px`);
+                if (anchorBottom) this.setImportant(el, 'top', `${Math.round(resize.startTop + resize.startH - height)}px`);
                 event.preventDefault();
+                event.stopPropagation();
             });
+
             const finish = event => {
-                if (!this.resize || this.resize.key !== key) return;
-                const el = this.element(key);
-                const rect = el?.getBoundingClientRect?.();
-                if (rect) {
-                    this.update(key, {
-                        mode: 'free',
-                        x: Math.round(rect.left),
-                        y: Math.round(rect.top),
-                        width: Math.round(rect.width),
-                        height: Math.round(rect.height),
-                        dynamic: false
-                    });
-                }
+                const resize = this.resize;
+                if (!resize || resize.key !== key) return;
                 this.resize = null;
                 document.documentElement.classList.remove('eh-panel-resizing');
                 try { grip.releasePointerCapture?.(event.pointerId); } catch (error) {}
+                if (!resize.started) return;
+
+                const el = this.element(key);
+                const rect = el?.getBoundingClientRect?.();
+                if (!rect) return;
+                // RESIZE altera dimensão; nunca muda dock/lado/zoom.
+                // Ajuste manual desliga somente o tamanho dinâmico para respeitar o usuário.
+                this.update(key, {
+                    width: Math.round(rect.width),
+                    height: Math.round(rect.height),
+                    dynamic: false
+                });
             };
             grip.addEventListener('pointerup', finish);
             grip.addEventListener('pointercancel', finish);
         },
 
         bindAll() {
+            this.validateStored();
             ['main','whatsapp','operation'].forEach(key => {
                 this.bind(key);
                 this.bindHandle(key);
@@ -5462,6 +5660,54 @@
 
         monthSummary(monthKey = this.monthKey(new Date())) {
             return this.summary(this.recordsForPeriod({ monthKey }));
+        },
+
+        monthStats(monthKey = this.monthKey(new Date()), now = new Date()) {
+            const match = String(monthKey || '').match(/^(\d{4})-(\d{2})$/);
+            if (!match) return null;
+            const year = Number(match[1]);
+            const month = Number(match[2]);
+            const daysInMonth = new Date(year, month, 0).getDate();
+            const currentKey = this.monthKey(now);
+            const summary = this.monthSummary(monthKey);
+            const isCurrentMonth = monthKey === currentKey;
+            const isPastMonth = monthKey < currentKey;
+            const isFutureMonth = monthKey > currentKey;
+            const elapsedDays = isCurrentMonth ? Math.max(1, now.getDate()) : (isPastMonth ? daysInMonth : 0);
+            const divisor = Math.max(1, elapsedDays || 1);
+            const merchandiseValue = this.money(summary.merchandiseReceivedValue + summary.merchandiseSentValue);
+            const average = {
+                movement: elapsedDays ? this.money(summary.movement / divisor) : 0,
+                passage: elapsedDays ? this.money(summary.passageValue / divisor) : 0,
+                merchandise: elapsedDays ? this.money(merchandiseValue / divisor) : 0,
+                commission: elapsedDays ? this.money(summary.commission / divisor) : 0
+            };
+            const configuredCommissionPercent = Math.max(0, Number(EH.Config.FINANCE_COMMISSION_PERCENT) || 0);
+            const projectedMovement = this.money(average.movement * daysInMonth);
+            const projection = isCurrentMonth ? {
+                movement: projectedMovement,
+                passage: this.money(average.passage * daysInMonth),
+                merchandise: this.money(average.merchandise * daysInMonth),
+                // Projeção estatística: usa o percentual atualmente configurado no Helper.
+                // Não altera comissão realizada nem cria operação financeira.
+                commission: this.money(projectedMovement * configuredCommissionPercent / 100),
+                commissionPercent: configuredCommissionPercent
+            } : null;
+            return {
+                monthKey,
+                year,
+                month,
+                daysInMonth,
+                elapsedDays,
+                isCurrentMonth,
+                isPastMonth,
+                isFutureMonth,
+                summary,
+                merchandiseValue,
+                average,
+                projection,
+                projectionDate: `${String(daysInMonth).padStart(2,'0')}/${String(month).padStart(2,'0')}`
+            };
         },
 
         companies() {
@@ -11311,15 +11557,17 @@
     };
 
     EH.OperationCars = {
-        MAPS_KEY: 'operationCars.maps.v3',
-        LAST_KEY: 'operationCars.lastMap.v3',
-        SCHEDULE_KEY: 'operationCars.schedule.v1',
-        SELECTED_KEY: 'operationCars.selected.v1',
+        MAPS_KEY: 'operationCars.maps.v4',
+        LAST_KEY: 'operationCars.lastMap.v4',
+        SCHEDULE_KEY: 'operationCars.schedule.v2',
+        SELECTED_KEY: 'operationCars.selected.v2',
         lastDomSignature: '',
         lastMapKey: '',
         stylesInjected: false,
         started: false,
         visibleScheduleRecords: [],
+        rowButtonsBound: new WeakSet(),
+        mapButtons: new Map(),
 
         normalize(value) {
             return EH.Utils.normalize(value || '');
@@ -11363,103 +11611,52 @@
             };
         },
 
-        loadScheduleRecords() {
-            const records = EH.Storage.get(this.SCHEDULE_KEY, []);
-            return Array.isArray(records) ? records : [];
+        timeMinutes(value) {
+            const match = String(value || '').match(/\b(\d{1,2}):(\d{2})\b/);
+            if (!match) return null;
+            const h = Number(match[1]), m = Number(match[2]);
+            if (!Number.isFinite(h) || !Number.isFinite(m) || h > 23 || m > 59) return null;
+            return h * 60 + m;
         },
 
-        saveScheduleRecords(records = []) {
-            const existing = this.loadScheduleRecords();
-            const map = new Map();
-            [...existing, ...(Array.isArray(records)?records:[])].forEach(item => {
-                if (!item?.service) return;
-                const key = [item.service, item.date || '', item.departure || '', this.normalize(item.lineRaw || '')].join('|');
-                map.set(key, item);
-            });
-            const min = new Date(); min.setDate(min.getDate()-2);
-            const minKey = this.todayKey(min);
-            const safe = Array.from(map.values())
-                .filter(item => !item.date || item.date >= minKey)
-                .sort((a,b)=>Number(b.detectedAt||0)-Number(a.detectedAt||0))
-                .slice(0, 120);
-            EH.Storage.set(this.SCHEDULE_KEY, safe);
-            return safe;
+        timeDistance(a, b) {
+            const am = this.timeMinutes(a), bm = this.timeMinutes(b);
+            if (am === null || bm === null) return Infinity;
+            return Math.abs(am - bm);
         },
 
-        selectedCar() {
-            const selected = EH.Storage.get(this.SELECTED_KEY, null);
-            if (!selected?.service) return null;
-            if (selected.date && selected.date !== this.todayKey()) return null;
-            return selected;
+        readFieldText(selectors = []) {
+            const el = EH.Utils.first(selectors);
+            if (!el) return '';
+            if ('value' in el && EH.Utils.clean(el.value || '')) return EH.Utils.clean(el.value);
+            const selected = el.querySelector?.('.ng-value-label, .ng-value, option:checked');
+            return EH.Utils.clean(selected?.textContent || el.textContent || '');
         },
 
-        selectCar(record, { quiet = false } = {}) {
-            if (!record?.service) return;
-            const selected = {
-                service:String(record.service),
-                departure:EH.Utils.clean(record.departure || ''),
-                date:String(record.date || ''),
-                dateBr:String(record.dateBr || ''),
-                time:String(record.time || ''),
-                lineRaw:EH.Utils.clean(record.lineRaw || ''),
-                lineCode:EH.Utils.clean(record.lineCode || record.config?.lineCode || ''),
-                companyCode:EH.Utils.clean(record.companyCode || ''),
-                company:EH.Utils.clean(record.company || ''),
-                selectedAt:Date.now()
+        searchContext() {
+            const origin = this.readFieldText(EH.Selectors.ORIGEM?.length ? EH.Selectors.ORIGEM : EH.Selectors.ORIGEM_SELECT);
+            const destination = this.readFieldText(EH.Selectors.DESTINO?.length ? EH.Selectors.DESTINO : EH.Selectors.DESTINO_SELECT);
+            const dateEl = EH.Utils.first(EH.Selectors.DATA);
+            const rawDate = EH.Utils.clean(dateEl?.value || dateEl?.textContent || '');
+            let date = '';
+            let dateBr = '';
+            if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+                date = rawDate;
+                const [y,m,d] = rawDate.split('-');
+                dateBr = `${d}/${m}/${y}`;
+            } else {
+                date = this.brDateToKey(rawDate);
+                dateBr = rawDate.match(/\d{2}\/\d{2}\/\d{4}/)?.[0] || '';
+            }
+            return {
+                origin: EH.Utils.clean(origin),
+                destination: EH.Utils.clean(destination),
+                date,
+                dateBr
             };
-            EH.Storage.set(this.SELECTED_KEY, selected);
-            this.render();
-            if (!quiet) EH.Toast?.info?.(`Serviço ${selected.service} selecionado.`);
-        },
-
-        clearSelectedCar() {
-            EH.Storage.remove(this.SELECTED_KEY);
-            this.render();
-        },
-
-        searchScheduleRecords(query = '') {
-            const q = this.normalize(query);
-            const visible = this.visibleScheduleRecords?.length ? this.visibleScheduleRecords : [];
-            const stored = this.loadScheduleRecords();
-            const map = new Map();
-            [...visible,...stored].forEach(item => {
-                if (!item?.service) return;
-                const key=[item.service,item.date||'',item.departure||'',this.normalize(item.lineRaw||'')].join('|');
-                if (!map.has(key)) map.set(key,item);
-            });
-            let rows=Array.from(map.values());
-            const today=this.todayKey();
-            rows=rows.filter(item=>!item.date || item.date===today);
-            if (!q) return rows.sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0)||String(a.service).localeCompare(String(b.service)));
-            const digits=q.replace(/\D/g,'');
-            const exactService=rows.filter(item=>String(item.service)===digits && digits);
-            if (exactService.length) return exactService;
-            return rows.filter(item => {
-                const config=this.serviceConfig(item.service);
-                const haystack=this.normalize([
-                    item.service,item.time,item.departure,item.lineRaw,item.lineCode,
-                    item.company,item.companyCode,config?.name,config?.lineCode,config?.operationalTime
-                ].filter(Boolean).join(' '));
-                return haystack.includes(q);
-            }).sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0)||String(a.service).localeCompare(String(b.service)));
-        },
-
-        selectedMapRecord() {
-            const selected=this.selectedCar();
-            if (!selected?.service) return null;
-            const candidates=this.loadMaps().filter(record => String(record.service||'')===String(selected.service));
-            const date=selected.date || this.todayKey();
-            return candidates.filter(record=>!date || record.date===date).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))[0] || null;
-        },
-
-        agencyCode() {
-            return String(EH.Config.OPERATION_AGENCY_CODE || '287').replace(/\D/g, '') || '287';
         },
 
         trailingCode(value) {
-            // A referência operacional é SOMENTE o código numérico final da localidade.
-            // Ex.: "ARENOPOLIS - GO - 287" -> "287".
-            // Não procura 287 no meio do texto, CPF, bilhete, serviço ou qualquer outra coluna.
             const normalized = this.normalize(EH.Utils.clean(value || ''));
             const match = normalized.match(/(?:^|\s*-\s*)(\d+)\s*$/);
             return match ? String(match[1]) : '';
@@ -11469,32 +11666,17 @@
             const raw = EH.Utils.clean(value || '');
             const normalized = this.normalize(raw);
             const code = this.trailingCode(raw);
-
-            // Cidade/UF são apenas descritivos. O código final é extraído separadamente
-            // para que a decisão operacional não dependa do nome ARENOPOLIS.
             const withoutCode = code
                 ? normalized.replace(new RegExp(`\\s*-\\s*${code}\\s*$`), '').trim()
                 : normalized;
             const match = withoutCode.match(/^(.*?)\s*-\s*([A-Z]{2})$/);
             if (!match) return { raw, city: withoutCode, uf: '', code };
-            return {
-                raw,
-                city: EH.Utils.clean(match[1]),
-                uf: match[2],
-                code
-            };
-        },
-
-        isAgencyCode(location) {
-            const parsed = typeof location === 'string' ? this.parseLocation(location) : (location || {});
-            return String(parsed.code || '') === this.agencyCode();
+            return { raw, city: EH.Utils.clean(match[1]), uf: match[2], code };
         },
 
         shortLocation(location) {
             const parsed = typeof location === 'string' ? this.parseLocation(location) : (location || {});
-            const city = EH.Utils.clean(parsed.city || parsed.raw || '');
-            const uf = EH.Utils.clean(parsed.uf || '');
-            return [city, uf].filter(Boolean).join(' - ');
+            return [EH.Utils.clean(parsed.city || parsed.raw || ''), EH.Utils.clean(parsed.uf || '')].filter(Boolean).join(' - ');
         },
 
         parseLine(value) {
@@ -11510,20 +11692,314 @@
                 code = codeMatch[1];
                 left = codeMatch[2];
             }
-            return {
-                raw,
-                code,
-                origin: this.parseLocation(left),
-                destination: this.parseLocation(right)
+            return { raw, code, origin: this.parseLocation(left), destination: this.parseLocation(right) };
+        },
+
+        agencyCode() {
+            return String(EH.Config.OPERATION_AGENCY_CODE || '287').replace(/\D/g, '') || '287';
+        },
+
+        routineConfigs() {
+            const used = new Set();
+            return (Array.isArray(EH.Config.OPERATION_ROUTINES) ? EH.Config.OPERATION_ROUTINES : [])
+                .map((item, index) => {
+                    const time = EH.Utils.clean(item?.operationalTime || '');
+                    const name = EH.Utils.clean(item?.name || '');
+                    const baseId = EH.Utils.clean(item?.id || '') || `${time}-${name}-${index}`;
+                    let id = this.normalize(baseId).replace(/[^A-Z0-9]+/g, '-').replace(/^-+|-+$/g, '').toLowerCase() || `rotina-${index+1}`;
+                    if (used.has(id)) id = `${id}-${index+1}`;
+                    used.add(id);
+                    return {
+                        id,
+                        name: name || `Carro ${index+1}`,
+                        operationalTime: /^\d{1,2}:\d{2}$/.test(time) ? time.padStart(5, '0') : '',
+                        active: item?.active !== undefined ? Boolean(item.active) : true,
+                        originHint: EH.Utils.clean(item?.originHint || ''),
+                        destinationHint: EH.Utils.clean(item?.destinationHint || ''),
+                        companyHint: EH.Utils.clean(item?.companyHint || ''),
+                        lineHint: EH.Utils.clean(item?.lineHint || ''),
+                        order: index
+                    };
+                })
+                .filter(item => item.operationalTime && item.name);
+        },
+
+        routeMatchScore(record, routine) {
+            const tolerance = Math.max(0, Number(EH.Config.OPERATION_TIME_TOLERANCE_MINUTES) || 20);
+            const diff = this.timeDistance(record?.time || record?.departure || '', routine?.operationalTime || '');
+            if (!Number.isFinite(diff) || diff > tolerance) return null;
+
+            let score = Math.max(0, 100 - diff * 2);
+            const originHint = this.normalize(routine.originHint || '');
+            const destinationHint = this.normalize(routine.destinationHint || '');
+            const queryOrigin = this.normalize(record.queryOrigin || '');
+            const queryDestination = this.normalize(record.queryDestination || '');
+            const line = this.normalize(record.lineRaw || '');
+            const company = this.normalize([record.companyCode, record.company].filter(Boolean).join(' '));
+
+            // A origem/destino da PESQUISA é o melhor indicador de sentido.
+            if (originHint && queryOrigin) {
+                if (!queryOrigin.includes(originHint) && !originHint.includes(queryOrigin)) return null;
+                score += 45;
+            } else if (originHint && line.includes(originHint)) {
+                score += 15;
+            }
+
+            if (destinationHint) {
+                // O destino consultado pode ser uma parada intermediária do carro.
+                // Portanto, destino divergente não elimina sozinho o resultado; ele apenas
+                // deixa de receber o bônus. A origem/sentido continua sendo o filtro forte.
+                if (queryDestination && (queryDestination.includes(destinationHint) || destinationHint.includes(queryDestination))) score += 45;
+                else if (line.includes(destinationHint)) score += 25;
+            }
+
+            const companyHint = this.normalize(routine.companyHint || '');
+            if (companyHint) {
+                if (!company.includes(companyHint)) return null;
+                score += 10;
+            }
+            const lineHint = this.normalize(routine.lineHint || '');
+            if (lineHint) {
+                if (!line.includes(lineHint) && !this.normalize(record.lineCode || '').includes(lineHint)) return null;
+                score += 15;
+            }
+            return { score, diff };
+        },
+
+        routineForSchedule(record) {
+            const matches = this.routineConfigs()
+                .filter(item => item.active)
+                .map(routine => ({ routine, match: this.routeMatchScore(record, routine) }))
+                .filter(item => item.match)
+                .sort((a,b) => b.match.score - a.match.score || a.match.diff - b.match.diff || a.routine.order - b.routine.order);
+            return matches[0]?.routine || null;
+        },
+
+        routineStates(date = this.todayKey()) {
+            const rows = this.searchScheduleRecords('').filter(item => !date || !item.date || item.date === date);
+            return this.routineConfigs().filter(item => item.active).map(routine => {
+                const matches = rows
+                    .map(record => ({ record, match: this.routeMatchScore(record, routine) }))
+                    .filter(item => item.match)
+                    .sort((a,b) => b.match.score - a.match.score || a.match.diff - b.match.diff || Number(a.record.timestamp||0)-Number(b.record.timestamp||0))
+                    .map(item => item.record);
+                return { routine, matches, primary: matches[0] || null };
+            });
+        },
+
+        routineForService(service, date = this.todayKey()) {
+            const rows = this.searchScheduleRecords('').filter(item =>
+                String(item.service || '') === String(service || '') && (!date || !item.date || item.date === date)
+            );
+            for (const row of rows) {
+                const routine = this.routineForSchedule(row);
+                if (routine) return routine;
+            }
+            return null;
+        },
+
+        loadScheduleRecords() {
+            const records = EH.Storage.get(this.SCHEDULE_KEY, []);
+            return Array.isArray(records) ? records : [];
+        },
+
+        saveScheduleRecords(records = []) {
+            const existing = this.loadScheduleRecords();
+            const map = new Map();
+            [...existing, ...(Array.isArray(records) ? records : [])].forEach(item => {
+                if (!item?.service) return;
+                const key = item.resultKey || [
+                    item.service, item.date || '', item.departure || '',
+                    this.normalize(item.lineRaw || ''), this.normalize(item.floor || ''),
+                    this.normalize(item.queryOrigin || ''), this.normalize(item.queryDestination || '')
+                ].join('|');
+                map.set(key, { ...item, resultKey:key });
+            });
+            const min = new Date(); min.setDate(min.getDate()-3);
+            const minKey = this.todayKey(min);
+            const safe = Array.from(map.values())
+                .filter(item => !item.date || item.date >= minKey)
+                .sort((a,b)=>Number(b.detectedAt||0)-Number(a.detectedAt||0))
+                .slice(0, 220);
+            EH.Storage.set(this.SCHEDULE_KEY, safe);
+            return safe;
+        },
+
+        detectFloor(row) {
+            const text = this.normalize(row?.textContent || '');
+            if (text.includes('1º ANDAR') || text.includes('1° ANDAR') || text.includes('1 ANDAR')) return '1º andar';
+            if (text.includes('2º ANDAR') || text.includes('2° ANDAR') || text.includes('2 ANDAR')) return '2º andar';
+            return '';
+        },
+
+        bindScheduleMapButton(row, record) {
+            const button = Array.from(row?.querySelectorAll?.('button') || []).find(btn => this.normalize(btn.getAttribute('title') || btn.textContent || '').includes('MAPA'));
+            if (!button) return;
+            if (record?.resultKey) this.mapButtons.set(String(record.resultKey), button);
+            if (this.rowButtonsBound.has(button)) return;
+            this.rowButtonsBound.add(button);
+            button.addEventListener('pointerdown', () => this.selectCar(record, { quiet:true }), true);
+            button.addEventListener('click', () => this.selectCar(record, { quiet:true }), true);
+        },
+
+        openScheduleMap(record) {
+            if (!record?.service) return false;
+            this.selectCar(record, { quiet:true });
+            const button = this.mapButtons.get(String(record.resultKey || ''));
+            if (button?.isConnected) {
+                button.click();
+                return true;
+            }
+            EH.Toast?.info?.('O carro foi selecionado. Para abrir o mapa, mantenha a pesquisa de horários correspondente visível no E-Pass.');
+            return false;
+        },
+
+        readScheduleResults() {
+            const tables = Array.from(document.querySelectorAll('app-pesquisa-venda table, app-pesquisa table, table.table-hover'));
+            const table = tables.find(item => {
+                const headers = Array.from(item.querySelectorAll('thead th')).map(th => this.normalize(th.textContent));
+                return headers.includes('SERVICO') && headers.some(h => h.includes('HORARIO DE SAIDA')) && headers.includes('LINHA');
+            });
+            if (!table) {
+                this.visibleScheduleRecords = [];
+                return [];
+            }
+
+            const headers = Array.from(table.querySelectorAll('thead th')).map(th => this.normalize(th.textContent));
+            const idx = {
+                service: headers.findIndex(h => h === 'SERVICO'),
+                departure: headers.findIndex(h => h.includes('HORARIO DE SAIDA')),
+                line: headers.findIndex(h => h === 'LINHA'),
+                arrival: headers.findIndex(h => h.includes('HORARIO DE CHEGADA'))
             };
+            const context = this.searchContext();
+            const now = Date.now();
+            this.mapButtons.clear();
+
+            const rows = Array.from(table.querySelectorAll('tbody tr')).map((row, rowIndex) => {
+                const cells = Array.from(row.querySelectorAll(':scope > td'));
+                const texts = cells.map(td => EH.Utils.clean(td.textContent || ''));
+                const service = String(texts[idx.service >= 0 ? idx.service : 0] || '').replace(/\D/g, '');
+                if (!service) return null;
+                const departure = EH.Utils.clean(texts[idx.departure >= 0 ? idx.departure : 1] || '');
+                const dt = this.parseScheduleDateTime(departure);
+                const lineCell = cells[idx.line >= 0 ? idx.line : 2];
+                const badge = lineCell?.querySelector?.('.badge');
+                const companyCode = EH.Utils.clean(badge?.textContent || '');
+                let lineRaw = EH.Utils.clean(lineCell?.textContent || '');
+                if (companyCode && this.normalize(lineRaw).startsWith(this.normalize(companyCode))) {
+                    lineRaw = EH.Utils.clean(lineRaw.slice(companyCode.length));
+                }
+                const parsedLine = this.parseLine(lineRaw);
+                const company = EH.Utils.clean(EH.Config.LINHAS?.[companyCode] || companyCode || '');
+                const floor = this.detectFloor(row);
+                const date = dt.date || context.date || '';
+                const dateBr = dt.dateBr || context.dateBr || '';
+                const record = {
+                    rowIndex,
+                    service,
+                    departure,
+                    date,
+                    dateBr,
+                    time:dt.time,
+                    timestamp:dt.timestamp,
+                    arrival: EH.Utils.clean(texts[idx.arrival >= 0 ? idx.arrival : 3] || ''),
+                    lineRaw,
+                    lineCode: parsedLine.code || '',
+                    lineOrigin: parsedLine.origin || null,
+                    lineDestination: parsedLine.destination || null,
+                    companyCode,
+                    company,
+                    floor,
+                    queryOrigin: context.origin,
+                    queryDestination: context.destination,
+                    detectedAt: now
+                };
+                record.resultKey = [
+                    record.service, record.date, record.departure, this.normalize(record.lineRaw),
+                    this.normalize(record.floor), this.normalize(record.queryOrigin), this.normalize(record.queryDestination)
+                ].join('|');
+                record.routineId = this.routineForSchedule(record)?.id || '';
+                this.bindScheduleMapButton(row, record);
+                return record;
+            }).filter(Boolean);
+
+            const unique = Array.from(new Map(rows.map(item => [item.resultKey, item])).values());
+            this.visibleScheduleRecords = unique;
+            this.saveScheduleRecords(unique);
+            return unique;
+        },
+
+        scanScheduleList() {
+            return this.readScheduleResults();
+        },
+
+        searchScheduleRecords(query = '') {
+            const q = this.normalize(query);
+            const visible = this.visibleScheduleRecords?.length ? this.visibleScheduleRecords : [];
+            const stored = this.loadScheduleRecords();
+            const map = new Map();
+            [...visible,...stored].forEach(item => {
+                if (!item?.service) return;
+                const key = item.resultKey || [item.service,item.date||'',item.departure||'',this.normalize(item.lineRaw||''),this.normalize(item.floor||'')].join('|');
+                if (!map.has(key)) map.set(key,item);
+            });
+            const today = this.todayKey();
+            let rows = Array.from(map.values()).filter(item => !item.date || item.date === today);
+            if (!q) return rows.sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0)||String(a.service).localeCompare(String(b.service)));
+            const digits = q.replace(/\D/g,'');
+            const exactService = digits ? rows.filter(item => String(item.service) === digits) : [];
+            if (exactService.length) return exactService;
+            return rows.filter(item => {
+                const routine = this.routineForSchedule(item);
+                const haystack = this.normalize([
+                    item.service,item.time,item.departure,item.lineRaw,item.lineCode,item.company,item.companyCode,
+                    item.queryOrigin,item.queryDestination,item.floor,routine?.name,routine?.operationalTime
+                ].filter(Boolean).join(' '));
+                return haystack.includes(q);
+            }).sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0)||String(a.service).localeCompare(String(b.service)));
+        },
+
+        selectedCar() {
+            const selected = EH.Storage.get(this.SELECTED_KEY, null);
+            if (!selected?.service) return null;
+            if (selected.date && selected.date !== this.todayKey()) return null;
+            return selected;
+        },
+
+        selectCar(record, { quiet = false } = {}) {
+            if (!record?.service) return;
+            const routine = this.routineForSchedule(record);
+            const selected = {
+                resultKey: String(record.resultKey || ''),
+                service:String(record.service),
+                departure:EH.Utils.clean(record.departure || ''),
+                date:String(record.date || ''),
+                dateBr:String(record.dateBr || ''),
+                time:String(record.time || ''),
+                lineRaw:EH.Utils.clean(record.lineRaw || ''),
+                lineCode:EH.Utils.clean(record.lineCode || ''),
+                companyCode:EH.Utils.clean(record.companyCode || ''),
+                company:EH.Utils.clean(record.company || ''),
+                floor:EH.Utils.clean(record.floor || ''),
+                queryOrigin:EH.Utils.clean(record.queryOrigin || ''),
+                queryDestination:EH.Utils.clean(record.queryDestination || ''),
+                routineId:routine?.id || record.routineId || '',
+                selectedAt:Date.now()
+            };
+            EH.Storage.set(this.SELECTED_KEY, selected);
+            this.render();
+            if (!quiet) EH.Toast?.info?.(`Serviço ${selected.service}${selected.floor ? ` • ${selected.floor}` : ''} selecionado.`);
+        },
+
+        clearSelectedCar() {
+            EH.Storage.remove(this.SELECTED_KEY);
+            this.render();
         },
 
         metadataFromCard(card) {
             const body = card?.querySelector?.('.body') || card;
-            const text = String(body?.innerText || body?.textContent || '')
-                .replace(/\u00a0/g, ' ')
-                .replace(/\s+/g, ' ')
-                .trim();
+            const text = String(body?.innerText || body?.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
             const service = EH.Utils.clean(text.match(/Servi[cç]o:\s*([^\s]+)(?=\s+Data do Servi[cç]o:|$)/i)?.[1] || '');
             const dateMatch = text.match(/Data do Servi[cç]o:\s*(\d{2}\/\d{2}\/\d{4})\s*-\s*Hor[aá]rio:\s*(\d{2}:\d{2}:\d{2})/i);
             const lineRaw = EH.Utils.clean(text.match(/Linha:\s*(.+)$/i)?.[1] || '');
@@ -11532,10 +12008,10 @@
                 service,
                 serviceDateBr: dateMatch?.[1] || '',
                 serviceDate: this.brDateToKey(dateMatch?.[1] || ''),
-                lineDeparture: dateMatch?.[2] ? dateMatch[2].slice(0, 5) : '',
+                lineDeparture: dateMatch?.[2] ? dateMatch[2].slice(0,5) : '',
                 line: this.parseLine(lineRaw),
                 agency,
-                raw: text
+                raw:text
             };
         },
 
@@ -11554,1159 +12030,630 @@
             const headers = this.tableHeaders(table);
             const indexOf = patterns => headers.findIndex(header => patterns.some(pattern => header.includes(pattern)));
             const idx = {
-                name: indexOf(['NOME']),
-                ticket: indexOf(['BILHETE']),
-                cpf: indexOf(['CPF']),
-                seat: indexOf(['POLTRONA']),
-                origin: indexOf(['ORIGEM']),
-                destination: indexOf(['DESTINO'])
+                name:indexOf(['NOME']), ticket:indexOf(['BILHETE']), cpf:indexOf(['CPF']),
+                seat:indexOf(['POLTRONA']), origin:indexOf(['ORIGEM']), destination:indexOf(['DESTINO'])
             };
-            return Array.from(table?.querySelectorAll?.('tbody tr') || []).map((row, rowIndex) => {
-                const cells = Array.from(row.querySelectorAll('td')).map(td => EH.Utils.clean(td.textContent));
-                if (!cells.length) return null;
+            return Array.from(table?.querySelectorAll?.('tbody tr') || []).map((row,rowIndex)=>{
+                const cells=Array.from(row.querySelectorAll('td')).map(td=>EH.Utils.clean(td.textContent));
+                if(!cells.length)return null;
                 return {
                     rowIndex,
-                    name: idx.name >= 0 ? cells[idx.name] || '' : '',
-                    ticket: idx.ticket >= 0 ? cells[idx.ticket] || '' : '',
-                    cpf: idx.cpf >= 0 ? String(cells[idx.cpf] || '').replace(/\D/g, '') : '',
-                    seat: idx.seat >= 0 ? cells[idx.seat] || '' : '',
-                    origin: this.parseLocation(idx.origin >= 0 ? cells[idx.origin] || '' : ''),
-                    destination: this.parseLocation(idx.destination >= 0 ? cells[idx.destination] || '' : '')
+                    name:idx.name>=0?cells[idx.name]||'':'',
+                    ticket:idx.ticket>=0?cells[idx.ticket]||'':'',
+                    cpf:idx.cpf>=0?String(cells[idx.cpf]||'').replace(/\D/g,''):'',
+                    seat:idx.seat>=0?cells[idx.seat]||'':'',
+                    origin:this.parseLocation(idx.origin>=0?cells[idx.origin]||'':''),
+                    destination:this.parseLocation(idx.destination>=0?cells[idx.destination]||'':'')
                 };
             }).filter(Boolean);
         },
 
         parseLocalities(table) {
-            const headers = this.tableHeaders(table);
-            const indexOf = patterns => headers.findIndex(header => patterns.some(pattern => header.includes(pattern)));
-            const idx = {
-                locality: indexOf(['LOCALIDADE']),
-                board: indexOf(['EMBARQUE']),
-                alight: indexOf(['DESEMBARQUE']),
-                balance: indexOf(['SALDO'])
-            };
-            const number = value => {
-                const parsed = Number(String(value ?? '').replace(/[^\d-]/g, ''));
-                return Number.isFinite(parsed) ? parsed : null;
-            };
-            return Array.from(table?.querySelectorAll?.('tbody tr') || []).map((row, order) => {
-                const cells = Array.from(row.querySelectorAll('td')).map(td => EH.Utils.clean(td.textContent));
-                if (!cells.length) return null;
+            const headers=this.tableHeaders(table);
+            const indexOf=patterns=>headers.findIndex(header=>patterns.some(pattern=>header.includes(pattern)));
+            const idx={locality:indexOf(['LOCALIDADE']),board:indexOf(['EMBARQUE']),alight:indexOf(['DESEMBARQUE']),balance:indexOf(['SALDO'])};
+            const number=value=>{const parsed=Number(String(value??'').replace(/[^\d-]/g,''));return Number.isFinite(parsed)?parsed:null;};
+            return Array.from(table?.querySelectorAll?.('tbody tr')||[]).map((row,order)=>{
+                const cells=Array.from(row.querySelectorAll('td')).map(td=>EH.Utils.clean(td.textContent));
+                if(!cells.length)return null;
                 return {
                     order,
-                    location: this.parseLocation(idx.locality >= 0 ? cells[idx.locality] || '' : ''),
-                    board: number(idx.board >= 0 ? cells[idx.board] : null),
-                    alight: number(idx.alight >= 0 ? cells[idx.alight] : null),
-                    balance: number(idx.balance >= 0 ? cells[idx.balance] : null)
+                    location:this.parseLocation(idx.locality>=0?cells[idx.locality]||'':''),
+                    board:number(idx.board>=0?cells[idx.board]:null),
+                    alight:number(idx.alight>=0?cells[idx.alight]:null),
+                    balance:number(idx.balance>=0?cells[idx.balance]:null)
                 };
             }).filter(Boolean);
         },
 
         findMapSections(modal) {
-            const body = modal?.querySelector?.('.nsm-body') || modal;
-            if (!body) return [];
-            const sections = [];
-            let current = null;
-
-            Array.from(body.children || []).forEach(child => {
-                const normalized = this.normalize(child.textContent || '');
-                const isMetadata = child.matches?.('.card') && normalized.includes('SERVICO:') && normalized.includes('DATA DO SERVICO:') && normalized.includes('LINHA:');
-                if (isMetadata) {
-                    if (current) sections.push(current);
-                    current = { metadata: this.metadataFromCard(child), passengerTable: null, localityTable: null };
-                    return;
-                }
-                if (!current) return;
-                const table = child.matches?.('table') ? child : child.querySelector?.('table');
-                if (!table) return;
-                const type = this.tableType(table);
-                if (type === 'passengers' && !current.passengerTable) current.passengerTable = table;
-                else if (type === 'localities' && !current.localityTable) current.localityTable = table;
+            const body=modal?.querySelector?.('.nsm-body')||modal;
+            if(!body)return[];
+            const metadataCards=Array.from(body.querySelectorAll('.card')).filter(card=>{
+                const n=this.normalize(card.textContent||'');
+                return n.includes('SERVICO:')&&n.includes('DATA DO SERVICO:')&&n.includes('LINHA:');
             });
-            if (current) sections.push(current);
+            if(!metadataCards.length)return[];
 
-            if (!sections.length) {
-                const metadataCards = Array.from(modal.querySelectorAll('.card')).filter(card => {
-                    const normalized = this.normalize(card.textContent || '');
-                    return normalized.includes('SERVICO:') && normalized.includes('DATA DO SERVICO:') && normalized.includes('LINHA:');
-                });
-                const tables = Array.from(modal.querySelectorAll('table'));
-                metadataCards.forEach((card, index) => {
-                    const nextCard = metadataCards[index + 1];
-                    const after = tables.filter(table => Boolean(card.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING));
-                    const inRange = nextCard ? after.filter(table => Boolean(table.compareDocumentPosition(nextCard) & Node.DOCUMENT_POSITION_FOLLOWING)) : after;
-                    sections.push({
-                        metadata: this.metadataFromCard(card),
-                        passengerTable: inRange.find(table => this.tableType(table) === 'passengers') || null,
-                        localityTable: inRange.find(table => this.tableType(table) === 'localities') || null
+            const sections=[];
+            metadataCards.forEach((card,index)=>{
+                const nextCard=metadataCards[index+1]||null;
+                const section={metadata:this.metadataFromCard(card),passengerTable:null,localityTable:null,sectionIndex:index};
+                let node=card.nextElementSibling;
+                while(node&&node!==nextCard){
+                    const tables=node.matches?.('table')?[node]:Array.from(node.querySelectorAll?.('table')||[]);
+                    tables.forEach(table=>{
+                        const type=this.tableType(table);
+                        if(type==='passengers'&&!section.passengerTable)section.passengerTable=table;
+                        else if(type==='localities'&&!section.localityTable)section.localityTable=table;
                     });
-                });
-            }
-            return sections.filter(section => section.metadata?.service);
-        },
-
-        sortPassengers(items = []) {
-            const result = items.slice();
-            if (!EH.Config.OPERATION_SORT_BY_SEAT) return result;
-            return result.sort((a, b) => {
-                const seatA = Number(String(a.seat || '').match(/\d+/)?.[0] || 9999);
-                const seatB = Number(String(b.seat || '').match(/\d+/)?.[0] || 9999);
-                return seatA - seatB || String(a.name || '').localeCompare(String(b.name || ''), 'pt-BR');
-            });
-        },
-
-        agencySummary(passengers = [], localities = []) {
-            const code = this.agencyCode();
-            const rows = localities.filter(item => String(item?.location?.code || '') === code);
-            const boarders = this.sortPassengers(passengers.filter(item => String(item?.origin?.code || '') === code));
-            const alighters = this.sortPassengers(passengers.filter(item => String(item?.destination?.code || '') === code));
-
-            if (!rows.length) {
-                return {
-                    exists: false,
-                    multiple: false,
-                    rows: [],
-                    row: null,
-                    board: null,
-                    alight: null,
-                    balance: null,
-                    boarders,
-                    alighters,
-                    warning: '',
-                    resolution: 'not-found',
-                    countsMatchPassengers: null,
-                    code
-                };
-            }
-
-            // Duplicatas idênticas do DOM são tratadas como uma única representação.
-            const distinct = [];
-            const seen = new Set();
-            rows.forEach(item => {
-                const signature = [this.normalize(item.location?.raw), item.board, item.alight, item.balance].join('|');
-                if (seen.has(signature)) return;
-                seen.add(signature);
-                distinct.push(item);
-            });
-
-            let selected = null;
-            let resolution = 'exact-code';
-            let warning = '';
-            if (distinct.length === 1) {
-                selected = distinct[0];
-                if (rows.length > 1) resolution = 'duplicate-dom';
-            } else {
-                // AJUSTE FINO 5.55: a única validação secundária também é baseada no 287.
-                // Conta passageiros cuja ORIGEM termina em 287 e cuja DESTINAÇÃO termina em 287
-                // e procura uma única linha 287 cujos números oficiais coincidam exatamente.
-                const countMatches = distinct.filter(item =>
-                    Number(item.board) === boarders.length && Number(item.alight) === alighters.length
-                );
-                if (countMatches.length === 1) {
-                    selected = countMatches[0];
-                    resolution = 'code-plus-passenger-counts';
-                } else {
-                    // Não usar cidade, UF, horário ou posição para escolher.
-                    // Não somar linhas 287 diferentes e não adivinhar.
-                    warning = `Mais de um registro diferente com código ${code} foi encontrado e nenhum pôde ser confirmado somente pelos passageiros do código ${code}.`;
+                    node=node.nextElementSibling;
                 }
-            }
+                if(!section.passengerTable||!section.localityTable){
+                    const allTables=Array.from(body.querySelectorAll('table'));
+                    const cardIndex=Array.from(body.querySelectorAll('*')).indexOf(card);
+                    const nextIndex=nextCard?Array.from(body.querySelectorAll('*')).indexOf(nextCard):Infinity;
+                    allTables.forEach(table=>{
+                        const all=Array.from(body.querySelectorAll('*'));
+                        const ti=all.indexOf(table);
+                        if(ti<=cardIndex||ti>=nextIndex)return;
+                        const type=this.tableType(table);
+                        if(type==='passengers'&&!section.passengerTable)section.passengerTable=table;
+                        else if(type==='localities'&&!section.localityTable)section.localityTable=table;
+                    });
+                }
+                sections.push(section);
+            });
+            return sections;
+        },
 
-            if (!selected) {
-                return {
-                    exists: true,
-                    multiple: true,
-                    rows,
-                    row: null,
-                    board: null,
-                    alight: null,
-                    balance: null,
-                    boarders,
-                    alighters,
-                    warning,
-                    resolution: 'ambiguous',
-                    countsMatchPassengers: null,
-                    code
-                };
-            }
+        sortPassengers(items=[]) {
+            if(!EH.Config.OPERATION_SORT_BY_SEAT)return items.slice();
+            return items.slice().sort((a,b)=>{
+                const sa=Number(String(a.seat||'').match(/\d+/)?.[0]||9999);
+                const sb=Number(String(b.seat||'').match(/\d+/)?.[0]||9999);
+                return sa-sb||String(a.name||'').localeCompare(String(b.name||''),'pt-BR');
+            });
+        },
 
-            return {
-                exists: true,
-                multiple: false,
-                rows,
-                row: selected,
-                board: selected.board,
-                alight: selected.alight,
-                balance: selected.balance,
-                boarders,
-                alighters,
-                warning,
-                resolution,
-                code,
-                matchedLocality: EH.Utils.clean(selected.location?.raw || ''),
-                countsMatchPassengers: Number(selected.board) === boarders.length && Number(selected.alight) === alighters.length
+        agencySummary(passengers=[],localities=[]) {
+            const code=this.agencyCode();
+            const rows=localities.filter(item=>String(item?.location?.code||'')===code);
+            const boarders=this.sortPassengers(passengers.filter(item=>String(item?.origin?.code||'')===code));
+            const alighters=this.sortPassengers(passengers.filter(item=>String(item?.destination?.code||'')===code));
+            if(!rows.length)return{exists:false,multiple:false,rows:[],row:null,board:null,alight:null,balance:null,boarders,alighters,warning:'',resolution:'not-found',countsMatchPassengers:null,code};
+
+            const distinct=[];const seen=new Set();
+            rows.forEach(item=>{
+                const signature=[this.normalize(item.location?.raw),item.board,item.alight,item.balance].join('|');
+                if(seen.has(signature))return;seen.add(signature);distinct.push(item);
+            });
+            let selected=null,resolution='exact-code',warning='';
+            if(distinct.length===1){selected=distinct[0];if(rows.length>1)resolution='duplicate-dom';}
+            else{
+                const matches=distinct.filter(item=>Number(item.board)===boarders.length&&Number(item.alight)===alighters.length);
+                if(matches.length===1){selected=matches[0];resolution='code-plus-passenger-counts';}
+                else warning=`Mais de um registro diferente com código ${code} foi encontrado e nenhum pôde ser confirmado somente pelos passageiros do código ${code}.`;
+            }
+            if(!selected)return{exists:true,multiple:true,rows,row:null,board:null,alight:null,balance:null,boarders,alighters,warning,resolution:'ambiguous',countsMatchPassengers:null,code};
+            return{
+                exists:true,multiple:false,rows,row:selected,board:selected.board,alight:selected.alight,balance:selected.balance,
+                boarders,alighters,warning,resolution,code,matchedLocality:EH.Utils.clean(selected.location?.raw||''),
+                countsMatchPassengers:Number(selected.board)===boarders.length&&Number(selected.alight)===alighters.length
             };
         },
 
-        buildRecord(section) {
-            const meta = section.metadata;
-            const passengers = section.passengerTable ? this.parsePassengers(section.passengerTable) : [];
-            const localities = section.localityTable ? this.parseLocalities(section.localityTable) : [];
-            const agency = this.agencySummary(passengers, localities);
-            const lineToken = meta.line?.code || this.normalize(meta.line?.raw) || 'SEM-LINHA';
-            return {
-                mapKey: [meta.serviceDate, meta.service, lineToken, meta.lineDeparture].filter(Boolean).join('|'),
-                date: meta.serviceDate,
-                dateBr: meta.serviceDateBr,
-                service: meta.service,
-                lineCode: meta.line?.code || '',
-                lineRaw: meta.line?.raw || '',
-                lineOrigin: meta.line?.origin || null,
-                lineDestination: meta.line?.destination || null,
-                lineDeparture: meta.lineDeparture || '',
-                agencySource: meta.agency || '',
-                agency,
-                updatedAt: Date.now()
+        scheduleCandidates(meta) {
+            const date = meta?.serviceDate || this.todayKey();
+            const map = new Map();
+            [...(this.visibleScheduleRecords||[]),...this.loadScheduleRecords()].forEach(item => {
+                if (String(item?.service||'') !== String(meta?.service||'')) return;
+                if (date && item.date && item.date !== date) return;
+                const key=String(item.resultKey||[item.service,item.date,item.departure,this.normalize(item.lineRaw),this.normalize(item.floor)].join('|'));
+                if(!map.has(key))map.set(key,item);
+            });
+            return Array.from(map.values()).sort((a,b)=>{
+                const lineA=meta?.line?.code&&this.normalize(a.lineCode||'')===this.normalize(meta.line.code)?0:1;
+                const lineB=meta?.line?.code&&this.normalize(b.lineCode||'')===this.normalize(meta.line.code)?0:1;
+                return lineA-lineB||this.timeDistance(a.time,meta?.lineDeparture)-this.timeDistance(b.time,meta?.lineDeparture)||Number(a.rowIndex||0)-Number(b.rowIndex||0);
+            });
+        },
+
+        scheduleForMap(meta) {
+            const rows=this.scheduleCandidates(meta);
+            const selected=this.selectedCar();
+            if(selected?.service===meta?.service){
+                const exact=rows.find(item=>selected.resultKey&&item.resultKey===selected.resultKey);
+                if(exact)return exact;
+            }
+            if(meta?.line?.code){
+                const exactLine=rows.find(item=>this.normalize(item.lineCode||'')===this.normalize(meta.line.code));
+                if(exactLine)return exactLine;
+            }
+            return rows[0]||null;
+        },
+
+        assignSchedulesToSections(sections=[]) {
+            const assignments=new Array(sections.length).fill(null);
+            const used=new Set();
+            const selected=this.selectedCar();
+            sections.forEach((section,index)=>{
+                const meta=section?.metadata||{};
+                const candidates=this.scheduleCandidates(meta);
+                if(!candidates.length)return;
+                const sameServiceSections=sections.filter(other=>String(other?.metadata?.service||'')===String(meta.service||'')&&String(other?.metadata?.serviceDate||'')===String(meta.serviceDate||''));
+                // Quando somente um mapa/andar está aberto, respeita exatamente o resultado clicado.
+                if(sameServiceSections.length===1&&selected?.service===meta.service){
+                    const exact=candidates.find(item=>selected.resultKey&&item.resultKey===selected.resultKey);
+                    if(exact){assignments[index]=exact;used.add(String(exact.resultKey||''));return;}
+                }
+                let pool=candidates;
+                if(meta?.line?.code){
+                    const sameLine=candidates.filter(item=>this.normalize(item.lineCode||'')===this.normalize(meta.line.code));
+                    if(sameLine.length)pool=sameLine;
+                }
+                const unused=pool.find(item=>!used.has(String(item.resultKey||'')))||pool[0];
+                assignments[index]=unused||null;
+                if(unused?.resultKey)used.add(String(unused.resultKey));
+            });
+            return assignments;
+        },
+
+        buildRecord(section, scheduleOverride = null) {
+            const meta=section.metadata;
+            const passengers=section.passengerTable?this.parsePassengers(section.passengerTable):[];
+            const localities=section.localityTable?this.parseLocalities(section.localityTable):[];
+            const agency=this.agencySummary(passengers,localities);
+            const schedule=scheduleOverride||this.scheduleForMap(meta);
+            const routine=schedule?this.routineForSchedule(schedule):this.routineForService(meta.service,meta.serviceDate);
+            const lineToken=meta.line?.code||this.normalize(meta.line?.raw)||'SEM-LINHA';
+            const sectionToken=schedule?.floor?this.normalize(schedule.floor):`secao-${Number(section.sectionIndex||0)+1}`;
+            return{
+                mapKey:[meta.serviceDate,meta.service,lineToken,meta.lineDeparture,sectionToken].filter(Boolean).join('|'),
+                date:meta.serviceDate,dateBr:meta.serviceDateBr,service:meta.service,
+                lineCode:meta.line?.code||'',lineRaw:meta.line?.raw||'',lineOrigin:meta.line?.origin||null,lineDestination:meta.line?.destination||null,
+                lineDeparture:meta.lineDeparture||'',agencySource:meta.agency||'',agency,
+                floor:EH.Utils.clean(schedule?.floor||''),scheduleResultKey:schedule?.resultKey||'',
+                operationalTime:routine?.operationalTime||schedule?.time||'',routineId:routine?.id||'',
+                operationalName:routine?.name||'',companyCode:schedule?.companyCode||'',company:schedule?.company||'',
+                queryOrigin:schedule?.queryOrigin||'',queryDestination:schedule?.queryDestination||'',
+                sectionIndex:Number(section.sectionIndex||0),updatedAt:Date.now()
             };
+        },
+
+        readVehicleMap() {
+            const modal=EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
+            if(!modal)return[];
+            const sections=this.findMapSections(modal);
+            const schedules=this.assignSchedulesToSections(sections);
+            return sections.map((section,index)=>this.buildRecord(section,schedules[index]||null)).filter(record=>record.date&&record.service);
         },
 
         parseCurrentMap() {
-            const modal = EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
-            if (!modal) return [];
-            return this.findMapSections(modal)
-                .map(section => this.buildRecord(section))
-                .filter(record => record.date && record.service);
+            return this.readVehicleMap();
         },
 
-        mapSignature(records = []) {
-            return records.map(record => {
-                const agency = record.agency || {};
-                const passengerTickets = [...(agency.boarders || []), ...(agency.alighters || [])]
-                    .map(item => item.ticket)
-                    .filter(Boolean)
-                    .sort()
-                    .join(',');
-                return [record.mapKey, agency.exists, agency.multiple, agency.board, agency.alight, agency.balance, passengerTickets].join('~');
+        mapSignature(records=[]) {
+            return records.map(record=>{
+                const agency=record.agency||{};
+                const tickets=[...(agency.boarders||[]),...(agency.alighters||[])].map(item=>item.ticket).filter(Boolean).sort().join(',');
+                return[record.mapKey,agency.exists,agency.multiple,agency.board,agency.alight,agency.balance,tickets].join('~');
             }).join('||');
         },
 
-        serviceConfigs() {
-            const result = [];
-            const used = new Set();
-            (Array.isArray(EH.Config.OPERATION_SERVICES) ? EH.Config.OPERATION_SERVICES : []).forEach((item, index) => {
-                const service = String(item?.service || '').replace(/\D/g, '');
-                if (!service || used.has(service)) return;
-                used.add(service);
-                result.push({
-                    service,
-                    name: EH.Utils.clean(item?.name || `Serviço ${service}`),
-                    operationalTime: EH.Utils.clean(item?.operationalTime || ''),
-                    attends: Boolean(item?.attends),
-                    observation: EH.Utils.clean(item?.observation || ''),
-                    lineCode: EH.Utils.clean(item?.lineCode || ''),
-                    order: index
-                });
-            });
-            return result;
-        },
-
-        serviceConfig(service) {
-            return this.serviceConfigs().find(item => item.service === String(service || '')) || null;
-        },
-
-        displayName(record) {
-            const config = this.serviceConfig(record?.service);
-            if (config?.name) return config.name;
-            const origin = this.shortLocation(record?.lineOrigin);
-            const destination = this.shortLocation(record?.lineDestination);
-            return [origin, destination].filter(Boolean).join(' → ') || `Serviço ${record?.service || '—'}`;
-        },
-
         loadMaps() {
-            const records = EH.Storage.get(this.MAPS_KEY, []);
-            return Array.isArray(records) ? records : [];
+            const records=EH.Storage.get(this.MAPS_KEY,[]);
+            return Array.isArray(records)?records:[];
         },
 
-        saveMaps(newRecords = []) {
-            const existing = this.loadMaps();
-            const map = new Map(existing.map(item => [String(item.mapKey || ''), item]));
-            newRecords.forEach(record => {
-                if (record?.mapKey) map.set(record.mapKey, record);
-            });
-            const minDate = new Date();
-            minDate.setDate(minDate.getDate() - 7);
-            const minKey = this.todayKey(minDate);
-            const records = Array.from(map.values())
-                .filter(item => !item.date || item.date >= minKey)
-                .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))
-                .slice(0, 50);
-            EH.Storage.set(this.MAPS_KEY, records);
-            return records;
+        saveMaps(newRecords=[]) {
+            const existing=this.loadMaps();
+            const map=new Map(existing.map(item=>[String(item.mapKey||''),item]));
+            newRecords.forEach(record=>{if(record?.mapKey)map.set(record.mapKey,record);});
+            const min=new Date();min.setDate(min.getDate()-7);const minKey=this.todayKey(min);
+            const records=Array.from(map.values()).filter(item=>!item.date||item.date>=minKey).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0,100);
+            EH.Storage.set(this.MAPS_KEY,records);return records;
         },
 
-        preferredRecord(records = []) {
-            if (!records.length) return null;
-            const service = String(records[0]?.service || '');
-            const config = this.serviceConfig(service);
-            if (config?.lineCode) {
-                const exact = records.find(record => this.normalize(record.lineCode) === this.normalize(config.lineCode));
-                if (exact) return exact;
+        mapsForService(service,date=this.todayKey()) {
+            return this.loadMaps().filter(record=>String(record.service||'')===String(service||'')&&(!date||record.date===date)).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+        },
+
+        selectedMapRecord() {
+            const selected=this.selectedCar();
+            if(!selected?.service)return null;
+            const records=this.mapsForService(selected.service,selected.date||this.todayKey());
+            if(selected.floor){
+                const exact=records.find(record=>this.normalize(record.floor||'')===this.normalize(selected.floor));
+                if(exact)return exact;
             }
-            return records.slice().sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0))[0] || null;
+            if(selected.resultKey){
+                const exact=records.find(record=>record.scheduleResultKey===selected.resultKey);
+                if(exact)return exact;
+            }
+            return records[0]||null;
         },
 
         rememberLast(record) {
-            if (!record?.mapKey) return;
-            this.lastMapKey = record.mapKey;
-            EH.Storage.set(this.LAST_KEY, { date: record.date, mapKey: record.mapKey });
+            if(!record?.mapKey)return;
+            this.lastMapKey=record.mapKey;EH.Storage.set(this.LAST_KEY,{date:record.date,mapKey:record.mapKey});
         },
 
         lastRecord() {
-            const today = this.todayKey();
-            const maps = this.loadMaps().filter(record => record.date === today);
-            const stored = EH.Storage.get(this.LAST_KEY, null);
-            const key = this.lastMapKey || (stored?.date === today ? stored?.mapKey : '');
-            if (key) {
-                const found = maps.find(record => record.mapKey === key);
-                if (found) return found;
-            }
-            return maps[0] || null;
+            const today=this.todayKey();
+            const maps=this.loadMaps().filter(record=>record.date===today);
+            const stored=EH.Storage.get(this.LAST_KEY,null);
+            const key=this.lastMapKey||(stored?.date===today?stored?.mapKey:'');
+            if(key){const found=maps.find(record=>record.mapKey===key);if(found)return found;}
+            return maps[0]||null;
         },
 
-        bestMapForService(serviceConfig) {
-            const today = this.todayKey();
-            const candidates = this.loadMaps()
-                .filter(record => record.date === today && String(record.service || '') === String(serviceConfig?.service || ''))
-                .sort((a, b) => Number(b.updatedAt || 0) - Number(a.updatedAt || 0));
-            if (!candidates.length) return null;
-            if (serviceConfig?.lineCode) {
-                const exact = candidates.find(record => this.normalize(record.lineCode) === this.normalize(serviceConfig.lineCode));
-                if (exact) return exact;
-            }
-            return candidates[0];
+        displayName(record) {
+            if(record?.operationalName)return record.operationalName;
+            const routine=this.routineForService(record?.service,record?.date||this.todayKey());
+            if(routine?.name)return routine.name;
+            const origin=this.shortLocation(record?.lineOrigin),destination=this.shortLocation(record?.lineDestination);
+            return[origin,destination].filter(Boolean).join(' → ')||`Serviço ${record?.service||'—'}`;
         },
 
-        scanCurrentMap({ quiet = false } = {}) {
-            const records = this.parseCurrentMap();
-            if (!records.length) {
-                if (!quiet) EH.Toast.warning('Abra o “Mapa de Viagem” do carro e aguarde os dados aparecerem.');
-                return { found: false, updated: false, records: [] };
-            }
-            const signature = this.mapSignature(records);
-            const preferred = this.preferredRecord(records);
-            if (signature === this.lastDomSignature) {
-                if (preferred) {
-                    this.rememberLast(preferred);
-                    const schedule = [...(this.visibleScheduleRecords || []), ...this.loadScheduleRecords()]
-                        .filter(item => String(item.service || '') === String(preferred.service || ''))
-                        .sort((a,b)=>Number(b.detectedAt||0)-Number(a.detectedAt||0))[0];
-                    this.selectCar(schedule || {
-                        service: preferred.service,
-                        date: preferred.date,
-                        dateBr: preferred.dateBr,
-                        time: preferred.lineDeparture,
-                        departure: preferred.lineDeparture,
-                        lineCode: preferred.lineCode,
-                        lineRaw: preferred.lineRaw || ''
-                    }, { quiet: true });
-                    EH.Reminders?.linkMapRecord?.(preferred);
+        preferredRecord(records=[]) {
+            if(!records.length)return null;
+            const selected=this.selectedCar();
+            if(selected?.service){
+                const same=records.filter(r=>String(r.service)===String(selected.service));
+                if(selected.floor){
+                    const exact=same.find(r=>this.normalize(r.floor||'')===this.normalize(selected.floor));
+                    if(exact)return exact;
                 }
-                this.render();
-                if (!quiet) EH.Toast.info('Este mapa já está atualizado no Helper.');
-                return { found: true, updated: false, records };
+                if(same[0])return same[0];
             }
-            this.lastDomSignature = signature;
-            this.saveMaps(records);
-            if (preferred) {
+            return records[0]||null;
+        },
+
+        scanCurrentMap({quiet=false}={}) {
+            const records=this.readVehicleMap();
+            if(!records.length){
+                if(!quiet)EH.Toast.warning('Abra o Mapa de Viagem para atualizar o código 287.');
+                return{found:false,updated:false,records:[]};
+            }
+            const signature=this.mapSignature(records);
+            const preferred=this.preferredRecord(records);
+            const changed=signature!==this.lastDomSignature;
+            if(changed){
+                this.lastDomSignature=signature;
+                this.saveMaps(records);
+            }
+            if(preferred){
                 this.rememberLast(preferred);
-                const schedule = [...(this.visibleScheduleRecords || []), ...this.loadScheduleRecords()]
-                    .filter(item => String(item.service || '') === String(preferred.service || ''))
-                    .sort((a,b)=>Number(b.detectedAt||0)-Number(a.detectedAt||0))[0];
-                this.selectCar(schedule || {
-                    service: preferred.service,
-                    date: preferred.date,
-                    dateBr: preferred.dateBr,
-                    time: preferred.lineDeparture,
-                    departure: preferred.lineDeparture,
-                    lineCode: preferred.lineCode,
-                    lineRaw: preferred.lineRaw || ''
-                }, { quiet: true });
+                const schedule=this.scheduleForMap({
+                    service:preferred.service,serviceDate:preferred.date,lineDeparture:preferred.lineDeparture,
+                    line:{code:preferred.lineCode,raw:preferred.lineRaw}
+                });
+                if(schedule)this.selectCar(schedule,{quiet:true});
                 EH.Reminders?.linkMapRecord?.(preferred);
             }
             this.render();
-
-            if (!quiet && preferred) {
-                const agency = preferred.agency || {};
-                if (!agency.exists) {
-                    EH.Toast.info(`Serviço ${preferred.service} • código ${this.agencyCode()} não aparece no resumo do mapa.`);
-                } else if (agency.multiple) {
-                    EH.Toast.warning(`Serviço ${preferred.service} • ${agency.warning || `mais de um registro da agência ${this.agencyCode()}.`}`);
-                } else {
-                    EH.Toast.success(`Serviço ${preferred.service} • Agência ${this.agencyCode()}: ↑ ${agency.board ?? '—'} • ↓ ${agency.alight ?? '—'} • 🚌 ${agency.balance ?? '—'}`);
-                }
+            if(!quiet&&preferred){
+                const agency=preferred.agency||{};
+                if(!agency.exists)EH.Toast.info(`Serviço ${preferred.service} • código ${this.agencyCode()} não aparece no resumo do mapa.`);
+                else if(agency.multiple)EH.Toast.warning(`Serviço ${preferred.service} • ${agency.warning||`mais de um registro da agência ${this.agencyCode()}.`}`);
+                else EH.Toast.success(`Serviço ${preferred.service} • Agência ${this.agencyCode()}: ↑ ${agency.board??'—'} • ↓ ${agency.alight??'—'} • 🚌 ${agency.balance??'—'}`);
             }
-            return { found: true, updated: true, records };
+            return{found:true,updated:changed,records};
         },
 
         seatLabel(value) {
-            const text = EH.Utils.clean(value || '—');
-            const number = Number(String(text).match(/\d+/)?.[0]);
-            return Number.isFinite(number) ? String(number).padStart(2, '0') : text;
+            const text=EH.Utils.clean(value||'—');const n=Number(String(text).match(/\d+/)?.[0]);
+            return Number.isFinite(n)?String(n).padStart(2,'0'):text;
         },
 
-        passengerSecondary(item, kind) {
-            if (kind === 'board') return `→ ${this.shortLocation(item?.destination) || 'Destino não identificado'}`;
-            if (kind === 'alight') return `${this.shortLocation(item?.origin) || 'Origem não identificada'} → ${this.shortLocation(item?.destination) || 'destino'}`;
-            return `${this.shortLocation(item?.origin)} → ${this.shortLocation(item?.destination)}`;
+        passengerSecondary(item,kind) {
+            if(kind==='board')return`→ ${this.shortLocation(item?.destination)||'Destino não identificado'}`;
+            if(kind==='alight')return`${this.shortLocation(item?.origin)||'Origem não identificada'} → ${this.shortLocation(item?.destination)||'destino'}`;
+            return`${this.shortLocation(item?.origin)} → ${this.shortLocation(item?.destination)}`;
         },
 
         resolveRecord(recordOrService) {
-            if (recordOrService?.mapKey) return recordOrService;
-            const config = typeof recordOrService === 'string' ? this.serviceConfig(recordOrService) : recordOrService;
-            return config ? this.bestMapForService(config) : this.lastRecord();
+            if(recordOrService?.mapKey)return recordOrService;
+            if(typeof recordOrService==='string')return this.mapsForService(recordOrService)[0]||null;
+            return this.lastRecord();
         },
 
-        showPassengers(recordOrService, kind = 'board') {
-            const record = this.resolveRecord(recordOrService);
-            if (!record) {
-                EH.Toast.warning('O mapa deste carro ainda não foi atualizado.');
-                return;
-            }
-            const agency = record.agency || {};
-            if (!agency.exists) {
-                EH.Toast.info(`Código ${this.agencyCode()} não aparece no resumo deste mapa.`);
-                return;
-            }
-            if (agency.multiple) {
-                EH.Toast.warning(agency.warning || `Mais de um registro da agência ${this.agencyCode()} encontrado.`);
-                return;
-            }
-            const items = kind === 'alight' ? (agency.alighters || []) : (agency.boarders || []);
-            const config = this.serviceConfig(record.service);
-            const titleText = kind === 'alight'
-                ? `DESEMBARQUES — AGÊNCIA ${this.agencyCode()}`
-                : `EMBARQUES — AGÊNCIA ${this.agencyCode()}`;
+        showPassengers(recordOrService,kind='board') {
+            const record=this.resolveRecord(recordOrService);
+            if(!record){EH.Toast.warning('O mapa deste carro ainda não foi atualizado.');return;}
+            const agency=record.agency||{};
+            if(!agency.exists){EH.Toast.info(`Código ${this.agencyCode()} não aparece no resumo deste mapa.`);return;}
+            if(agency.multiple){EH.Toast.warning(agency.warning||`Mais de um registro da agência ${this.agencyCode()} encontrado.`);return;}
+            const items=kind==='alight'?(agency.alighters||[]):(agency.boarders||[]);
             document.querySelector('#eh-operation-passengers-modal')?.remove();
-
-            const overlay = document.createElement('div');
-            overlay.id = 'eh-operation-passengers-modal';
-            overlay.className = 'eh-overlay eh-operation-overlay';
-            const modal = document.createElement('div');
-            modal.className = 'eh-modal eh-operation-modal';
-            const head = document.createElement('div');
-            head.className = 'eh-modal-head';
-            const headText = document.createElement('div');
-            headText.style.flex = '1';
-            const title = document.createElement('div');
-            title.className = 'eh-modal-title';
-            title.textContent = titleText;
-            const note = document.createElement('div');
-            note.className = 'eh-modal-note';
-            note.textContent = `${config?.operationalTime || record.lineDeparture || '—'} • ${this.displayName(record)} • Serviço ${record.service}`;
-            headText.append(title, note);
-            const close = document.createElement('button');
-            close.type = 'button';
-            close.className = 'eh-modal-close';
-            close.textContent = '×';
-            head.append(headText, close);
-
-            const content = document.createElement('div');
-            content.className = 'eh-modal-content eh-operation-passenger-list';
-            if (!items.length) {
-                const empty = document.createElement('div');
-                empty.className = 'eh-operation-empty';
-                empty.textContent = kind === 'alight'
-                    ? `Nenhum passageiro com destino associado ao código ${this.agencyCode()} foi encontrado.`
-                    : `Nenhum passageiro com origem associada ao código ${this.agencyCode()} foi encontrado.`;
+            const overlay=document.createElement('div');overlay.id='eh-operation-passengers-modal';overlay.className='eh-overlay eh-operation-overlay';
+            const modal=document.createElement('div');modal.className='eh-modal eh-operation-modal';
+            const head=document.createElement('div');head.className='eh-modal-head';
+            const headText=document.createElement('div');headText.style.flex='1';
+            const title=document.createElement('div');title.className='eh-modal-title';title.textContent=kind==='alight'?`DESEMBARQUES — AGÊNCIA ${this.agencyCode()}`:`EMBARQUES — AGÊNCIA ${this.agencyCode()}`;
+            const note=document.createElement('div');note.className='eh-modal-note';
+            note.textContent=`${record.operationalTime||record.lineDeparture||'—'} • ${this.displayName(record)} • Serviço ${record.service}${record.floor?` • ${record.floor}`:''}`;
+            headText.append(title,note);const close=document.createElement('button');close.type='button';close.className='eh-modal-close';close.textContent='×';head.append(headText,close);
+            const content=document.createElement('div');content.className='eh-modal-content eh-operation-passenger-list';
+            if(!items.length){
+                const empty=document.createElement('div');empty.className='eh-operation-empty';
+                empty.textContent=kind==='alight'?`Nenhum passageiro com destino associado ao código ${this.agencyCode()} foi encontrado.`:`Nenhum passageiro com origem associada ao código ${this.agencyCode()} foi encontrado.`;
                 content.appendChild(empty);
-            } else {
-                items.forEach(item => {
-                    const row = document.createElement('div');
-                    row.className = 'eh-operation-passenger';
-                    const seat = document.createElement('strong');
-                    seat.className = 'eh-operation-seat';
-                    seat.textContent = this.seatLabel(item.seat);
-                    const info = document.createElement('div');
-                    info.className = 'eh-operation-passenger-info';
-                    const name = document.createElement('strong');
-                    name.textContent = item.name || 'Passageiro sem nome';
-                    const route = document.createElement('small');
-                    route.textContent = this.passengerSecondary(item, kind);
-                    info.append(name, route);
-                    const reminder = EH.Reminders?.matchPassenger?.(item, record);
-                    if (reminder) {
-                        const pending = document.createElement('small');
-                        pending.className = `eh-operation-reminder-state ${reminder.status === 'completed' ? 'done' : 'pending'}`;
-                        pending.textContent = reminder.status === 'completed'
-                            ? '✓ Bilhete já impresso/concluído'
-                            : `⚠ Precisa imprimir passagem${reminder.cpf ? ` • CPF ${EH.Reminders.maskCpf(reminder.cpf)}` : ''}`;
-                        info.appendChild(pending);
-                    }
-                    row.append(seat, info);
-                    content.appendChild(row);
-                });
-            }
-
-            const footer = document.createElement('div');
-            footer.className = 'eh-modal-actions';
-            const closeBottom = document.createElement('button');
-            closeBottom.type = 'button';
-            closeBottom.className = 'eh-modal-btn';
-            closeBottom.textContent = 'Fechar';
-            footer.appendChild(closeBottom);
-            modal.append(head, content, footer);
-            overlay.appendChild(modal);
-            document.body.appendChild(overlay);
-            const dismiss = () => overlay.remove();
-            close.addEventListener('click', dismiss);
-            closeBottom.addEventListener('click', dismiss);
-            overlay.addEventListener('click', event => { if (event.target === overlay) dismiss(); });
+            }else items.forEach(item=>{
+                const row=document.createElement('div');row.className='eh-operation-passenger';
+                const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(item.seat);
+                const info=document.createElement('div');info.className='eh-operation-passenger-info';
+                const name=document.createElement('strong');name.textContent=item.name||'Passageiro sem nome';
+                const route=document.createElement('small');route.textContent=this.passengerSecondary(item,kind);info.append(name,route);
+                const reminder=EH.Reminders?.matchPassenger?.(item,record);
+                if(reminder){const pending=document.createElement('small');pending.className=`eh-operation-reminder-state ${reminder.status==='completed'?'done':'pending'}`;pending.textContent=reminder.status==='completed'?'✓ Bilhete já impresso/concluído':`⚠ Precisa imprimir passagem${reminder.cpf?` • CPF ${EH.Reminders.maskCpf(reminder.cpf)}`:''}`;info.appendChild(pending);}
+                row.append(seat,info);content.appendChild(row);
+            });
+            const foot=document.createElement('div');foot.className='eh-modal-actions';const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(close2);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
         showDetails(recordOrService) {
-            const record = this.resolveRecord(recordOrService);
-            if (!record) {
-                EH.Toast.warning('Este serviço ainda não teve um mapa lido hoje.');
-                return;
-            }
+            const record=this.resolveRecord(recordOrService);
+            if(!record){EH.Toast.warning('Este serviço ainda não teve um mapa lido hoje.');return;}
             document.querySelector('#eh-operation-details-modal')?.remove();
-            const agency = record.agency || {};
-            const config = this.serviceConfig(record.service);
-
-            const overlay = document.createElement('div');
-            overlay.id = 'eh-operation-details-modal';
-            overlay.className = 'eh-overlay eh-operation-overlay';
-            const modal = document.createElement('div');
-            modal.className = 'eh-modal eh-operation-modal';
-            const head = document.createElement('div');
-            head.className = 'eh-modal-head';
-            const titleWrap = document.createElement('div');
-            titleWrap.style.flex = '1';
-            const title = document.createElement('div');
-            title.className = 'eh-modal-title';
-            title.textContent = `Serviço ${record.service} — ${this.displayName(record)}`;
-            const note = document.createElement('div');
-            note.className = 'eh-modal-note';
-            note.textContent = `${record.dateBr || record.date || ''}${record.lineCode ? ` • Linha ${record.lineCode}` : ''}${config ? ` • ${config.attends ? 'ATENDO' : 'APENAS CONSULTA'}` : ' • Carro não cadastrado no Helper'}`;
-            titleWrap.append(title, note);
-            const close = document.createElement('button');
-            close.type = 'button';
-            close.className = 'eh-modal-close';
-            close.textContent = '×';
-            head.append(titleWrap, close);
-
-            const content = document.createElement('div');
-            content.className = 'eh-modal-content';
-            const summary = document.createElement('div');
-            summary.className = 'eh-operation-detail-summary';
-            const h = document.createElement('strong');
-            h.textContent = `AGÊNCIA ${this.agencyCode()}`;
-            summary.appendChild(h);
-            if (!agency.exists) {
-                const empty = document.createElement('div');
-                empty.className = 'eh-operation-empty';
-                empty.textContent = `Código ${this.agencyCode()} não aparece no resumo deste mapa.`;
-                summary.appendChild(empty);
-            } else if (agency.multiple) {
-                const warning = document.createElement('div');
-                warning.className = 'eh-operation-warning';
-                warning.textContent = `⚠ ${agency.warning || `Mais de um registro da agência ${this.agencyCode()} encontrado.`}`;
-                summary.appendChild(warning);
-            } else {
-                const metrics = document.createElement('div');
-                metrics.className = 'eh-operation-detail-metrics';
-                [['↑ Embarques', agency.board], ['↓ Desembarques', agency.alight], ['🚌 Saldo', agency.balance]].forEach(([label, value]) => {
-                    const cell = document.createElement('div');
-                    cell.textContent = label;
-                    const strong = document.createElement('strong');
-                    strong.textContent = value === null || value === undefined ? '—' : String(value);
-                    cell.appendChild(strong);
-                    metrics.appendChild(cell);
-                });
-                summary.appendChild(metrics);
-                if (agency.countsMatchPassengers === false) {
-                    const mismatch = document.createElement('div');
-                    mismatch.className = 'eh-operation-warning subtle';
-                    mismatch.textContent = '⚠ Os números oficiais do resumo foram preservados; a quantidade de passageiros listados não coincidiu exatamente.';
-                    summary.appendChild(mismatch);
-                }
+            const agency=record.agency||{};
+            const overlay=document.createElement('div');overlay.id='eh-operation-details-modal';overlay.className='eh-overlay eh-operation-overlay';
+            const modal=document.createElement('div');modal.className='eh-modal eh-operation-modal';
+            const head=document.createElement('div');head.className='eh-modal-head';
+            const titleWrap=document.createElement('div');titleWrap.style.flex='1';
+            const title=document.createElement('div');title.className='eh-modal-title';title.textContent=`Serviço ${record.service} — ${this.displayName(record)}`;
+            const note=document.createElement('div');note.className='eh-modal-note';note.textContent=[record.dateBr||record.date,record.floor,record.lineCode?`Linha ${record.lineCode}`:''].filter(Boolean).join(' • ');
+            titleWrap.append(title,note);const close=document.createElement('button');close.className='eh-modal-close';close.textContent='×';head.append(titleWrap,close);
+            const content=document.createElement('div');content.className='eh-modal-content';
+            const summary=document.createElement('div');summary.className='eh-operation-detail-summary';const h=document.createElement('strong');h.textContent=`AGÊNCIA ${this.agencyCode()}`;summary.append(h);
+            if(!agency.exists){const empty=document.createElement('div');empty.className='eh-operation-empty';empty.textContent=`Código ${this.agencyCode()} não aparece no resumo deste mapa.`;summary.append(empty);}
+            else if(agency.multiple){const warning=document.createElement('div');warning.className='eh-operation-warning';warning.textContent=`⚠ ${agency.warning}`;summary.append(warning);}
+            else{
+                const metrics=document.createElement('div');metrics.className='eh-operation-detail-metrics';
+                [['↑ Embarques',agency.board],['↓ Desembarques',agency.alight],['🚌 Saldo',agency.balance]].forEach(([label,value])=>{const cell=document.createElement('div');cell.textContent=label;const strong=document.createElement('strong');strong.textContent=value??'—';cell.append(strong);metrics.append(cell);});
+                summary.append(metrics);
+                const actions=document.createElement('div');actions.className='eh-operation-detail-actions';
+                const b=document.createElement('button');b.className='eh-modal-btn';b.textContent='↑ Ver embarques';b.addEventListener('click',()=>this.showPassengers(record,'board'));
+                const a=document.createElement('button');a.className='eh-modal-btn';a.textContent='↓ Ver desembarques';a.addEventListener('click',()=>this.showPassengers(record,'alight'));actions.append(b,a);summary.append(actions);
             }
-            content.appendChild(summary);
+            content.append(summary);
+            const foot=document.createElement('div');foot.className='eh-modal-actions';const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(close2);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
+        },
 
-            if (agency.exists && !agency.multiple) {
-                const actions = document.createElement('div');
-                actions.className = 'eh-operation-detail-actions';
-                const board = document.createElement('button');
-                board.type = 'button';
-                board.className = 'eh-modal-btn success';
-                board.textContent = `↑ Embarques (${agency.boarders?.length || 0})`;
-                board.addEventListener('click', () => this.showPassengers(record, 'board'));
-                const alight = document.createElement('button');
-                alight.type = 'button';
-                alight.className = 'eh-modal-btn';
-                alight.textContent = `↓ Desembarques (${agency.alighters?.length || 0})`;
-                alight.addEventListener('click', () => this.showPassengers(record, 'alight'));
-                actions.append(board, alight);
-                content.appendChild(actions);
+        mapForSchedule(item) {
+            const maps=this.mapsForService(item?.service,item?.date||this.todayKey());
+            if(item?.floor){
+                const exact=maps.find(record=>this.normalize(record.floor||'')===this.normalize(item.floor));
+                if(exact)return exact;
             }
-
-            const footer = document.createElement('div');
-            footer.className = 'eh-modal-actions';
-            const update = document.createElement('button');
-            update.type = 'button';
-            update.className = 'eh-modal-btn primary';
-            update.textContent = '↻ Atualizar pelo mapa aberto';
-            update.addEventListener('click', () => this.scanCurrentMap({ quiet: false }));
-            const closeBottom = document.createElement('button');
-            closeBottom.type = 'button';
-            closeBottom.className = 'eh-modal-btn';
-            closeBottom.textContent = 'Fechar';
-            footer.append(update, closeBottom);
-            modal.append(head, content, footer);
-            overlay.appendChild(modal);
-            document.body.appendChild(overlay);
-            const dismiss = () => overlay.remove();
-            close.addEventListener('click', dismiss);
-            closeBottom.addEventListener('click', dismiss);
-            overlay.addEventListener('click', event => { if (event.target === overlay) dismiss(); });
+            if(item?.resultKey){
+                const exact=maps.find(record=>record.scheduleResultKey===item.resultKey);
+                if(exact)return exact;
+            }
+            return maps[0]||null;
         },
 
         showCarSearch() {
-            this.scanScheduleList();
-            document.querySelector('#eh-operation-car-search-modal')?.remove();
-            const overlay=document.createElement('div');
-            overlay.id='eh-operation-car-search-modal';
-            overlay.className='eh-overlay eh-operation-overlay';
-            const modal=document.createElement('div');
-            modal.className='eh-modal eh-operation-modal';
-            modal.style.width='min(760px,96vw)';
-
-            const head=document.createElement('div');
-            head.className='eh-modal-head';
-            const wrap=document.createElement('div'); wrap.style.flex='1';
-            const title=document.createElement('div'); title.className='eh-modal-title'; title.textContent='🔎 Pesquisar carro';
-            const note=document.createElement('div'); note.className='eh-modal-note'; note.textContent='Prioridade: Serviço → horário → linha → empresa';
-            wrap.append(title,note);
-            const close=document.createElement('button'); close.type='button'; close.className='eh-modal-close'; close.textContent='×';
-            head.append(wrap,close);
-
-            const content=document.createElement('div'); content.className='eh-modal-content';
-            const toolbar=document.createElement('div'); toolbar.className='eh-operation-car-search-toolbar';
-            const input=document.createElement('input'); input.type='search'; input.placeholder='Ex.: 6319, 07:00, 901929600, Jotamar'; input.autocomplete='off';
-            const refresh=document.createElement('button'); refresh.type='button'; refresh.className='eh-modal-btn'; refresh.textContent='Ler resultados da tela';
-            toolbar.append(input,refresh);
-            const status=document.createElement('div'); status.className='eh-modal-note'; status.style.margin='8px 0';
-            const list=document.createElement('div'); list.className='eh-operation-day-list';
-            content.append(toolbar,status,list);
-
+            document.querySelector('#eh-operation-car-search')?.remove();
+            const overlay=document.createElement('div');overlay.id='eh-operation-car-search';overlay.className='eh-overlay eh-operation-overlay';
+            const modal=document.createElement('div');modal.className='eh-modal eh-operation-modal';
+            const head=document.createElement('div');head.className='eh-modal-head';const title=document.createElement('div');title.className='eh-modal-title';title.textContent='🔎 Pesquisar carro';const close=document.createElement('button');close.className='eh-modal-close';close.textContent='×';head.append(title,close);
+            const content=document.createElement('div');content.className='eh-modal-content';
+            const toolbar=document.createElement('div');toolbar.className='eh-operation-car-search-toolbar';
+            const input=document.createElement('input');input.type='search';input.placeholder='Serviço, horário, linha, empresa…';input.autocomplete='off';
+            const refresh=document.createElement('button');refresh.className='eh-modal-btn';refresh.textContent='Ler resultados da tela';toolbar.append(input,refresh);
+            const status=document.createElement('div');status.className='eh-modal-note';status.style.margin='8px 0';const list=document.createElement('div');list.className='eh-operation-day-list';content.append(toolbar,status,list);
             const renderRows=()=>{
                 const rows=this.searchScheduleRecords(input.value);
-                status.textContent = rows.length
-                    ? `${rows.length} carro(s) encontrado(s) na pesquisa atual/memória recente.`
-                    : 'Nenhum carro encontrado. Faça uma pesquisa de horários no E-Pass ou altere o termo.';
+                status.textContent=rows.length?`${rows.length} resultado(s) do dia.`:'Nenhum carro encontrado. Faça uma pesquisa de horários no E-Pass.';
                 list.innerHTML='';
                 rows.forEach(item=>{
-                    const cfg=this.serviceConfig(item.service);
-                    const mapRecord=this.loadMaps()
-                        .filter(r=>String(r.service||'')===String(item.service) && (!item.date || r.date===item.date))
-                        .sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))[0] || null;
-                    const row=document.createElement('div'); row.className='eh-operation-day-row';
-                    const marker=document.createElement('div'); marker.className='eh-operation-day-status'; marker.textContent=mapRecord?'✓':'○';
-                    const info=document.createElement('div'); info.className='eh-operation-day-info';
-                    const top=document.createElement('strong');
-                    top.textContent=`${item.time || cfg?.operationalTime || '—'} • ${cfg?.name || item.lineRaw || `Serviço ${item.service}`}`;
-                    const sub=document.createElement('small');
-                    sub.textContent=`Serviço ${item.service}${item.lineCode||cfg?.lineCode?` • Linha ${item.lineCode||cfg?.lineCode}`:''}${item.company?` • ${item.company}`:item.companyCode?` • ${item.companyCode}`:''}`;
+                    const routine=this.routineForSchedule(item),mapRecord=this.mapForSchedule(item);
+                    const row=document.createElement('div');row.className='eh-operation-day-row';
+                    const marker=document.createElement('div');marker.className='eh-operation-day-status';marker.textContent=mapRecord?'✓':'○';
+                    const info=document.createElement('div');info.className='eh-operation-day-info';
+                    const top=document.createElement('strong');top.textContent=`${item.time||'—'} • ${routine?.name||item.lineRaw||`Serviço ${item.service}`}`;
+                    const sub=document.createElement('small');sub.textContent=[`Serviço ${item.service}`,item.floor,item.lineCode?`Linha ${item.lineCode}`:'',item.company||item.companyCode].filter(Boolean).join(' • ');
                     const map=document.createElement('small');
-                    if(!mapRecord) map.textContent=`Mapa ainda não consultado • Agência ${this.agencyCode()} aguardando mapa`;
-                    else if(!mapRecord.agency?.exists) map.textContent=`Mapa lido • Agência ${this.agencyCode()} não encontrada`;
-                    else if(mapRecord.agency?.multiple) map.textContent=`⚠ ${mapRecord.agency.warning || 'Leitura 287 ambígua'}`;
-                    else map.textContent=`↑ ${mapRecord.agency.board ?? '—'}  ↓ ${mapRecord.agency.alight ?? '—'}  🚌 ${mapRecord.agency.balance ?? '—'} • ${this.formatUpdatedAt(mapRecord.updatedAt)}`;
+                    if(!mapRecord)map.textContent=`Mapa ainda não consultado • Agência ${this.agencyCode()} aguardando mapa`;
+                    else if(!mapRecord.agency?.exists)map.textContent=`Mapa lido • Agência ${this.agencyCode()} não encontrada`;
+                    else if(mapRecord.agency?.multiple)map.textContent=`⚠ ${mapRecord.agency.warning||'Leitura 287 ambígua'}`;
+                    else map.textContent=`↑ ${mapRecord.agency.board??'—'} ↓ ${mapRecord.agency.alight??'—'} 🚌 ${mapRecord.agency.balance??'—'} • ${this.formatUpdatedAt(mapRecord.updatedAt)}`;
                     info.append(top,sub,map);
-                    const actions=document.createElement('div'); actions.className='eh-operation-search-actions';
-                    const choose=document.createElement('button'); choose.type='button'; choose.className='eh-modal-btn primary'; choose.textContent='Selecionar';
-                    choose.addEventListener('click',()=>{this.selectCar(item);dismiss();});
-                    actions.appendChild(choose);
-                    if(mapRecord){
-                        const detail=document.createElement('button'); detail.type='button'; detail.className='eh-modal-btn'; detail.textContent='Detalhes';
-                        detail.addEventListener('click',()=>this.showDetails(mapRecord));
-                        actions.appendChild(detail);
-                    }
-                    row.append(marker,info,actions); list.appendChild(row);
+                    const actions=document.createElement('div');actions.className='eh-operation-search-actions';
+                    const canOpen=Boolean(this.mapButtons.get(String(item.resultKey||''))?.isConnected);
+                    const choose=document.createElement('button');choose.className='eh-modal-btn primary';choose.textContent=canOpen?'Abrir mapa':'Selecionar';choose.addEventListener('click',()=>{if(canOpen)this.openScheduleMap(item);else this.selectCar(item);dismiss();});actions.append(choose);
+                    if(mapRecord){const detail=document.createElement('button');detail.className='eh-modal-btn';detail.textContent='Detalhes';detail.addEventListener('click',()=>this.showDetails(mapRecord));actions.append(detail);}
+                    row.append(marker,info,actions);list.append(row);
                 });
             };
-            input.addEventListener('input',renderRows);
-            input.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();renderRows();}});
-            refresh.addEventListener('click',()=>{this.scanScheduleList();renderRows();EH.Toast?.info?.('Resultados da pesquisa de horários relidos.');});
+            input.addEventListener('input',renderRows);input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();renderRows();}});
+            refresh.addEventListener('click',()=>{this.readScheduleResults();renderRows();EH.Toast.info('Resultados relidos.');});
+            const foot=document.createElement('div');foot.className='eh-modal-actions';const clear=document.createElement('button');clear.className='eh-modal-btn';clear.textContent='Limpar selecionado';clear.addEventListener('click',()=>this.clearSelectedCar());const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(clear,close2);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});renderRows();input.focus();
+        },
 
-            const foot=document.createElement('div'); foot.className='eh-modal-actions';
-            const clear=document.createElement('button'); clear.type='button'; clear.className='eh-modal-btn'; clear.textContent='Limpar selecionado';
-            clear.addEventListener('click',()=>{this.clearSelectedCar();});
-            const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar';
-            foot.append(clear,close2);
-            modal.append(head,content,foot); overlay.appendChild(modal); document.body.appendChild(overlay);
-            const dismiss=()=>overlay.remove();
-            close.addEventListener('click',dismiss); close2.addEventListener('click',dismiss);
-            overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
-            renderRows(); input.focus();
+        otherMapsWithAgency() {
+            const assignedServices=new Set(this.routineStates().flatMap(state=>state.matches.map(item=>String(item.service))));
+            return this.loadMaps().filter(record=>{
+                if(record.date!==this.todayKey())return false;
+                if(assignedServices.has(String(record.service)))return false;
+                if(!record.agency?.exists||record.agency?.multiple)return false;
+                return Number(record.agency.board||0)>0||Number(record.agency.alight||0)>0;
+            });
         },
 
         showCars() {
             document.querySelector('#eh-operation-cars-modal')?.remove();
-            const overlay = document.createElement('div');
-            overlay.id = 'eh-operation-cars-modal';
-            overlay.className = 'eh-overlay eh-operation-overlay';
-            const modal = document.createElement('div');
-            modal.className = 'eh-modal eh-operation-modal';
-            const head = document.createElement('div');
-            head.className = 'eh-modal-head';
-            const titleWrap = document.createElement('div');
-            titleWrap.style.flex = '1';
-            const title = document.createElement('div');
-            title.className = 'eh-modal-title';
-            title.textContent = 'CARROS — HOJE';
-            const note = document.createElement('div');
-            note.className = 'eh-modal-note';
-            note.textContent = `Agência ${this.agencyCode()} • Serviço é o identificador principal`;
-            titleWrap.append(title, note);
-            const close = document.createElement('button');
-            close.type = 'button';
-            close.className = 'eh-modal-close';
-            close.textContent = '×';
-            head.append(titleWrap, close);
-
-            const content = document.createElement('div');
-            content.className = 'eh-modal-content eh-operation-day-list';
-            const configs = this.serviceConfigs();
-            const groups = [
-                ['ATENDO', configs.filter(item => item.attends)],
-                ['APENAS CONSULTA', configs.filter(item => !item.attends)]
-            ];
-            groups.forEach(([label, items]) => {
-                const groupTitle = document.createElement('div');
-                groupTitle.className = 'eh-operation-group-title';
-                groupTitle.textContent = label;
-                content.appendChild(groupTitle);
-                items.sort((a, b) => String(a.operationalTime).localeCompare(String(b.operationalTime)) || Number(a.service) - Number(b.service)).forEach(config => {
-                    const record = this.bestMapForService(config);
-                    const row = document.createElement('div');
-                    row.className = 'eh-operation-day-row';
-                    const status = document.createElement('div');
-                    status.className = 'eh-operation-day-status';
-                    status.textContent = record ? '✓' : '○';
-                    const info = document.createElement('div');
-                    info.className = 'eh-operation-day-info';
-                    const top = document.createElement('strong');
-                    top.textContent = `${config.operationalTime || '—'} • ${config.name}`;
-                    const sub = document.createElement('small');
-                    sub.textContent = `Serviço ${config.service}${config.observation ? ` • ${config.observation}` : ''}`;
-                    const metrics = document.createElement('small');
-                    if (!record) {
-                        metrics.textContent = `Código ${this.agencyCode()}: aguardando leitura do mapa`;
-                    } else if (!record.agency?.exists) {
-                        metrics.textContent = `Código ${this.agencyCode()} não aparece no mapa • Atualizado ${this.formatUpdatedAt(record.updatedAt)}`;
-                    } else if (record.agency?.multiple) {
-                        metrics.textContent = `⚠ ${record.agency.warning || 'Mais de um registro encontrado'} • Atualizado ${this.formatUpdatedAt(record.updatedAt)}`;
-                    } else {
-                        metrics.textContent = `↑ ${record.agency.board ?? '—'}   ↓ ${record.agency.alight ?? '—'}   🚌 ${record.agency.balance ?? '—'} • Atualizado ${this.formatUpdatedAt(record.updatedAt)}`;
-                    }
-                    info.append(top, sub, metrics);
-                    const action = document.createElement('button');
-                    action.type = 'button';
-                    action.className = 'eh-modal-btn';
-                    action.textContent = 'Ver';
-                    action.disabled = !record;
-                    action.addEventListener('click', () => this.showDetails(record));
-                    row.append(status, info, action);
-                    content.appendChild(row);
+            const overlay=document.createElement('div');overlay.id='eh-operation-cars-modal';overlay.className='eh-overlay eh-operation-overlay';
+            const modal=document.createElement('div');modal.className='eh-modal eh-operation-modal';
+            const head=document.createElement('div');head.className='eh-modal-head';const titleWrap=document.createElement('div');titleWrap.style.flex='1';
+            const title=document.createElement('div');title.className='eh-modal-title';title.textContent='CARROS DO DIA';
+            const note=document.createElement('div');note.className='eh-modal-note';note.textContent=`Horários configuráveis • Serviço detectado da pesquisa do dia • Agência ${this.agencyCode()}`;titleWrap.append(title,note);
+            const close=document.createElement('button');close.className='eh-modal-close';close.textContent='×';head.append(titleWrap,close);
+            const content=document.createElement('div');content.className='eh-modal-content eh-operation-day-list';
+            const groupTitle=document.createElement('div');groupTitle.className='eh-operation-group-title';groupTitle.textContent='CARROS PRINCIPAIS';content.append(groupTitle);
+            this.routineStates().forEach(state=>{
+                const row=document.createElement('div');row.className='eh-operation-day-row';
+                const status=document.createElement('div');status.className='eh-operation-day-status';status.textContent=state.matches.some(m=>this.mapForSchedule(m))?'✓':state.matches.length?'▶':'○';
+                const info=document.createElement('div');info.className='eh-operation-day-info';
+                const top=document.createElement('strong');top.textContent=`${state.routine.operationalTime} • ${state.routine.name}`;
+                const sub=document.createElement('small');
+                if(!state.matches.length)sub.textContent='Serviço hoje: aguardando pesquisa de horários';
+                else sub.textContent=`Serviço${state.matches.length>1?'s':''} hoje: ${state.matches.map(m=>`${m.service}${m.floor?` (${m.floor})`:''}`).join(' • ')}`;
+                info.append(top,sub);
+                state.matches.forEach(item=>{
+                    const map=this.mapForSchedule(item);const detail=document.createElement('small');
+                    if(!map)detail.textContent=`#${item.service}${item.floor?` • ${item.floor}`:''} • Agência ${this.agencyCode()} aguardando mapa`;
+                    else if(!map.agency?.exists)detail.textContent=`#${item.service} • Agência ${this.agencyCode()} não encontrada`;
+                    else if(map.agency?.multiple)detail.textContent=`#${item.service} • ⚠ leitura 287 ambígua`;
+                    else detail.textContent=`#${item.service}${item.floor?` • ${item.floor}`:''} • ↑ ${map.agency.board??'—'} ↓ ${map.agency.alight??'—'} 🚌 ${map.agency.balance??'—'}`;
+                    info.append(detail);
                 });
-            });
-
-            const unknownToday = this.loadMaps().filter(record => record.date === this.todayKey() && !this.serviceConfig(record.service));
-            if (unknownToday.length) {
-                const groupTitle = document.createElement('div');
-                groupTitle.className = 'eh-operation-group-title';
-                groupTitle.textContent = 'OUTROS MAPAS LIDOS';
-                content.appendChild(groupTitle);
-                unknownToday.slice(0, 8).forEach(record => {
-                    const row = document.createElement('div');
-                    row.className = 'eh-operation-day-row';
-                    const status = document.createElement('div');
-                    status.className = 'eh-operation-day-status';
-                    status.textContent = '•';
-                    const info = document.createElement('div');
-                    info.className = 'eh-operation-day-info';
-                    const top = document.createElement('strong');
-                    top.textContent = `Serviço ${record.service} • ${this.displayName(record)}`;
-                    const metrics = document.createElement('small');
-                    metrics.textContent = !record.agency?.exists
-                        ? `Código ${this.agencyCode()} não encontrado`
-                        : record.agency?.multiple
-                            ? `⚠ ${record.agency.warning || 'Registros 287 ambíguos'}`
-                            : `↑ ${record.agency.board ?? '—'} ↓ ${record.agency.alight ?? '—'} 🚌 ${record.agency.balance ?? '—'}`;
-                    info.append(top, metrics);
-                    const action = document.createElement('button');
-                    action.type = 'button';
-                    action.className = 'eh-modal-btn';
-                    action.textContent = 'Ver';
-                    action.addEventListener('click', () => this.showDetails(record));
-                    row.append(status, info, action);
-                    content.appendChild(row);
-                });
-            }
-
-            const footer = document.createElement('div');
-            footer.className = 'eh-modal-actions';
-            const update = document.createElement('button');
-            update.type = 'button';
-            update.className = 'eh-modal-btn primary';
-            update.textContent = '↻ Ler mapa aberto';
-            update.addEventListener('click', () => this.scanCurrentMap({ quiet: false }));
-            const settings = document.createElement('button');
-            settings.type = 'button';
-            settings.className = 'eh-modal-btn';
-            settings.textContent = '⚙ Configurar carros';
-            settings.addEventListener('click', () => {
-                overlay.remove();
-                EH.Storage.set('settingsTab', 'carros');
-                EH.UI.showSettings();
-            });
-            const closeBottom = document.createElement('button');
-            closeBottom.type = 'button';
-            closeBottom.className = 'eh-modal-btn';
-            closeBottom.textContent = 'Fechar';
-            footer.append(update, settings, closeBottom);
-            modal.append(head, content, footer);
-            overlay.appendChild(modal);
-            document.body.appendChild(overlay);
-            const dismiss = () => overlay.remove();
-            close.addEventListener('click', dismiss);
-            closeBottom.addEventListener('click', dismiss);
-            overlay.addEventListener('click', event => { if (event.target === overlay) dismiss(); });
-        },
-
-        scanScheduleList() {
-            const tables = Array.from(document.querySelectorAll('app-pesquisa-venda table, app-pesquisa table, table.table-hover'));
-            const table = tables.find(item => {
-                const headers = Array.from(item.querySelectorAll('thead th')).map(th => this.normalize(th.textContent));
-                return headers.includes('SERVICO') && headers.some(h => h.includes('HORARIO DE SAIDA')) && headers.includes('LINHA');
-            });
-            if (!table) { this.visibleScheduleRecords = []; return []; }
-
-            const rows = Array.from(table.querySelectorAll('tbody tr')).map(row => {
-                const cells = Array.from(row.querySelectorAll(':scope > td')).map(td => EH.Utils.clean(td.textContent || ''));
-                const service = String(cells[0] || '').replace(/\D/g, '');
-                if (!service) return null;
-                const departure = EH.Utils.clean(cells[1] || '');
-                const dt = this.parseScheduleDateTime(departure);
-                const lineCell = row.querySelector('td:nth-child(3)');
-                const badge = lineCell?.querySelector?.('.badge');
-                const companyCode = EH.Utils.clean(badge?.textContent || '');
-                let lineRaw = EH.Utils.clean(lineCell?.textContent || cells[2] || '');
-                if (companyCode && lineRaw.toUpperCase().startsWith(companyCode.toUpperCase())) {
-                    lineRaw = EH.Utils.clean(lineRaw.slice(companyCode.length));
+                const validMaps=state.matches.map(item=>this.mapForSchedule(item)).filter(map=>map?.agency?.exists&&!map.agency.multiple);
+                if(validMaps.length>1){
+                    const total=document.createElement('small');total.className='eh-operation-total-movement';
+                    const boardTotal=validMaps.reduce((sum,map)=>sum+Number(map.agency.board||0),0);
+                    const alightTotal=validMaps.reduce((sum,map)=>sum+Number(map.agency.alight||0),0);
+                    total.textContent=`Total de movimento na ${this.agencyCode()}: ↑ ${boardTotal} ↓ ${alightTotal} • saldos preservados por mapa/andar`;
+                    info.append(total);
                 }
-                const config = this.serviceConfig(service);
-                const company = EH.Utils.clean(EH.Config.LINHAS?.[companyCode] || companyCode || '');
-                return {
-                    service,
-                    departure,
-                    date:dt.date,
-                    dateBr:dt.dateBr,
-                    time:dt.time,
-                    timestamp:dt.timestamp,
-                    lineRaw,
-                    lineCode:config?.lineCode || '',
-                    companyCode,
-                    company,
-                    config,
-                    detectedAt:Date.now()
-                };
-            }).filter(Boolean);
-
-            const unique = Array.from(new Map(rows.map(item => [
-                [item.service,item.date||'',item.departure||'',this.normalize(item.lineRaw||'')].join('|'),
-                item
-            ])).values());
-            this.visibleScheduleRecords = unique;
-            this.saveScheduleRecords(unique);
-            return unique;
+                const action=document.createElement('button');action.className='eh-modal-btn';
+                const canOpen=Boolean(state.primary&&this.mapButtons.get(String(state.primary.resultKey||''))?.isConnected);
+                action.textContent=state.primary?(canOpen?'Abrir mapa':'Selecionar'):'Aguardando';
+                action.disabled=!state.primary;
+                action.addEventListener('click',()=>{if(!state.primary)return;if(canOpen)this.openScheduleMap(state.primary);else this.selectCar(state.primary);});
+                row.append(status,info,action);content.append(row);
+            });
+            const others=this.otherMapsWithAgency();
+            if(others.length){
+                const gt=document.createElement('div');gt.className='eh-operation-group-title';gt.textContent='OUTROS CARROS COM MOVIMENTO NA 287';content.append(gt);
+                others.forEach(record=>{
+                    const row=document.createElement('div');row.className='eh-operation-day-row';const status=document.createElement('div');status.className='eh-operation-day-status';status.textContent='•';
+                    const info=document.createElement('div');info.className='eh-operation-day-info';const top=document.createElement('strong');top.textContent=`Serviço ${record.service} • ${this.displayName(record)}`;
+                    const metrics=document.createElement('small');metrics.textContent=`↑ ${record.agency.board??'—'} ↓ ${record.agency.alight??'—'} 🚌 ${record.agency.balance??'—'}`;info.append(top,metrics);
+                    const action=document.createElement('button');action.className='eh-modal-btn';action.textContent='Ver';action.addEventListener('click',()=>this.showDetails(record));row.append(status,info,action);content.append(row);
+                });
+            }
+            const foot=document.createElement('div');foot.className='eh-modal-actions';
+            const refresh=document.createElement('button');refresh.className='eh-modal-btn primary';refresh.textContent='↻ Ler pesquisa atual';refresh.addEventListener('click',()=>{this.readScheduleResults();overlay.remove();this.showCars();});
+            const settings=document.createElement('button');settings.className='eh-modal-btn';settings.textContent='⚙ Configurar horários';settings.addEventListener('click',()=>{overlay.remove();EH.Storage.set('settingsTab','carros');EH.UI.showSettings();});
+            const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(refresh,settings,close2);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
-        nextRoutineConfig() {
-            const visibleKnown = (this.visibleScheduleRecords || []).map(item => item.config).filter(Boolean);
-            if (visibleKnown.length === 1) return visibleKnown[0];
-            if (visibleKnown.length > 1) {
-                const attended = visibleKnown.filter(item => item.attends);
-                if (attended.length === 1) return attended[0];
-            }
-            const now = new Date();
-            const current = now.getHours() * 60 + now.getMinutes();
-            const attended = this.serviceConfigs().filter(item => item.attends && /^\d{1,2}:\d{2}$/.test(item.operationalTime || ''));
-            const withMinutes = attended.map(item => {
-                const [h,m] = item.operationalTime.split(':').map(Number);
-                return { ...item, minutes: h * 60 + m };
-            }).sort((a,b) => a.minutes - b.minutes);
-            return withMinutes.find(item => item.minutes >= current) || withMinutes[0] || this.serviceConfigs()[0] || null;
+        nextRoutineState() {
+            const states=this.routineStates();
+            if(!states.length)return null;
+            const now=new Date(),current=now.getHours()*60+now.getMinutes();
+            const ordered=states.map(state=>({...state,minutes:this.timeMinutes(state.routine.operationalTime)})).filter(s=>s.minutes!==null).sort((a,b)=>a.minutes-b.minutes);
+            return ordered.find(state=>state.minutes>=current)||ordered[0]||null;
         },
 
         render() {
-            const host = EH.OperationDock?.host || EH.UI?.operationBox;
-            if (EH.UI?.operationBox && EH.OperationDock?.host) EH.UI.operationBox.hidden = true;
-            if (!host || !EH.Config.OPERATION_CARS_ENABLED) {
-                if (host) host.hidden = true;
-                return;
-            }
-            host.hidden = false;
-            host.innerHTML = '';
+            const host=EH.OperationDock?.host||EH.UI?.operationBox;
+            if(EH.UI?.operationBox&&EH.OperationDock?.host)EH.UI.operationBox.hidden=true;
+            if(!host||!EH.Config.OPERATION_CARS_ENABLED){if(host)host.hidden=true;return;}
+            host.hidden=false;host.innerHTML='';
 
-            const selected = this.selectedCar();
-            const record = selected ? this.selectedMapRecord() : this.lastRecord();
-            const nextConfig = !selected && !record ? this.nextRoutineConfig() : null;
-            const serviceId = String(selected?.service || record?.service || nextConfig?.service || '');
-            const config = this.serviceConfig(serviceId);
-            const agency = record?.agency || null;
-            const selectedName = config?.name || selected?.lineRaw || (record ? this.displayName(record) : nextConfig?.name) || `Agência ${this.agencyCode()}`;
-            const selectedTime = selected?.time || config?.operationalTime || record?.lineDeparture || nextConfig?.operationalTime || '';
+            const selected=this.selectedCar();
+            const selectedMap=selected?this.selectedMapRecord():null;
+            const last=!selected?this.lastRecord():null;
+            const next=!selected&&!last?this.nextRoutineState():null;
+            const schedule=selected||(last?this.scheduleForMap({service:last.service,serviceDate:last.date,lineDeparture:last.lineDeparture,line:{code:last.lineCode,raw:last.lineRaw}}):next?.primary);
+            const routine=schedule?this.routineForSchedule(schedule):(last?this.routineForService(last.service,last.date):next?.routine);
+            const record=selectedMap||last||(schedule?this.mapForSchedule(schedule):null);
+            const agency=record?.agency||null;
 
-            const searchRow = document.createElement('div');
-            searchRow.className = 'eh-operation-search-row';
-            const searchButton = document.createElement('button');
-            searchButton.type = 'button';
-            searchButton.className = 'eh-context-btn primary';
-            searchButton.textContent = '🔎 Pesquisar carro';
-            searchButton.addEventListener('click', () => this.showCarSearch());
-            const detected = document.createElement('span');
-            detected.textContent = `${this.searchScheduleRecords('').length} detectado(s)`;
-            searchRow.append(searchButton, detected);
+            const searchRow=document.createElement('div');searchRow.className='eh-operation-search-row';
+            const searchButton=document.createElement('button');searchButton.className='eh-context-btn primary';searchButton.textContent='🔎 Pesquisar carro';searchButton.addEventListener('click',()=>this.showCarSearch());
+            const detected=document.createElement('span');detected.textContent=`${this.searchScheduleRecords('').length} resultado(s)`;searchRow.append(searchButton,detected);
 
-            const head = document.createElement('div');
-            head.className = 'eh-operation-head';
-            const eyebrow = document.createElement('span');
-            eyebrow.textContent = selected ? 'CARRO SELECIONADO' : record ? 'MAPA ATUAL' : 'PRÓXIMO / ROTINA';
-            const heading = document.createElement('div');
-            heading.className = 'eh-operation-heading';
-            const service = document.createElement('strong');
-            service.textContent = serviceId ? `Serviço ${serviceId}` : 'CARROS';
-            const route = document.createElement('span');
-            route.textContent = selectedName;
-            heading.append(service, route);
-            head.append(eyebrow, heading);
+            const head=document.createElement('div');head.className='eh-operation-head';const eyebrow=document.createElement('span');eyebrow.textContent=selected?'CARRO SELECIONADO':record?'MAPA ATUAL':'PRÓXIMO DA ROTINA';
+            const heading=document.createElement('div');heading.className='eh-operation-heading';const service=document.createElement('strong');
+            service.textContent=schedule?.service?`Serviço ${schedule.service}`:(routine?'Serviço hoje: —':'CARROS');
+            const route=document.createElement('span');route.textContent=routine?.name||record?.operationalName||record?.lineRaw||'Faça uma pesquisa de horários';heading.append(service,route);head.append(eyebrow,heading);
 
-            if (serviceId) {
-                const tag = document.createElement('div');
-                tag.className = `eh-operation-service-tag ${config?.attends ? 'attends' : 'consult'}`;
-                tag.textContent = config ? (config.attends ? 'ATENDO' : 'APENAS CONSULTA') : 'CARRO NÃO CADASTRADO';
-                head.appendChild(tag);
+            if(routine){const tag=document.createElement('div');tag.className='eh-operation-service-tag attends';tag.textContent=`${routine.operationalTime} • HORÁRIO OPERACIONAL`;head.append(tag);}
+
+            const agencyTitle=document.createElement('div');agencyTitle.className='eh-operation-agency-title';agencyTitle.textContent=`AGÊNCIA ${this.agencyCode()}`;
+            const metrics=document.createElement('div');metrics.className='eh-operation-metrics';
+            const metricButton=(kind,label,value,enabled)=>{const button=document.createElement('button');button.className=`eh-operation-metric ${kind}`;button.disabled=!enabled;const s=document.createElement('span');s.textContent=label;const b=document.createElement('strong');b.textContent=value===null||value===undefined?'—':String(value);button.append(s,b);return button;};
+            const canUse=Boolean(record&&agency?.exists&&!agency?.multiple);
+            const board=metricButton('board','↑ Embarques',canUse?agency.board:null,canUse),alight=metricButton('alight','↓ Desembarques',canUse?agency.alight:null,canUse);
+            const balance=document.createElement('div');balance.className='eh-operation-metric balance';const bl=document.createElement('span');bl.textContent='🚌 Sai com';const bv=document.createElement('strong');bv.textContent=canUse&&agency.balance!==null&&agency.balance!==undefined?String(agency.balance):'—';balance.append(bl,bv);metrics.append(board,alight,balance);
+            if(canUse){board.addEventListener('click',()=>this.showPassengers(record,'board'));alight.addEventListener('click',()=>this.showPassengers(record,'alight'));}
+
+            const message=document.createElement('div');message.className='eh-operation-meta';
+            if(!schedule&&!record)message.textContent=`Agência ${this.agencyCode()} aguardando pesquisa de horários`;
+            else if(!record)message.textContent=`${routine?.operationalTime||schedule?.time||'—'} • ${schedule?.service?`Serviço ${schedule.service} • `:''}Agência ${this.agencyCode()} aguardando mapa`;
+            else if(!agency?.exists)message.textContent=`Serviço ${record.service} • Agência ${this.agencyCode()} não encontrada neste mapa.`;
+            else if(agency.multiple){message.classList.add('warning');message.textContent=`⚠ ${agency.warning}`;}
+            else{
+                const parts=[routine?.operationalTime||record.operationalTime,`Serviço ${record.service}`,record.floor,record.lineCode?`Linha ${record.lineCode}`:'',`Atualizado às ${this.formatUpdatedAt(record.updatedAt)}`].filter(Boolean);
+                const pending=(agency.boarders||[]).map(p=>EH.Reminders?.matchPassenger?.(p,record)).filter(r=>r&&r.status!=='completed').length;
+                if(pending)parts.push(`${pending} precisa(m) imprimir`);
+                message.textContent=parts.join(' • ');
             }
 
-            const agencyTitle = document.createElement('div');
-            agencyTitle.className = 'eh-operation-agency-title';
-            agencyTitle.textContent = `AGÊNCIA ${this.agencyCode()}`;
+            const principal=document.createElement('div');principal.className='eh-operation-found-list';const ft=document.createElement('span');ft.textContent='CARROS PRINCIPAIS';principal.append(ft);
+            this.routineStates().forEach(state=>{
+                const button=document.createElement('button');const current=state.matches.some(m=>String(m.resultKey)===String(schedule?.resultKey));button.className=current?'selected':'';
+                const serviceText=state.matches.length?state.matches.map(m=>`${m.service}${m.floor?`/${m.floor.replace(' andar','')}`:''}`).join(', '):'aguardando';
+                button.textContent=`${state.routine.operationalTime} • ${state.routine.name} • ${serviceText}`;
+                button.addEventListener('click',()=>state.primary?this.selectCar(state.primary):EH.Toast.info('Faça uma pesquisa de horários para detectar o serviço de hoje.'));principal.append(button);
+            });
 
-            const metrics = document.createElement('div');
-            metrics.className = 'eh-operation-metrics';
-            const metricButton = (kind, label, value, enabled) => {
-                const button = document.createElement('button');
-                button.type = 'button';
-                button.className = `eh-operation-metric ${kind}`;
-                button.disabled = !enabled;
-                const labelNode = document.createElement('span');
-                labelNode.textContent = label;
-                const valueNode = document.createElement('strong');
-                valueNode.textContent = value === null || value === undefined ? '—' : String(value);
-                button.append(labelNode, valueNode);
-                return button;
-            };
-            const canUseAgency = Boolean(record && agency?.exists && !agency?.multiple);
-            const board = metricButton('board', '↑ Embarques', canUseAgency ? agency.board : null, canUseAgency);
-            const alight = metricButton('alight', '↓ Desembarques', canUseAgency ? agency.alight : null, canUseAgency);
-            const balance = document.createElement('div');
-            balance.className = 'eh-operation-metric balance';
-            const balanceLabel = document.createElement('span');
-            balanceLabel.textContent = '🚌 Sai com';
-            const balanceValue = document.createElement('strong');
-            balanceValue.textContent = canUseAgency && agency.balance !== null && agency.balance !== undefined ? String(agency.balance) : '—';
-            balance.append(balanceLabel, balanceValue);
-            metrics.append(board, alight, balance);
-            if (canUseAgency) {
-                board.addEventListener('click', () => this.showPassengers(record, 'board'));
-                alight.addEventListener('click', () => this.showPassengers(record, 'alight'));
-            }
-
-            const message = document.createElement('div');
-            message.className = 'eh-operation-meta';
-            if (!record) {
-                const parts = [];
-                if (selectedTime) parts.push(selectedTime);
-                if (serviceId) parts.push(`Serviço ${serviceId}`);
-                parts.push(`Agência ${this.agencyCode()} aguardando mapa`);
-                message.textContent = parts.join(' • ');
-            } else if (!agency?.exists) {
-                message.textContent = `Serviço ${record.service} • Agência ${this.agencyCode()} não encontrada neste mapa.`;
-            } else if (agency.multiple) {
-                message.classList.add('warning');
-                message.textContent = `⚠ ${agency.warning || `Mais de um registro da agência ${this.agencyCode()} encontrado.`}`;
-            } else {
-                const parts = [];
-                if (selectedTime) parts.push(selectedTime);
-                parts.push(`Serviço ${record.service}`);
-                if (record.lineCode) parts.push(`Linha ${record.lineCode}`);
-                const updated = this.formatUpdatedAt(record.updatedAt);
-                if (updated) parts.push(`Atualizado às ${updated}`);
-                const pendingPrints = (agency.boarders || [])
-                    .map(passenger => EH.Reminders?.matchPassenger?.(passenger, record))
-                    .filter(reminder => reminder && reminder.status !== 'completed').length;
-                if (pendingPrints) parts.push(`${pendingPrints} precisa(m) imprimir`);
-                if (agency.countsMatchPassengers === false) parts.push('⚠ conferir lista');
-                message.textContent = parts.join(' • ');
-            }
-
-            const foundList = document.createElement('div');
-            foundList.className = 'eh-operation-found-list';
-            const currentDetected = (this.visibleScheduleRecords?.length ? this.visibleScheduleRecords : this.searchScheduleRecords('')).slice(0, 4);
-            if (currentDetected.length) {
-                const foundTitle = document.createElement('span');
-                foundTitle.textContent = 'CARROS ENCONTRADOS';
-                foundList.appendChild(foundTitle);
-                currentDetected.forEach(item => {
-                    const cfg = this.serviceConfig(item.service);
-                    const button = document.createElement('button');
-                    button.type = 'button';
-                    button.className = String(item.service) === serviceId ? 'selected' : '';
-                    button.textContent = `${item.time || cfg?.operationalTime || '—'} • ${cfg?.name || item.lineRaw || `Serviço ${item.service}`} • #${item.service}`;
-                    button.title = [item.lineRaw, item.company].filter(Boolean).join(' • ');
-                    button.addEventListener('click', () => this.selectCar(item));
-                    foundList.appendChild(button);
-                });
-            } else {
-                foundList.hidden = true;
-            }
-
-            const actions = document.createElement('div');
-            actions.className = 'eh-operation-actions';
-            const update = document.createElement('button');
-            update.type = 'button';
-            update.className = 'eh-context-btn';
-            update.textContent = '↻ Ler mapa';
-            update.addEventListener('click', () => this.scanCurrentMap({ quiet: false }));
-            const passengers = document.createElement('button');
-            passengers.type = 'button';
-            passengers.className = 'eh-context-btn';
-            passengers.textContent = 'Passageiros';
-            passengers.disabled = !canUseAgency;
-            passengers.addEventListener('click', () => this.showDetails(record));
-            const all = document.createElement('button');
-            all.type = 'button';
-            all.className = 'eh-context-btn';
-            all.textContent = 'Carros ›';
-            all.addEventListener('click', () => this.showCars());
-            actions.append(update, passengers, all);
-
-            host.append(searchRow, head, agencyTitle, metrics, message, foundList, actions);
+            const actions=document.createElement('div');actions.className='eh-operation-actions';
+            const update=document.createElement('button');update.className='eh-context-btn';update.textContent='↻ Ler mapa';update.addEventListener('click',()=>this.scanCurrentMap({quiet:false}));
+            const passengers=document.createElement('button');passengers.className='eh-context-btn';passengers.textContent='Passageiros';passengers.disabled=!canUse;passengers.addEventListener('click',()=>this.showDetails(record));
+            const all=document.createElement('button');all.className='eh-context-btn';all.textContent='Carros ›';all.addEventListener('click',()=>this.showCars());actions.append(update,passengers,all);
+            host.append(searchRow,head,agencyTitle,metrics,message,principal,actions);
         },
 
         injectStyles() {
-            if (this.stylesInjected) return;
-            this.stylesInjected = true;
+            if(this.stylesInjected)return;this.stylesInjected=true;
             GM_addStyle(`
-                :is(#eh-root, #eh-operation-dock) .eh-operation-host {
-                    display:grid; gap:7px; margin:7px 0 8px; padding:9px;
-                    border:1px solid #d9e2e8; border-radius:10px; background:#fbfcfd;
-                    color:#26313f; box-shadow:0 2px 8px rgba(28,45,68,.045);
-                }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-host[hidden] { display:none !important; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-head { display:grid; gap:4px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-head > span { color:#718092; font-size:7.5px; font-weight:900; letter-spacing:.38px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-heading { display:flex; align-items:baseline; gap:7px; min-width:0; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-heading strong { color:#1f2b39; font-size:15px; line-height:1; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-heading span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#3e4b5c; font-size:9.5px; font-weight:800; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-service-tag { width:max-content; padding:2px 6px; border-radius:999px; font-size:7.3px; font-weight:900; letter-spacing:.25px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-service-tag.attends { background:#eaf6f1; color:#236e5c; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-service-tag.consult { background:#f1f3f6; color:#687386; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-agency-title { color:#405064; font-size:8px; font-weight:950; letter-spacing:.35px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-metrics { display:grid; grid-template-columns:1fr 1fr 1.05fr; gap:5px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-metric { min-width:0; min-height:47px; display:grid; align-content:center; gap:3px; padding:6px; border:1px solid #e1e7ec; border-radius:8px; background:#fff; color:#5c6878; text-align:left; }
-                #eh-root button.eh-operation-metric { cursor:pointer; font:inherit; }
-                #eh-root button.eh-operation-metric:hover:not(:disabled) { border-color:#b9cad8; background:#f7fafc; }
-                #eh-root button.eh-operation-metric:disabled { cursor:default; opacity:.72; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-metric span { font-size:7.6px; font-weight:800; line-height:1.2; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-metric strong { color:#253142; font-size:14px; line-height:1; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-metric.board strong { color:#24735e; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-metric.alight strong { color:#a35a31; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-metric.balance strong { color:#2868a7; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-meta { color:#7a8695; font-size:7.7px; line-height:1.35; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-meta.warning { color:#9a5a23; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-actions { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-actions .eh-context-btn { min-width:0; padding:6px 4px; font-size:7.8px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-search-row { display:flex; align-items:center; gap:7px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-search-row .eh-context-btn { flex:1; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-search-row span { color:#7b8794; font-size:7.5px; white-space:nowrap; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list { display:grid; gap:3px; padding-top:2px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list > span { color:#7b8794; font-size:7px; font-weight:900; letter-spacing:.35px; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list button { width:100%; min-height:24px; padding:4px 6px; border:1px solid #e2e7ec; border-radius:6px; background:#fff; color:#526073; text-align:left; font-size:7.3px; font-weight:750; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list button.selected { border-color:#9db8d2; background:#eef5fb; color:#315d86; }
-                .eh-operation-car-search-toolbar { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; }
-                .eh-operation-car-search-toolbar input { min-height:38px; padding:8px 10px; border:1px solid #ccd5df; border-radius:8px; font:inherit; font-size:12px; }
-                .eh-operation-search-actions { display:flex; flex-wrap:wrap; gap:5px; justify-content:flex-end; }
-                .eh-operation-reminder-state { margin-top:2px; font-weight:800 !important; }
-                .eh-operation-reminder-state.pending { color:#a35d24 !important; }
-                .eh-operation-reminder-state.done { color:#2d785f !important; }
-
-                .eh-operation-modal { width:min(760px, 94vw); }
-                .eh-operation-passenger-list, .eh-operation-day-list { display:grid; gap:7px; }
-                .eh-operation-passenger { display:grid; grid-template-columns:48px minmax(0,1fr); gap:10px; align-items:start; padding:10px; border:1px solid #e2e7ed; border-radius:9px; background:#fafbfd; }
-                .eh-operation-seat { display:flex; align-items:center; justify-content:center; min-height:38px; border-radius:8px; background:#edf3f7; color:#1e3448; font-size:17px; }
-                .eh-operation-passenger-info { min-width:0; display:grid; gap:3px; }
-                .eh-operation-passenger-info > strong { color:#202b38; font-size:12px; }
-                .eh-operation-passenger-info small { color:#697687; font-size:10px; }
-                .eh-operation-empty { padding:18px; border:1px dashed #d9e0e7; border-radius:9px; color:#718092; text-align:center; font-size:11px; }
-                .eh-operation-warning { padding:9px 10px; border:1px solid #f0cfaa; border-radius:8px; background:#fff8ee; color:#8b561f; font-size:10px; line-height:1.4; }
-                .eh-operation-warning.subtle { margin-top:7px; }
-                .eh-operation-detail-summary { display:grid; gap:8px; }
-                .eh-operation-detail-summary > strong { font-size:11px; color:#34465b; }
-                .eh-operation-detail-metrics { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:7px; }
-                .eh-operation-detail-metrics > div { display:grid; gap:3px; padding:9px; border:1px solid #e2e8ee; border-radius:8px; color:#687587; font-size:9px; }
-                .eh-operation-detail-metrics strong { color:#263548; font-size:16px; }
-                .eh-operation-detail-actions { display:flex; flex-wrap:wrap; gap:7px; margin-top:10px; }
-                .eh-operation-group-title { margin:8px 0 2px; color:#536175; font-size:9px; font-weight:950; letter-spacing:.4px; }
-                .eh-operation-day-row { display:grid; grid-template-columns:22px minmax(0,1fr) auto; align-items:center; gap:8px; padding:9px; border:1px solid #e2e7ed; border-radius:9px; background:#fbfcfd; }
-                .eh-operation-day-status { font-size:15px; font-weight:900; color:#517064; }
-                .eh-operation-day-info { min-width:0; display:grid; gap:3px; }
-                .eh-operation-day-info strong { color:#26313f; font-size:11px; }
-                .eh-operation-day-info small { color:#748091; font-size:9.5px; line-height:1.35; }
-
-                .eh-operation-settings-list { display:grid; gap:8px; margin-top:8px; }
-                .eh-operation-settings-service { display:grid; grid-template-columns:90px minmax(160px,1.4fr) 90px minmax(130px,1fr); gap:7px; padding:9px; border:1px solid #e1e6ec; border-radius:9px; background:#fff; }
-                .eh-operation-settings-service .eh-check { align-self:end; min-height:36px; }
-                .eh-operation-settings-service-note { grid-column:1 / -1; }
-
-                @media (max-width: 760px) {
-                    :is(#eh-root, #eh-operation-dock) .eh-operation-metrics { grid-template-columns:1fr 1fr; }
-                    :is(#eh-root, #eh-operation-dock) .eh-operation-metric.balance { grid-column:1 / -1; }
-                    :is(#eh-root, #eh-operation-dock) .eh-operation-actions { grid-template-columns:1fr; }
-                    .eh-operation-day-row { grid-template-columns:22px minmax(0,1fr); }
-                    .eh-operation-day-row > button { grid-column:1 / -1; }
-                    .eh-operation-detail-metrics { grid-template-columns:1fr; }
-                    .eh-operation-settings-service { grid-template-columns:1fr; }
-                    .eh-operation-settings-service-note { grid-column:auto; }
-                }
+                :is(#eh-root,#eh-operation-dock) .eh-operation-host{display:grid;gap:7px;margin:7px 0 8px;padding:9px;border:1px solid #d9e2e8;border-radius:10px;background:#fbfcfd;color:#26313f;box-shadow:0 2px 8px rgba(28,45,68,.045)}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-host[hidden]{display:none!important}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-head{display:grid;gap:4px}:is(#eh-root,#eh-operation-dock) .eh-operation-head>span{color:#718092;font-size:7.5px;font-weight:900;letter-spacing:.38px}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-heading{display:flex;align-items:baseline;gap:7px;min-width:0}:is(#eh-root,#eh-operation-dock) .eh-operation-heading strong{color:#1f2b39;font-size:15px;line-height:1}:is(#eh-root,#eh-operation-dock) .eh-operation-heading span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#3e4b5c;font-size:9.5px;font-weight:800}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-service-tag{width:max-content;padding:2px 6px;border-radius:999px;font-size:7.3px;font-weight:900;letter-spacing:.25px;background:#eaf6f1;color:#236e5c}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-agency-title{color:#405064;font-size:8px;font-weight:950;letter-spacing:.35px}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-metrics{display:grid;grid-template-columns:1fr 1fr 1.05fr;gap:5px}:is(#eh-root,#eh-operation-dock) .eh-operation-metric{min-width:0;min-height:47px;display:grid;align-content:center;gap:3px;padding:6px;border:1px solid #e1e7ec;border-radius:8px;background:#fff;color:#5c6878;text-align:left}
+                :is(#eh-root,#eh-operation-dock) button.eh-operation-metric{cursor:pointer;font:inherit}:is(#eh-root,#eh-operation-dock) button.eh-operation-metric:disabled{cursor:default;opacity:.72}:is(#eh-root,#eh-operation-dock) .eh-operation-metric span{font-size:7.6px;font-weight:800}:is(#eh-root,#eh-operation-dock) .eh-operation-metric strong{font-size:14px;color:#253142}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-metric.board strong{color:#24735e}:is(#eh-root,#eh-operation-dock) .eh-operation-metric.alight strong{color:#a35a31}:is(#eh-root,#eh-operation-dock) .eh-operation-metric.balance strong{color:#2868a7}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-meta{color:#7a8695;font-size:7.7px;line-height:1.35}:is(#eh-root,#eh-operation-dock) .eh-operation-meta.warning{color:#9a5a23}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-actions{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px}:is(#eh-root,#eh-operation-dock) .eh-operation-actions .eh-context-btn{min-width:0;padding:6px 4px;font-size:7.8px}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-search-row{display:flex;align-items:center;gap:7px}:is(#eh-root,#eh-operation-dock) .eh-operation-search-row .eh-context-btn{flex:1}:is(#eh-root,#eh-operation-dock) .eh-operation-search-row span{color:#7b8794;font-size:7.5px;white-space:nowrap}
+                :is(#eh-root,#eh-operation-dock) .eh-operation-found-list{display:grid;gap:3px;padding-top:2px}:is(#eh-root,#eh-operation-dock) .eh-operation-found-list>span{color:#7b8794;font-size:7px;font-weight:900;letter-spacing:.35px}:is(#eh-root,#eh-operation-dock) .eh-operation-found-list button{width:100%;min-height:24px;padding:4px 6px;border:1px solid #e2e7ec;border-radius:6px;background:#fff;color:#526073;text-align:left;font-size:7.3px;font-weight:750;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}:is(#eh-root,#eh-operation-dock) .eh-operation-found-list button.selected{border-color:#9db8d2;background:#eef5fb;color:#315d86}
+                .eh-operation-car-search-toolbar{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px}.eh-operation-car-search-toolbar input{min-height:38px;padding:8px 10px;border:1px solid #ccd5df;border-radius:8px;font:inherit;font-size:12px}.eh-operation-search-actions{display:flex;flex-wrap:wrap;gap:5px;justify-content:flex-end}
+                .eh-operation-modal{width:min(800px,94vw)}.eh-operation-passenger-list,.eh-operation-day-list{display:grid;gap:7px}.eh-operation-passenger{display:grid;grid-template-columns:48px minmax(0,1fr);gap:10px;align-items:start;padding:10px;border:1px solid #e2e7ed;border-radius:9px;background:#fafbfd}.eh-operation-seat{display:flex;align-items:center;justify-content:center;min-height:38px;border-radius:8px;background:#edf3f7;color:#1e3448;font-size:17px}.eh-operation-passenger-info{display:grid;gap:3px}.eh-operation-passenger-info>strong{font-size:12px}.eh-operation-passenger-info small{font-size:10px;color:#697687}
+                .eh-operation-empty{padding:18px;border:1px dashed #d9e0e7;border-radius:9px;color:#718092;text-align:center;font-size:11px}.eh-operation-warning{padding:9px 10px;border:1px solid #f0cfaa;border-radius:8px;background:#fff8ee;color:#8b561f;font-size:10px}.eh-operation-detail-summary{display:grid;gap:8px}.eh-operation-detail-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.eh-operation-detail-metrics>div{display:grid;gap:3px;padding:9px;border:1px solid #e2e8ee;border-radius:8px;font-size:9px}.eh-operation-detail-metrics strong{font-size:16px}.eh-operation-detail-actions{display:flex;flex-wrap:wrap;gap:7px}
+                .eh-operation-group-title{margin:8px 0 2px;color:#536175;font-size:9px;font-weight:950;letter-spacing:.4px}.eh-operation-day-row{display:grid;grid-template-columns:22px minmax(0,1fr) auto;align-items:center;gap:8px;padding:9px;border:1px solid #e2e7ed;border-radius:9px;background:#fbfcfd}.eh-operation-day-status{font-size:15px;font-weight:900;color:#517064}.eh-operation-day-info{min-width:0;display:grid;gap:3px}.eh-operation-day-info strong{font-size:11px}.eh-operation-day-info small{font-size:9.5px;color:#748091}
+                .eh-operation-reminder-state.pending{color:#a35d24!important}.eh-operation-reminder-state.done{color:#2d785f!important}
+                .eh-operation-settings-list{display:grid;gap:8px;margin-top:8px}.eh-operation-settings-service{display:grid;grid-template-columns:100px minmax(180px,1.5fr) minmax(125px,1fr) minmax(125px,1fr);gap:7px;padding:9px;border:1px solid #e1e6ec;border-radius:9px;background:#fff}.eh-operation-settings-service .eh-check{align-self:end;min-height:36px}.eh-operation-settings-service .eh-remove-routine{align-self:end}.eh-operation-settings-service-note{grid-column:1/-1}
+                @media(max-width:760px){:is(#eh-root,#eh-operation-dock) .eh-operation-metrics{grid-template-columns:1fr 1fr}:is(#eh-root,#eh-operation-dock) .eh-operation-metric.balance{grid-column:1/-1}:is(#eh-root,#eh-operation-dock) .eh-operation-actions{grid-template-columns:1fr}.eh-operation-day-row{grid-template-columns:22px minmax(0,1fr)}.eh-operation-day-row>button,.eh-operation-search-actions{grid-column:1/-1}.eh-operation-detail-metrics{grid-template-columns:1fr}.eh-operation-settings-service{grid-template-columns:1fr}.eh-operation-settings-service-note{grid-column:auto}}
             `);
         },
 
         onPageUpdate(page) {
-            if (page === 'pesquisa') this.scanScheduleList();
-            else if (!EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL)) this.visibleScheduleRecords = [];
-            const modal = EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
-            if (modal) this.scanCurrentMap({ quiet: true });
+            if(page==='pesquisa')this.readScheduleResults();
+            else if(!EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL))this.visibleScheduleRecords=[];
+            if(EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL))this.scanCurrentMap({quiet:true});
             this.render();
         },
 
         init() {
-            if (this.started || EH.WhatsAppBridge.isWhatsAppHost()) return;
-            this.started = true;
-            this.injectStyles();
-            this.render();
+            if(this.started||EH.WhatsAppBridge.isWhatsAppHost())return;
+            this.started=true;this.injectStyles();this.render();
         }
     };
 
@@ -13125,7 +13072,8 @@
             const wrap = document.createElement('div');
             wrap.className = 'eh-finance-mini';
             const today = EH.FinanceLedger.todaySummary();
-            const month = EH.FinanceLedger.monthSummary();
+            const stats = EH.FinanceLedger.monthStats();
+            const month = stats?.summary || EH.FinanceLedger.monthSummary();
             const kpis = document.createElement('div');
             kpis.className = 'eh-finance-kpis';
             const item = (label, value) => {
@@ -13134,8 +13082,26 @@
                 const b = document.createElement('strong'); b.textContent = EH.Utils.formatMoney(value);
                 box.append(s,b); return box;
             };
-            kpis.append(item('Hoje • movimentado', today.movement), item('Hoje • comissão', today.commission), item('Mês • passagens', month.passageValue), item('Mês • comissão', month.commission));
+            kpis.append(
+                item('Hoje • movimentado', today.movement),
+                item('Mês • realizado', month.movement),
+                item('Média/dia', stats?.average?.movement || 0),
+                item(stats?.isCurrentMonth ? 'Projeção do mês' : 'Mês • comissão', stats?.isCurrentMonth ? (stats?.projection?.movement || 0) : month.commission),
+                item('Comissão atual', month.commission),
+                item(stats?.isCurrentMonth ? 'Comissão projetada' : 'Média comissão/dia', stats?.isCurrentMonth ? (stats?.projection?.commission || 0) : (stats?.average?.commission || 0))
+            );
             wrap.appendChild(kpis);
+            if (stats) {
+                const info=document.createElement('div');
+                info.className='eh-finance-company-line';
+                const label=document.createElement('span');
+                label.textContent=stats.isCurrentMonth
+                    ? `${stats.elapsedDays} dias transcorridos • ${stats.daysInMonth} dias no mês`
+                    : `${stats.daysInMonth} dias no mês • mês encerrado`;
+                const value=document.createElement('b');
+                value.textContent=stats.isCurrentMonth?`até ${stats.projectionDate}`:'final';
+                info.append(label,value);wrap.appendChild(info);
+            }
             const top = Object.values(month.byCompany || {}).sort((a,b)=>b.commission-a.commission).slice(0,4);
             top.forEach(company => {
                 const line = document.createElement('div'); line.className = 'eh-finance-company-line';
@@ -13203,14 +13169,59 @@
             const merchPane=makePane('mercadorias','Mercadorias');
 
             const renderSummary=()=>{
-                summaryPane.innerHTML=''; const today=EH.FinanceLedger.todaySummary(); const month=EH.FinanceLedger.monthSummary(monthState.key);
-                const nav=document.createElement('div');nav.className='eh-finance-month-nav';const prev=document.createElement('button');prev.className='eh-modal-btn';prev.textContent='‹';const lbl=document.createElement('strong');lbl.textContent=monthLabel(monthState.key);const next=document.createElement('button');next.className='eh-modal-btn';next.textContent='›';prev.addEventListener('click',()=>shiftMonth(-1));next.addEventListener('click',()=>shiftMonth(1));nav.append(prev,lbl,next);
+                summaryPane.innerHTML='';
+                const today=EH.FinanceLedger.todaySummary();
+                const stats=EH.FinanceLedger.monthStats(monthState.key);
+                const month=stats?.summary||EH.FinanceLedger.monthSummary(monthState.key);
+                const nav=document.createElement('div');nav.className='eh-finance-month-nav';
+                const prev=document.createElement('button');prev.className='eh-modal-btn';prev.textContent='‹';
+                const lbl=document.createElement('strong');lbl.textContent=monthLabel(monthState.key);
+                const next=document.createElement('button');next.className='eh-modal-btn';next.textContent='›';
+                prev.addEventListener('click',()=>shiftMonth(-1));next.addEventListener('click',()=>shiftMonth(1));nav.append(prev,lbl,next);
+
                 const grid=document.createElement('div');grid.className='eh-finance-summary-grid';
                 const stat=(label,value,sub)=>{const el=document.createElement('div');el.className='eh-finance-stat';const s=document.createElement('small');s.textContent=label;const b=document.createElement('strong');b.textContent=EH.Utils.formatMoney(value);const sp=document.createElement('span');sp.textContent=sub||'';el.append(s,b,sp);return el;};
-                grid.append(stat('Hoje • Passagens',today.passageValue,`${today.passageCount} operação(ões)`),stat('Hoje • Mercadorias',today.merchandiseReceivedValue+today.merchandiseSentValue,`${today.merchandiseReceivedCount} recebidas • ${today.merchandiseSentCount} enviadas`),stat('Hoje • Movimentação',today.movement,`Entradas ${EH.Utils.formatMoney(today.entradas)} • Saídas ${EH.Utils.formatMoney(today.saidas)}`),stat('Hoje • Comissão',today.commission,'Comissão efetiva/estimada'),stat('Mês • Passagens',month.passageValue,`${month.passageCount} operação(ões)`),stat('Mês • Mercadorias',month.merchandiseReceivedValue+month.merchandiseSentValue,`${month.merchandiseReceivedCount+month.merchandiseSentCount} operação(ões)`),stat('Mês • Movimentação',month.movement,monthLabel(monthState.key)),stat('Mês • Comissão',month.commission,monthLabel(monthState.key)));
-                summaryPane.append(nav,grid);
-                const official=EH.FinanceLedger.officialCommissionByCompany(); const companyWrap=document.createElement('div');companyWrap.style.marginTop='12px';
-                Object.values(month.byCompany||{}).sort((a,b)=>b.commission-a.commission).forEach(company=>{const card=document.createElement('div');card.className='eh-finance-company-card';const h=document.createElement('h4');h.textContent=company.company;const row=document.createElement('div');row.className='eh-finance-company-grid';const c=(l,v)=>{const d=document.createElement('div');d.textContent=l;const b=document.createElement('b');b.textContent=v;d.appendChild(b);return d;};row.append(c('Operações',String(company.operations)),c('Movimentado',EH.Utils.formatMoney(company.movement)),c('Comissão',EH.Utils.formatMoney(company.commission)),c('Percentual médio',`${company.averagePercent.toFixed(2).replace('.',',')}%`));card.append(h,row);if(Object.prototype.hasOwnProperty.call(official,company.company)){const diff=Math.abs(company.commission-official[company.company]);const note=document.createElement('div');note.className='eh-settings-note';note.textContent=`Helper: ${EH.Utils.formatMoney(company.commission)} • E-Pass: ${EH.Utils.formatMoney(official[company.company])} ${diff<=0.02?'✓ Conferido':'⚠ Conferir'}`;card.appendChild(note);}companyWrap.appendChild(card);}); summaryPane.appendChild(companyWrap);
+                grid.append(
+                    stat('Hoje • Movimentação',today.movement,`Comissão ${EH.Utils.formatMoney(today.commission)}`),
+                    stat(stats?.isCurrentMonth?'Realizado até hoje':'Total final',month.movement,monthLabel(monthState.key)),
+                    stat(stats?.isCurrentMonth?'Média diária':'Média diária final',stats?.average?.movement||0,stats?`${stats.elapsedDays} dia(s) considerado(s)`:'' ),
+                    stat('Comissão realizada',month.commission,'Comissão efetiva/estimada registrada')
+                );
+                if(stats?.isCurrentMonth&&stats.projection){
+                    grid.append(
+                        stat(`Projeção para ${stats.projectionDate}`,stats.projection.movement,`${stats.daysInMonth} dias no mês`),
+                        stat('Comissão projetada',stats.projection.commission,`Projeção do movimento × ${Number(stats.projection.commissionPercent||0).toFixed(2).replace('.',',')}%`),
+                        stat('Passagens • média/dia',stats.average.passage,`Projeção ${EH.Utils.formatMoney(stats.projection.passage)}`),
+                        stat('Mercadorias • média/dia',stats.average.merchandise,`Projeção ${EH.Utils.formatMoney(stats.projection.merchandise)}`)
+                    );
+                } else if(stats){
+                    grid.append(
+                        stat('Passagens • total',month.passageValue,`${month.passageCount} operação(ões)`),
+                        stat('Mercadorias • total',stats.merchandiseValue,`${month.merchandiseReceivedCount+month.merchandiseSentCount} operação(ões)`),
+                        stat('Passagens • média/dia',stats.average.passage,`${stats.daysInMonth} dias no mês`),
+                        stat('Comissão • média/dia',stats.average.commission,'Mês encerrado')
+                    );
+                }
+
+                const explanation=document.createElement('div');explanation.className='eh-help-box';
+                if(stats?.isCurrentMonth){
+                    explanation.textContent=`${stats.elapsedDays} dias corridos transcorridos • ${stats.daysInMonth} dias no mês. Projeção = média diária acumulada × dias do mês. A projeção é somente estatística e não entra no Caixa, histórico ou comissão realizada.`;
+                }else if(stats){
+                    explanation.textContent=`Mês encerrado: ${stats.daysInMonth} dias. Não é gerada projeção para meses anteriores.`;
+                }
+                summaryPane.append(nav,grid,explanation);
+
+                const official=EH.FinanceLedger.officialCommissionByCompany();const companyWrap=document.createElement('div');companyWrap.style.marginTop='12px';
+                Object.values(month.byCompany||{}).sort((a,b)=>b.commission-a.commission).forEach(company=>{
+                    const card=document.createElement('div');card.className='eh-finance-company-card';const h=document.createElement('h4');h.textContent=company.company;
+                    const row=document.createElement('div');row.className='eh-finance-company-grid';
+                    const c=(l,v)=>{const d=document.createElement('div');d.textContent=l;const b=document.createElement('b');b.textContent=v;d.appendChild(b);return d;};
+                    row.append(c('Operações',String(company.operations)),c('Movimentado',EH.Utils.formatMoney(company.movement)),c('Comissão',EH.Utils.formatMoney(company.commission)),c('Percentual médio',`${company.averagePercent.toFixed(2).replace('.',',')}%`));
+                    card.append(h,row);
+                    if(Object.prototype.hasOwnProperty.call(official,company.company)){const diff=Math.abs(company.commission-official[company.company]);const note=document.createElement('div');note.className='eh-settings-note';note.textContent=`Helper: ${EH.Utils.formatMoney(company.commission)} • E-Pass: ${EH.Utils.formatMoney(official[company.company])} ${diff<=0.02?'✓ Conferido':'⚠ Conferir'}`;card.appendChild(note);}
+                    companyWrap.appendChild(card);
+                });
+                summaryPane.appendChild(companyWrap);
             };
 
             const renderHistory=()=>{
@@ -14826,47 +14837,63 @@
             sections.financeiro.pane.appendChild(financeCard);
 
             // CARROS / OPERAÇÃO
-            const operationServiceFields = [];
+            const operationRoutineFields = [];
             const operationGeneralCard = card('Agência e leitura');
             const operationGeneralGrid = grid();
             operationGeneralGrid.append(
-                textField('operationAgencyCode', 'Código da minha agência', EH.Config.OPERATION_AGENCY_CODE, 'A leitura principal do mapa procura este código no resumo por localidade.'),
-                checkField('operationSortBySeat', 'Ordenar passageiros por poltrona', EH.Config.OPERATION_SORT_BY_SEAT)
+                textField('operationAgencyCode', 'Código da minha agência', EH.Config.OPERATION_AGENCY_CODE, 'A leitura principal do mapa procura exatamente este código no resumo por localidade.'),
+                numberField('operationTolerance', 'Tolerância do horário (min)', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES, { min:0, max:90, step:5, hint:'Ex.: 12:00 operacional pode aparecer como 11:50 no E-Pass.' })
             );
             operationGeneralCard.append(
                 checkField('operationCarsEnabled', 'Exibir módulo Carros', EH.Config.OPERATION_CARS_ENABLED),
                 checkField('operationDockEnabled', 'Usar painel secundário Operação / Carros', EH.Config.OPERATION_DOCK_ENABLED),
+                checkField('operationSortBySeat', 'Ordenar passageiros por poltrona', EH.Config.OPERATION_SORT_BY_SEAT),
                 operationGeneralGrid,
-                note('O saldo mostrado é sempre o valor oficial da própria linha da agência. O Helper não soma outras localidades e não recompõe saldo.')
+                note('O número do Serviço NÃO é configuração fixa. O Helper detecta Serviço + Linha + Empresa na pesquisa real daquele dia e usa o código 287 no mapa.')
             );
             sections.carros.pane.appendChild(operationGeneralCard);
 
-            const operationServicesCard = card('Serviços cadastrados');
-            operationServicesCard.appendChild(note('Serviço é o identificador principal. Linha e horário servem apenas para validação e referência operacional.'));
+            const operationServicesCard = card('Carros principais / horários');
+            operationServicesCard.appendChild(note('Configure somente a rotina. O “Serviço de hoje” é detectado automaticamente. Origem/Destino ajudam a diferenciar sentidos com horários próximos.'));
             const operationServicesList = document.createElement('div');
             operationServicesList.className = 'eh-operation-settings-list';
-            (EH.Config.OPERATION_SERVICES || []).forEach((serviceItem, index) => {
-                const row = document.createElement('div');
-                row.className = 'eh-operation-settings-service';
-                const serviceField = textField(`operationService_${index}`, 'Serviço', serviceItem.service);
-                const nameField = textField(`operationName_${index}`, 'Nome operacional', serviceItem.name);
-                const timeField = textField(`operationTime_${index}`, 'Horário', serviceItem.operationalTime);
-                const lineField = textField(`operationLine_${index}`, 'Linha real (validação)', serviceItem.lineCode || '');
-                const attendWrap = checkField(`operationAttends_${index}`, 'Atendo', serviceItem.attends);
-                const observationField = textField(`operationObservation_${index}`, 'Observação', serviceItem.observation || '');
-                observationField.classList.add('eh-operation-settings-service-note');
-                row.append(serviceField, nameField, timeField, lineField, attendWrap, observationField);
+
+            const makeRoutineInput = (labelText, value, type='text') => {
+                const wrap=document.createElement('div');wrap.className='eh-field';
+                const label=document.createElement('label');label.textContent=labelText;
+                const input=document.createElement('input');input.type=type;input.value=String(value||'');
+                wrap.append(label,input);
+                return {wrap,input};
+            };
+            const addRoutineRow = (item = {}) => {
+                const index = operationRoutineFields.length;
+                const row=document.createElement('div');row.className='eh-operation-settings-service';
+                const time=makeRoutineInput('Horário operacional',item.operationalTime||'');
+                const name=makeRoutineInput('Nome operacional',item.name||'');
+                const origin=makeRoutineInput('Origem referência',item.originHint||'');
+                const destination=makeRoutineInput('Destino referência',item.destinationHint||'');
+                const line=makeRoutineInput('Linha (opcional)',item.lineHint||'');
+                const company=makeRoutineInput('Empresa (opcional)',item.companyHint||'');
+                const activeWrap=document.createElement('label');activeWrap.className='eh-check';
+                const active=document.createElement('input');active.type='checkbox';active.checked=item.active!==undefined?Boolean(item.active):true;
+                const activeText=document.createElement('span');activeText.textContent='Ativo';activeWrap.append(active,activeText);
+                const remove=document.createElement('button');remove.type='button';remove.className='eh-modal-btn eh-remove-routine';remove.textContent='Excluir';
+                const entry={row,time:time.input,name:name.input,origin:origin.input,destination:destination.input,line:line.input,company:company.input,active,id:String(item.id||`rotina-${Date.now()}-${index}`)};
+                remove.addEventListener('click',()=>{entry.removed=true;row.remove();});
+                row.append(time.wrap,name.wrap,origin.wrap,destination.wrap,line.wrap,company.wrap,activeWrap,remove);
                 operationServicesList.appendChild(row);
-                operationServiceFields.push({
-                    service: fields[`operationService_${index}`],
-                    name: fields[`operationName_${index}`],
-                    time: fields[`operationTime_${index}`],
-                    line: fields[`operationLine_${index}`],
-                    attends: fields[`operationAttends_${index}`],
-                    observation: fields[`operationObservation_${index}`]
-                });
-            });
-            operationServicesCard.appendChild(operationServicesList);
+                operationRoutineFields.push(entry);
+                return entry;
+            };
+            const rebuildRoutineRows = (items=[]) => {
+                operationServicesList.innerHTML='';
+                operationRoutineFields.splice(0,operationRoutineFields.length);
+                (Array.isArray(items)?items:[]).forEach(item=>addRoutineRow(item));
+            };
+            rebuildRoutineRows(EH.Config.OPERATION_ROUTINES || []);
+            const addRoutine=document.createElement('button');addRoutine.type='button';addRoutine.className='eh-modal-btn';addRoutine.textContent='+ Adicionar horário';
+            addRoutine.addEventListener('click',()=>addRoutineRow({active:true}));
+            operationServicesCard.append(operationServicesList,addRoutine);
             sections.carros.pane.appendChild(operationServicesCard);
 
             // LEMBRETES
@@ -15081,15 +15108,8 @@
                 const defaultPanels = EH.PanelManager.defaults();
                 Object.keys(defaultPanels).forEach(key => panelDrafts[key] = { ...defaultPanels[key] });
                 loadPanelDraft(fields.managedPanel.value);
-                operationServiceFields.forEach((row, index) => {
-                    const item = d.OPERATION_SERVICES?.[index] || {};
-                    row.service.value = String(item.service || '');
-                    row.name.value = String(item.name || '');
-                    row.time.value = String(item.operationalTime || '');
-                    row.line.value = String(item.lineCode || '');
-                    row.attends.checked = Boolean(item.attends);
-                    row.observation.value = String(item.observation || '');
-                });
+                fields.operationTolerance.value = String(d.OPERATION_TIME_TOLERANCE_MINUTES || 20);
+                rebuildRoutineRows(d.OPERATION_ROUTINES || []);
                 fields.debug.checked = Boolean(d.DEBUG);
                 Object.entries(presetButtons).forEach(([name, button]) => button.classList.toggle('active', name === 'padrao'));
                 EH.Toast.info('Padrões carregados. Clique em “Salvar configurações” para aplicar.');
@@ -15173,24 +15193,35 @@
                 EH.Config.SYNC_SUPABASE_URL = String(fields.syncUrl.value || '').trim();
                 EH.Config.SYNC_SUPABASE_KEY = String(fields.syncKey.value || '').trim();
                 EH.Config.SYNC_SUPABASE_EMAIL = String(fields.syncEmail.value || '').trim();
-                const operationServices = operationServiceFields.map(row => ({
-                    service: String(row.service.value || '').replace(/\D/g, ''),
-                    name: EH.Utils.clean(row.name.value || ''),
-                    operationalTime: EH.Utils.clean(row.time.value || ''),
-                    attends: row.attends.checked,
-                    observation: EH.Utils.clean(row.observation.value || ''),
-                    lineCode: EH.Utils.clean(row.line.value || '')
-                })).filter(item => item.service);
-                const duplicateServices = operationServices.map(item => item.service).filter((value, index, arr) => arr.indexOf(value) !== index);
-                if (!operationServices.length || duplicateServices.length) {
-                    EH.Toast.error(duplicateServices.length ? `Serviço duplicado: ${duplicateServices[0]}` : 'Cadastre pelo menos um serviço operacional.');
+                const operationRoutines = operationRoutineFields
+                    .filter(row => !row.removed && row.row.isConnected)
+                    .map((row,index) => {
+                        const time=EH.Utils.clean(row.time.value||'');
+                        const name=EH.Utils.clean(row.name.value||'');
+                        const rawId=EH.Utils.clean(row.id||'')||`${time}-${name}-${index}`;
+                        return {
+                            id: EH.Utils.normalize(rawId).replace(/[^A-Z0-9]+/g,'-').replace(/^-+|-+$/g,'').toLowerCase() || `rotina-${index+1}`,
+                            name,
+                            operationalTime:time,
+                            active:Boolean(row.active.checked),
+                            originHint:EH.Utils.clean(row.origin.value||''),
+                            destinationHint:EH.Utils.clean(row.destination.value||''),
+                            companyHint:EH.Utils.clean(row.company.value||''),
+                            lineHint:EH.Utils.clean(row.line.value||'')
+                        };
+                    })
+                    .filter(item => item.name || item.operationalTime);
+                const invalidRoutine=operationRoutines.find(item=>!item.name||!/^\d{1,2}:\d{2}$/.test(item.operationalTime));
+                if(!operationRoutines.length||invalidRoutine){
+                    EH.Toast.error(!operationRoutines.length?'Cadastre pelo menos um horário operacional.':'Confira nome e horário dos carros principais (HH:MM).');
                     return;
                 }
                 EH.Config.OPERATION_CARS_ENABLED = fields.operationCarsEnabled.checked;
                 EH.Config.OPERATION_DOCK_ENABLED = fields.operationDockEnabled.checked;
                 EH.Config.OPERATION_AGENCY_CODE = String(fields.operationAgencyCode.value || '').replace(/\D/g, '') || '287';
                 EH.Config.OPERATION_SORT_BY_SEAT = fields.operationSortBySeat.checked;
-                EH.Config.OPERATION_SERVICES = operationServices;
+                EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = clamp(fields.operationTolerance.value, 0, 90, 20);
+                EH.Config.OPERATION_ROUTINES = operationRoutines;
                 EH.Config.DEBUG = fields.debug.checked;
                 EH.Config.WHATSAPP_MODE = 'web';
 
@@ -15233,7 +15264,8 @@
                     operationAgencyCode: EH.Config.OPERATION_AGENCY_CODE,
                     operationSortBySeat: EH.Config.OPERATION_SORT_BY_SEAT,
                     operationDockEnabled: EH.Config.OPERATION_DOCK_ENABLED,
-                    operationServices: EH.Config.OPERATION_SERVICES,
+                    operationTimeToleranceMinutes: EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,
+                    operationRoutines: EH.Config.OPERATION_ROUTINES,
                     reminderCreateAfterTicket: EH.Config.REMINDER_CREATE_AFTER_TICKET,
                     reminderAskAfterTicket: EH.Config.REMINDER_ASK_AFTER_TICKET,
                     reminderMaskCpf: EH.Config.REMINDER_MASK_CPF,
