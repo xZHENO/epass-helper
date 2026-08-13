@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.57.0
+// @version      5.57.1
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -19,7 +19,7 @@
 // @grant        GM_addValueChangeListener
 // @grant        GM_listValues
 // @grant        GM_xmlhttpRequest
-// @connect      *.supabase.co
+// @connect      supabase.co
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @run-at       document-idle
 // @noframes
@@ -34,7 +34,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.57.0',
+        VERSION: '5.57.1',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
         STORAGE_SCHEMA_VERSION: 4,
@@ -10788,8 +10788,11 @@
                         data:body,
                         timeout:15000,
                         onload:resolve,
-                        onerror:()=>reject(new Error('Falha de rede ao acessar a sincronização.')),
-                        ontimeout:()=>reject(new Error('Tempo esgotado ao acessar a sincronização.'))
+                        onerror:(error)=>{
+                            const detail = String(error?.error || error?.message || '').trim();
+                            reject(new Error(`Falha de rede ao acessar o Supabase${detail ? `: ${detail}` : ''}. Verifique a permissão @connect, a URL do projeto e sua conexão.`));
+                        },
+                        ontimeout:()=>reject(new Error('Tempo esgotado ao acessar o Supabase. Verifique a URL do projeto e sua conexão.'))
                     });
                 });
                 status=Number(response?.status||0);
