@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.54.0
+// @version      5.55.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.54.0',
+        VERSION: '5.55.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -9989,14 +9989,14 @@
     };
 
     // ============================================================
-    // PAINEL OPERACIONAL DOS CARROS — v5.54
-    // Regra operacional principal: CÓDIGO DA AGÊNCIA.
-    // O Helper usa diretamente Embarque, Desembarque e Saldo da linha 287.
-    // Não soma cidades, não recompõe saldo e não altera nenhum dado do E-Pass.
+    // PAINEL OPERACIONAL DOS CARROS — v5.55
+    // Regra operacional principal: CÓDIGO NUMÉRICO FINAL DA AGÊNCIA.
+    // 287 é a chave: origem 287 = embarque; destino 287 = desembarque; resumo 287 = números oficiais.
+    // Cidade/UF são somente descritivos. Não soma cidades, não recompõe saldo e não altera o E-Pass.
     // ============================================================
     EH.OperationCars = {
-        MAPS_KEY: 'operationCars.maps.v2',
-        LAST_KEY: 'operationCars.lastMap.v2',
+        MAPS_KEY: 'operationCars.maps.v3',
+        LAST_KEY: 'operationCars.lastMap.v3',
         lastDomSignature: '',
         lastMapKey: '',
         stylesInjected: false,
@@ -10029,27 +10029,38 @@
             return String(EH.Config.OPERATION_AGENCY_CODE || '287').replace(/\D/g, '') || '287';
         },
 
+        trailingCode(value) {
+            // A referência operacional é SOMENTE o código numérico final da localidade.
+            // Ex.: "ARENOPOLIS - GO - 287" -> "287".
+            // Não procura 287 no meio do texto, CPF, bilhete, serviço ou qualquer outra coluna.
+            const normalized = this.normalize(EH.Utils.clean(value || ''));
+            const match = normalized.match(/(?:^|\s*-\s*)(\d+)\s*$/);
+            return match ? String(match[1]) : '';
+        },
+
         parseLocation(value) {
             const raw = EH.Utils.clean(value || '');
             const normalized = this.normalize(raw);
-            const match = normalized.match(/^(.*?)\s*-\s*([A-Z]{2})(?:\s*-\s*([A-Z0-9]+))?$/);
-            if (!match) return { raw, city: normalized, uf: '', code: '' };
+            const code = this.trailingCode(raw);
+
+            // Cidade/UF são apenas descritivos. O código final é extraído separadamente
+            // para que a decisão operacional não dependa do nome ARENOPOLIS.
+            const withoutCode = code
+                ? normalized.replace(new RegExp(`\\s*-\\s*${code}\\s*$`), '').trim()
+                : normalized;
+            const match = withoutCode.match(/^(.*?)\s*-\s*([A-Z]{2})$/);
+            if (!match) return { raw, city: withoutCode, uf: '', code };
             return {
                 raw,
                 city: EH.Utils.clean(match[1]),
                 uf: match[2],
-                code: match[3] || ''
+                code
             };
         },
 
         isAgencyCode(location) {
             const parsed = typeof location === 'string' ? this.parseLocation(location) : (location || {});
             return String(parsed.code || '') === this.agencyCode();
-        },
-
-        isAgencyCity(location) {
-            const parsed = typeof location === 'string' ? this.parseLocation(location) : (location || {});
-            return this.normalize(parsed.city) === 'ARENOPOLIS' && this.normalize(parsed.uf) === 'GO';
         },
 
         shortLocation(location) {
@@ -10236,7 +10247,8 @@
                     alighters,
                     warning: '',
                     resolution: 'not-found',
-                    countsMatchPassengers: null
+                    countsMatchPassengers: null,
+                    code
                 };
             }
 
@@ -10257,14 +10269,19 @@
                 selected = distinct[0];
                 if (rows.length > 1) resolution = 'duplicate-dom';
             } else {
-                // Código 287 continua sendo a referência principal. Arenópolis é usado apenas
-                // como confirmação secundária quando há mais de um registro 287 no mesmo mapa.
-                const cityMatches = distinct.filter(item => this.isAgencyCity(item.location));
-                if (cityMatches.length === 1) {
-                    selected = cityMatches[0];
-                    resolution = 'code-plus-city-validation';
+                // AJUSTE FINO 5.55: a única validação secundária também é baseada no 287.
+                // Conta passageiros cuja ORIGEM termina em 287 e cuja DESTINAÇÃO termina em 287
+                // e procura uma única linha 287 cujos números oficiais coincidam exatamente.
+                const countMatches = distinct.filter(item =>
+                    Number(item.board) === boarders.length && Number(item.alight) === alighters.length
+                );
+                if (countMatches.length === 1) {
+                    selected = countMatches[0];
+                    resolution = 'code-plus-passenger-counts';
                 } else {
-                    warning = `Mais de um registro da agência ${code} encontrado.`;
+                    // Não usar cidade, UF, horário ou posição para escolher.
+                    // Não somar linhas 287 diferentes e não adivinhar.
+                    warning = `Mais de um registro diferente com código ${code} foi encontrado e nenhum pôde ser confirmado somente pelos passageiros do código ${code}.`;
                 }
             }
 
@@ -10281,7 +10298,8 @@
                     alighters,
                     warning,
                     resolution: 'ambiguous',
-                    countsMatchPassengers: null
+                    countsMatchPassengers: null,
+                    code
                 };
             }
 
@@ -10297,6 +10315,8 @@
                 alighters,
                 warning,
                 resolution,
+                code,
+                matchedLocality: EH.Utils.clean(selected.location?.raw || ''),
                 countsMatchPassengers: Number(selected.board) === boarders.length && Number(selected.alight) === alighters.length
             };
         },
@@ -10461,7 +10481,7 @@
             if (!quiet && preferred) {
                 const agency = preferred.agency || {};
                 if (!agency.exists) {
-                    EH.Toast.info(`Serviço ${preferred.service} • Agência ${this.agencyCode()} não aparece neste mapa.`);
+                    EH.Toast.info(`Serviço ${preferred.service} • código ${this.agencyCode()} não aparece no resumo do mapa.`);
                 } else if (agency.multiple) {
                     EH.Toast.warning(`Serviço ${preferred.service} • ${agency.warning || `mais de um registro da agência ${this.agencyCode()}.`}`);
                 } else {
@@ -10497,7 +10517,7 @@
             }
             const agency = record.agency || {};
             if (!agency.exists) {
-                EH.Toast.info(`Agência ${this.agencyCode()} não aparece neste mapa.`);
+                EH.Toast.info(`Código ${this.agencyCode()} não aparece no resumo deste mapa.`);
                 return;
             }
             if (agency.multiple) {
@@ -10619,7 +10639,7 @@
             if (!agency.exists) {
                 const empty = document.createElement('div');
                 empty.className = 'eh-operation-empty';
-                empty.textContent = `Agência ${this.agencyCode()} não aparece neste mapa.`;
+                empty.textContent = `Código ${this.agencyCode()} não aparece no resumo deste mapa.`;
                 summary.appendChild(empty);
             } else if (agency.multiple) {
                 const warning = document.createElement('div');
@@ -10736,9 +10756,9 @@
                     sub.textContent = `Serviço ${config.service}${config.observation ? ` • ${config.observation}` : ''}`;
                     const metrics = document.createElement('small');
                     if (!record) {
-                        metrics.textContent = `Agência ${this.agencyCode()}: aguardando leitura do mapa`;
+                        metrics.textContent = `Código ${this.agencyCode()}: aguardando leitura do mapa`;
                     } else if (!record.agency?.exists) {
-                        metrics.textContent = `Agência ${this.agencyCode()} não aparece neste mapa • Atualizado ${this.formatUpdatedAt(record.updatedAt)}`;
+                        metrics.textContent = `Código ${this.agencyCode()} não aparece no mapa • Atualizado ${this.formatUpdatedAt(record.updatedAt)}`;
                     } else if (record.agency?.multiple) {
                         metrics.textContent = `⚠ ${record.agency.warning || 'Mais de um registro encontrado'} • Atualizado ${this.formatUpdatedAt(record.updatedAt)}`;
                     } else {
@@ -10774,7 +10794,7 @@
                     top.textContent = `Serviço ${record.service} • ${this.displayName(record)}`;
                     const metrics = document.createElement('small');
                     metrics.textContent = !record.agency?.exists
-                        ? `Agência ${this.agencyCode()} não encontrada`
+                        ? `Código ${this.agencyCode()} não encontrado`
                         : record.agency?.multiple
                             ? `⚠ ${record.agency.warning || 'Registros 287 ambíguos'}`
                             : `↑ ${record.agency.board ?? '—'} ↓ ${record.agency.alight ?? '—'} 🚌 ${record.agency.balance ?? '—'}`;
@@ -10853,7 +10873,7 @@
 
             const agencyTitle = document.createElement('div');
             agencyTitle.className = 'eh-operation-agency-title';
-            agencyTitle.textContent = `AGÊNCIA ${this.agencyCode()}`;
+            agencyTitle.textContent = `CÓDIGO ${this.agencyCode()} • AGÊNCIA`;
 
             const metrics = document.createElement('div');
             metrics.className = 'eh-operation-metrics';
@@ -10888,9 +10908,9 @@
             const message = document.createElement('div');
             message.className = 'eh-operation-meta';
             if (!record) {
-                message.textContent = 'Aguardando leitura do Mapa de Viagem.';
+                message.textContent = `Aguardando mapa • procurando código ${this.agencyCode()}.`;
             } else if (!agency?.exists) {
-                message.textContent = `Agência ${this.agencyCode()} não aparece neste mapa.`;
+                message.textContent = `Código ${this.agencyCode()} não aparece no resumo deste mapa.`;
             } else if (agency.multiple) {
                 message.classList.add('warning');
                 message.textContent = `⚠ ${agency.warning || `Mais de um registro da agência ${this.agencyCode()} encontrado.`}`;
