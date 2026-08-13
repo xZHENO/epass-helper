@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.55.0
+// @version      5.56.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.55.0',
+        VERSION: '5.56.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -68,6 +68,11 @@
         OPERATION_CARS_ENABLED: true,
         OPERATION_AGENCY_CODE: '287',
         OPERATION_SORT_BY_SEAT: true,
+        OPERATION_DOCK_ENABLED: true,
+        REMINDER_CREATE_AFTER_TICKET: true,
+        REMINDER_ASK_AFTER_TICKET: true,
+        REMINDER_MASK_CPF: true,
+        REMINDER_HIGHLIGHT_TODAY: true,
         OPERATION_SERVICES: [
             { service: '6147', name: 'Goiânia → Cuiabá', operationalTime: '11:00', attends: true,  observation: '',             lineCode: 'MTTO0034019' },
             { service: '6319', name: 'Goiânia → Barra do Garças', operationalTime: '07:00', attends: true,  observation: '',             lineCode: '901929600' },
@@ -320,6 +325,11 @@
             EH.Config.OPERATION_CARS_ENABLED = Boolean(this.get('operationCarsEnabled', EH.Config.OPERATION_CARS_ENABLED));
             EH.Config.OPERATION_AGENCY_CODE = String(this.get('operationAgencyCode', EH.Config.OPERATION_AGENCY_CODE) || '287').replace(/\D/g, '') || '287';
             EH.Config.OPERATION_SORT_BY_SEAT = Boolean(this.get('operationSortBySeat', EH.Config.OPERATION_SORT_BY_SEAT));
+            EH.Config.OPERATION_DOCK_ENABLED = Boolean(this.get('operationDockEnabled', EH.Config.OPERATION_DOCK_ENABLED));
+            EH.Config.REMINDER_CREATE_AFTER_TICKET = Boolean(this.get('reminderCreateAfterTicket', EH.Config.REMINDER_CREATE_AFTER_TICKET));
+            EH.Config.REMINDER_ASK_AFTER_TICKET = Boolean(this.get('reminderAskAfterTicket', EH.Config.REMINDER_ASK_AFTER_TICKET));
+            EH.Config.REMINDER_MASK_CPF = Boolean(this.get('reminderMaskCpf', EH.Config.REMINDER_MASK_CPF));
+            EH.Config.REMINDER_HIGHLIGHT_TODAY = Boolean(this.get('reminderHighlightToday', EH.Config.REMINDER_HIGHLIGHT_TODAY));
             const savedOperationServices = this.get('operationServices', null);
             if (Array.isArray(savedOperationServices) && savedOperationServices.length) {
                 const defaultsByService = new Map((EH.ConfigDefaults?.OPERATION_SERVICES || []).map(item => [String(item.service || ''), item]));
@@ -2342,6 +2352,254 @@
     };
 
     // ============================================================
+    // GERENCIADOR DE PAINÉIS — v5.56
+    // Movimento/fixação independentes. Nunca altera app-root do E-Pass.
+    // ============================================================
+    EH.PanelManager = {
+        KEY: 'panelManager.v1',
+        drag: null,
+        bound: new WeakSet(),
+
+        defaults() {
+            return {
+                main: { mode: 'automatic', x: null, y: null, width: 370, height: 560, zoom: 100, dynamic: true },
+                whatsapp: { mode: 'automatic', x: null, y: null, width: 320, height: 460, zoom: 100, dynamic: true },
+                operation: { mode: 'bottom-right', x: null, y: null, width: 300, height: 285, zoom: 100, dynamic: true }
+            };
+        },
+
+        normalizePanel(key, value = {}) {
+            const fallback = this.defaults()[key] || this.defaults().main;
+            const modes = ['automatic', 'free', 'left', 'right', 'top', 'bottom', 'top-left', 'top-right', 'bottom-left', 'bottom-right'];
+            const mode = modes.includes(String(value.mode || '')) ? String(value.mode) : fallback.mode;
+            const limits = key === 'operation'
+                ? { minW: 240, maxW: 480, minH: 210, maxH: 720 }
+                : key === 'whatsapp'
+                    ? { minW: 240, maxW: 560, minH: 240, maxH: 900 }
+                    : { minW: 260, maxW: 600, minH: 300, maxH: 900 };
+            return {
+                mode,
+                x: Number.isFinite(Number(value.x)) ? Number(value.x) : fallback.x,
+                y: Number.isFinite(Number(value.y)) ? Number(value.y) : fallback.y,
+                width: Math.min(limits.maxW, Math.max(limits.minW, Number(value.width) || fallback.width)),
+                height: Math.min(limits.maxH, Math.max(limits.minH, Number(value.height) || fallback.height)),
+                zoom: Math.min(150, Math.max(75, Number(value.zoom) || fallback.zoom)),
+                dynamic: value.dynamic !== undefined ? Boolean(value.dynamic) : Boolean(fallback.dynamic)
+            };
+        },
+
+        load() {
+            const raw = EH.Storage.get(this.KEY, null) || {};
+            const result = {};
+            ['main', 'whatsapp', 'operation'].forEach(key => { result[key] = this.normalizePanel(key, raw[key] || {}); });
+            return result;
+        },
+
+        save(all) {
+            const normalized = {};
+            ['main', 'whatsapp', 'operation'].forEach(key => { normalized[key] = this.normalizePanel(key, all?.[key] || {}); });
+            EH.Storage.set(this.KEY, normalized);
+            this.applyAll();
+            return normalized;
+        },
+
+        get(key) { return this.load()[key] || this.normalizePanel(key, {}); },
+
+        update(key, patch = {}) {
+            const all = this.load();
+            all[key] = this.normalizePanel(key, { ...all[key], ...patch });
+            return this.save(all)[key];
+        },
+
+        restore(key) {
+            const all = this.load();
+            all[key] = this.defaults()[key];
+            this.save(all);
+            EH.Toast?.info?.(`Posição do painel ${this.label(key)} restaurada.`);
+        },
+
+        restoreAll() {
+            EH.Storage.set(this.KEY, this.defaults());
+            this.applyAll();
+            EH.Toast?.info?.('Posições dos painéis restauradas.');
+        },
+
+        label(key) {
+            return key === 'main' ? 'Atendimento' : key === 'whatsapp' ? 'WhatsApp' : 'Operação';
+        },
+
+        element(key) {
+            if (key === 'main') return EH.UI?.root || document.querySelector('#eh-root');
+            if (key === 'whatsapp') return EH.WhatsAppDock?.root || document.querySelector('#eh-wa-dock');
+            return EH.OperationDock?.root || document.querySelector('#eh-operation-dock');
+        },
+
+        header(key) {
+            const el = this.element(key);
+            if (!el) return null;
+            return key === 'main' ? el.querySelector('.eh-header')
+                : key === 'whatsapp' ? el.querySelector('.eh-wa-dock-head')
+                    : el.querySelector('.eh-operation-dock-head');
+        },
+
+        dynamicSize(key) {
+            const vw = Math.max(320, window.innerWidth || 1366);
+            const vh = Math.max(480, window.innerHeight || 768);
+            if (key === 'main') return {
+                width: Math.round(Math.min(430, Math.max(290, vw * (vw < 900 ? .38 : .27)))),
+                height: Math.round(Math.min(720, Math.max(390, vh * (vh < 700 ? .66 : .72)))),
+                zoom: vw < 800 ? 90 : 100
+            };
+            if (key === 'whatsapp') return {
+                width: Math.round(Math.min(420, Math.max(250, vw * (vw < 900 ? .34 : .23)))),
+                height: Math.round(Math.min(690, Math.max(300, vh * (vh < 700 ? .58 : .66)))),
+                zoom: vw < 800 ? 90 : 100
+            };
+            return {
+                width: Math.round(Math.min(360, Math.max(250, vw * .22))),
+                height: Math.round(Math.min(440, Math.max(230, vh * .38))),
+                zoom: vw < 760 ? 90 : 100
+            };
+        },
+
+        recommended(key) { return this.dynamicSize(key); },
+
+        clearPositionOverrides(el) {
+            if (!el) return;
+            ['top','left','right','bottom','width','height','max-height','max-width'].forEach(prop => el.style.removeProperty(prop));
+        },
+
+        setImportant(el, prop, value) {
+            if (!el) return;
+            if (value === null || value === undefined || value === '') el.style.removeProperty(prop);
+            else el.style.setProperty(prop, String(value), 'important');
+        },
+
+        applyContentZoom(key, percent) {
+            const factor = Math.min(1.5, Math.max(.75, Number(percent) / 100 || 1));
+            if (key === 'main' && EH.UI?.body) EH.UI.body.style.zoom = String(factor);
+            if (key === 'operation' && EH.OperationDock?.body) EH.OperationDock.body.style.zoom = String(factor);
+            if (key === 'whatsapp') {
+                const root = this.element('whatsapp');
+                if (!root) return;
+                let wrap = root.querySelector(':scope > .eh-wa-scale-body');
+                const head = root.querySelector(':scope > .eh-wa-dock-head');
+                if (!wrap && head) {
+                    wrap = document.createElement('div');
+                    wrap.className = 'eh-wa-scale-body';
+                    Array.from(root.children).filter(child => child !== head).forEach(child => wrap.appendChild(child));
+                    root.appendChild(wrap);
+                }
+                if (wrap) wrap.style.zoom = String(factor);
+            }
+        },
+
+        apply(key) {
+            const el = this.element(key);
+            if (!el) return;
+            const cfg = this.get(key);
+            const edge = window.innerWidth <= 760 ? 8 : 14;
+            const viewportW = Math.max(320, window.innerWidth || 1366);
+            const viewportH = Math.max(480, window.innerHeight || 768);
+            const auto = this.dynamicSize(key);
+            const width = cfg.dynamic ? auto.width : cfg.width;
+            const height = cfg.dynamic ? auto.height : cfg.height;
+            const zoom = cfg.dynamic ? auto.zoom : cfg.zoom;
+
+            this.applyContentZoom(key, zoom);
+
+            // Automatic mantém o layout aprovado para Atendimento/WhatsApp.
+            if (cfg.mode === 'automatic' && key !== 'operation') {
+                ['top','left','right','bottom','width','height','max-height','max-width'].forEach(prop => el.style.removeProperty(prop));
+                return;
+            }
+
+            this.setImportant(el, 'width', `${Math.min(width, viewportW - edge * 2)}px`);
+            this.setImportant(el, 'height', `${Math.min(height, viewportH - edge * 2)}px`);
+            this.setImportant(el, 'max-height', `${viewportH - edge * 2}px`);
+            this.setImportant(el, 'max-width', `${viewportW - edge * 2}px`);
+
+            const w = Math.min(width, viewportW - edge * 2);
+            const h = Math.min(height, viewportH - edge * 2);
+            let x = edge;
+            let y = edge;
+            switch (cfg.mode) {
+                case 'free':
+                    x = Math.min(viewportW - w - edge, Math.max(edge, Number(cfg.x) || edge));
+                    y = Math.min(viewportH - h - edge, Math.max(edge, Number(cfg.y) || edge));
+                    break;
+                case 'left': x = edge; y = Math.max(edge, Math.round((viewportH - h) / 2)); break;
+                case 'right': x = viewportW - w - edge; y = Math.max(edge, Math.round((viewportH - h) / 2)); break;
+                case 'top': x = Math.max(edge, Math.round((viewportW - w) / 2)); y = edge; break;
+                case 'bottom': x = Math.max(edge, Math.round((viewportW - w) / 2)); y = viewportH - h - edge; break;
+                case 'top-left': x = edge; y = edge; break;
+                case 'top-right': x = viewportW - w - edge; y = edge; break;
+                case 'bottom-left': x = edge; y = viewportH - h - edge; break;
+                case 'bottom-right': x = viewportW - w - edge; y = viewportH - h - edge; break;
+                default:
+                    if (key === 'operation') { x = viewportW - w - edge; y = viewportH - h - edge; }
+                    else return;
+            }
+            this.setImportant(el, 'left', `${x}px`);
+            this.setImportant(el, 'top', `${y}px`);
+            this.setImportant(el, 'right', 'auto');
+            this.setImportant(el, 'bottom', 'auto');
+        },
+
+        applyAll() {
+            ['main', 'whatsapp', 'operation'].forEach(key => this.apply(key));
+        },
+
+        bind(key) {
+            const header = this.header(key);
+            if (!header || this.bound.has(header)) return;
+            this.bound.add(header);
+            header.classList.add('eh-drag-handle');
+            header.addEventListener('pointerdown', event => {
+                if (event.button !== 0) return;
+                if (event.target?.closest?.('button, input, select, textarea, a, [role="button"]')) return;
+                const el = this.element(key);
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                this.update(key, { mode: 'free', x: rect.left, y: rect.top, dynamic: false, width: rect.width, height: rect.height });
+                this.drag = { key, pointerId: event.pointerId, dx: event.clientX - rect.left, dy: event.clientY - rect.top };
+                header.setPointerCapture?.(event.pointerId);
+                document.documentElement.classList.add('eh-panel-dragging');
+                event.preventDefault();
+            });
+            header.addEventListener('pointermove', event => {
+                if (!this.drag || this.drag.key !== key || this.drag.pointerId !== event.pointerId) return;
+                const el = this.element(key);
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                const edge = 6;
+                const x = Math.min(window.innerWidth - rect.width - edge, Math.max(edge, event.clientX - this.drag.dx));
+                const y = Math.min(window.innerHeight - rect.height - edge, Math.max(edge, event.clientY - this.drag.dy));
+                this.setImportant(el, 'left', `${x}px`);
+                this.setImportant(el, 'top', `${y}px`);
+                this.setImportant(el, 'right', 'auto');
+                this.setImportant(el, 'bottom', 'auto');
+            });
+            const finish = event => {
+                if (!this.drag || this.drag.key !== key) return;
+                const el = this.element(key);
+                const rect = el?.getBoundingClientRect?.();
+                if (rect) this.update(key, { mode: 'free', x: Math.round(rect.left), y: Math.round(rect.top), width: Math.round(rect.width), height: Math.round(rect.height), dynamic: false });
+                this.drag = null;
+                document.documentElement.classList.remove('eh-panel-dragging');
+                try { header.releasePointerCapture?.(event.pointerId); } catch (error) {}
+            };
+            header.addEventListener('pointerup', finish);
+            header.addEventListener('pointercancel', finish);
+        },
+
+        bindAll() {
+            ['main','whatsapp','operation'].forEach(key => this.bind(key));
+            this.applyAll();
+        }
+    };
+
+    // ============================================================
     // ESTILO
     // ============================================================
     EH.Style = {
@@ -2368,7 +2626,10 @@
                     --eh-layout-transition: 180ms;
                 }
 
-                #eh-root, #eh-root * { box-sizing: border-box; }
+                #eh-root, #eh-root *, #eh-operation-dock, #eh-operation-dock *, #eh-wa-dock, #eh-wa-dock * { box-sizing: border-box; }
+                .eh-drag-handle { cursor: grab !important; touch-action: none; }
+                html.eh-panel-dragging, html.eh-panel-dragging * { cursor: grabbing !important; user-select: none !important; }
+                .eh-wa-scale-body { min-height:0; flex:1 1 auto; display:flex; flex-direction:column; overflow:hidden; transform-origin:top left; }
 
                 /* Componentes do painel esquerdo. Posicionamento e dimensões ficam
                    exclusivamente no bloco de layout abaixo. */
@@ -4054,7 +4315,9 @@
             EH.RequisitionManager?.scanDom?.();
             EH.UI.updateState(page);
             EH.OperationCars?.onPageUpdate?.(page);
+            EH.Reminders?.onPageUpdate?.(page);
             EH.WhatsAppDock?.renderOrganizer?.(page);
+            EH.PanelManager?.bindAll?.();
             if ((page === 'caixa' || page === 'comissoes') && EH.Config.FINANCE_AUTO_REGISTER) {
                 const now = Date.now();
                 if (!this.lastFinanceSyncAt || (now - this.lastFinanceSyncAt) > 1800) {
@@ -9994,6 +10257,231 @@
     // 287 é a chave: origem 287 = embarque; destino 287 = desembarque; resumo 287 = números oficiais.
     // Cidade/UF são somente descritivos. Não soma cidades, não recompõe saldo e não altera o E-Pass.
     // ============================================================
+    // ============================================================
+    // LEMBRETES DE IMPRESSÃO / EMBARQUE — v5.56
+    // Persistentes, deduplicados por bilhete/localizador quando disponível.
+    // ============================================================
+    EH.Reminders = {
+        KEY: 'ticketReminders.v1',
+        PENDING_SEARCH_KEY: 'ticketReminders.pendingSearch.v1',
+        searchBusy: false,
+        stylesInjected: false,
+
+        normalizeCpf(value) { return String(value || '').replace(/\D/g, '').slice(0, 11); },
+        load() {
+            const items = EH.Storage.get(this.KEY, []);
+            return Array.isArray(items) ? items : [];
+        },
+        save(items) {
+            const safe = (Array.isArray(items) ? items : []).slice(-1000);
+            EH.Storage.set(this.KEY, safe);
+            this.render();
+            return safe;
+        },
+        parseTravel(raw) {
+            const text = EH.Utils.clean(raw || '');
+            const m = text.match(/(\d{2})\/(\d{2})\/(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::\d{2})?)?/);
+            if (!m) return { raw:text, key:'', timestamp:0, dateBr:'', time:'' };
+            const day=Number(m[1]), month=Number(m[2])-1, year=Number(m[3]);
+            const hour=Number(m[4] || 12), minute=Number(m[5] || 0);
+            const date = new Date(year, month, day, hour, minute, 0, 0);
+            return {
+                raw:text,
+                key:`${year}-${String(month+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`,
+                timestamp:date.getTime(),
+                dateBr:`${String(day).padStart(2,'0')}/${String(month+1).padStart(2,'0')}/${year}`,
+                time:m[4] ? `${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}` : ''
+            };
+        },
+        keyFor(item, ticket, cpf) {
+            const number = EH.Utils.clean(ticket?.number || '');
+            if (number) return `ticket:${number}`;
+            const date = EH.Utils.clean(ticket?.date || '');
+            const origin = EH.Utils.normalize(ticket?.origin || '');
+            const destination = EH.Utils.normalize(ticket?.destination || '');
+            return `route:${cpf}|${date}|${origin}|${destination}`;
+        },
+        candidateItems(items=[]) {
+            const result=[];
+            (Array.isArray(items)?items:[]).forEach(item => {
+                const cpf=this.normalizeCpf(item?.cpf || '');
+                const passenger = item?.passengerId ? EH.SaleContext?.load?.().find(p=>p.id===item.passengerId) : (cpf ? EH.SaleContext?.findPassengerByCpf?.(cpf) : null);
+                const name=EH.Utils.clean(item?.name || passenger?.name || '');
+                const tickets=(item?.data?.tickets || item?.tickets || []).filter(Boolean);
+                tickets.forEach(ticket => {
+                    const travel=this.parseTravel(ticket.date);
+                    result.push({
+                        id:this.keyFor(item,ticket,cpf), ticketNumber:EH.Utils.clean(ticket.number||''),
+                        cpf, name, passengerId:item?.passengerId || passenger?.id || null,
+                        origin:EH.Utils.clean(ticket.origin||''), destination:EH.Utils.clean(ticket.destination||''),
+                        travelRaw:EH.Utils.clean(ticket.date||''), travelDate:travel.key, travelDateBr:travel.dateBr,
+                        travelTime:travel.time, travelTimestamp:travel.timestamp,
+                        status:'pending', source:'epass-ticket', createdAt:Date.now(), completedAt:0
+                    });
+                });
+            });
+            return result;
+        },
+        captureItems(items=[]) {
+            if (!EH.Config.REMINDER_CREATE_AFTER_TICKET) return 0;
+            const candidates=this.candidateItems(items);
+            if (!candidates.length) return 0;
+            const existing=this.load();
+            const ids=new Set(existing.map(x=>String(x.id||'')));
+            const fresh=candidates.filter(x=>!ids.has(x.id));
+            if (!fresh.length) return 0;
+            if (EH.Config.REMINDER_ASK_AFTER_TICKET) {
+                const ok=window.confirm(`Criar lembrete de impressão/embarque para ${fresh.length} passagem(ns)?`);
+                if (!ok) return 0;
+            }
+            this.save([...existing,...fresh]);
+            EH.Toast?.success?.(`${fresh.length} lembrete(s) de passagem criado(s).`);
+            return fresh.length;
+        },
+        complete(id) {
+            const items=this.load();
+            const item=items.find(x=>x.id===id);
+            if (!item) return;
+            item.status='completed'; item.completedAt=Date.now();
+            this.save(items);
+            EH.Toast?.success?.('Lembrete marcado como impresso/concluído.');
+        },
+        reopen(id) {
+            const items=this.load(); const item=items.find(x=>x.id===id); if(!item)return;
+            item.status='pending'; item.completedAt=0; this.save(items);
+        },
+        todayKey(offset=0) {
+            const d=new Date(); d.setDate(d.getDate()+offset);
+            return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        },
+        pending() { return this.load().filter(x=>x.status!=='completed').sort((a,b)=>(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15)||a.createdAt-b.createdAt); },
+        maskCpf(cpf) { return EH.Config.REMINDER_MASK_CPF ? EH.SaleContext.maskCpfPublic(cpf) : EH.SaleContext.maskCpf(cpf); },
+        async copyCpf(item) {
+            const cpf=this.normalizeCpf(item?.cpf); if(cpf.length!==11) return EH.Toast.warning('CPF não disponível neste lembrete.');
+            await EH.Clipboard.copyText(cpf); EH.Toast.success('CPF copiado.');
+        },
+        searchTicket(item) {
+            const cpf=this.normalizeCpf(item?.cpf); if(cpf.length!==11) return EH.Toast.warning('CPF não disponível neste lembrete.');
+            EH.Storage.set(this.PENDING_SEARCH_KEY,{ cpf, reminderId:item.id, expiresAt:Date.now()+60000 });
+            if (EH.Pages.detect()==='passagens') this.runPendingSearch(); else EH.SaleContext.navigateToPassagens();
+        },
+        async runPendingSearch() {
+            if (this.searchBusy) return;
+            const pending=EH.Storage.get(this.PENDING_SEARCH_KEY,null);
+            if(!pending?.cpf || Number(pending.expiresAt||0)<Date.now()) { EH.Storage.remove(this.PENDING_SEARCH_KEY); return; }
+            const input=EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT); if(!input) return;
+            this.searchBusy=true;
+            try {
+                EH.SaleContext.setNativeValue(input, EH.SaleContext.maskCpf(pending.cpf));
+                input.focus(); await EH.Utils.sleep(90); input.blur();
+                const button=EH.SaleContext.findSearchButton(input); const form=input.closest('form');
+                if(button) button.click(); else if(form?.requestSubmit) form.requestSubmit(); else form?.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+                EH.Storage.remove(this.PENDING_SEARCH_KEY);
+                EH.Toast.success('CPF preenchido e busca iniciada.');
+            } finally { this.searchBusy=false; }
+        },
+        onPageUpdate(page) { if(page==='passagens') EH.Runtime.timeout('reminder-pending-search',()=>this.runPendingSearch(),350); },
+        labelFor(item) {
+            const today=this.todayKey(0), tomorrow=this.todayKey(1);
+            if(item.travelDate===today) return `HOJE${item.travelTime?` — ${item.travelTime}`:''}`;
+            if(item.travelDate===tomorrow) return `AMANHÃ${item.travelTime?` — ${item.travelTime}`:''}`;
+            return [item.travelDateBr,item.travelTime].filter(Boolean).join(' — ') || 'DATA NÃO IDENTIFICADA';
+        },
+        openModal() {
+            document.querySelector('#eh-reminders-overlay')?.remove();
+            const overlay=document.createElement('div'); overlay.className='eh-overlay'; overlay.id='eh-reminders-overlay';
+            const modal=document.createElement('div'); modal.className='eh-modal'; modal.style.width='min(760px,96vw)';
+            const head=document.createElement('div'); head.className='eh-modal-head';
+            const title=document.createElement('div'); title.className='eh-modal-title'; title.textContent='Lembretes de passagens';
+            const close=document.createElement('button'); close.type='button'; close.className='eh-modal-close'; close.textContent='✕'; head.append(title,close);
+            const content=document.createElement('div'); content.className='eh-modal-content eh-reminder-list';
+            const renderList=()=>{
+                content.innerHTML=''; const items=this.load().slice().sort((a,b)=>(a.status==='completed')-(b.status==='completed')||(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15));
+                if(!items.length){ const empty=document.createElement('div'); empty.className='eh-reminder-empty'; empty.textContent='Nenhum lembrete salvo.'; content.appendChild(empty); return; }
+                items.forEach(item=>{
+                    const card=document.createElement('div'); card.className=`eh-reminder-card ${item.status==='completed'?'completed':''}`;
+                    const top=document.createElement('div'); top.className='eh-reminder-card-top';
+                    const when=document.createElement('strong'); when.textContent=this.labelFor(item);
+                    const state=document.createElement('span'); state.textContent=item.status==='completed'?'✓ IMPRESSO':'PENDENTE'; top.append(when,state);
+                    const name=document.createElement('b'); name.textContent=item.name || 'Passageiro';
+                    const cpf=document.createElement('div'); cpf.className='eh-reminder-cpf'; cpf.textContent=`CPF: ${this.maskCpf(item.cpf)}`;
+                    const route=document.createElement('small'); route.textContent=[item.origin,item.destination].filter(Boolean).join(' → ') || 'Trecho não identificado';
+                    const id=document.createElement('small'); id.textContent=item.ticketNumber?`Bilhete ${item.ticketNumber}`:'Identificador por CPF + trecho + data';
+                    const actions=document.createElement('div'); actions.className='eh-reminder-actions';
+                    const copy=document.createElement('button'); copy.type='button'; copy.className='eh-modal-btn'; copy.textContent='Copiar CPF'; copy.addEventListener('click',()=>this.copyCpf(item));
+                    const search=document.createElement('button'); search.type='button'; search.className='eh-modal-btn primary'; search.textContent='Buscar passagem'; search.addEventListener('click',()=>this.searchTicket(item));
+                    const done=document.createElement('button'); done.type='button'; done.className='eh-modal-btn'; done.textContent=item.status==='completed'?'Reabrir':'✓ Impresso'; done.addEventListener('click',()=>{ item.status==='completed'?this.reopen(item.id):this.complete(item.id); renderList(); });
+                    actions.append(copy,search,done); card.append(top,name,cpf,route,id,actions); content.appendChild(card);
+                });
+            }; renderList();
+            const foot=document.createElement('div'); foot.className='eh-modal-actions'; const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar'; foot.appendChild(close2);
+            modal.append(head,content,foot); overlay.appendChild(modal); document.body.appendChild(overlay);
+            const dismiss=()=>overlay.remove(); close.onclick=dismiss; close2.onclick=dismiss; overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
+        },
+        render() {
+            const host=EH.UI?.reminderBox; if(!host)return;
+            const pending=this.pending();
+            if(!pending.length){ host.hidden=true; host.innerHTML=''; return; }
+            host.hidden=false; host.innerHTML='';
+            const today=pending.filter(x=>x.travelDate===this.todayKey(0)); const tomorrow=pending.filter(x=>x.travelDate===this.todayKey(1));
+            const title=document.createElement('div'); title.className='eh-reminder-host-title'; title.innerHTML='<span>LEMBRETES</span><strong>Passagens para imprimir</strong>';
+            const summary=document.createElement('div'); summary.className='eh-reminder-host-summary';
+            const todayBtn=document.createElement('button'); todayBtn.type='button'; todayBtn.textContent=`Hoje ${today.length}`;
+            const tomorrowBtn=document.createElement('button'); tomorrowBtn.type='button'; tomorrowBtn.textContent=`Amanhã ${tomorrow.length}`;
+            const totalBtn=document.createElement('button'); totalBtn.type='button'; totalBtn.textContent=`Pendentes ${pending.length}`;
+            [todayBtn,tomorrowBtn,totalBtn].forEach(btn=>btn.addEventListener('click',()=>this.openModal())); summary.append(todayBtn,tomorrowBtn,totalBtn);
+            const next=pending[0]; const nextLine=document.createElement('div'); nextLine.className='eh-reminder-next';
+            const main=document.createElement('strong'); main.textContent=`${next.travelTime||'—'} • ${next.name||'Passageiro'}`;
+            const sub=document.createElement('small'); sub.textContent=`${this.maskCpf(next.cpf)} • ${[next.origin,next.destination].filter(Boolean).join(' → ')}`; nextLine.append(main,sub);
+            host.append(title,summary,nextLine);
+        },
+        injectStyles() {
+            if(this.stylesInjected)return; this.stylesInjected=true;
+            GM_addStyle(`
+                #eh-root .eh-reminder-host{display:grid;gap:6px;margin:7px 0;padding:8px;border:1px solid #e1d7bd;border-radius:9px;background:#fffaf0;color:#303946}
+                #eh-root .eh-reminder-host[hidden]{display:none!important}.eh-reminder-host-title{display:grid;gap:1px}.eh-reminder-host-title span{font-size:7px;font-weight:950;letter-spacing:.5px;color:#92703a}.eh-reminder-host-title strong{font-size:10px;color:#334155}
+                .eh-reminder-host-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}.eh-reminder-host-summary button{min-height:27px;border:1px solid #e4d7ba;border-radius:7px;background:#fff;color:#6b5734;font-size:8px;font-weight:850;cursor:pointer}.eh-reminder-next{display:grid;gap:2px;padding-top:5px;border-top:1px solid #eee2c9}.eh-reminder-next strong{font-size:9px}.eh-reminder-next small{font-size:7.8px;color:#746956;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+                .eh-reminder-list{display:grid;gap:8px}.eh-reminder-card{display:grid;gap:5px;padding:11px;border:1px solid #dfe5eb;border-radius:10px;background:#fff}.eh-reminder-card.completed{opacity:.68;background:#f7f9fa}.eh-reminder-card-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.eh-reminder-card-top strong{font-size:12px;color:#253348}.eh-reminder-card-top span{font-size:8px;font-weight:900;color:#697687}.eh-reminder-card>b{font-size:12px}.eh-reminder-cpf{font-size:11px;font-weight:800;color:#334155}.eh-reminder-card small{font-size:10px;color:#6d7888}.eh-reminder-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px}.eh-reminder-empty{padding:25px;text-align:center;color:#718092}
+            `);
+        },
+        init(){ this.injectStyles(); this.render(); }
+    };
+
+    // ============================================================
+    // PAINEL SECUNDÁRIO OPERAÇÃO / CARROS — v5.56
+    // ============================================================
+    EH.OperationDock = {
+        root:null, body:null, host:null, launcher:null, collapsed:false,
+        init(){
+            if(this.root || !EH.Config.OPERATION_DOCK_ENABLED || !document.body)return;
+            this.collapsed=Boolean(EH.Storage.get('operationDockCollapsed',false));
+            const root=document.createElement('aside'); root.id='eh-operation-dock'; root.classList.toggle('eh-operation-dock-collapsed',this.collapsed);
+            const head=document.createElement('div'); head.className='eh-operation-dock-head';
+            const brand=document.createElement('div'); brand.className='eh-operation-dock-brand'; brand.innerHTML='<span>OPERAÇÃO</span><strong>🚌 Carros</strong>';
+            const actions=document.createElement('div'); actions.className='eh-operation-dock-actions';
+            const more=document.createElement('button'); more.type='button'; more.title='Carros de hoje'; more.textContent='☷'; more.addEventListener('click',e=>{e.stopPropagation();EH.OperationCars.showCars();});
+            const collapse=document.createElement('button'); collapse.type='button'; collapse.title='Recolher Operação'; collapse.textContent='—'; collapse.addEventListener('click',e=>{e.stopPropagation();this.setCollapsed(true);}); actions.append(more,collapse); head.append(brand,actions);
+            const body=document.createElement('div'); body.className='eh-operation-dock-body';
+            const host=document.createElement('div'); host.className='eh-operation-host'; body.appendChild(host); root.append(head,body);
+            const launcher=document.createElement('button'); launcher.id='eh-operation-launcher'; launcher.type='button'; launcher.textContent='🚌 CARROS'; launcher.hidden=!this.collapsed; launcher.addEventListener('click',()=>this.setCollapsed(false));
+            document.body.append(root,launcher); this.root=root; this.body=body; this.host=host; this.launcher=launcher;
+            root.style.setProperty('display', this.collapsed ? 'none' : 'flex', 'important');
+            this.injectStyles(); EH.PanelManager?.bind?.('operation'); EH.PanelManager?.apply?.('operation');
+        },
+        setCollapsed(value){
+            this.collapsed=Boolean(value); EH.Storage.set('operationDockCollapsed',this.collapsed);
+            if(this.root){ this.root.classList.toggle('eh-operation-dock-collapsed',this.collapsed); this.root.style.setProperty('display', EH.Config.OPERATION_DOCK_ENABLED && !this.collapsed ? 'flex' : 'none', 'important'); }
+            if(this.launcher)this.launcher.hidden=!EH.Config.OPERATION_DOCK_ENABLED || !this.collapsed;
+        },
+        injectStyles(){
+            GM_addStyle(`
+                #eh-operation-dock{position:fixed!important;z-index:2147482950;width:300px;height:285px;display:flex;flex-direction:column;border:1px solid #d9e1ea;border-radius:14px;background:rgba(248,250,252,.99);box-shadow:0 14px 38px rgba(26,44,72,.16);overflow:hidden;font-family:Inter,"Segoe UI",Arial,sans-serif;color:#26313f}
+                #eh-operation-dock.eh-operation-dock-collapsed{display:none!important}.eh-operation-dock-head{min-height:44px;padding:7px 8px 7px 11px;display:flex;align-items:center;justify-content:space-between;gap:8px;border-bottom:1px solid #dce3eb;background:linear-gradient(180deg,#fff 0%,#f4f7fa 100%)}.eh-operation-dock-brand{display:grid;gap:1px}.eh-operation-dock-brand span{font-size:7px;font-weight:950;letter-spacing:.7px;color:#7a8798}.eh-operation-dock-brand strong{font-size:11px;color:#25364b}.eh-operation-dock-actions{display:flex;gap:3px}.eh-operation-dock-actions button{width:28px;height:28px;border:0;border-radius:7px;background:transparent;color:#5e6d7d;cursor:pointer}.eh-operation-dock-actions button:hover{background:#e8edf3}.eh-operation-dock-body{min-height:0;flex:1;overflow:auto;padding:8px}.eh-operation-dock-body>.eh-operation-host{margin:0!important}
+                #eh-operation-launcher{position:fixed;right:0;bottom:110px;z-index:2147482951;min-width:24px;padding:8px 5px;border:1px solid #cbd5e1;border-right:0;border-radius:9px 0 0 9px;background:#fff;color:#315b88;font-size:8px;font-weight:900;writing-mode:vertical-rl;cursor:pointer;box-shadow:-4px 4px 14px rgba(31,48,70,.12)}
+            `);
+        }
+    };
+
     EH.OperationCars = {
         MAPS_KEY: 'operationCars.maps.v3',
         LAST_KEY: 'operationCars.lastMap.v3',
@@ -10001,6 +10489,7 @@
         lastMapKey: '',
         stylesInjected: false,
         started: false,
+        visibleScheduleRecords: [],
 
         normalize(value) {
             return EH.Utils.normalize(value || '');
@@ -10839,8 +11328,47 @@
             overlay.addEventListener('click', event => { if (event.target === overlay) dismiss(); });
         },
 
+        scanScheduleList() {
+            const tables = Array.from(document.querySelectorAll('app-pesquisa-venda table, app-pesquisa table, table.table-hover'));
+            const table = tables.find(item => {
+                const headers = Array.from(item.querySelectorAll('thead th')).map(th => this.normalize(th.textContent));
+                return headers.includes('SERVICO') && headers.some(h => h.includes('HORARIO DE SAIDA')) && headers.includes('LINHA');
+            });
+            if (!table) { this.visibleScheduleRecords = []; return []; }
+            const rows = Array.from(table.querySelectorAll('tbody tr')).map(row => {
+                const cells = Array.from(row.querySelectorAll(':scope > td')).map(td => EH.Utils.clean(td.textContent || ''));
+                const service = String(cells[0] || '').replace(/\D/g, '');
+                if (!service) return null;
+                const departure = EH.Utils.clean(cells[1] || '');
+                const lineRaw = EH.Utils.clean(cells[2] || '');
+                const config = this.serviceConfig(service);
+                const badge = row.querySelector('td:nth-child(3) .badge');
+                return { service, departure, lineRaw, companyCode: EH.Utils.clean(badge?.textContent || ''), config };
+            }).filter(Boolean);
+            this.visibleScheduleRecords = rows;
+            return rows;
+        },
+
+        nextRoutineConfig() {
+            const visibleKnown = (this.visibleScheduleRecords || []).map(item => item.config).filter(Boolean);
+            if (visibleKnown.length === 1) return visibleKnown[0];
+            if (visibleKnown.length > 1) {
+                const attended = visibleKnown.filter(item => item.attends);
+                if (attended.length === 1) return attended[0];
+            }
+            const now = new Date();
+            const current = now.getHours() * 60 + now.getMinutes();
+            const attended = this.serviceConfigs().filter(item => item.attends && /^\d{1,2}:\d{2}$/.test(item.operationalTime || ''));
+            const withMinutes = attended.map(item => {
+                const [h,m] = item.operationalTime.split(':').map(Number);
+                return { ...item, minutes: h * 60 + m };
+            }).sort((a,b) => a.minutes - b.minutes);
+            return withMinutes.find(item => item.minutes >= current) || withMinutes[0] || this.serviceConfigs()[0] || null;
+        },
+
         render() {
-            const host = EH.UI?.operationBox;
+            const host = EH.OperationDock?.host || EH.UI?.operationBox;
+            if (EH.UI?.operationBox && EH.OperationDock?.host) EH.UI.operationBox.hidden = true;
             if (!host || !EH.Config.OPERATION_CARS_ENABLED) {
                 if (host) host.hidden = true;
                 return;
@@ -10848,7 +11376,8 @@
             host.hidden = false;
             host.innerHTML = '';
             const record = this.lastRecord();
-            const config = record ? this.serviceConfig(record.service) : null;
+            const nextConfig = !record ? this.nextRoutineConfig() : null;
+            const config = record ? this.serviceConfig(record.service) : nextConfig;
             const agency = record?.agency || null;
 
             const head = document.createElement('div');
@@ -10858,9 +11387,9 @@
             const heading = document.createElement('div');
             heading.className = 'eh-operation-heading';
             const service = document.createElement('strong');
-            service.textContent = record ? `#${record.service}` : 'CARROS';
+            service.textContent = record ? `#${record.service}` : (nextConfig ? `#${nextConfig.service}` : 'CARROS');
             const route = document.createElement('span');
-            route.textContent = record ? this.displayName(record) : `Agência ${this.agencyCode()}`;
+            route.textContent = record ? this.displayName(record) : (nextConfig?.name || `Agência ${this.agencyCode()}`);
             heading.append(service, route);
             head.append(eyebrow, heading);
 
@@ -10908,7 +11437,7 @@
             const message = document.createElement('div');
             message.className = 'eh-operation-meta';
             if (!record) {
-                message.textContent = `Aguardando mapa • procurando código ${this.agencyCode()}.`;
+                message.textContent = nextConfig ? `${nextConfig.operationalTime || '—'} • Serviço ${nextConfig.service} • Agência ${this.agencyCode()} aguardando mapa.` : `Aguardando mapa • procurando código ${this.agencyCode()}.`;
             } else if (!agency?.exists) {
                 message.textContent = `Código ${this.agencyCode()} não aparece no resumo deste mapa.`;
             } else if (agency.multiple) {
@@ -10952,35 +11481,35 @@
             if (this.stylesInjected) return;
             this.stylesInjected = true;
             GM_addStyle(`
-                #eh-root .eh-operation-host {
+                :is(#eh-root, #eh-operation-dock) .eh-operation-host {
                     display:grid; gap:7px; margin:7px 0 8px; padding:9px;
                     border:1px solid #d9e2e8; border-radius:10px; background:#fbfcfd;
                     color:#26313f; box-shadow:0 2px 8px rgba(28,45,68,.045);
                 }
-                #eh-root .eh-operation-host[hidden] { display:none !important; }
-                #eh-root .eh-operation-head { display:grid; gap:4px; }
-                #eh-root .eh-operation-head > span { color:#718092; font-size:7.5px; font-weight:900; letter-spacing:.38px; }
-                #eh-root .eh-operation-heading { display:flex; align-items:baseline; gap:7px; min-width:0; }
-                #eh-root .eh-operation-heading strong { color:#1f2b39; font-size:15px; line-height:1; }
-                #eh-root .eh-operation-heading span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#3e4b5c; font-size:9.5px; font-weight:800; }
-                #eh-root .eh-operation-service-tag { width:max-content; padding:2px 6px; border-radius:999px; font-size:7.3px; font-weight:900; letter-spacing:.25px; }
-                #eh-root .eh-operation-service-tag.attends { background:#eaf6f1; color:#236e5c; }
-                #eh-root .eh-operation-service-tag.consult { background:#f1f3f6; color:#687386; }
-                #eh-root .eh-operation-agency-title { color:#405064; font-size:8px; font-weight:950; letter-spacing:.35px; }
-                #eh-root .eh-operation-metrics { display:grid; grid-template-columns:1fr 1fr 1.05fr; gap:5px; }
-                #eh-root .eh-operation-metric { min-width:0; min-height:47px; display:grid; align-content:center; gap:3px; padding:6px; border:1px solid #e1e7ec; border-radius:8px; background:#fff; color:#5c6878; text-align:left; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-host[hidden] { display:none !important; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-head { display:grid; gap:4px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-head > span { color:#718092; font-size:7.5px; font-weight:900; letter-spacing:.38px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-heading { display:flex; align-items:baseline; gap:7px; min-width:0; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-heading strong { color:#1f2b39; font-size:15px; line-height:1; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-heading span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:#3e4b5c; font-size:9.5px; font-weight:800; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-service-tag { width:max-content; padding:2px 6px; border-radius:999px; font-size:7.3px; font-weight:900; letter-spacing:.25px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-service-tag.attends { background:#eaf6f1; color:#236e5c; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-service-tag.consult { background:#f1f3f6; color:#687386; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-agency-title { color:#405064; font-size:8px; font-weight:950; letter-spacing:.35px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-metrics { display:grid; grid-template-columns:1fr 1fr 1.05fr; gap:5px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-metric { min-width:0; min-height:47px; display:grid; align-content:center; gap:3px; padding:6px; border:1px solid #e1e7ec; border-radius:8px; background:#fff; color:#5c6878; text-align:left; }
                 #eh-root button.eh-operation-metric { cursor:pointer; font:inherit; }
                 #eh-root button.eh-operation-metric:hover:not(:disabled) { border-color:#b9cad8; background:#f7fafc; }
                 #eh-root button.eh-operation-metric:disabled { cursor:default; opacity:.72; }
-                #eh-root .eh-operation-metric span { font-size:7.6px; font-weight:800; line-height:1.2; }
-                #eh-root .eh-operation-metric strong { color:#253142; font-size:14px; line-height:1; }
-                #eh-root .eh-operation-metric.board strong { color:#24735e; }
-                #eh-root .eh-operation-metric.alight strong { color:#a35a31; }
-                #eh-root .eh-operation-metric.balance strong { color:#2868a7; }
-                #eh-root .eh-operation-meta { color:#7a8695; font-size:7.7px; line-height:1.35; }
-                #eh-root .eh-operation-meta.warning { color:#9a5a23; }
-                #eh-root .eh-operation-actions { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; }
-                #eh-root .eh-operation-actions .eh-context-btn { min-width:0; padding:6px 4px; font-size:7.8px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-metric span { font-size:7.6px; font-weight:800; line-height:1.2; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-metric strong { color:#253142; font-size:14px; line-height:1; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-metric.board strong { color:#24735e; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-metric.alight strong { color:#a35a31; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-metric.balance strong { color:#2868a7; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-meta { color:#7a8695; font-size:7.7px; line-height:1.35; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-meta.warning { color:#9a5a23; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-actions { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-actions .eh-context-btn { min-width:0; padding:6px 4px; font-size:7.8px; }
 
                 .eh-operation-modal { width:min(760px, 94vw); }
                 .eh-operation-passenger-list, .eh-operation-day-list { display:grid; gap:7px; }
@@ -11011,9 +11540,9 @@
                 .eh-operation-settings-service-note { grid-column:1 / -1; }
 
                 @media (max-width: 760px) {
-                    #eh-root .eh-operation-metrics { grid-template-columns:1fr 1fr; }
-                    #eh-root .eh-operation-metric.balance { grid-column:1 / -1; }
-                    #eh-root .eh-operation-actions { grid-template-columns:1fr; }
+                    :is(#eh-root, #eh-operation-dock) .eh-operation-metrics { grid-template-columns:1fr 1fr; }
+                    :is(#eh-root, #eh-operation-dock) .eh-operation-metric.balance { grid-column:1 / -1; }
+                    :is(#eh-root, #eh-operation-dock) .eh-operation-actions { grid-template-columns:1fr; }
                     .eh-operation-day-row { grid-template-columns:22px minmax(0,1fr); }
                     .eh-operation-day-row > button { grid-column:1 / -1; }
                     .eh-operation-detail-metrics { grid-template-columns:1fr; }
@@ -11023,7 +11552,9 @@
             `);
         },
 
-        onPageUpdate() {
+        onPageUpdate(page) {
+            if (page === 'pesquisa') this.scanScheduleList();
+            else if (!EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL)) this.visibleScheduleRecords = [];
             const modal = EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
             if (modal) this.scanCurrentMap({ quiet: true });
             this.render();
@@ -11045,6 +11576,7 @@
         body: null,
         statusText: null,
         statusDot: null,
+        reminderBox: null,
         buttons: {},
         busy: false,
 
@@ -11126,6 +11658,10 @@
             const context = document.createElement('div');
             context.className = 'eh-context-card';
 
+            const reminderBox = document.createElement('div');
+            reminderBox.className = 'eh-reminder-host';
+            reminderBox.hidden = true;
+
             const operationBox = document.createElement('div');
             operationBox.className = 'eh-operation-host';
             operationBox.hidden = true;
@@ -11186,7 +11722,7 @@
             flowSummary.textContent = 'Fluxo do atendimento';
             flowSection.append(flowSummary, steps);
 
-            body.append(flowSection, context, operationBox, saleBox, quickTitle, quickRoutes, divider, toolsTitle, actions, more);
+            body.append(flowSection, context, reminderBox, operationBox, saleBox, quickTitle, quickRoutes, divider, toolsTitle, actions, more);
             panel.append(header, body, footer);
             root.appendChild(panel);
 
@@ -11213,6 +11749,7 @@
             this.quickRoutes = quickRoutes;
             this.saleBox = saleBox;
             this.contextBox = context;
+            this.reminderBox = reminderBox;
             this.operationBox = operationBox;
             this.flowSection = flowSection;
             this.toolsDivider = divider;
@@ -11835,14 +12372,18 @@
                 this.setBusy(true, 'Capturando passagem…');
                 prepared = EH.Tickets.prepareCapture(card);
                 const activePassenger = EH.SaleContext?.getActivePassenger?.() || null;
-                EH.Tickets.rememberCapturedItems([{
-                    passengerId: activePassenger?.id || null,
-                    cpf: activePassenger?.cpf || '',
-                    name: activePassenger?.name || '',
+                const searchedCpf = EH.SaleContext?.normalizeCpf?.(EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT)?.value || '') || '';
+                const fallbackPassenger = activePassenger || (searchedCpf ? EH.SaleContext?.findPassengerByCpf?.(searchedCpf) : null);
+                const reminderCaptureItems = [{
+                    passengerId: fallbackPassenger?.id || null,
+                    cpf: fallbackPassenger?.cpf || searchedCpf || '',
+                    name: fallbackPassenger?.name || '',
                     data: prepared.data,
                     tickets: prepared.data?.tickets?.slice?.() || [],
                     ticket: prepared.data?.tickets?.[0] || null
-                }]);
+                }];
+                EH.Tickets.rememberCapturedItems(reminderCaptureItems);
+                EH.Reminders?.captureItems?.(reminderCaptureItems);
                 EH.Tickets.clearSelection();
 
                 const canvasPromise = EH.Capture.renderTicket(prepared);
@@ -11909,6 +12450,7 @@
             try {
                 this.setBusy(true, selectedItems.length > 1 ? `Juntando ${selectedItems.length} bilhetes…` : 'Capturando bilhete…');
                 EH.Tickets.rememberCapturedItems(selectedItems);
+                EH.Reminders?.captureItems?.(selectedItems);
                 const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
                 const canvases = selectedItems.map(item => EH.Capture.renderTicketCanvas(item.data, width));
                 const canvas = EH.Capture.combineTicketCanvases(canvases);
@@ -12007,6 +12549,7 @@
             }
 
             try {
+                EH.Reminders?.captureItems?.(selectedItems);
                 this.setBusy(true, selectedItems.length > 1 ? `Gerando imagem com ${selectedItems.length} bilhetes…` : 'Preparando bilhete…');
                 const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
                 const canvases = selectedItems.map(item => EH.Capture.renderTicketCanvas(item.data, width));
@@ -12934,6 +13477,7 @@
                 valores: makePane('valores', 'Valores e Captura', 'Taxas existentes e qualidade das imagens geradas pelo Helper.'),
                 financeiro: makePane('financeiro', 'Financeiro', 'Comissão e comportamento do controle local de Caixa e Comissões.'),
                 carros: makePane('carros', 'Carros / Operação', 'Agência 287 e serviços usados na consulta rápida do Mapa de Viagem.'),
+                lembretes: makePane('lembretes', 'Lembretes', 'Passagens emitidas/capturadas que precisam ser localizadas e impressas posteriormente.'),
                 avancado: makePane('avancado', 'Avançado', 'Diagnóstico e opções técnicas que normalmente não precisam ser alteradas.')
             };
 
@@ -13012,6 +13556,38 @@
             );
             dimensionsCard.appendChild(dimensionsGrid);
             sections.paineis.pane.appendChild(dimensionsCard);
+
+            const managedPanels = EH.PanelManager.load();
+            const panelDrafts = JSON.parse(JSON.stringify(managedPanels));
+            const controlCard = card('Mover, fixar e dimensionar');
+            const controlGrid = grid();
+            controlGrid.append(
+                selectField('managedPanel', 'Painel', 'main', [
+                    ['main','Atendimento'], ['whatsapp','WhatsApp'], ['operation','Operação / Carros']
+                ]),
+                selectField('managedMode', 'Posição', panelDrafts.main.mode, [
+                    ['automatic','Automático atual'], ['free','Livre / arrastar'], ['left','Esquerda'], ['right','Direita'],
+                    ['top','Superior'], ['bottom','Inferior'], ['top-left','Superior esquerdo'], ['top-right','Superior direito'],
+                    ['bottom-left','Inferior esquerdo'], ['bottom-right','Inferior direito']
+                ]),
+                numberField('managedWidth', 'Largura (px)', panelDrafts.main.width, { min:220, max:700, step:5 }),
+                numberField('managedHeight', 'Altura (px)', panelDrafts.main.height, { min:200, max:900, step:5 }),
+                numberField('managedZoom', 'Zoom do conteúdo (%)', panelDrafts.main.zoom, { min:75, max:150, step:5 })
+            );
+            controlCard.append(controlGrid, checkField('managedDynamic','Tamanho dinâmico',panelDrafts.main.dynamic,'Quando ativo, largura/altura/zoom são ajustados dentro de limites seguros sem alterar o E-Pass.'));
+            const panelControlActions=document.createElement('div'); panelControlActions.className='eh-settings-action-row';
+            const fitPanel=document.createElement('button'); fitPanel.type='button'; fitPanel.className='eh-modal-btn'; fitPanel.textContent='Ajustar à tela';
+            const restorePanel=document.createElement('button'); restorePanel.type='button'; restorePanel.className='eh-modal-btn'; restorePanel.textContent='Restaurar este painel';
+            const restoreAllPanels=document.createElement('button'); restoreAllPanels.type='button'; restoreAllPanels.className='eh-modal-btn'; restoreAllPanels.textContent='Restaurar todos';
+            panelControlActions.append(fitPanel,restorePanel,restoreAllPanels); controlCard.append(panelControlActions,note('Arraste somente pelo cabeçalho. Botões e campos não iniciam movimento. O modo Livre é salvo após soltar.'));
+            sections.paineis.pane.appendChild(controlCard);
+            const capturePanelDraft=()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,zoom:Number(fields.managedZoom.value)||100,dynamic:fields.managedDynamic.checked}; };
+            const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedZoom.value=String(cfg.zoom); fields.managedDynamic.checked=Boolean(cfg.dynamic); };
+            let previousManagedPanel='main'; fields.managedPanel.addEventListener('change',()=>{ const next=fields.managedPanel.value; fields.managedPanel.value=previousManagedPanel; capturePanelDraft(); fields.managedPanel.value=next; previousManagedPanel=next; loadPanelDraft(next); });
+            ['managedMode','managedWidth','managedHeight','managedZoom','managedDynamic'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
+            fitPanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; const rec=EH.PanelManager.recommended(key); fields.managedWidth.value=String(rec.width); fields.managedHeight.value=String(rec.height); fields.managedZoom.value=String(rec.zoom); fields.managedDynamic.checked=false; capturePanelDraft(); });
+            restorePanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...EH.PanelManager.defaults()[key]}; loadPanelDraft(key); });
+            restoreAllPanels.addEventListener('click',()=>{ const defs=EH.PanelManager.defaults(); Object.keys(defs).forEach(k=>panelDrafts[k]={...defs[k]}); loadPanelDraft(fields.managedPanel.value); });
 
             // WHATSAPP
             const waStateCard = card('Painel integrado');
@@ -13110,7 +13686,8 @@
                 checkField('operationSortBySeat', 'Ordenar passageiros por poltrona', EH.Config.OPERATION_SORT_BY_SEAT)
             );
             operationGeneralCard.append(
-                checkField('operationCarsEnabled', 'Exibir módulo Carros no painel', EH.Config.OPERATION_CARS_ENABLED),
+                checkField('operationCarsEnabled', 'Exibir módulo Carros', EH.Config.OPERATION_CARS_ENABLED),
+                checkField('operationDockEnabled', 'Usar painel secundário Operação / Carros', EH.Config.OPERATION_DOCK_ENABLED),
                 operationGeneralGrid,
                 note('O saldo mostrado é sempre o valor oficial da própria linha da agência. O Helper não soma outras localidades e não recompõe saldo.')
             );
@@ -13143,6 +13720,17 @@
             });
             operationServicesCard.appendChild(operationServicesList);
             sections.carros.pane.appendChild(operationServicesCard);
+
+            // LEMBRETES
+            const reminderCard = card('Impressão / embarque');
+            reminderCard.append(
+                checkField('reminderCreate','Criar lembrete após capturar bilhete emitido',EH.Config.REMINDER_CREATE_AFTER_TICKET),
+                checkField('reminderAsk','Perguntar antes de criar o lembrete',EH.Config.REMINDER_ASK_AFTER_TICKET),
+                checkField('reminderMaskCpf','Mostrar CPF mascarado no painel',EH.Config.REMINDER_MASK_CPF),
+                checkField('reminderHighlightToday','Destacar lembretes de hoje',EH.Config.REMINDER_HIGHLIGHT_TODAY),
+                note('O CPF completo permanece salvo localmente e é usado somente ao copiar ou buscar a passagem.')
+            );
+            sections.lembretes.pane.appendChild(reminderCard);
 
             // AVANÇADO
             const advancedCard = card('Diagnóstico');
@@ -13259,8 +13847,16 @@
                 fields.financeAskCompany.checked = Boolean(d.FINANCE_ASK_COMPANY_MERCH);
                 fields.financeConfirmDelete.checked = Boolean(d.FINANCE_CONFIRM_DELETE);
                 fields.operationCarsEnabled.checked = Boolean(d.OPERATION_CARS_ENABLED);
+                fields.operationDockEnabled.checked = Boolean(d.OPERATION_DOCK_ENABLED);
                 fields.operationAgencyCode.value = String(d.OPERATION_AGENCY_CODE || '287');
                 fields.operationSortBySeat.checked = Boolean(d.OPERATION_SORT_BY_SEAT);
+                fields.reminderCreate.checked = Boolean(d.REMINDER_CREATE_AFTER_TICKET);
+                fields.reminderAsk.checked = Boolean(d.REMINDER_ASK_AFTER_TICKET);
+                fields.reminderMaskCpf.checked = Boolean(d.REMINDER_MASK_CPF);
+                fields.reminderHighlightToday.checked = Boolean(d.REMINDER_HIGHLIGHT_TODAY);
+                const defaultPanels = EH.PanelManager.defaults();
+                Object.keys(defaultPanels).forEach(key => panelDrafts[key] = { ...defaultPanels[key] });
+                loadPanelDraft(fields.managedPanel.value);
                 operationServiceFields.forEach((row, index) => {
                     const item = d.OPERATION_SERVICES?.[index] || {};
                     row.service.value = String(item.service || '');
@@ -13343,6 +13939,11 @@
                 EH.Config.FINANCE_ASK_COMPANY_MERCH = fields.financeAskCompany.checked;
                 EH.Config.FINANCE_CONFIRM_DELETE = fields.financeConfirmDelete.checked;
 
+                capturePanelDraft();
+                EH.Config.REMINDER_CREATE_AFTER_TICKET = fields.reminderCreate.checked;
+                EH.Config.REMINDER_ASK_AFTER_TICKET = fields.reminderAsk.checked;
+                EH.Config.REMINDER_MASK_CPF = fields.reminderMaskCpf.checked;
+                EH.Config.REMINDER_HIGHLIGHT_TODAY = fields.reminderHighlightToday.checked;
                 const operationServices = operationServiceFields.map(row => ({
                     service: String(row.service.value || '').replace(/\D/g, ''),
                     name: EH.Utils.clean(row.name.value || ''),
@@ -13357,6 +13958,7 @@
                     return;
                 }
                 EH.Config.OPERATION_CARS_ENABLED = fields.operationCarsEnabled.checked;
+                EH.Config.OPERATION_DOCK_ENABLED = fields.operationDockEnabled.checked;
                 EH.Config.OPERATION_AGENCY_CODE = String(fields.operationAgencyCode.value || '').replace(/\D/g, '') || '287';
                 EH.Config.OPERATION_SORT_BY_SEAT = fields.operationSortBySeat.checked;
                 EH.Config.OPERATION_SERVICES = operationServices;
@@ -13401,16 +14003,29 @@
                     operationCarsEnabled: EH.Config.OPERATION_CARS_ENABLED,
                     operationAgencyCode: EH.Config.OPERATION_AGENCY_CODE,
                     operationSortBySeat: EH.Config.OPERATION_SORT_BY_SEAT,
+                    operationDockEnabled: EH.Config.OPERATION_DOCK_ENABLED,
                     operationServices: EH.Config.OPERATION_SERVICES,
+                    reminderCreateAfterTicket: EH.Config.REMINDER_CREATE_AFTER_TICKET,
+                    reminderAskAfterTicket: EH.Config.REMINDER_ASK_AFTER_TICKET,
+                    reminderMaskCpf: EH.Config.REMINDER_MASK_CPF,
+                    reminderHighlightToday: EH.Config.REMINDER_HIGHLIGHT_TODAY,
                     debug: fields.debug.checked
                 };
                 Object.entries(settingsToSave).forEach(([key, value]) => EH.Storage.set(key, value));
+                EH.PanelManager.save(panelDrafts);
 
                 // Estado dos overlays usa a mesma memória já existente do projeto.
                 EH.State.setPanel('left', fields.mainOpen.checked);
                 EH.State.setPanel('right', fields.waVisible.checked);
 
                 EH.Layout.sync();
+                if (EH.Config.OPERATION_DOCK_ENABLED) EH.OperationDock?.init?.();
+                if (EH.OperationDock?.root) {
+                    EH.OperationDock.root.style.setProperty('display', EH.Config.OPERATION_DOCK_ENABLED && !EH.OperationDock.collapsed ? 'flex' : 'none', 'important');
+                    if (EH.OperationDock.launcher) EH.OperationDock.launcher.hidden = !EH.Config.OPERATION_DOCK_ENABLED || !EH.OperationDock.collapsed;
+                }
+                EH.PanelManager?.bindAll?.();
+                EH.Reminders?.render?.();
                 EH.OperationCars?.render?.();
 
                 const verification = {
@@ -13455,7 +14070,7 @@
 
             const isOwnMutation = mutation => {
                 const target = mutation?.target instanceof Element ? mutation.target : mutation?.target?.parentElement;
-                return Boolean(target?.closest?.('#eh-root, #eh-wa-dock, #eh-toast-area, .eh-overlay, .eh-capture-overlay'));
+                return Boolean(target?.closest?.('#eh-root, #eh-wa-dock, #eh-operation-dock, #eh-operation-launcher, #eh-toast-area, .eh-overlay, .eh-capture-overlay'));
             };
 
             this.observer = new MutationObserver(mutations => {
@@ -13491,12 +14106,15 @@
             EH.Style.inject();
             EH.Toast.init();
             EH.UI.init();
+            EH.Reminders.init();
+            EH.OperationDock.init();
             EH.OperationCars.init();
             EH.SaleCpfs.init();
             EH.RequisitionManager.init();
             EH.WhatsAppDock.init();
             EH.Layout.sync();
-            EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => EH.Layout.sync(), 140));
+            EH.PanelManager.bindAll();
+            EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => { EH.Layout.sync(); EH.PanelManager.applyAll(); }, 140));
             EH.Observer.start();
             EH.Pages.update();
             EH.Runtime.timeout('pending-route', () => EH.Routes.applyPending(), 800);
