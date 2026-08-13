@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.50.0
+// @version      5.51.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.50.0',
+        VERSION: '5.51.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -175,7 +175,19 @@
             '.modalCodigoPrefeitura.nsm-dialog-open'
         ],
         REQUISITION_CODE_INPUT: ['input[formcontrolname="codigoRequisicao"]'],
-        REQUISITION_ID_INPUT: ['input[formcontrolname="idRequisicao"]']
+        REQUISITION_ID_INPUT: ['input[formcontrolname="idRequisicao"]'],
+
+        // Financeiro — seletores confirmados nos HTMLs reais CAIXA.html e COMISSÕES.html.
+        // Nesta etapa são usados SOMENTE para leitura; nenhum valor oficial do E-Pass é alterado.
+        CAIXA_ROOT: ['app-visualizar-caixa'],
+        CAIXA_TABLES: 'app-visualizar-caixa table.table-hover',
+        COMISSOES_ROOT: ['sacar-comissao'],
+        COMISSOES_HISTORY: ['sacar-comissao .historico-comissoes'],
+        COMISSOES_HISTORY_ROWS: 'sacar-comissao .historico-comissoes div[data-index]',
+        COMISSOES_VALUE: '.item-values',
+        COMISSOES_ORIGINAL_VALUE: '.item-valor-original',
+        COMISSOES_DATE: '.date',
+        COMISSOES_COMPANY: '.sublinhado'
     };
 
     // ============================================================
@@ -3920,6 +3932,8 @@
             const path = String(location.pathname || '').toLocaleLowerCase('pt-BR');
 
             // Angular: a rota é a primeira fonte de verdade do contexto.
+            if (path.includes('/caixa/comissoes')) return 'comissoes';
+            if (path.includes('/caixa')) return 'caixa';
             if (path.includes('/solicitacoes/requisicoes') || path.includes('/solicitacoes')) return 'requisicao';
             if (path.includes('/vendas/passagens')) return 'passagens';
             if (path.includes('/vendas/pagamento')) return 'pagamento';
@@ -3928,6 +3942,8 @@
             if (path.includes('/vendas/pesquisa')) return 'pesquisa';
 
             // Fallbacks somente para variações reais da aplicação.
+            if (EH.Utils.first(EH.Selectors.COMISSOES_ROOT)) return 'comissoes';
+            if (EH.Utils.first(EH.Selectors.CAIXA_ROOT)) return 'caixa';
             if (EH.Utils.first(EH.Selectors.REQUISITION_FORM_ROOT) || document.querySelector('app-solicitacoes')) return 'requisicao';
             if (EH.Payment?.isPage()) return 'pagamento';
             if (EH.Tickets?.isPassagensPage()) return 'passagens';
@@ -3951,6 +3967,268 @@
             EH.UI.updateState(page);
             EH.WhatsAppDock?.renderOrganizer?.(page);
             return page;
+        }
+    };
+
+    // ============================================================
+    // LEITOR FINANCEIRO — ETAPA 1 (READ-ONLY)
+    // Baseado nos HTMLs reais CAIXA.html e COMISSÕES.html.
+    // Não persiste, não soma e não altera valores oficiais do E-Pass nesta etapa.
+    // ============================================================
+    EH.FinanceReader = {
+        normalizeLabel(value) {
+            return EH.Utils.normalize(EH.Utils.clean(value || ''));
+        },
+
+        directChildren(element, selector) {
+            if (!element) return [];
+            return Array.from(element.children || []).filter(child => {
+                try { return child.matches(selector); } catch (error) { return false; }
+            });
+        },
+
+        isCaixaPage() {
+            const path = String(location.pathname || '').toLocaleLowerCase('pt-BR');
+            return path.includes('/caixa') && !path.includes('/caixa/comissoes')
+                || Boolean(EH.Utils.first(EH.Selectors.CAIXA_ROOT));
+        },
+
+        isCommissionsPage() {
+            const path = String(location.pathname || '').toLocaleLowerCase('pt-BR');
+            return path.includes('/caixa/comissoes')
+                || Boolean(EH.Utils.first(EH.Selectors.COMISSOES_ROOT));
+        },
+
+        findHeading(root, tagNames, text) {
+            const wanted = this.normalizeLabel(text);
+            const tags = Array.isArray(tagNames) ? tagNames.join(',') : String(tagNames || 'h1,h2,h3,h4,h5');
+            return Array.from(root?.querySelectorAll?.(tags) || [])
+                .find(element => this.normalizeLabel(element.textContent) === wanted) || null;
+        },
+
+        valueByLabel(root, labelText) {
+            const wanted = this.normalizeLabel(labelText);
+            const label = Array.from(root?.querySelectorAll?.('label') || [])
+                .find(element => this.normalizeLabel(element.textContent) === wanted);
+            if (!label) return null;
+            const immediate = label.parentElement;
+            const holder = label.closest('.text-center') || immediate;
+            const valueElement = immediate?.querySelector?.('h4, h3, h2, strong, b')
+                || holder?.querySelector?.('h4, h3, h2, strong, b');
+            const raw = EH.Utils.clean(valueElement?.textContent || '');
+            return {
+                label: EH.Utils.clean(label.textContent || ''),
+                raw,
+                value: EH.Utils.parseMoney(raw)
+            };
+        },
+
+        parseCompanySummaryFromHeading(root, headingText) {
+            const heading = this.findHeading(root, ['h2', 'h3'], headingText);
+            if (!heading) return [];
+            const cardBody = heading.closest('.card-body') || heading.parentElement;
+            const row = Array.from(cardBody?.querySelectorAll?.('.row.m-1') || [])[0];
+            if (!row) return [];
+
+            return Array.from(row.children || []).map(block => {
+                const company = EH.Utils.clean(block.querySelector('i')?.textContent || '');
+                const amountElement = block.querySelector('b.h4, b');
+                const raw = EH.Utils.clean(amountElement?.textContent || '');
+                if (!company || !raw) return null;
+                return {
+                    company,
+                    amount: EH.Utils.parseMoney(raw),
+                    raw
+                };
+            }).filter(Boolean);
+        },
+
+        tableHeaders(table) {
+            const firstRow = table?.querySelector?.('thead tr') || table?.querySelector?.('tr');
+            return Array.from(firstRow?.querySelectorAll?.('th,td') || [])
+                .map(cell => EH.Utils.clean(cell.textContent || ''));
+        },
+
+        findTableByHeaders(root, requiredHeaders = []) {
+            const required = requiredHeaders.map(value => this.normalizeLabel(value));
+            return Array.from(root?.querySelectorAll?.('table.table-hover, table') || []).find(table => {
+                const headers = this.tableHeaders(table).map(value => this.normalizeLabel(value));
+                return required.every(value => headers.includes(value));
+            }) || null;
+        },
+
+        headerIndex(headers = [], wanted) {
+            const target = this.normalizeLabel(wanted);
+            return headers.findIndex(value => this.normalizeLabel(value) === target);
+        },
+
+        parseCaixaHeader(root) {
+            const title = Array.from(root?.querySelectorAll?.('h1') || [])
+                .find(element => /CAIXA\s*#\s*\d+/i.test(element.textContent || ''));
+            const titleText = EH.Utils.clean(title?.textContent || '');
+            const number = titleText.match(/CAIXA\s*#\s*(\d+)/i)?.[1] || '';
+            const titleRow = title?.parentElement;
+            const totalElement = titleRow
+                ? Array.from(titleRow.querySelectorAll('h2,h3,h4')).find(element => /R\$/i.test(element.textContent || ''))
+                : null;
+            const totalRaw = EH.Utils.clean(totalElement?.textContent || '');
+
+            const openingContainer = Array.from(root?.querySelectorAll?.('label') || [])
+                .find(element => this.normalizeLabel(element.textContent).startsWith('ABERTURA'))?.parentElement || null;
+            const openingRaw = EH.Utils.clean(openingContainer?.textContent || '').replace(/^Abertura\s*:\s*/i, '');
+
+            return {
+                caixaNumber: number,
+                title: titleText,
+                caixaValue: EH.Utils.parseMoney(totalRaw),
+                caixaValueRaw: totalRaw,
+                opening: openingRaw,
+                entradas: this.valueByLabel(root, 'Entradas'),
+                saidasPagamentos: this.valueByLabel(root, 'Saídas/Pagamentos'),
+                saidasBoletos: this.valueByLabel(root, 'Saídas/Boletos'),
+                saldoDinheiro: this.valueByLabel(root, 'Saldo em Dinheiro')
+            };
+        },
+
+        parseCaixaSales(root) {
+            const table = this.findTableByHeaders(root, ['Data', 'Lançamentos', 'Total']);
+            if (!table) return [];
+            const headers = this.tableHeaders(table);
+            const dataIndex = this.headerIndex(headers, 'Data');
+            const launchIndex = this.headerIndex(headers, 'Lançamentos');
+            const totalIndex = this.headerIndex(headers, 'Total');
+            const tbodyRows = Array.from(table.querySelectorAll('tbody tr'));
+
+            return tbodyRows.map((row, rowIndex) => {
+                const cells = Array.from(row.querySelectorAll('td'));
+                const launchCell = cells[launchIndex] || null;
+                const launch = EH.Utils.clean(launchCell?.textContent || '');
+                const saleMatch = launch.match(/\bVENDA\s*\|\s*(\d+)\s*-\s*(.*)$/i);
+                if (!saleMatch) return null;
+
+                const dateCell = EH.Utils.clean(cells[dataIndex]?.textContent || '');
+                const dateMatch = dateCell.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2})/);
+                const dateTime = EH.Utils.clean(dateMatch?.[1] || '');
+                const agent = dateTime ? EH.Utils.clean(dateCell.replace(dateTime, '')) : '';
+                const totalRaw = EH.Utils.clean(cells[totalIndex]?.textContent || '');
+                const badge = EH.Utils.clean(launchCell?.querySelector?.('.badge')?.textContent || '');
+
+                const breakdown = {};
+                ['D', 'CC', 'CD', 'R', 'NC', 'PIX'].forEach(header => {
+                    const index = this.headerIndex(headers, header);
+                    if (index < 0 || !cells[index]) return;
+                    const raw = EH.Utils.clean(cells[index].textContent || '');
+                    breakdown[header] = { raw, value: EH.Utils.parseMoney(raw) };
+                });
+
+                return {
+                    rowIndex,
+                    saleId: saleMatch[1],
+                    passenger: EH.Utils.clean(saleMatch[2] || ''),
+                    companyCode: badge,
+                    dateTime,
+                    agent,
+                    total: EH.Utils.parseMoney(totalRaw),
+                    totalRaw,
+                    breakdown,
+                    rawLaunch: launch
+                };
+            }).filter(Boolean);
+        },
+
+        parseCaixaAgentSummary(root) {
+            const table = this.findTableByHeaders(root, ['Lançamentos', 'Novo Horizonte', 'Maia', 'Central Bahia', 'Jotamar', 'Total']);
+            if (!table) return null;
+            const headers = this.tableHeaders(table);
+            const rows = Array.from(table.querySelectorAll('tbody tr')).map(row => {
+                const cells = Array.from(row.querySelectorAll('td'));
+                return cells.map(cell => EH.Utils.clean(cell.textContent || ''));
+            });
+            return { headers, rows };
+        },
+
+        parseCaixa() {
+            const root = EH.Utils.first(EH.Selectors.CAIXA_ROOT);
+            if (!root) return null;
+            return {
+                page: 'caixa',
+                header: this.parseCaixaHeader(root),
+                commissionSummary: this.parseCompanySummaryFromHeading(root, 'Comissão'),
+                sales: this.parseCaixaSales(root),
+                agentSummary: this.parseCaixaAgentSummary(root),
+                commissionLink: Array.from(root.querySelectorAll('a[href]'))
+                    .find(anchor => /\/caixa\/comissoes\/saque/i.test(anchor.getAttribute('href') || ''))?.getAttribute('href') || ''
+            };
+        },
+
+        commissionRowKind(row) {
+            if (row?.querySelector?.('.mes-anterior')) return 'SALDO_ANTERIOR';
+            const operations = this.directChildren(row, 'b.ml-2.mr-1')
+                .map(element => EH.Utils.clean(element.textContent || ''))
+                .filter(Boolean);
+            return operations[0] || '';
+        },
+
+        parseCommissionHistoryRow(row) {
+            if (!row) return null;
+            const saldoAnterior = EH.Utils.clean(row.querySelector('.mes-anterior')?.textContent || '');
+            const valueElement = row.querySelector(EH.Selectors.COMISSOES_VALUE);
+            const rawAmount = EH.Utils.clean(valueElement?.textContent || '');
+            if (!rawAmount) return null;
+
+            const originalElement = row.querySelector(EH.Selectors.COMISSOES_ORIGINAL_VALUE);
+            const rawOriginal = EH.Utils.clean(originalElement?.textContent || '');
+            const dateTime = EH.Utils.clean(row.querySelector(EH.Selectors.COMISSOES_DATE)?.textContent || '');
+            const company = EH.Utils.clean(row.querySelector(EH.Selectors.COMISSOES_COMPANY)?.textContent || '');
+            const directSpans = this.directChildren(row, 'span');
+            const category = EH.Utils.clean(
+                directSpans.find(element => !element.classList.contains('sublinhado') && !element.classList.contains('mes-anterior'))?.textContent || ''
+            );
+            const operationTags = this.directChildren(row, 'b.ml-2.mr-1');
+            const operation = EH.Utils.clean(operationTags[0]?.textContent || '');
+            const operationStatus = EH.Utils.clean(operationTags[1]?.textContent || '');
+            const lowTexts = this.directChildren(row, 'i.low')
+                .map(element => EH.Utils.clean(element.textContent || ''))
+                .filter(Boolean);
+            const operator = lowTexts.length ? lowTexts[lowTexts.length - 1] : '';
+
+            return {
+                // data-index é somente posição visual da lista; NÃO deve virar ID persistente.
+                domIndex: EH.Utils.clean(row.getAttribute('data-index') || ''),
+                kind: saldoAnterior ? 'SALDO_ANTERIOR' : (operation || category || 'MOVIMENTO'),
+                category,
+                company,
+                operation,
+                operationStatus,
+                dateTime,
+                amount: EH.Utils.parseMoney(rawAmount),
+                amountRaw: rawAmount,
+                originalValue: rawOriginal ? EH.Utils.parseMoney(rawOriginal) : null,
+                originalValueRaw: rawOriginal,
+                operator,
+                isPriorBalance: Boolean(saldoAnterior),
+                priorBalanceLabel: saldoAnterior,
+                rawText: EH.Utils.clean(row.textContent || '')
+            };
+        },
+
+        parseCommissions() {
+            const root = EH.Utils.first(EH.Selectors.COMISSOES_ROOT);
+            if (!root) return null;
+            const rows = EH.Utils.all(EH.Selectors.COMISSOES_HISTORY_ROWS)
+                .map(row => this.parseCommissionHistoryRow(row))
+                .filter(Boolean);
+            return {
+                page: 'comissoes',
+                summary: this.parseCompanySummaryFromHeading(root, 'Resumo'),
+                history: rows
+            };
+        },
+
+        snapshot() {
+            if (this.isCommissionsPage()) return this.parseCommissions();
+            if (this.isCaixaPage()) return this.parseCaixa();
+            return null;
         }
     };
 
@@ -8652,6 +8930,24 @@
                     layout: EH.Layout?.lastMetrics || null,
                     whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null
                 },
+                financeReadOnly: (() => {
+                    const snapshot = EH.FinanceReader?.snapshot?.();
+                    if (!snapshot) return null;
+                    if (snapshot.page === 'caixa') {
+                        return {
+                            page: 'caixa',
+                            caixaNumber: snapshot.header?.caixaNumber || '',
+                            salesFound: snapshot.sales?.length || 0,
+                            companiesFound: snapshot.commissionSummary?.length || 0,
+                            hasAgentSummary: Boolean(snapshot.agentSummary)
+                        };
+                    }
+                    return {
+                        page: 'comissoes',
+                        historyRowsFound: snapshot.history?.length || 0,
+                        companiesFound: snapshot.summary?.length || 0
+                    };
+                })(),
                 runtime: {
                     listeners: EH.Runtime?.listeners?.size || 0,
                     intervals: EH.Runtime?.intervals?.size || 0,
