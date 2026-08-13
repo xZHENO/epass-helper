@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.56.0
+// @version      5.57.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -17,6 +17,9 @@
 // @grant        GM_addStyle
 // @grant        GM_setClipboard
 // @grant        GM_addValueChangeListener
+// @grant        GM_listValues
+// @grant        GM_xmlhttpRequest
+// @connect      *.supabase.co
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
 // @run-at       document-idle
 // @noframes
@@ -31,9 +34,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.56.0',
+        VERSION: '5.57.0',
         DEBUG: false,
-        STORAGE_PREFIX: 'epassHelperV5.',
+        STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
+        STORAGE_SCHEMA_VERSION: 4,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -73,6 +77,12 @@
         REMINDER_ASK_AFTER_TICKET: true,
         REMINDER_MASK_CPF: true,
         REMINDER_HIGHLIGHT_TODAY: true,
+        SYNC_PROVIDER: 'none',
+        SYNC_ENABLED: false,
+        SYNC_SUPABASE_URL: '',
+        SYNC_SUPABASE_KEY: '',
+        SYNC_SUPABASE_EMAIL: '',
+        SYNC_INTERVAL_MS: 60000,
         OPERATION_SERVICES: [
             { service: '6147', name: 'Goiânia → Cuiabá', operationalTime: '11:00', attends: true,  observation: '',             lineCode: 'MTTO0034019' },
             { service: '6319', name: 'Goiânia → Barra do Garças', operationalTime: '07:00', attends: true,  observation: '',             lineCode: '901929600' },
@@ -330,6 +340,11 @@
             EH.Config.REMINDER_ASK_AFTER_TICKET = Boolean(this.get('reminderAskAfterTicket', EH.Config.REMINDER_ASK_AFTER_TICKET));
             EH.Config.REMINDER_MASK_CPF = Boolean(this.get('reminderMaskCpf', EH.Config.REMINDER_MASK_CPF));
             EH.Config.REMINDER_HIGHLIGHT_TODAY = Boolean(this.get('reminderHighlightToday', EH.Config.REMINDER_HIGHLIGHT_TODAY));
+            EH.Config.SYNC_PROVIDER = String(this.get('syncProvider', EH.Config.SYNC_PROVIDER) || 'none');
+            EH.Config.SYNC_ENABLED = Boolean(this.get('syncEnabled', EH.Config.SYNC_ENABLED));
+            EH.Config.SYNC_SUPABASE_URL = String(this.get('syncSupabaseUrl', EH.Config.SYNC_SUPABASE_URL) || '').trim();
+            EH.Config.SYNC_SUPABASE_KEY = String(this.get('syncSupabaseKey', EH.Config.SYNC_SUPABASE_KEY) || '').trim();
+            EH.Config.SYNC_SUPABASE_EMAIL = String(this.get('syncSupabaseEmail', EH.Config.SYNC_SUPABASE_EMAIL) || '').trim();
             const savedOperationServices = this.get('operationServices', null);
             if (Array.isArray(savedOperationServices) && savedOperationServices.length) {
                 const defaultsByService = new Map((EH.ConfigDefaults?.OPERATION_SERVICES || []).map(item => [String(item.service || ''), item]));
@@ -352,6 +367,198 @@
             }
 
             EH.Config.DEBUG = Boolean(this.get('debug', EH.Config.DEBUG));
+        }
+    };
+
+
+    // ============================================================
+    // VERSIONAMENTO DOS DADOS — v5.57
+    // O namespace de dados é estável e NÃO depende da versão do script.
+    // Migrações são sempre não destrutivas.
+    // ============================================================
+    EH.StorageSchema = {
+        META_KEY: 'storage.meta.v1',
+        BACKUP_PREFIX: 'storage.backup.pre_v',
+        CURRENT_VERSION: Number(EH.Config.STORAGE_SCHEMA_VERSION || 4),
+
+        listNames() {
+            try {
+                if (typeof GM_listValues === 'function') return GM_listValues() || [];
+            } catch (error) {
+                EH.Logger.warn('Não foi possível listar o armazenamento do UserScript:', error);
+            }
+            return [];
+        },
+
+        snapshot({ includeEphemeral = false } = {}) {
+            const prefix = EH.Config.STORAGE_PREFIX;
+            const skip = [
+                'waBridge.', 'waAck', 'capturedTickets', 'history.images',
+                'operationCars.schedule.currentDom'
+            ];
+            const values = {};
+            this.listNames().forEach(fullKey => {
+                if (!String(fullKey).startsWith(prefix)) return;
+                const shortKey = String(fullKey).slice(prefix.length);
+                if (!includeEphemeral && skip.some(part => shortKey.includes(part))) return;
+                if (shortKey.startsWith(this.BACKUP_PREFIX)) return;
+                try { values[shortKey] = GM_getValue(fullKey); } catch (error) {}
+            });
+            return {
+                schemaVersion: this.CURRENT_VERSION,
+                scriptVersion: EH.Config.VERSION,
+                createdAt: Date.now(),
+                values
+            };
+        },
+
+        backupBeforeMigration(fromVersion) {
+            const key = `${this.BACKUP_PREFIX}${this.CURRENT_VERSION}`;
+            if (EH.Storage.get(key, null)) return;
+            const snapshot = this.snapshot({ includeEphemeral: false });
+            snapshot.fromVersion = Number(fromVersion || 0);
+            EH.Storage.set(key, snapshot);
+        },
+
+        migratePanels() {
+            const key = 'panelManager.v1';
+            const raw = EH.Storage.get(key, null);
+            if (!raw || typeof raw !== 'object') return;
+            const next = { ...raw };
+            ['main', 'whatsapp', 'operation'].forEach((panelKey, index) => {
+                const current = next[panelKey] && typeof next[panelKey] === 'object' ? next[panelKey] : {};
+                next[panelKey] = {
+                    ...current,
+                    handleY: Number.isFinite(Number(current.handleY)) ? Number(current.handleY) : [30, 55, 80][index],
+                    allowDrag: current.allowDrag !== undefined ? Boolean(current.allowDrag) : true,
+                    allowResize: current.allowResize !== undefined ? Boolean(current.allowResize) : true
+                };
+            });
+            EH.Storage.set(key, next);
+        },
+
+        migrateReminders() {
+            const key = 'ticketReminders.v1';
+            const raw = EH.Storage.get(key, []);
+            if (!Array.isArray(raw)) return;
+            let changed = false;
+            const deviceId = EH.Device?.id?.() || '';
+            const next = raw.map(item => {
+                if (!item || typeof item !== 'object') return item;
+                const createdAt = Number(item.createdAt || Date.now());
+                const updatedAt = Number(item.updatedAt || item.completedAt || createdAt);
+                const merged = {
+                    ...item,
+                    createdAt,
+                    updatedAt,
+                    deviceId: item.deviceId || deviceId,
+                    syncState: item.syncState || 'local'
+                };
+                if (JSON.stringify(merged) !== JSON.stringify(item)) changed = true;
+                return merged;
+            });
+            if (changed) EH.Storage.set(key, next);
+        },
+
+        migrate() {
+            const meta = EH.Storage.get(this.META_KEY, null) || {};
+            const fromVersion = Number(meta.schemaVersion || 0);
+            if (fromVersion >= this.CURRENT_VERSION) return meta;
+
+            this.backupBeforeMigration(fromVersion);
+            // Migrações incrementais: somente acrescentam/normalizam campos.
+            this.migratePanels();
+            this.migrateReminders();
+
+            const next = {
+                schemaVersion: this.CURRENT_VERSION,
+                migratedFrom: fromVersion,
+                migratedAt: Date.now(),
+                scriptVersion: EH.Config.VERSION
+            };
+            EH.Storage.set(this.META_KEY, next);
+            return next;
+        },
+
+        exportConfiguration() {
+            const keys = [
+                'settingsPreset','uiDensity','panelOpacity','panelRadius','shadowLevel',
+                'overlaySide','overlayTopOffset','panelCustomWidth','panelHeightPercent',
+                'whatsappCustomWidth','whatsappHeightPercent','panelZoom','whatsappDockZoom',
+                'captureScale','ticketCaptureWidth','autoRouteCapture','autoCopyImages',
+                'aplicarTaxasOrigem','taxasOrigem','messages',
+                'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
+                'financeAskCompanyMerch','financeConfirmDelete',
+                'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
+                'operationDockEnabled','operationServices',
+                'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
+                'reminderHighlightToday','panelManager.v1',
+                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail'
+            ];
+            const values = {};
+            keys.forEach(key => {
+                const value = EH.Storage.get(key, undefined);
+                if (value !== undefined) values[key] = value;
+            });
+            return {
+                kind: 'epass-helper-settings',
+                schemaVersion: this.CURRENT_VERSION,
+                scriptVersion: EH.Config.VERSION,
+                exportedAt: Date.now(),
+                values
+            };
+        },
+
+        downloadJson(filename, payload) {
+            const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+            setTimeout(() => URL.revokeObjectURL(url), 1500);
+        },
+
+        importConfiguration(payload) {
+            if (!payload || payload.kind !== 'epass-helper-settings' || typeof payload.values !== 'object') {
+                throw new Error('Arquivo de configurações inválido.');
+            }
+            const allowed = new Set(Object.keys(this.exportConfiguration().values).concat([
+                'settingsPreset','uiDensity','panelOpacity','panelRadius','shadowLevel',
+                'overlaySide','overlayTopOffset','panelCustomWidth','panelHeightPercent',
+                'whatsappCustomWidth','whatsappHeightPercent','panelZoom','whatsappDockZoom',
+                'captureScale','ticketCaptureWidth','autoRouteCapture','autoCopyImages',
+                'aplicarTaxasOrigem','taxasOrigem','messages',
+                'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
+                'financeAskCompanyMerch','financeConfirmDelete',
+                'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
+                'operationDockEnabled','operationServices',
+                'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
+                'reminderHighlightToday','panelManager.v1',
+                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail'
+            ]));
+            Object.entries(payload.values).forEach(([key, value]) => {
+                if (allowed.has(key)) EH.Storage.set(key, value);
+            });
+            EH.Storage.set(this.META_KEY, {
+                schemaVersion: this.CURRENT_VERSION,
+                importedAt: Date.now(),
+                scriptVersion: EH.Config.VERSION
+            });
+        }
+    };
+
+    EH.Device = {
+        KEY: 'device.id.v1',
+        id() {
+            let id = EH.Storage.get(this.KEY, '');
+            if (!id) {
+                id = `dev-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+                EH.Storage.set(this.KEY, id);
+            }
+            return String(id);
         }
     };
 
@@ -2358,13 +2565,17 @@
     EH.PanelManager = {
         KEY: 'panelManager.v1',
         drag: null,
+        resize: null,
+        handleDrag: null,
         bound: new WeakSet(),
+        handleBound: new WeakSet(),
+        resizeBound: new WeakSet(),
 
         defaults() {
             return {
-                main: { mode: 'automatic', x: null, y: null, width: 370, height: 560, zoom: 100, dynamic: true },
-                whatsapp: { mode: 'automatic', x: null, y: null, width: 320, height: 460, zoom: 100, dynamic: true },
-                operation: { mode: 'bottom-right', x: null, y: null, width: 300, height: 285, zoom: 100, dynamic: true }
+                main: { mode: 'automatic', x: null, y: null, width: 370, height: 560, zoom: 100, dynamic: true, handleY: 30, allowDrag: true, allowResize: true },
+                whatsapp: { mode: 'automatic', x: null, y: null, width: 320, height: 460, zoom: 100, dynamic: true, handleY: 55, allowDrag: true, allowResize: true },
+                operation: { mode: 'bottom-right', x: null, y: null, width: 300, height: 285, zoom: 100, dynamic: true, handleY: 80, allowDrag: true, allowResize: true }
             };
         },
 
@@ -2384,7 +2595,10 @@
                 width: Math.min(limits.maxW, Math.max(limits.minW, Number(value.width) || fallback.width)),
                 height: Math.min(limits.maxH, Math.max(limits.minH, Number(value.height) || fallback.height)),
                 zoom: Math.min(150, Math.max(75, Number(value.zoom) || fallback.zoom)),
-                dynamic: value.dynamic !== undefined ? Boolean(value.dynamic) : Boolean(fallback.dynamic)
+                dynamic: value.dynamic !== undefined ? Boolean(value.dynamic) : Boolean(fallback.dynamic),
+                handleY: Math.min(90, Math.max(10, Number(value.handleY) || fallback.handleY || 50)),
+                allowDrag: value.allowDrag !== undefined ? Boolean(value.allowDrag) : Boolean(fallback.allowDrag),
+                allowResize: value.allowResize !== undefined ? Boolean(value.allowResize) : Boolean(fallback.allowResize)
             };
         },
 
@@ -2440,6 +2654,87 @@
             return key === 'main' ? el.querySelector('.eh-header')
                 : key === 'whatsapp' ? el.querySelector('.eh-wa-dock-head')
                     : el.querySelector('.eh-operation-dock-head');
+        },
+
+        handleElement(key) {
+            if (key === 'main') return EH.UI?.launcher || document.querySelector('#eh-launcher');
+            if (key === 'whatsapp') return EH.WhatsAppDock?.handle || document.querySelector('#eh-wa-handle');
+            return EH.OperationDock?.launcher || document.querySelector('#eh-operation-launcher');
+        },
+
+        limits(key) {
+            return key === 'operation'
+                ? { minW: 240, maxW: 480, minH: 210, maxH: 720 }
+                : key === 'whatsapp'
+                    ? { minW: 240, maxW: 560, minH: 240, maxH: 900 }
+                    : { minW: 260, maxW: 600, minH: 300, maxH: 900 };
+        },
+
+        fixedSide(key, cfg = this.get(key)) {
+            const mode = String(cfg?.mode || '');
+            if (mode.includes('left') || mode === 'left') return 'left';
+            if (mode.includes('right') || mode === 'right') return 'right';
+            if (mode === 'free') {
+                const el = this.element(key);
+                const rect = el?.getBoundingClientRect?.();
+                if (rect) return rect.left + rect.width / 2 < window.innerWidth / 2 ? 'left' : 'right';
+            }
+            return key === 'main' && EH.Config.OVERLAY_SIDE === 'left' ? 'left' : 'right';
+        },
+
+        resolvedHandleY(key, cfg = this.get(key)) {
+            const side = this.fixedSide(key, cfg);
+            let y = Math.min(90, Math.max(10, Number(cfg?.handleY) || 50));
+            const all = this.load();
+            const occupied = [];
+            ['main','whatsapp','operation'].forEach(otherKey => {
+                if (otherKey === key) return;
+                const other = all[otherKey];
+                if (this.fixedSide(otherKey, other) !== side) return;
+                occupied.push(Number(other?.handleY) || 50);
+            });
+            occupied.sort((a,b) => a-b);
+            for (let i = 0; i < 8; i++) {
+                if (!occupied.some(other => Math.abs(other - y) < 7)) break;
+                y = y <= 83 ? y + 7 : y - 7;
+            }
+            return Math.min(90, Math.max(10, y));
+        },
+
+        applyHandle(key) {
+            const handle = this.handleElement(key);
+            if (!handle) return;
+            const cfg = this.get(key);
+            const side = this.fixedSide(key, cfg);
+            const y = this.resolvedHandleY(key, cfg);
+            handle.style.setProperty('position', 'fixed', 'important');
+            handle.style.setProperty('top', `${y}%`, 'important');
+            handle.style.setProperty('bottom', 'auto', 'important');
+            handle.style.setProperty('transform', 'translateY(-50%)', 'important');
+            if (side === 'left') {
+                handle.style.setProperty('left', '0', 'important');
+                handle.style.setProperty('right', 'auto', 'important');
+                handle.style.setProperty('border-radius', '0 8px 8px 0', 'important');
+            } else {
+                handle.style.setProperty('right', '0', 'important');
+                handle.style.setProperty('left', 'auto', 'important');
+                handle.style.setProperty('border-radius', '8px 0 0 8px', 'important');
+            }
+        },
+
+        ensureResizeGrip(key) {
+            const el = this.element(key);
+            if (!el) return null;
+            let grip = el.querySelector(':scope > .eh-panel-resize-grip');
+            if (!grip) {
+                grip = document.createElement('div');
+                grip.className = 'eh-panel-resize-grip';
+                grip.title = 'Arraste para redimensionar';
+                grip.setAttribute('aria-hidden', 'true');
+                el.appendChild(grip);
+            }
+            grip.hidden = !this.get(key).allowResize;
+            return grip;
         },
 
         dynamicSize(key) {
@@ -2511,6 +2806,8 @@
             // Automatic mantém o layout aprovado para Atendimento/WhatsApp.
             if (cfg.mode === 'automatic' && key !== 'operation') {
                 ['top','left','right','bottom','width','height','max-height','max-width'].forEach(prop => el.style.removeProperty(prop));
+                this.ensureResizeGrip(key);
+                this.applyHandle(key);
                 return;
             }
 
@@ -2544,6 +2841,8 @@
             this.setImportant(el, 'top', `${y}px`);
             this.setImportant(el, 'right', 'auto');
             this.setImportant(el, 'bottom', 'auto');
+            this.ensureResizeGrip(key);
+            this.applyHandle(key);
         },
 
         applyAll() {
@@ -2557,6 +2856,7 @@
             header.classList.add('eh-drag-handle');
             header.addEventListener('pointerdown', event => {
                 if (event.button !== 0) return;
+                if (!this.get(key).allowDrag) return;
                 if (event.target?.closest?.('button, input, select, textarea, a, [role="button"]')) return;
                 const el = this.element(key);
                 if (!el) return;
@@ -2593,8 +2893,115 @@
             header.addEventListener('pointercancel', finish);
         },
 
+        bindHandle(key) {
+            const handle = this.handleElement(key);
+            if (!handle || this.handleBound.has(handle)) return;
+            this.handleBound.add(handle);
+            let moved = false;
+            handle.addEventListener('pointerdown', event => {
+                if (event.button !== 0) return;
+                moved = false;
+                this.handleDrag = { key, pointerId: event.pointerId, startY: event.clientY, currentY: event.clientY };
+                handle.setPointerCapture?.(event.pointerId);
+            });
+            handle.addEventListener('pointermove', event => {
+                if (!this.handleDrag || this.handleDrag.key !== key || this.handleDrag.pointerId !== event.pointerId) return;
+                this.handleDrag.currentY = event.clientY;
+                if (Math.abs(event.clientY - this.handleDrag.startY) < 4 && !moved) return;
+                moved = true;
+                const pct = Math.min(90, Math.max(10, (event.clientY / Math.max(1, window.innerHeight)) * 100));
+                handle.style.setProperty('top', `${pct}%`, 'important');
+                handle.style.setProperty('bottom', 'auto', 'important');
+                handle.style.setProperty('transform', 'translateY(-50%)', 'important');
+                event.preventDefault();
+            });
+            const finish = event => {
+                if (!this.handleDrag || this.handleDrag.key !== key) return;
+                if (moved) {
+                    const pct = Math.min(90, Math.max(10, (this.handleDrag.currentY / Math.max(1, window.innerHeight)) * 100));
+                    this.update(key, { handleY: Math.round(pct * 10) / 10 });
+                    handle.dataset.ehHandleDraggedAt = String(Date.now());
+                }
+                this.handleDrag = null;
+                try { handle.releasePointerCapture?.(event.pointerId); } catch (error) {}
+            };
+            handle.addEventListener('pointerup', finish);
+            handle.addEventListener('pointercancel', finish);
+            handle.addEventListener('click', event => {
+                const draggedAt = Number(handle.dataset.ehHandleDraggedAt || 0);
+                if (draggedAt && Date.now() - draggedAt < 350) {
+                    event.preventDefault();
+                    event.stopImmediatePropagation();
+                }
+            }, true);
+            this.applyHandle(key);
+        },
+
+        bindResize(key) {
+            const grip = this.ensureResizeGrip(key);
+            if (!grip || this.resizeBound.has(grip)) return;
+            this.resizeBound.add(grip);
+            grip.addEventListener('pointerdown', event => {
+                if (event.button !== 0 || !this.get(key).allowResize) return;
+                const el = this.element(key);
+                if (!el) return;
+                const rect = el.getBoundingClientRect();
+                this.resize = {
+                    key,
+                    pointerId: event.pointerId,
+                    startX: event.clientX,
+                    startY: event.clientY,
+                    startW: rect.width,
+                    startH: rect.height,
+                    startLeft: rect.left,
+                    startTop: rect.top
+                };
+                grip.setPointerCapture?.(event.pointerId);
+                document.documentElement.classList.add('eh-panel-resizing');
+                event.preventDefault();
+                event.stopPropagation();
+            });
+            grip.addEventListener('pointermove', event => {
+                if (!this.resize || this.resize.key !== key || this.resize.pointerId !== event.pointerId) return;
+                const el = this.element(key);
+                if (!el) return;
+                const limits = this.limits(key);
+                const maxW = Math.min(limits.maxW, window.innerWidth - this.resize.startLeft - 6);
+                const maxH = Math.min(limits.maxH, window.innerHeight - this.resize.startTop - 6);
+                const width = Math.min(maxW, Math.max(limits.minW, this.resize.startW + (event.clientX - this.resize.startX)));
+                const height = Math.min(maxH, Math.max(limits.minH, this.resize.startH + (event.clientY - this.resize.startY)));
+                this.setImportant(el, 'width', `${Math.round(width)}px`);
+                this.setImportant(el, 'height', `${Math.round(height)}px`);
+                event.preventDefault();
+            });
+            const finish = event => {
+                if (!this.resize || this.resize.key !== key) return;
+                const el = this.element(key);
+                const rect = el?.getBoundingClientRect?.();
+                if (rect) {
+                    this.update(key, {
+                        mode: 'free',
+                        x: Math.round(rect.left),
+                        y: Math.round(rect.top),
+                        width: Math.round(rect.width),
+                        height: Math.round(rect.height),
+                        dynamic: false
+                    });
+                }
+                this.resize = null;
+                document.documentElement.classList.remove('eh-panel-resizing');
+                try { grip.releasePointerCapture?.(event.pointerId); } catch (error) {}
+            };
+            grip.addEventListener('pointerup', finish);
+            grip.addEventListener('pointercancel', finish);
+        },
+
         bindAll() {
-            ['main','whatsapp','operation'].forEach(key => this.bind(key));
+            ['main','whatsapp','operation'].forEach(key => {
+                this.bind(key);
+                this.bindHandle(key);
+                this.bindResize(key);
+            });
             this.applyAll();
         }
     };
@@ -2628,6 +3035,14 @@
 
                 #eh-root, #eh-root *, #eh-operation-dock, #eh-operation-dock *, #eh-wa-dock, #eh-wa-dock * { box-sizing: border-box; }
                 .eh-drag-handle { cursor: grab !important; touch-action: none; }
+                .eh-panel-resize-grip {
+                    position:absolute; right:2px; bottom:2px; width:16px; height:16px;
+                    z-index:2147483640; cursor:nwse-resize; touch-action:none;
+                    border-radius:0 0 7px 0; opacity:.42;
+                    background:linear-gradient(135deg,transparent 0 50%,rgba(76,92,112,.55) 52% 58%,transparent 60% 68%,rgba(76,92,112,.55) 70% 76%,transparent 78%);
+                }
+                .eh-panel-resize-grip:hover { opacity:.9; }
+                html.eh-panel-dragging, html.eh-panel-resizing { user-select:none !important; }
                 html.eh-panel-dragging, html.eh-panel-dragging * { cursor: grabbing !important; user-select: none !important; }
                 .eh-wa-scale-body { min-height:0; flex:1 1 auto; display:flex; flex-direction:column; overflow:hidden; transform-origin:top left; }
 
@@ -10261,6 +10676,335 @@
     // LEMBRETES DE IMPRESSÃO / EMBARQUE — v5.56
     // Persistentes, deduplicados por bilhete/localizador quando disponível.
     // ============================================================
+
+    // ============================================================
+    // SINCRONIZAÇÃO REAL DE LEMBRETES — SUPABASE (opcional) v5.57
+    // - Desativada por padrão.
+    // - Nunca usa service_role/secret no navegador.
+    // - O Helper continua localmente se a rede cair.
+    // - Merge é por registro + updatedAt; não substitui o banco inteiro.
+    // ============================================================
+    EH.Sync = {
+        AUTH_KEY: 'sync.supabase.auth.v1',
+        STATUS_KEY: 'sync.status.v1',
+        timer: null,
+        busy: false,
+        lastStatus: { state: 'local', pending: 0, message: 'Somente local' },
+
+        config() {
+            return {
+                enabled: Boolean(EH.Config.SYNC_ENABLED),
+                provider: String(EH.Config.SYNC_PROVIDER || 'none'),
+                url: String(EH.Config.SYNC_SUPABASE_URL || '').replace(/\/+$/, ''),
+                key: String(EH.Config.SYNC_SUPABASE_KEY || '').trim(),
+                email: String(EH.Config.SYNC_SUPABASE_EMAIL || '').trim()
+            };
+        },
+
+        safeKey(key) {
+            const raw = String(key || '').trim();
+            if (!raw) return '';
+            if (raw.startsWith('sb_secret_')) throw new Error('Não use uma chave secret do Supabase no UserScript.');
+            if (raw.split('.').length === 3) {
+                try {
+                    const segment = raw.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+                    const payload = JSON.parse(atob(segment + '='.repeat((4 - segment.length % 4) % 4)));
+                    if (String(payload?.role || '').toLowerCase() === 'service_role') {
+                        throw new Error('Não use service_role no navegador. Use apenas a publishable/anon key com RLS.');
+                    }
+                } catch (error) {
+                    if (String(error?.message || '').includes('service_role')) throw error;
+                }
+            }
+            return raw;
+        },
+
+        normalizeUrl(url) {
+            const value = String(url || '').trim().replace(/\/+$/, '');
+            if (!value) return '';
+            if (!/^https:\/\/[a-z0-9.-]+/i.test(value)) throw new Error('Use a URL HTTPS do projeto Supabase.');
+            return value;
+        },
+
+        auth() {
+            const auth = EH.Storage.get(this.AUTH_KEY, null);
+            return auth && typeof auth === 'object' ? auth : null;
+        },
+
+        setStatus(state, message = '', pending = null) {
+            const status = {
+                state,
+                message,
+                pending: pending === null ? this.pendingCount() : Number(pending || 0),
+                at: Date.now()
+            };
+            this.lastStatus = status;
+            EH.Storage.set(this.STATUS_KEY, status);
+            EH.Reminders?.render?.();
+            return status;
+        },
+
+        status() {
+            return this.lastStatus?.at ? this.lastStatus : (EH.Storage.get(this.STATUS_KEY, null) || this.lastStatus);
+        },
+
+        pendingCount() {
+            const items = EH.Reminders?.load?.() || [];
+            return items.filter(item => item?.syncState === 'pending' || item?.syncState === 'error').length;
+        },
+
+        configured() {
+            const cfg = this.config();
+            return cfg.enabled && cfg.provider === 'supabase' && Boolean(cfg.url && cfg.key);
+        },
+
+        async request(path, options = {}, { auth = true } = {}) {
+            const cfg = this.config();
+            const url = this.normalizeUrl(cfg.url);
+            const key = this.safeKey(cfg.key);
+            if (!url || !key) throw new Error('Sincronização Supabase ainda não configurada.');
+            const headers = {
+                'Content-Type': 'application/json',
+                apikey: key,
+                ...(options.headers || {})
+            };
+            if (auth) {
+                const token = await this.ensureToken();
+                if (!token) throw new Error('Entre na conta de sincronização primeiro.');
+                headers.Authorization = `Bearer ${token}`;
+            }
+            const target=`${url}${path}`;
+            const method=String(options.method||'GET').toUpperCase();
+            const body=options.body ?? null;
+
+            let status=0;
+            let raw='';
+            if (typeof GM_xmlhttpRequest === 'function') {
+                const response = await new Promise((resolve,reject)=>{
+                    GM_xmlhttpRequest({
+                        method,
+                        url:target,
+                        headers,
+                        data:body,
+                        timeout:15000,
+                        onload:resolve,
+                        onerror:()=>reject(new Error('Falha de rede ao acessar a sincronização.')),
+                        ontimeout:()=>reject(new Error('Tempo esgotado ao acessar a sincronização.'))
+                    });
+                });
+                status=Number(response?.status||0);
+                raw=String(response?.responseText||'');
+            } else {
+                const response=await fetch(target,{method,headers,body});
+                status=response.status;
+                raw=await response.text();
+            }
+
+            let data=null;
+            if(raw){
+                try{data=JSON.parse(raw);}catch(error){data=raw;}
+            }
+            if(status<200 || status>=300){
+                const message=data?.msg||data?.message||data?.error_description||data?.error||`HTTP ${status}`;
+                throw new Error(String(message));
+            }
+            return data;
+        },
+
+        async login(email, password) {
+            const cfg = this.config();
+            const normalizedEmail = String(email || cfg.email || '').trim();
+            const pwd = String(password || '');
+            if (!normalizedEmail || !pwd) throw new Error('Informe e-mail e senha da conta de sincronização.');
+            const data = await this.request('/auth/v1/token?grant_type=password', {
+                method: 'POST',
+                body: JSON.stringify({ email: normalizedEmail, password: pwd })
+            }, { auth: false });
+            const now = Date.now();
+            EH.Storage.set(this.AUTH_KEY, {
+                accessToken: data?.access_token || '',
+                refreshToken: data?.refresh_token || '',
+                expiresAt: now + Math.max(60, Number(data?.expires_in || 3600)) * 1000,
+                userId: data?.user?.id || '',
+                email: data?.user?.email || normalizedEmail
+            });
+            EH.Config.SYNC_SUPABASE_EMAIL = normalizedEmail;
+            EH.Storage.set('syncSupabaseEmail', normalizedEmail);
+            this.setStatus('connected', 'Conta conectada.');
+            await this.syncReminders({ quiet: true });
+            return data;
+        },
+
+        logout() {
+            EH.Storage.remove(this.AUTH_KEY);
+            this.setStatus(this.configured() ? 'auth-required' : 'local', this.configured() ? 'Entre para sincronizar.' : 'Somente local');
+        },
+
+        async ensureToken() {
+            const auth = this.auth();
+            if (!auth?.accessToken) return '';
+            if (Number(auth.expiresAt || 0) > Date.now() + 60000) return String(auth.accessToken);
+            if (!auth.refreshToken) return '';
+            try {
+                const data = await this.request('/auth/v1/token?grant_type=refresh_token', {
+                    method: 'POST',
+                    body: JSON.stringify({ refresh_token: auth.refreshToken })
+                }, { auth: false });
+                const next = {
+                    ...auth,
+                    accessToken: data?.access_token || '',
+                    refreshToken: data?.refresh_token || auth.refreshToken,
+                    expiresAt: Date.now() + Math.max(60, Number(data?.expires_in || 3600)) * 1000,
+                    userId: data?.user?.id || auth.userId || '',
+                    email: data?.user?.email || auth.email || ''
+                };
+                EH.Storage.set(this.AUTH_KEY, next);
+                return next.accessToken;
+            } catch (error) {
+                this.logout();
+                return '';
+            }
+        },
+
+        sanitizeReminder(item = {}) {
+            const createdAt = Number(item.createdAt || Date.now());
+            const updatedAt = Number(item.updatedAt || item.completedAt || createdAt);
+            return {
+                id: String(item.id || ''),
+                name: EH.Utils.clean(item.name || ''),
+                cpf: String(item.cpf || '').replace(/\D/g, '').slice(0, 11),
+                origin: EH.Utils.clean(item.origin || ''),
+                destination: EH.Utils.clean(item.destination || ''),
+                travelDate: String(item.travelDate || ''),
+                travelDateBr: String(item.travelDateBr || ''),
+                travelTime: String(item.travelTime || ''),
+                travelTimestamp: Number(item.travelTimestamp || 0),
+                service: String(item.service || '').replace(/\D/g, ''),
+                seat: EH.Utils.clean(item.seat || ''),
+                mapFoundAt: Number(item.mapFoundAt || 0),
+                ticketNumber: EH.Utils.clean(item.ticketNumber || ''),
+                passengerId: item.passengerId || null,
+                status: item.status === 'completed' ? 'completed' : 'pending',
+                source: EH.Utils.clean(item.source || 'epass-ticket'),
+                createdAt,
+                updatedAt,
+                completedAt: Number(item.completedAt || 0),
+                deviceId: String(item.deviceId || EH.Device.id())
+            };
+        },
+
+        mergeRecords(localItems, remoteItems) {
+            const map = new Map();
+            (Array.isArray(localItems) ? localItems : []).forEach(item => {
+                const safe = this.sanitizeReminder(item);
+                if (safe.id) map.set(safe.id, { ...item, ...safe });
+            });
+            (Array.isArray(remoteItems) ? remoteItems : []).forEach(remote => {
+                const safe = this.sanitizeReminder(remote?.payload || remote || {});
+                if (!safe.id) return;
+                const current = map.get(safe.id);
+                const currentUpdated = Number(current?.updatedAt || current?.createdAt || 0);
+                const remoteUpdated = Number(safe.updatedAt || safe.createdAt || 0);
+                if (!current || remoteUpdated > currentUpdated || (remoteUpdated === currentUpdated && safe.deviceId > String(current.deviceId || ''))) {
+                    map.set(safe.id, { ...safe, syncState: 'synced', syncedAt: Date.now() });
+                }
+            });
+            return Array.from(map.values()).slice(-1000);
+        },
+
+        async syncReminders({ quiet = false } = {}) {
+            if (this.busy) return this.status();
+            if (!this.configured()) {
+                return this.setStatus('local', 'Sincronização entre computadores não configurada.');
+            }
+            const auth = this.auth();
+            if (!auth?.userId || !(await this.ensureToken())) {
+                return this.setStatus('auth-required', 'Entre na conta Supabase para sincronizar.');
+            }
+
+            this.busy = true;
+            this.setStatus('syncing', 'Sincronizando…');
+            try {
+                const userId = this.auth()?.userId;
+                const remoteRows = await this.request('/rest/v1/epass_reminders?select=id,payload,updated_at,device_id&order=updated_at.asc', {
+                    method: 'GET',
+                    headers: { Accept: 'application/json' }
+                });
+                const remoteById = new Map((Array.isArray(remoteRows) ? remoteRows : []).map(row => [
+                    String(row.id || row?.payload?.id || ''),
+                    this.sanitizeReminder(row.payload || {})
+                ]));
+
+                let local = this.mergeRecords(EH.Reminders?.load?.() || [], remoteRows || []);
+                const push = [];
+                local.forEach(item => {
+                    const safe = this.sanitizeReminder(item);
+                    const remote = remoteById.get(safe.id);
+                    if (!remote || Number(safe.updatedAt || 0) > Number(remote.updatedAt || 0)) {
+                        push.push({
+                            user_id: userId,
+                            id: safe.id,
+                            payload: safe,
+                            updated_at: new Date(safe.updatedAt || Date.now()).toISOString(),
+                            device_id: safe.deviceId
+                        });
+                    }
+                });
+
+                if (push.length) {
+                    await this.request('/rest/v1/epass_reminders?on_conflict=user_id,id', {
+                        method: 'POST',
+                        headers: {
+                            Prefer: 'resolution=merge-duplicates,return=minimal'
+                        },
+                        body: JSON.stringify(push)
+                    });
+                }
+
+                const syncedAt = Date.now();
+                local = local.map(item => ({ ...item, syncState: 'synced', syncedAt }));
+                EH.Storage.set(EH.Reminders.KEY, local);
+                EH.Reminders.render();
+                const status = this.setStatus('synced', 'Sincronizado', 0);
+                if (!quiet) EH.Toast?.success?.('Lembretes sincronizados entre os dispositivos.');
+                return status;
+            } catch (error) {
+                const local = (EH.Reminders?.load?.() || []).map(item => ({
+                    ...item,
+                    syncState: item.status ? 'pending' : (item.syncState || 'pending')
+                }));
+                EH.Storage.set(EH.Reminders.KEY, local);
+                EH.Reminders?.render?.();
+                const status = this.setStatus(navigator.onLine === false ? 'offline' : 'error', navigator.onLine === false ? 'Sem conexão • alterações salvas localmente.' : `Falha na sincronização: ${error.message}`);
+                if (!quiet) EH.Toast?.warning?.(status.message);
+                return status;
+            } finally {
+                this.busy = false;
+            }
+        },
+
+        markPending(items = []) {
+            if (!this.configured()) return items;
+            return (Array.isArray(items) ? items : []).map(item => ({
+                ...item,
+                syncState: item.syncState === 'synced' ? 'pending' : (item.syncState || 'pending')
+            }));
+        },
+
+        start() {
+            if (this.timer) clearInterval(this.timer);
+            const cfg = this.config();
+            if (!cfg.enabled || cfg.provider !== 'supabase') {
+                this.setStatus('local', 'Somente local');
+                return;
+            }
+            this.setStatus(this.auth()?.accessToken ? 'connected' : 'auth-required', this.auth()?.accessToken ? 'Conta conectada.' : 'Entre para sincronizar.');
+            EH.Runtime.timeout('sync-first-run', () => this.syncReminders({ quiet: true }), 2500);
+            this.timer = setInterval(() => this.syncReminders({ quiet: true }), Math.max(30000, Number(EH.Config.SYNC_INTERVAL_MS || 60000)));
+            EH.Runtime?.on?.('sync-online', window, 'online', () => this.syncReminders({ quiet: true }), { passive: true });
+        }
+    };
+
     EH.Reminders = {
         KEY: 'ticketReminders.v1',
         PENDING_SEARCH_KEY: 'ticketReminders.pendingSearch.v1',
@@ -10316,7 +11060,9 @@
                         origin:EH.Utils.clean(ticket.origin||''), destination:EH.Utils.clean(ticket.destination||''),
                         travelRaw:EH.Utils.clean(ticket.date||''), travelDate:travel.key, travelDateBr:travel.dateBr,
                         travelTime:travel.time, travelTimestamp:travel.timestamp,
-                        status:'pending', source:'epass-ticket', createdAt:Date.now(), completedAt:0
+                        service:String(item?.service || ticket?.service || '').replace(/\D/g,''),
+                        status:'pending', source:'epass-ticket', createdAt:Date.now(), updatedAt:Date.now(), completedAt:0,
+                        deviceId:EH.Device.id(), syncState:EH.Sync?.configured?.() ? 'pending' : 'local'
                     });
                 });
             });
@@ -10335,6 +11081,7 @@
                 if (!ok) return 0;
             }
             this.save([...existing,...fresh]);
+            EH.Sync?.syncReminders?.({ quiet: true });
             EH.Toast?.success?.(`${fresh.length} lembrete(s) de passagem criado(s).`);
             return fresh.length;
         },
@@ -10342,13 +11089,14 @@
             const items=this.load();
             const item=items.find(x=>x.id===id);
             if (!item) return;
-            item.status='completed'; item.completedAt=Date.now();
+            item.status='completed'; item.completedAt=Date.now(); item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local';
             this.save(items);
+            EH.Sync?.syncReminders?.({ quiet: true });
             EH.Toast?.success?.('Lembrete marcado como impresso/concluído.');
         },
         reopen(id) {
             const items=this.load(); const item=items.find(x=>x.id===id); if(!item)return;
-            item.status='pending'; item.completedAt=0; this.save(items);
+            item.status='pending'; item.completedAt=0; item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local'; this.save(items); EH.Sync?.syncReminders?.({ quiet: true });
         },
         todayKey(offset=0) {
             const d=new Date(); d.setDate(d.getDate()+offset);
@@ -10387,6 +11135,74 @@
             if(item.travelDate===tomorrow) return `AMANHÃ${item.travelTime?` — ${item.travelTime}`:''}`;
             return [item.travelDateBr,item.travelTime].filter(Boolean).join(' — ') || 'DATA NÃO IDENTIFICADA';
         },
+
+        matchPassenger(passenger, record = null) {
+            if (!passenger) return null;
+            const cpf = this.normalizeCpf(passenger.cpf || '');
+            const ticket = EH.Utils.clean(passenger.ticket || '');
+            const service = String(record?.service || '').replace(/\D/g, '');
+            const date = String(record?.date || '');
+            const candidates = this.load().filter(item => {
+                if (item.status === 'completed' && !ticket && !cpf) return false;
+                if (ticket && item.ticketNumber && EH.Utils.clean(item.ticketNumber) === ticket) return true;
+                if (cpf && this.normalizeCpf(item.cpf) === cpf) {
+                    if (service && item.service && String(item.service) !== service) return false;
+                    if (date && item.travelDate && item.travelDate !== date) return false;
+                    return true;
+                }
+                return false;
+            });
+            if (!candidates.length) return null;
+            return candidates.sort((a,b)=>Number(b.updatedAt||b.createdAt||0)-Number(a.updatedAt||a.createdAt||0))[0] || null;
+        },
+
+        pendingForService(service, date = '') {
+            const serviceId = String(service || '').replace(/\D/g, '');
+            return this.pending().filter(item => {
+                if (serviceId && item.service && String(item.service) !== serviceId) return false;
+                if (date && item.travelDate && item.travelDate !== date) return false;
+                return true;
+            });
+        },
+
+        linkMapRecord(record) {
+            if (!record?.service || !record?.agency?.exists || record?.agency?.multiple) return 0;
+            const passengers=[...(record.agency.boarders||[]),...(record.agency.alighters||[])];
+            if(!passengers.length)return 0;
+            const items=this.load();
+            let changed=0;
+            passengers.forEach(passenger=>{
+                const cpf=this.normalizeCpf(passenger?.cpf||'');
+                const ticket=EH.Utils.clean(passenger?.ticket||'');
+                const candidates=items.filter(item=>{
+                    if(ticket && item.ticketNumber && EH.Utils.clean(item.ticketNumber)===ticket)return true;
+                    if(cpf && this.normalizeCpf(item.cpf)===cpf){
+                        if(item.travelDate && record.date && item.travelDate!==record.date)return false;
+                        return true;
+                    }
+                    return false;
+                });
+                if(candidates.length!==1)return;
+                const item=candidates[0];
+                const nextService=String(record.service||'').replace(/\D/g,'');
+                const nextSeat=EH.Utils.clean(passenger?.seat||'');
+                if(String(item.service||'')!==nextService || (nextSeat && EH.Utils.clean(item.seat||'')!==nextSeat)){
+                    item.service=nextService;
+                    if(nextSeat)item.seat=nextSeat;
+                    item.mapFoundAt=Date.now();
+                    item.updatedAt=Date.now();
+                    item.deviceId=EH.Device.id();
+                    item.syncState=EH.Sync?.configured?.()?'pending':'local';
+                    changed++;
+                }
+            });
+            if(changed){
+                this.save(items);
+                EH.Sync?.syncReminders?.({quiet:true});
+            }
+            return changed;
+        },
+
         openModal() {
             document.querySelector('#eh-reminders-overlay')?.remove();
             const overlay=document.createElement('div'); overlay.className='eh-overlay'; overlay.id='eh-reminders-overlay';
@@ -10407,11 +11223,12 @@
                     const cpf=document.createElement('div'); cpf.className='eh-reminder-cpf'; cpf.textContent=`CPF: ${this.maskCpf(item.cpf)}`;
                     const route=document.createElement('small'); route.textContent=[item.origin,item.destination].filter(Boolean).join(' → ') || 'Trecho não identificado';
                     const id=document.createElement('small'); id.textContent=item.ticketNumber?`Bilhete ${item.ticketNumber}`:'Identificador por CPF + trecho + data';
+                    const mapInfo=document.createElement('small'); mapInfo.textContent=[item.service?`Serviço ${item.service}`:'',item.seat?`Poltrona ${item.seat}`:''].filter(Boolean).join(' • '); mapInfo.hidden=!mapInfo.textContent;
                     const actions=document.createElement('div'); actions.className='eh-reminder-actions';
                     const copy=document.createElement('button'); copy.type='button'; copy.className='eh-modal-btn'; copy.textContent='Copiar CPF'; copy.addEventListener('click',()=>this.copyCpf(item));
                     const search=document.createElement('button'); search.type='button'; search.className='eh-modal-btn primary'; search.textContent='Buscar passagem'; search.addEventListener('click',()=>this.searchTicket(item));
                     const done=document.createElement('button'); done.type='button'; done.className='eh-modal-btn'; done.textContent=item.status==='completed'?'Reabrir':'✓ Impresso'; done.addEventListener('click',()=>{ item.status==='completed'?this.reopen(item.id):this.complete(item.id); renderList(); });
-                    actions.append(copy,search,done); card.append(top,name,cpf,route,id,actions); content.appendChild(card);
+                    actions.append(copy,search,done); card.append(top,name,cpf,route,id,mapInfo,actions); content.appendChild(card);
                 });
             }; renderList();
             const foot=document.createElement('div'); foot.className='eh-modal-actions'; const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar'; foot.appendChild(close2);
@@ -10424,7 +11241,15 @@
             if(!pending.length){ host.hidden=true; host.innerHTML=''; return; }
             host.hidden=false; host.innerHTML='';
             const today=pending.filter(x=>x.travelDate===this.todayKey(0)); const tomorrow=pending.filter(x=>x.travelDate===this.todayKey(1));
-            const title=document.createElement('div'); title.className='eh-reminder-host-title'; title.innerHTML='<span>LEMBRETES</span><strong>Passagens para imprimir</strong>';
+            const title=document.createElement('div'); title.className='eh-reminder-host-title'; title.innerHTML='<span>EMBARQUES</span><strong>Passagens para imprimir</strong>';
+            const syncStatus=EH.Sync?.status?.() || {state:'local',pending:0};
+            const syncLine=document.createElement('small'); syncLine.className=`eh-reminder-sync ${syncStatus.state||'local'}`;
+            syncLine.textContent = syncStatus.state==='synced' ? '☁ Sincronizado'
+                : syncStatus.state==='syncing' ? '☁ Sincronizando…'
+                    : syncStatus.state==='offline' ? `⚠ Sem conexão${syncStatus.pending?` • ${syncStatus.pending} pendente(s)`:''}`
+                        : syncStatus.state==='auth-required' ? '☁ Sincronização: entrar na conta'
+                            : syncStatus.state==='error' ? `⚠ ${syncStatus.pending||0} alteração(ões) pendente(s)`
+                                : 'Somente neste computador';
             const summary=document.createElement('div'); summary.className='eh-reminder-host-summary';
             const todayBtn=document.createElement('button'); todayBtn.type='button'; todayBtn.textContent=`Hoje ${today.length}`;
             const tomorrowBtn=document.createElement('button'); tomorrowBtn.type='button'; tomorrowBtn.textContent=`Amanhã ${tomorrow.length}`;
@@ -10433,14 +11258,14 @@
             const next=pending[0]; const nextLine=document.createElement('div'); nextLine.className='eh-reminder-next';
             const main=document.createElement('strong'); main.textContent=`${next.travelTime||'—'} • ${next.name||'Passageiro'}`;
             const sub=document.createElement('small'); sub.textContent=`${this.maskCpf(next.cpf)} • ${[next.origin,next.destination].filter(Boolean).join(' → ')}`; nextLine.append(main,sub);
-            host.append(title,summary,nextLine);
+            host.append(title,syncLine,summary,nextLine);
         },
         injectStyles() {
             if(this.stylesInjected)return; this.stylesInjected=true;
             GM_addStyle(`
                 #eh-root .eh-reminder-host{display:grid;gap:6px;margin:7px 0;padding:8px;border:1px solid #e1d7bd;border-radius:9px;background:#fffaf0;color:#303946}
                 #eh-root .eh-reminder-host[hidden]{display:none!important}.eh-reminder-host-title{display:grid;gap:1px}.eh-reminder-host-title span{font-size:7px;font-weight:950;letter-spacing:.5px;color:#92703a}.eh-reminder-host-title strong{font-size:10px;color:#334155}
-                .eh-reminder-host-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}.eh-reminder-host-summary button{min-height:27px;border:1px solid #e4d7ba;border-radius:7px;background:#fff;color:#6b5734;font-size:8px;font-weight:850;cursor:pointer}.eh-reminder-next{display:grid;gap:2px;padding-top:5px;border-top:1px solid #eee2c9}.eh-reminder-next strong{font-size:9px}.eh-reminder-next small{font-size:7.8px;color:#746956;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+                .eh-reminder-sync{font-size:7.4px;color:#7a6c54}.eh-reminder-sync.synced{color:#2f7a5f}.eh-reminder-sync.offline,.eh-reminder-sync.error{color:#a36535}.eh-reminder-host-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}.eh-reminder-host-summary button{min-height:27px;border:1px solid #e4d7ba;border-radius:7px;background:#fff;color:#6b5734;font-size:8px;font-weight:850;cursor:pointer}.eh-reminder-next{display:grid;gap:2px;padding-top:5px;border-top:1px solid #eee2c9}.eh-reminder-next strong{font-size:9px}.eh-reminder-next small{font-size:7.8px;color:#746956;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
                 .eh-reminder-list{display:grid;gap:8px}.eh-reminder-card{display:grid;gap:5px;padding:11px;border:1px solid #dfe5eb;border-radius:10px;background:#fff}.eh-reminder-card.completed{opacity:.68;background:#f7f9fa}.eh-reminder-card-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.eh-reminder-card-top strong{font-size:12px;color:#253348}.eh-reminder-card-top span{font-size:8px;font-weight:900;color:#697687}.eh-reminder-card>b{font-size:12px}.eh-reminder-cpf{font-size:11px;font-weight:800;color:#334155}.eh-reminder-card small{font-size:10px;color:#6d7888}.eh-reminder-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px}.eh-reminder-empty{padding:25px;text-align:center;color:#718092}
             `);
         },
@@ -10485,6 +11310,8 @@
     EH.OperationCars = {
         MAPS_KEY: 'operationCars.maps.v3',
         LAST_KEY: 'operationCars.lastMap.v3',
+        SCHEDULE_KEY: 'operationCars.schedule.v1',
+        SELECTED_KEY: 'operationCars.selected.v1',
         lastDomSignature: '',
         lastMapKey: '',
         stylesInjected: false,
@@ -10512,6 +11339,114 @@
             const date = new Date(Number(timestamp));
             if (Number.isNaN(date.getTime())) return '';
             return date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+        },
+
+        parseScheduleDateTime(value) {
+            const text = EH.Utils.clean(value || '');
+            const match = text.match(/(\d{2})\/(\d{2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+            if (!match) {
+                const time = text.match(/\b(\d{1,2}):(\d{2})\b/);
+                return { raw:text, date:'', dateBr:'', time:time ? `${String(Number(time[1])).padStart(2,'0')}:${time[2]}` : '', timestamp:0 };
+            }
+            const day=Number(match[1]), month=Number(match[2]), year=Number(match[3]);
+            const hour=Number(match[4]), minute=Number(match[5]), second=Number(match[6]||0);
+            const date = new Date(year, month-1, day, hour, minute, second, 0);
+            return {
+                raw:text,
+                date:`${year}-${String(month).padStart(2,'0')}-${String(day).padStart(2,'0')}`,
+                dateBr:`${String(day).padStart(2,'0')}/${String(month).padStart(2,'0')}/${year}`,
+                time:`${String(hour).padStart(2,'0')}:${String(minute).padStart(2,'0')}`,
+                timestamp:date.getTime()
+            };
+        },
+
+        loadScheduleRecords() {
+            const records = EH.Storage.get(this.SCHEDULE_KEY, []);
+            return Array.isArray(records) ? records : [];
+        },
+
+        saveScheduleRecords(records = []) {
+            const existing = this.loadScheduleRecords();
+            const map = new Map();
+            [...existing, ...(Array.isArray(records)?records:[])].forEach(item => {
+                if (!item?.service) return;
+                const key = [item.service, item.date || '', item.departure || '', this.normalize(item.lineRaw || '')].join('|');
+                map.set(key, item);
+            });
+            const min = new Date(); min.setDate(min.getDate()-2);
+            const minKey = this.todayKey(min);
+            const safe = Array.from(map.values())
+                .filter(item => !item.date || item.date >= minKey)
+                .sort((a,b)=>Number(b.detectedAt||0)-Number(a.detectedAt||0))
+                .slice(0, 120);
+            EH.Storage.set(this.SCHEDULE_KEY, safe);
+            return safe;
+        },
+
+        selectedCar() {
+            const selected = EH.Storage.get(this.SELECTED_KEY, null);
+            if (!selected?.service) return null;
+            if (selected.date && selected.date !== this.todayKey()) return null;
+            return selected;
+        },
+
+        selectCar(record, { quiet = false } = {}) {
+            if (!record?.service) return;
+            const selected = {
+                service:String(record.service),
+                departure:EH.Utils.clean(record.departure || ''),
+                date:String(record.date || ''),
+                dateBr:String(record.dateBr || ''),
+                time:String(record.time || ''),
+                lineRaw:EH.Utils.clean(record.lineRaw || ''),
+                lineCode:EH.Utils.clean(record.lineCode || record.config?.lineCode || ''),
+                companyCode:EH.Utils.clean(record.companyCode || ''),
+                company:EH.Utils.clean(record.company || ''),
+                selectedAt:Date.now()
+            };
+            EH.Storage.set(this.SELECTED_KEY, selected);
+            this.render();
+            if (!quiet) EH.Toast?.info?.(`Serviço ${selected.service} selecionado.`);
+        },
+
+        clearSelectedCar() {
+            EH.Storage.remove(this.SELECTED_KEY);
+            this.render();
+        },
+
+        searchScheduleRecords(query = '') {
+            const q = this.normalize(query);
+            const visible = this.visibleScheduleRecords?.length ? this.visibleScheduleRecords : [];
+            const stored = this.loadScheduleRecords();
+            const map = new Map();
+            [...visible,...stored].forEach(item => {
+                if (!item?.service) return;
+                const key=[item.service,item.date||'',item.departure||'',this.normalize(item.lineRaw||'')].join('|');
+                if (!map.has(key)) map.set(key,item);
+            });
+            let rows=Array.from(map.values());
+            const today=this.todayKey();
+            rows=rows.filter(item=>!item.date || item.date===today);
+            if (!q) return rows.sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0)||String(a.service).localeCompare(String(b.service)));
+            const digits=q.replace(/\D/g,'');
+            const exactService=rows.filter(item=>String(item.service)===digits && digits);
+            if (exactService.length) return exactService;
+            return rows.filter(item => {
+                const config=this.serviceConfig(item.service);
+                const haystack=this.normalize([
+                    item.service,item.time,item.departure,item.lineRaw,item.lineCode,
+                    item.company,item.companyCode,config?.name,config?.lineCode,config?.operationalTime
+                ].filter(Boolean).join(' '));
+                return haystack.includes(q);
+            }).sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0)||String(a.service).localeCompare(String(b.service)));
+        },
+
+        selectedMapRecord() {
+            const selected=this.selectedCar();
+            if (!selected?.service) return null;
+            const candidates=this.loadMaps().filter(record => String(record.service||'')===String(selected.service));
+            const date=selected.date || this.todayKey();
+            return candidates.filter(record=>!date || record.date===date).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))[0] || null;
         },
 
         agencyCode() {
@@ -10957,14 +11892,44 @@
             const signature = this.mapSignature(records);
             const preferred = this.preferredRecord(records);
             if (signature === this.lastDomSignature) {
-                if (preferred) this.rememberLast(preferred);
+                if (preferred) {
+                    this.rememberLast(preferred);
+                    const schedule = [...(this.visibleScheduleRecords || []), ...this.loadScheduleRecords()]
+                        .filter(item => String(item.service || '') === String(preferred.service || ''))
+                        .sort((a,b)=>Number(b.detectedAt||0)-Number(a.detectedAt||0))[0];
+                    this.selectCar(schedule || {
+                        service: preferred.service,
+                        date: preferred.date,
+                        dateBr: preferred.dateBr,
+                        time: preferred.lineDeparture,
+                        departure: preferred.lineDeparture,
+                        lineCode: preferred.lineCode,
+                        lineRaw: preferred.lineRaw || ''
+                    }, { quiet: true });
+                    EH.Reminders?.linkMapRecord?.(preferred);
+                }
                 this.render();
                 if (!quiet) EH.Toast.info('Este mapa já está atualizado no Helper.');
                 return { found: true, updated: false, records };
             }
             this.lastDomSignature = signature;
             this.saveMaps(records);
-            if (preferred) this.rememberLast(preferred);
+            if (preferred) {
+                this.rememberLast(preferred);
+                const schedule = [...(this.visibleScheduleRecords || []), ...this.loadScheduleRecords()]
+                    .filter(item => String(item.service || '') === String(preferred.service || ''))
+                    .sort((a,b)=>Number(b.detectedAt||0)-Number(a.detectedAt||0))[0];
+                this.selectCar(schedule || {
+                    service: preferred.service,
+                    date: preferred.date,
+                    dateBr: preferred.dateBr,
+                    time: preferred.lineDeparture,
+                    departure: preferred.lineDeparture,
+                    lineCode: preferred.lineCode,
+                    lineRaw: preferred.lineRaw || ''
+                }, { quiet: true });
+                EH.Reminders?.linkMapRecord?.(preferred);
+            }
             this.render();
 
             if (!quiet && preferred) {
@@ -11065,6 +12030,15 @@
                     const route = document.createElement('small');
                     route.textContent = this.passengerSecondary(item, kind);
                     info.append(name, route);
+                    const reminder = EH.Reminders?.matchPassenger?.(item, record);
+                    if (reminder) {
+                        const pending = document.createElement('small');
+                        pending.className = `eh-operation-reminder-state ${reminder.status === 'completed' ? 'done' : 'pending'}`;
+                        pending.textContent = reminder.status === 'completed'
+                            ? '✓ Bilhete já impresso/concluído'
+                            : `⚠ Precisa imprimir passagem${reminder.cpf ? ` • CPF ${EH.Reminders.maskCpf(reminder.cpf)}` : ''}`;
+                        info.appendChild(pending);
+                    }
                     row.append(seat, info);
                     content.appendChild(row);
                 });
@@ -11192,6 +12166,86 @@
             close.addEventListener('click', dismiss);
             closeBottom.addEventListener('click', dismiss);
             overlay.addEventListener('click', event => { if (event.target === overlay) dismiss(); });
+        },
+
+        showCarSearch() {
+            this.scanScheduleList();
+            document.querySelector('#eh-operation-car-search-modal')?.remove();
+            const overlay=document.createElement('div');
+            overlay.id='eh-operation-car-search-modal';
+            overlay.className='eh-overlay eh-operation-overlay';
+            const modal=document.createElement('div');
+            modal.className='eh-modal eh-operation-modal';
+            modal.style.width='min(760px,96vw)';
+
+            const head=document.createElement('div');
+            head.className='eh-modal-head';
+            const wrap=document.createElement('div'); wrap.style.flex='1';
+            const title=document.createElement('div'); title.className='eh-modal-title'; title.textContent='🔎 Pesquisar carro';
+            const note=document.createElement('div'); note.className='eh-modal-note'; note.textContent='Prioridade: Serviço → horário → linha → empresa';
+            wrap.append(title,note);
+            const close=document.createElement('button'); close.type='button'; close.className='eh-modal-close'; close.textContent='×';
+            head.append(wrap,close);
+
+            const content=document.createElement('div'); content.className='eh-modal-content';
+            const toolbar=document.createElement('div'); toolbar.className='eh-operation-car-search-toolbar';
+            const input=document.createElement('input'); input.type='search'; input.placeholder='Ex.: 6319, 07:00, 901929600, Jotamar'; input.autocomplete='off';
+            const refresh=document.createElement('button'); refresh.type='button'; refresh.className='eh-modal-btn'; refresh.textContent='Ler resultados da tela';
+            toolbar.append(input,refresh);
+            const status=document.createElement('div'); status.className='eh-modal-note'; status.style.margin='8px 0';
+            const list=document.createElement('div'); list.className='eh-operation-day-list';
+            content.append(toolbar,status,list);
+
+            const renderRows=()=>{
+                const rows=this.searchScheduleRecords(input.value);
+                status.textContent = rows.length
+                    ? `${rows.length} carro(s) encontrado(s) na pesquisa atual/memória recente.`
+                    : 'Nenhum carro encontrado. Faça uma pesquisa de horários no E-Pass ou altere o termo.';
+                list.innerHTML='';
+                rows.forEach(item=>{
+                    const cfg=this.serviceConfig(item.service);
+                    const mapRecord=this.loadMaps()
+                        .filter(r=>String(r.service||'')===String(item.service) && (!item.date || r.date===item.date))
+                        .sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))[0] || null;
+                    const row=document.createElement('div'); row.className='eh-operation-day-row';
+                    const marker=document.createElement('div'); marker.className='eh-operation-day-status'; marker.textContent=mapRecord?'✓':'○';
+                    const info=document.createElement('div'); info.className='eh-operation-day-info';
+                    const top=document.createElement('strong');
+                    top.textContent=`${item.time || cfg?.operationalTime || '—'} • ${cfg?.name || item.lineRaw || `Serviço ${item.service}`}`;
+                    const sub=document.createElement('small');
+                    sub.textContent=`Serviço ${item.service}${item.lineCode||cfg?.lineCode?` • Linha ${item.lineCode||cfg?.lineCode}`:''}${item.company?` • ${item.company}`:item.companyCode?` • ${item.companyCode}`:''}`;
+                    const map=document.createElement('small');
+                    if(!mapRecord) map.textContent=`Mapa ainda não consultado • Agência ${this.agencyCode()} aguardando mapa`;
+                    else if(!mapRecord.agency?.exists) map.textContent=`Mapa lido • Agência ${this.agencyCode()} não encontrada`;
+                    else if(mapRecord.agency?.multiple) map.textContent=`⚠ ${mapRecord.agency.warning || 'Leitura 287 ambígua'}`;
+                    else map.textContent=`↑ ${mapRecord.agency.board ?? '—'}  ↓ ${mapRecord.agency.alight ?? '—'}  🚌 ${mapRecord.agency.balance ?? '—'} • ${this.formatUpdatedAt(mapRecord.updatedAt)}`;
+                    info.append(top,sub,map);
+                    const actions=document.createElement('div'); actions.className='eh-operation-search-actions';
+                    const choose=document.createElement('button'); choose.type='button'; choose.className='eh-modal-btn primary'; choose.textContent='Selecionar';
+                    choose.addEventListener('click',()=>{this.selectCar(item);dismiss();});
+                    actions.appendChild(choose);
+                    if(mapRecord){
+                        const detail=document.createElement('button'); detail.type='button'; detail.className='eh-modal-btn'; detail.textContent='Detalhes';
+                        detail.addEventListener('click',()=>this.showDetails(mapRecord));
+                        actions.appendChild(detail);
+                    }
+                    row.append(marker,info,actions); list.appendChild(row);
+                });
+            };
+            input.addEventListener('input',renderRows);
+            input.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();renderRows();}});
+            refresh.addEventListener('click',()=>{this.scanScheduleList();renderRows();EH.Toast?.info?.('Resultados da pesquisa de horários relidos.');});
+
+            const foot=document.createElement('div'); foot.className='eh-modal-actions';
+            const clear=document.createElement('button'); clear.type='button'; clear.className='eh-modal-btn'; clear.textContent='Limpar selecionado';
+            clear.addEventListener('click',()=>{this.clearSelectedCar();});
+            const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar';
+            foot.append(clear,close2);
+            modal.append(head,content,foot); overlay.appendChild(modal); document.body.appendChild(overlay);
+            const dismiss=()=>overlay.remove();
+            close.addEventListener('click',dismiss); close2.addEventListener('click',dismiss);
+            overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
+            renderRows(); input.focus();
         },
 
         showCars() {
@@ -11335,18 +12389,45 @@
                 return headers.includes('SERVICO') && headers.some(h => h.includes('HORARIO DE SAIDA')) && headers.includes('LINHA');
             });
             if (!table) { this.visibleScheduleRecords = []; return []; }
+
             const rows = Array.from(table.querySelectorAll('tbody tr')).map(row => {
                 const cells = Array.from(row.querySelectorAll(':scope > td')).map(td => EH.Utils.clean(td.textContent || ''));
                 const service = String(cells[0] || '').replace(/\D/g, '');
                 if (!service) return null;
                 const departure = EH.Utils.clean(cells[1] || '');
-                const lineRaw = EH.Utils.clean(cells[2] || '');
+                const dt = this.parseScheduleDateTime(departure);
+                const lineCell = row.querySelector('td:nth-child(3)');
+                const badge = lineCell?.querySelector?.('.badge');
+                const companyCode = EH.Utils.clean(badge?.textContent || '');
+                let lineRaw = EH.Utils.clean(lineCell?.textContent || cells[2] || '');
+                if (companyCode && lineRaw.toUpperCase().startsWith(companyCode.toUpperCase())) {
+                    lineRaw = EH.Utils.clean(lineRaw.slice(companyCode.length));
+                }
                 const config = this.serviceConfig(service);
-                const badge = row.querySelector('td:nth-child(3) .badge');
-                return { service, departure, lineRaw, companyCode: EH.Utils.clean(badge?.textContent || ''), config };
+                const company = EH.Utils.clean(EH.Config.LINHAS?.[companyCode] || companyCode || '');
+                return {
+                    service,
+                    departure,
+                    date:dt.date,
+                    dateBr:dt.dateBr,
+                    time:dt.time,
+                    timestamp:dt.timestamp,
+                    lineRaw,
+                    lineCode:config?.lineCode || '',
+                    companyCode,
+                    company,
+                    config,
+                    detectedAt:Date.now()
+                };
             }).filter(Boolean);
-            this.visibleScheduleRecords = rows;
-            return rows;
+
+            const unique = Array.from(new Map(rows.map(item => [
+                [item.service,item.date||'',item.departure||'',this.normalize(item.lineRaw||'')].join('|'),
+                item
+            ])).values());
+            this.visibleScheduleRecords = unique;
+            this.saveScheduleRecords(unique);
+            return unique;
         },
 
         nextRoutineConfig() {
@@ -11375,25 +12456,41 @@
             }
             host.hidden = false;
             host.innerHTML = '';
-            const record = this.lastRecord();
-            const nextConfig = !record ? this.nextRoutineConfig() : null;
-            const config = record ? this.serviceConfig(record.service) : nextConfig;
+
+            const selected = this.selectedCar();
+            const record = selected ? this.selectedMapRecord() : this.lastRecord();
+            const nextConfig = !selected && !record ? this.nextRoutineConfig() : null;
+            const serviceId = String(selected?.service || record?.service || nextConfig?.service || '');
+            const config = this.serviceConfig(serviceId);
             const agency = record?.agency || null;
+            const selectedName = config?.name || selected?.lineRaw || (record ? this.displayName(record) : nextConfig?.name) || `Agência ${this.agencyCode()}`;
+            const selectedTime = selected?.time || config?.operationalTime || record?.lineDeparture || nextConfig?.operationalTime || '';
+
+            const searchRow = document.createElement('div');
+            searchRow.className = 'eh-operation-search-row';
+            const searchButton = document.createElement('button');
+            searchButton.type = 'button';
+            searchButton.className = 'eh-context-btn primary';
+            searchButton.textContent = '🔎 Pesquisar carro';
+            searchButton.addEventListener('click', () => this.showCarSearch());
+            const detected = document.createElement('span');
+            detected.textContent = `${this.searchScheduleRecords('').length} detectado(s)`;
+            searchRow.append(searchButton, detected);
 
             const head = document.createElement('div');
             head.className = 'eh-operation-head';
             const eyebrow = document.createElement('span');
-            eyebrow.textContent = 'MAPA DO CARRO';
+            eyebrow.textContent = selected ? 'CARRO SELECIONADO' : record ? 'MAPA ATUAL' : 'PRÓXIMO / ROTINA';
             const heading = document.createElement('div');
             heading.className = 'eh-operation-heading';
             const service = document.createElement('strong');
-            service.textContent = record ? `#${record.service}` : (nextConfig ? `#${nextConfig.service}` : 'CARROS');
+            service.textContent = serviceId ? `Serviço ${serviceId}` : 'CARROS';
             const route = document.createElement('span');
-            route.textContent = record ? this.displayName(record) : (nextConfig?.name || `Agência ${this.agencyCode()}`);
+            route.textContent = selectedName;
             heading.append(service, route);
             head.append(eyebrow, heading);
 
-            if (record) {
+            if (serviceId) {
                 const tag = document.createElement('div');
                 tag.className = `eh-operation-service-tag ${config?.attends ? 'attends' : 'consult'}`;
                 tag.textContent = config ? (config.attends ? 'ATENDO' : 'APENAS CONSULTA') : 'CARRO NÃO CADASTRADO';
@@ -11402,7 +12499,7 @@
 
             const agencyTitle = document.createElement('div');
             agencyTitle.className = 'eh-operation-agency-title';
-            agencyTitle.textContent = `CÓDIGO ${this.agencyCode()} • AGÊNCIA`;
+            agencyTitle.textContent = `AGÊNCIA ${this.agencyCode()}`;
 
             const metrics = document.createElement('div');
             metrics.className = 'eh-operation-metrics';
@@ -11437,21 +12534,50 @@
             const message = document.createElement('div');
             message.className = 'eh-operation-meta';
             if (!record) {
-                message.textContent = nextConfig ? `${nextConfig.operationalTime || '—'} • Serviço ${nextConfig.service} • Agência ${this.agencyCode()} aguardando mapa.` : `Aguardando mapa • procurando código ${this.agencyCode()}.`;
+                const parts = [];
+                if (selectedTime) parts.push(selectedTime);
+                if (serviceId) parts.push(`Serviço ${serviceId}`);
+                parts.push(`Agência ${this.agencyCode()} aguardando mapa`);
+                message.textContent = parts.join(' • ');
             } else if (!agency?.exists) {
-                message.textContent = `Código ${this.agencyCode()} não aparece no resumo deste mapa.`;
+                message.textContent = `Serviço ${record.service} • Agência ${this.agencyCode()} não encontrada neste mapa.`;
             } else if (agency.multiple) {
                 message.classList.add('warning');
                 message.textContent = `⚠ ${agency.warning || `Mais de um registro da agência ${this.agencyCode()} encontrado.`}`;
             } else {
                 const parts = [];
-                if (config?.operationalTime) parts.push(config.operationalTime);
+                if (selectedTime) parts.push(selectedTime);
                 parts.push(`Serviço ${record.service}`);
                 if (record.lineCode) parts.push(`Linha ${record.lineCode}`);
                 const updated = this.formatUpdatedAt(record.updatedAt);
                 if (updated) parts.push(`Atualizado às ${updated}`);
-                if (agency.countsMatchPassengers === false) parts.push('⚠ conferir lista de passageiros');
+                const pendingPrints = (agency.boarders || [])
+                    .map(passenger => EH.Reminders?.matchPassenger?.(passenger, record))
+                    .filter(reminder => reminder && reminder.status !== 'completed').length;
+                if (pendingPrints) parts.push(`${pendingPrints} precisa(m) imprimir`);
+                if (agency.countsMatchPassengers === false) parts.push('⚠ conferir lista');
                 message.textContent = parts.join(' • ');
+            }
+
+            const foundList = document.createElement('div');
+            foundList.className = 'eh-operation-found-list';
+            const currentDetected = (this.visibleScheduleRecords?.length ? this.visibleScheduleRecords : this.searchScheduleRecords('')).slice(0, 4);
+            if (currentDetected.length) {
+                const foundTitle = document.createElement('span');
+                foundTitle.textContent = 'CARROS ENCONTRADOS';
+                foundList.appendChild(foundTitle);
+                currentDetected.forEach(item => {
+                    const cfg = this.serviceConfig(item.service);
+                    const button = document.createElement('button');
+                    button.type = 'button';
+                    button.className = String(item.service) === serviceId ? 'selected' : '';
+                    button.textContent = `${item.time || cfg?.operationalTime || '—'} • ${cfg?.name || item.lineRaw || `Serviço ${item.service}`} • #${item.service}`;
+                    button.title = [item.lineRaw, item.company].filter(Boolean).join(' • ');
+                    button.addEventListener('click', () => this.selectCar(item));
+                    foundList.appendChild(button);
+                });
+            } else {
+                foundList.hidden = true;
             }
 
             const actions = document.createElement('div');
@@ -11463,7 +12589,7 @@
             update.addEventListener('click', () => this.scanCurrentMap({ quiet: false }));
             const passengers = document.createElement('button');
             passengers.type = 'button';
-            passengers.className = 'eh-context-btn primary';
+            passengers.className = 'eh-context-btn';
             passengers.textContent = 'Passageiros';
             passengers.disabled = !canUseAgency;
             passengers.addEventListener('click', () => this.showDetails(record));
@@ -11474,7 +12600,7 @@
             all.addEventListener('click', () => this.showCars());
             actions.append(update, passengers, all);
 
-            host.append(head, agencyTitle, metrics, message, actions);
+            host.append(searchRow, head, agencyTitle, metrics, message, foundList, actions);
         },
 
         injectStyles() {
@@ -11510,6 +12636,19 @@
                 :is(#eh-root, #eh-operation-dock) .eh-operation-meta.warning { color:#9a5a23; }
                 :is(#eh-root, #eh-operation-dock) .eh-operation-actions { display:grid; grid-template-columns:1fr 1fr 1fr; gap:5px; }
                 :is(#eh-root, #eh-operation-dock) .eh-operation-actions .eh-context-btn { min-width:0; padding:6px 4px; font-size:7.8px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-search-row { display:flex; align-items:center; gap:7px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-search-row .eh-context-btn { flex:1; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-search-row span { color:#7b8794; font-size:7.5px; white-space:nowrap; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list { display:grid; gap:3px; padding-top:2px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list > span { color:#7b8794; font-size:7px; font-weight:900; letter-spacing:.35px; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list button { width:100%; min-height:24px; padding:4px 6px; border:1px solid #e2e7ec; border-radius:6px; background:#fff; color:#526073; text-align:left; font-size:7.3px; font-weight:750; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+                :is(#eh-root, #eh-operation-dock) .eh-operation-found-list button.selected { border-color:#9db8d2; background:#eef5fb; color:#315d86; }
+                .eh-operation-car-search-toolbar { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:8px; }
+                .eh-operation-car-search-toolbar input { min-height:38px; padding:8px 10px; border:1px solid #ccd5df; border-radius:8px; font:inherit; font-size:12px; }
+                .eh-operation-search-actions { display:flex; flex-wrap:wrap; gap:5px; justify-content:flex-end; }
+                .eh-operation-reminder-state { margin-top:2px; font-weight:800 !important; }
+                .eh-operation-reminder-state.pending { color:#a35d24 !important; }
+                .eh-operation-reminder-state.done { color:#2d785f !important; }
 
                 .eh-operation-modal { width:min(760px, 94vw); }
                 .eh-operation-passenger-list, .eh-operation-day-list { display:grid; gap:7px; }
@@ -13572,19 +14711,25 @@
                 ]),
                 numberField('managedWidth', 'Largura (px)', panelDrafts.main.width, { min:220, max:700, step:5 }),
                 numberField('managedHeight', 'Altura (px)', panelDrafts.main.height, { min:200, max:900, step:5 }),
-                numberField('managedZoom', 'Zoom do conteúdo (%)', panelDrafts.main.zoom, { min:75, max:150, step:5 })
+                numberField('managedZoom', 'Zoom do conteúdo (%)', panelDrafts.main.zoom, { min:75, max:150, step:5 }),
+                numberField('managedHandleY', 'Posição vertical da seta (%)', panelDrafts.main.handleY, { min:10, max:90, step:1 })
             );
-            controlCard.append(controlGrid, checkField('managedDynamic','Tamanho dinâmico',panelDrafts.main.dynamic,'Quando ativo, largura/altura/zoom são ajustados dentro de limites seguros sem alterar o E-Pass.'));
+            controlCard.append(
+                controlGrid,
+                checkField('managedDynamic','Tamanho dinâmico',panelDrafts.main.dynamic,'Quando ativo, largura/altura/zoom são ajustados dentro de limites seguros sem alterar o E-Pass.'),
+                checkField('managedAllowDrag','Permitir arrastar pelo cabeçalho',panelDrafts.main.allowDrag),
+                checkField('managedAllowResize','Permitir redimensionar pela alça inferior',panelDrafts.main.allowResize)
+            );
             const panelControlActions=document.createElement('div'); panelControlActions.className='eh-settings-action-row';
             const fitPanel=document.createElement('button'); fitPanel.type='button'; fitPanel.className='eh-modal-btn'; fitPanel.textContent='Ajustar à tela';
             const restorePanel=document.createElement('button'); restorePanel.type='button'; restorePanel.className='eh-modal-btn'; restorePanel.textContent='Restaurar este painel';
             const restoreAllPanels=document.createElement('button'); restoreAllPanels.type='button'; restoreAllPanels.className='eh-modal-btn'; restoreAllPanels.textContent='Restaurar todos';
             panelControlActions.append(fitPanel,restorePanel,restoreAllPanels); controlCard.append(panelControlActions,note('Arraste somente pelo cabeçalho. Botões e campos não iniciam movimento. O modo Livre é salvo após soltar.'));
             sections.paineis.pane.appendChild(controlCard);
-            const capturePanelDraft=()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,zoom:Number(fields.managedZoom.value)||100,dynamic:fields.managedDynamic.checked}; };
-            const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedZoom.value=String(cfg.zoom); fields.managedDynamic.checked=Boolean(cfg.dynamic); };
+            const capturePanelDraft=()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,zoom:Number(fields.managedZoom.value)||100,handleY:Number(fields.managedHandleY.value)||50,dynamic:fields.managedDynamic.checked,allowDrag:fields.managedAllowDrag.checked,allowResize:fields.managedAllowResize.checked}; };
+            const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedZoom.value=String(cfg.zoom); fields.managedHandleY.value=String(cfg.handleY); fields.managedDynamic.checked=Boolean(cfg.dynamic); fields.managedAllowDrag.checked=Boolean(cfg.allowDrag); fields.managedAllowResize.checked=Boolean(cfg.allowResize); };
             let previousManagedPanel='main'; fields.managedPanel.addEventListener('change',()=>{ const next=fields.managedPanel.value; fields.managedPanel.value=previousManagedPanel; capturePanelDraft(); fields.managedPanel.value=next; previousManagedPanel=next; loadPanelDraft(next); });
-            ['managedMode','managedWidth','managedHeight','managedZoom','managedDynamic'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
+            ['managedMode','managedWidth','managedHeight','managedZoom','managedHandleY','managedDynamic','managedAllowDrag','managedAllowResize'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
             fitPanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; const rec=EH.PanelManager.recommended(key); fields.managedWidth.value=String(rec.width); fields.managedHeight.value=String(rec.height); fields.managedZoom.value=String(rec.zoom); fields.managedDynamic.checked=false; capturePanelDraft(); });
             restorePanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...EH.PanelManager.defaults()[key]}; loadPanelDraft(key); });
             restoreAllPanels.addEventListener('click',()=>{ const defs=EH.PanelManager.defaults(); Object.keys(defs).forEach(k=>panelDrafts[k]={...defs[k]}); loadPanelDraft(fields.managedPanel.value); });
@@ -13732,6 +14877,57 @@
             );
             sections.lembretes.pane.appendChild(reminderCard);
 
+            const syncCard = card('Sincronização entre computadores');
+            const syncGrid = grid();
+            const syncEnabledWrap = checkField('syncEnabled','Sincronizar lembretes entre dispositivos',EH.Config.SYNC_ENABLED,'Usa Supabase quando configurado. Sem configuração externa, os lembretes continuam somente neste computador.');
+            const syncUrlWrap = textField('syncUrl','URL do projeto Supabase',EH.Config.SYNC_SUPABASE_URL,'Ex.: https://xxxxx.supabase.co');
+            const syncKeyWrap = textField('syncKey','Publishable / anon key',EH.Config.SYNC_SUPABASE_KEY,'Nunca use service_role ou secret key no UserScript.');
+            const syncEmailWrap = textField('syncEmail','E-mail da conta de sincronização',EH.Config.SYNC_SUPABASE_EMAIL,'Use a mesma conta autorizada no PC de casa e no guichê.');
+            const syncPasswordWrap = textField('syncPassword','Senha (não será salva)','');
+            fields.syncPassword.type='password'; fields.syncPassword.autocomplete='current-password';
+            syncGrid.append(syncUrlWrap,syncKeyWrap,syncEmailWrap,syncPasswordWrap);
+            const syncStatusLine=document.createElement('div'); syncStatusLine.className='eh-help-box';
+            const updateSyncStatus=()=>{const s=EH.Sync?.status?.()||{};syncStatusLine.textContent=`Status: ${s.message||s.state||'somente local'}${s.pending?` • ${s.pending} pendente(s)`:''}`;};
+            updateSyncStatus();
+            const syncActions=document.createElement('div'); syncActions.className='eh-settings-inline-actions';
+            const syncLogin=document.createElement('button'); syncLogin.type='button'; syncLogin.className='eh-modal-btn primary'; syncLogin.textContent='Entrar / testar';
+            const syncNow=document.createElement('button'); syncNow.type='button'; syncNow.className='eh-modal-btn'; syncNow.textContent='Sincronizar agora';
+            const syncLogout=document.createElement('button'); syncLogout.type='button'; syncLogout.className='eh-modal-btn'; syncLogout.textContent='Sair da sincronização';
+            syncActions.append(syncLogin,syncNow,syncLogout);
+            syncCard.append(
+                syncEnabledWrap,
+                syncGrid,
+                note('A sincronização real exige um projeto Supabase configurado com RLS. O Helper salva primeiro localmente; se a internet cair, a alteração fica pendente e é enviada depois.'),
+                syncStatusLine,
+                syncActions
+            );
+            sections.lembretes.pane.appendChild(syncCard);
+
+            const applySyncFields=()=>{
+                EH.Config.SYNC_PROVIDER=fields.syncEnabled.checked?'supabase':'none';
+                EH.Config.SYNC_ENABLED=fields.syncEnabled.checked;
+                EH.Config.SYNC_SUPABASE_URL=String(fields.syncUrl.value||'').trim();
+                EH.Config.SYNC_SUPABASE_KEY=String(fields.syncKey.value||'').trim();
+                EH.Config.SYNC_SUPABASE_EMAIL=String(fields.syncEmail.value||'').trim();
+                EH.Storage.set('syncProvider',EH.Config.SYNC_PROVIDER);
+                EH.Storage.set('syncEnabled',EH.Config.SYNC_ENABLED);
+                EH.Storage.set('syncSupabaseUrl',EH.Config.SYNC_SUPABASE_URL);
+                EH.Storage.set('syncSupabaseKey',EH.Config.SYNC_SUPABASE_KEY);
+                EH.Storage.set('syncSupabaseEmail',EH.Config.SYNC_SUPABASE_EMAIL);
+            };
+            syncLogin.addEventListener('click',async()=>{
+                try{
+                    applySyncFields();
+                    if(!EH.Config.SYNC_ENABLED) { fields.syncEnabled.checked=true; applySyncFields(); }
+                    await EH.Sync.login(fields.syncEmail.value,fields.syncPassword.value);
+                    fields.syncPassword.value='';
+                    EH.Sync.start(); updateSyncStatus();
+                    EH.Toast.success('Conta de sincronização conectada.');
+                }catch(error){EH.Toast.error(error.message||'Não foi possível entrar na sincronização.');updateSyncStatus();}
+            });
+            syncNow.addEventListener('click',async()=>{try{applySyncFields();await EH.Sync.syncReminders({quiet:false});updateSyncStatus();}catch(error){EH.Toast.error(error.message||'Falha ao sincronizar.');updateSyncStatus();}});
+            syncLogout.addEventListener('click',()=>{EH.Sync.logout();updateSyncStatus();});
+
             // AVANÇADO
             const advancedCard = card('Diagnóstico');
             const debugWrap = checkField('debug', 'Ativar logs de depuração no console', EH.Config.DEBUG, 'Use apenas quando precisar investigar algum problema.');
@@ -13761,8 +14957,28 @@
                     EH.Toast.error(error.message || 'Não foi possível copiar o HTML.');
                 }
             });
-            advancedActions.append(diagnostic, copyHtml);
-            advancedCard.append(debugWrap, advancedActions);
+            const exportSettings=document.createElement('button');
+            exportSettings.type='button'; exportSettings.className='eh-modal-btn'; exportSettings.textContent='Exportar configurações';
+            exportSettings.addEventListener('click',()=>{
+                const stamp=new Date().toISOString().slice(0,10);
+                EH.StorageSchema.downloadJson(`epass-helper-config-${stamp}.json`,EH.StorageSchema.exportConfiguration());
+                EH.Toast.success('Configurações exportadas.');
+            });
+            const importSettings=document.createElement('button');
+            importSettings.type='button'; importSettings.className='eh-modal-btn'; importSettings.textContent='Importar configurações';
+            const importInput=document.createElement('input'); importInput.type='file'; importInput.accept='application/json,.json'; importInput.hidden=true;
+            importSettings.addEventListener('click',()=>importInput.click());
+            importInput.addEventListener('change',async()=>{
+                const file=importInput.files?.[0]; if(!file)return;
+                try{
+                    const payload=JSON.parse(await file.text());
+                    EH.StorageSchema.importConfiguration(payload);
+                    EH.Toast.success('Configurações importadas. Recarregue a página para aplicar tudo.');
+                }catch(error){EH.Toast.error(error.message||'Não foi possível importar as configurações.');}
+                finally{importInput.value='';}
+            });
+            advancedActions.append(diagnostic, copyHtml, exportSettings, importSettings, importInput);
+            advancedCard.append(debugWrap, note(`Armazenamento de dados: versão ${EH.Config.STORAGE_SCHEMA_VERSION}. Atualizações do script usam migração não destrutiva.`), advancedActions);
             sections.avancado.pane.appendChild(advancedCard);
 
             const setActiveTab = id => {
@@ -13854,6 +15070,11 @@
                 fields.reminderAsk.checked = Boolean(d.REMINDER_ASK_AFTER_TICKET);
                 fields.reminderMaskCpf.checked = Boolean(d.REMINDER_MASK_CPF);
                 fields.reminderHighlightToday.checked = Boolean(d.REMINDER_HIGHLIGHT_TODAY);
+                fields.syncEnabled.checked = false;
+                fields.syncUrl.value = '';
+                fields.syncKey.value = '';
+                fields.syncEmail.value = '';
+                fields.syncPassword.value = '';
                 const defaultPanels = EH.PanelManager.defaults();
                 Object.keys(defaultPanels).forEach(key => panelDrafts[key] = { ...defaultPanels[key] });
                 loadPanelDraft(fields.managedPanel.value);
@@ -13944,6 +15165,11 @@
                 EH.Config.REMINDER_ASK_AFTER_TICKET = fields.reminderAsk.checked;
                 EH.Config.REMINDER_MASK_CPF = fields.reminderMaskCpf.checked;
                 EH.Config.REMINDER_HIGHLIGHT_TODAY = fields.reminderHighlightToday.checked;
+                EH.Config.SYNC_PROVIDER = fields.syncEnabled.checked ? 'supabase' : 'none';
+                EH.Config.SYNC_ENABLED = fields.syncEnabled.checked;
+                EH.Config.SYNC_SUPABASE_URL = String(fields.syncUrl.value || '').trim();
+                EH.Config.SYNC_SUPABASE_KEY = String(fields.syncKey.value || '').trim();
+                EH.Config.SYNC_SUPABASE_EMAIL = String(fields.syncEmail.value || '').trim();
                 const operationServices = operationServiceFields.map(row => ({
                     service: String(row.service.value || '').replace(/\D/g, ''),
                     name: EH.Utils.clean(row.name.value || ''),
@@ -14009,10 +15235,16 @@
                     reminderAskAfterTicket: EH.Config.REMINDER_ASK_AFTER_TICKET,
                     reminderMaskCpf: EH.Config.REMINDER_MASK_CPF,
                     reminderHighlightToday: EH.Config.REMINDER_HIGHLIGHT_TODAY,
+                    syncProvider: EH.Config.SYNC_PROVIDER,
+                    syncEnabled: EH.Config.SYNC_ENABLED,
+                    syncSupabaseUrl: EH.Config.SYNC_SUPABASE_URL,
+                    syncSupabaseKey: EH.Config.SYNC_SUPABASE_KEY,
+                    syncSupabaseEmail: EH.Config.SYNC_SUPABASE_EMAIL,
                     debug: fields.debug.checked
                 };
                 Object.entries(settingsToSave).forEach(([key, value]) => EH.Storage.set(key, value));
                 EH.PanelManager.save(panelDrafts);
+                EH.Sync?.start?.();
 
                 // Estado dos overlays usa a mesma memória já existente do projeto.
                 EH.State.setPanel('left', fields.mainOpen.checked);
@@ -14093,6 +15325,7 @@
             if (this.started) return;
             this.started = true;
 
+            EH.StorageSchema?.migrate?.();
             EH.Storage.loadSettings();
 
             // Na aba do WhatsApp Web o script funciona apenas como uma ponte silenciosa.
@@ -14107,6 +15340,7 @@
             EH.Toast.init();
             EH.UI.init();
             EH.Reminders.init();
+            EH.Sync?.start?.();
             EH.OperationDock.init();
             EH.OperationCars.init();
             EH.SaleCpfs.init();
