@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.51.0
+// @version      5.52.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -31,7 +31,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.51.0',
+        VERSION: '5.52.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.',
         TOAST_DURATION: 3400,
@@ -60,6 +60,11 @@
         PANEL_OPACITY: 1,
         PANEL_RADIUS: 15,
         SHADOW_LEVEL: 'normal',
+        FINANCE_COMMISSION_PERCENT: 10,
+        FINANCE_AUTO_REGISTER: true,
+        FINANCE_SHOW_CAIXA_SUMMARY: true,
+        FINANCE_ASK_COMPANY_MERCH: true,
+        FINANCE_CONFIRM_DELETE: true,
         CENTRAL_MIN_WIDTH: 280,
         LAYOUT_TRANSITION_MS: 180,
         APP_OBSERVER_DEBOUNCE_MS: 420,
@@ -288,6 +293,11 @@
             EH.Config.PANEL_RADIUS = Math.min(22, Math.max(8, Number(this.get('panelRadius', EH.Config.PANEL_RADIUS)) || 15));
             const shadow = String(this.get('shadowLevel', EH.Config.SHADOW_LEVEL) || 'normal');
             EH.Config.SHADOW_LEVEL = ['none', 'suave', 'normal'].includes(shadow) ? shadow : 'normal';
+            EH.Config.FINANCE_COMMISSION_PERCENT = Math.min(100, Math.max(0, Number(this.get('financeCommissionPercent', EH.Config.FINANCE_COMMISSION_PERCENT)) || 10));
+            EH.Config.FINANCE_AUTO_REGISTER = Boolean(this.get('financeAutoRegister', EH.Config.FINANCE_AUTO_REGISTER));
+            EH.Config.FINANCE_SHOW_CAIXA_SUMMARY = Boolean(this.get('financeShowCaixaSummary', EH.Config.FINANCE_SHOW_CAIXA_SUMMARY));
+            EH.Config.FINANCE_ASK_COMPANY_MERCH = Boolean(this.get('financeAskCompanyMerch', EH.Config.FINANCE_ASK_COMPANY_MERCH));
+            EH.Config.FINANCE_CONFIRM_DELETE = Boolean(this.get('financeConfirmDelete', EH.Config.FINANCE_CONFIRM_DELETE));
             EH.Config.DEBUG = Boolean(this.get('debug', EH.Config.DEBUG));
         }
     };
@@ -3385,6 +3395,41 @@
                     font-weight:900;
                 }
 
+                /* Financeiro — usa a identidade visual já existente do Helper. */
+                #eh-root .eh-finance-mini { display:grid; gap:7px; margin-top:7px; }
+                #eh-root .eh-finance-kpis { display:grid; grid-template-columns:1fr 1fr; gap:5px; }
+                #eh-root .eh-finance-kpi { padding:7px; border:1px solid #e5e9ef; border-radius:8px; background:#f8fafc; }
+                #eh-root .eh-finance-kpi small { display:block; color:#7a8594; font-size:7.5px; text-transform:uppercase; font-weight:900; }
+                #eh-root .eh-finance-kpi strong { display:block; margin-top:2px; color:#243041; font-size:11px; }
+                #eh-root .eh-finance-company-line { display:flex; justify-content:space-between; gap:7px; color:#566274; font-size:8.5px; }
+                #eh-root .eh-finance-company-line b { color:#243041; }
+                .eh-finance-summary-grid { display:grid; grid-template-columns:repeat(4,minmax(130px,1fr)); gap:8px; }
+                .eh-finance-stat { border:1px solid #e1e6ed; border-radius:10px; background:#fff; padding:10px; }
+                .eh-finance-stat small { display:block; color:#788393; font-size:9px; font-weight:800; text-transform:uppercase; }
+                .eh-finance-stat strong { display:block; margin-top:4px; color:#253142; font-size:16px; }
+                .eh-finance-stat span { display:block; margin-top:3px; color:#667284; font-size:9px; }
+                .eh-finance-toolbar { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:9px; }
+                .eh-finance-toolbar input, .eh-finance-toolbar select { min-height:34px; padding:6px 8px; border:1px solid #d6dce5; border-radius:8px; background:#fff; color:#253142; font-size:10px; }
+                .eh-finance-list { display:grid; gap:6px; max-height:420px; overflow:auto; padding-right:2px; }
+                .eh-finance-op { border:1px solid #e3e7ed; border-radius:9px; background:#fff; padding:8px; }
+                .eh-finance-op-head { display:flex; justify-content:space-between; gap:8px; align-items:start; }
+                .eh-finance-op-head strong { color:#26313f; font-size:10px; }
+                .eh-finance-op-head time { color:#7b8695; font-size:8.5px; white-space:nowrap; }
+                .eh-finance-op-values { display:flex; gap:12px; flex-wrap:wrap; margin-top:5px; color:#4e5a6a; font-size:9px; }
+                .eh-finance-op-values b { color:#217d58; }
+                .eh-finance-op details { margin-top:6px; font-size:8.5px; color:#697586; }
+                .eh-finance-op details summary { cursor:pointer; font-weight:800; }
+                .eh-finance-company-card { border:1px solid #e1e6ed; border-radius:10px; background:#fff; padding:10px; margin-bottom:7px; }
+                .eh-finance-company-card h4 { margin:0 0 6px; color:#253142; font-size:11px; }
+                .eh-finance-company-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; font-size:9px; color:#697586; }
+                .eh-finance-company-grid b { display:block; margin-top:2px; color:#253142; font-size:10px; }
+                .eh-finance-month-nav { display:flex; align-items:center; justify-content:center; gap:8px; margin:0 0 10px; }
+                .eh-finance-month-nav strong { min-width:120px; text-align:center; color:#26313f; }
+                @media (max-width:760px) {
+                    .eh-finance-summary-grid { grid-template-columns:1fr 1fr; }
+                    .eh-finance-company-grid { grid-template-columns:1fr 1fr; }
+                }
+
                 /* Seleção contextual na tela Passagens: aparece somente quando solicitada. */
                 .eh-ticket-batch-bar {
                     position:sticky;
@@ -3966,6 +4011,13 @@
             EH.RequisitionManager?.scanDom?.();
             EH.UI.updateState(page);
             EH.WhatsAppDock?.renderOrganizer?.(page);
+            if ((page === 'caixa' || page === 'comissoes') && EH.Config.FINANCE_AUTO_REGISTER) {
+                const now = Date.now();
+                if (!this.lastFinanceSyncAt || (now - this.lastFinanceSyncAt) > 1800) {
+                    this.lastFinanceSyncAt = now;
+                    try { EH.FinanceLedger?.syncFromCurrentPage?.({ quiet: true }); } catch (error) { EH.Logger.debug('Sincronização financeira adiada:', error); }
+                }
+            }
             return page;
         }
     };
@@ -4229,6 +4281,512 @@
             if (this.isCommissionsPage()) return this.parseCommissions();
             if (this.isCaixaPage()) return this.parseCaixa();
             return null;
+        }
+    };
+
+    // ============================================================
+    // MEMÓRIA FINANCEIRA OPERACIONAL — CAIXA / COMISSÕES
+    // Controle local auxiliar. Nunca altera valores oficiais do E-Pass.
+    // ============================================================
+    EH.FinanceLedger = {
+        STORE_KEY: 'financeLedgerV1',
+        META_KEY: 'financeMetaV1',
+
+        money(value) {
+            const number = Number(value);
+            return Number.isFinite(number) ? Math.round((number + Number.EPSILON) * 100) / 100 : 0;
+        },
+
+        normalizeCompany(value) {
+            const raw = EH.Utils.clean(value || '').toUpperCase();
+            const normalized = EH.Utils.normalize(raw);
+            if (!normalized) return 'NÃO INFORMADA';
+            if (normalized === 'MA' || normalized.includes('EXPRESSO MAIA') || normalized === 'MAIA') return 'EXPRESSO MAIA';
+            if (normalized === 'JO' || normalized.includes('JOTAMAR')) return 'JOTAMAR';
+            if (normalized === 'NH' || normalized.includes('NOVO HORIZONTE')) return 'NOVO HORIZONTE';
+            if (normalized === 'CB' || normalized.includes('CENTRAL BAHIA')) return 'CENTRAL BAHIA';
+            return raw || 'NÃO INFORMADA';
+        },
+
+        parseDateTime(value) {
+            const text = EH.Utils.clean(value || '');
+            let match = text.match(/^(\d{2})\/(\d{2})\/(\d{4})[,\s]+(\d{2}):(\d{2})(?::(\d{2}))?/);
+            if (match) {
+                const [, dd, mm, yyyy, hh, mi, ss = '00'] = match;
+                const date = new Date(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(mi), Number(ss));
+                return Number.isNaN(date.getTime()) ? null : date;
+            }
+            match = text.match(/^(\d{4})-(\d{2})-(\d{2})(?:[T\s](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+            if (match) {
+                const [, yyyy, mm, dd, hh = '00', mi = '00', ss = '00'] = match;
+                const date = new Date(Number(yyyy), Number(mm) - 1, Number(dd), Number(hh), Number(mi), Number(ss));
+                return Number.isNaN(date.getTime()) ? null : date;
+            }
+            const native = new Date(text);
+            return Number.isNaN(native.getTime()) ? null : native;
+        },
+
+        formatDateTime(date) {
+            const d = date instanceof Date ? date : this.parseDateTime(date);
+            if (!d || Number.isNaN(d.getTime())) return '';
+            const pad = n => String(n).padStart(2, '0');
+            return `${pad(d.getDate())}/${pad(d.getMonth()+1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        },
+
+        dayKey(value) {
+            const d = value instanceof Date ? value : this.parseDateTime(value);
+            if (!d) return '';
+            const pad = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+        },
+
+        monthKey(value) {
+            const d = value instanceof Date ? value : this.parseDateTime(value);
+            if (!d) return '';
+            const pad = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth()+1)}`;
+        },
+
+        load() {
+            const data = EH.Storage.get(this.STORE_KEY, []);
+            return Array.isArray(data) ? data : [];
+        },
+
+        save(records) {
+            const safe = Array.isArray(records) ? records : [];
+            EH.Storage.set(this.STORE_KEY, safe);
+            return safe;
+        },
+
+        loadMeta() {
+            const data = EH.Storage.get(this.META_KEY, {});
+            return data && typeof data === 'object' ? data : {};
+        },
+
+        saveMeta(meta) {
+            EH.Storage.set(this.META_KEY, meta || {});
+            return meta || {};
+        },
+
+        commissionPercentFor(company) {
+            const meta = this.loadMeta();
+            const map = meta.companyPercents && typeof meta.companyPercents === 'object' ? meta.companyPercents : {};
+            const key = this.normalizeCompany(company);
+            const specific = Number(map[key]);
+            if (Number.isFinite(specific) && specific >= 0) return specific;
+            return Number(EH.Config.FINANCE_COMMISSION_PERCENT) || 10;
+        },
+
+        estimateCommission(value, company) {
+            return this.money(this.money(value) * this.commissionPercentFor(company) / 100);
+        },
+
+        effectiveCommission(record) {
+            if (record?.commissionEpass !== null && record?.commissionEpass !== undefined && Number.isFinite(Number(record.commissionEpass))) {
+                return this.money(record.commissionEpass);
+            }
+            return this.money(record?.commissionEstimated || 0);
+        },
+
+        isCountableMovement(record) {
+            if (!record || record.deleted || record.mergedInto) return false;
+            const status = EH.Utils.normalize(record.status || '');
+            if (status.includes('SAQUE') || status.includes('SALDO ANTERIOR')) return false;
+            if (record.category === 'PASSAGEM') return status === 'VENDA' || !status;
+            return record.category === 'MERCADORIA_RECEBIDA' || record.category === 'MERCADORIA_ENVIADA';
+        },
+
+        isCommissionEffect(record) {
+            if (!record || record.deleted || record.mergedInto) return false;
+            const status = EH.Utils.normalize(record.status || '');
+            if (status.includes('SAQUE') || status.includes('SALDO ANTERIOR')) return false;
+            return record.category === 'PASSAGEM' || record.category === 'MERCADORIA_RECEBIDA' || record.category === 'MERCADORIA_ENVIADA' || status.includes('CANCELAMENTO') || status.includes('ESTORNO');
+        },
+
+        makeCommissionBaseKey(row) {
+            return [
+                'comissao',
+                EH.Utils.normalize(row.dateTime || ''),
+                EH.Utils.normalize(this.normalizeCompany(row.company)),
+                EH.Utils.normalize(row.operation || row.kind || ''),
+                EH.Utils.normalize(row.category || ''),
+                this.money(row.originalValue || 0).toFixed(2),
+                this.money(row.amount || 0).toFixed(2)
+            ].join('|');
+        },
+
+        recordFromCommission(row, occurrence) {
+            const date = this.parseDateTime(row.dateTime);
+            const company = this.normalizeCompany(row.company);
+            const operation = EH.Utils.clean(row.operation || row.kind || 'MOVIMENTO').toUpperCase();
+            const category = EH.Utils.normalize(row.category).includes('PASSAGEM') || operation === 'CANCELAMENTO'
+                ? 'PASSAGEM'
+                : 'OUTRO';
+            const original = row.originalValue === null || row.originalValue === undefined ? 0 : this.money(row.originalValue);
+            const commission = this.money(row.amount);
+            const base = this.makeCommissionBaseKey(row);
+            const sourceKey = `${base}|${occurrence}`;
+            return {
+                id: sourceKey,
+                sourceKey,
+                source: 'epass_comissoes',
+                sourceOrigin: 'epass',
+                category,
+                status: operation,
+                operationStatus: EH.Utils.clean(row.operationStatus || ''),
+                dateTime: this.formatDateTime(date) || EH.Utils.clean(row.dateTime || ''),
+                timestamp: date?.getTime?.() || 0,
+                dayKey: this.dayKey(date),
+                monthKey: this.monthKey(date),
+                company,
+                companyCode: '',
+                passenger: '',
+                cpfMasked: '',
+                identifier: '',
+                saleId: '',
+                originalValue: original,
+                commissionPercent: original ? this.money((commission / original) * 100) : this.commissionPercentFor(company),
+                commissionEpass: commission,
+                commissionEstimated: original ? this.estimateCommission(original, company) : 0,
+                nature: 'neutro',
+                description: row.isPriorBalance ? 'Saldo anterior' : '',
+                operator: EH.Utils.clean(row.operator || ''),
+                rawReference: EH.Utils.clean(row.rawText || ''),
+                createdAt: Date.now(),
+                updatedAt: Date.now()
+            };
+        },
+
+        recordFromCaixa(sale) {
+            const date = this.parseDateTime(sale.dateTime);
+            const company = this.normalizeCompany(sale.companyCode);
+            const value = this.money(sale.total);
+            const sourceKey = `caixa|${sale.saleId || `${EH.Utils.normalize(sale.dateTime)}|${company}|${value.toFixed(2)}`}`;
+            return {
+                id: sourceKey,
+                sourceKey,
+                source: 'epass_caixa',
+                sourceOrigin: 'epass',
+                category: 'PASSAGEM',
+                status: 'VENDA',
+                operationStatus: '',
+                dateTime: this.formatDateTime(date) || EH.Utils.clean(sale.dateTime || ''),
+                timestamp: date?.getTime?.() || 0,
+                dayKey: this.dayKey(date),
+                monthKey: this.monthKey(date),
+                company,
+                companyCode: EH.Utils.clean(sale.companyCode || ''),
+                passenger: EH.Utils.clean(sale.passenger || ''),
+                cpfMasked: '',
+                identifier: sale.saleId || '',
+                saleId: sale.saleId || '',
+                originalValue: value,
+                commissionPercent: this.commissionPercentFor(company),
+                commissionEpass: null,
+                commissionEstimated: this.estimateCommission(value, company),
+                nature: 'entrada',
+                description: '',
+                operator: EH.Utils.clean(sale.agent || ''),
+                breakdown: sale.breakdown || {},
+                rawReference: EH.Utils.clean(sale.rawLaunch || ''),
+                createdAt: Date.now(),
+                updatedAt: Date.now()
+            };
+        },
+
+        upsert(record, records = null) {
+            const list = records || this.load();
+            const index = list.findIndex(item => item.sourceKey === record.sourceKey || item.id === record.id);
+            if (index >= 0) {
+                const originalCreatedAt = list[index].createdAt || record.createdAt || Date.now();
+                list[index] = { ...list[index], ...record, createdAt: originalCreatedAt, updatedAt: Date.now() };
+                return { list, added: false, record: list[index] };
+            }
+            list.push(record);
+            return { list, added: true, record };
+        },
+
+        reconcile(records) {
+            const list = Array.isArray(records) ? records : [];
+            list.forEach(record => {
+                if (record.source === 'epass_caixa') {
+                    delete record.mergedInto;
+                    record.shadowedByCommission = false;
+                }
+            });
+            const sales = list.filter(record => record.source === 'epass_caixa' && record.status === 'VENDA' && !record.deleted);
+            const commissions = list.filter(record => record.source === 'epass_comissoes' && record.category === 'PASSAGEM' && record.status === 'VENDA' && !record.deleted);
+            commissions.forEach(record => { delete record.linkedToSaleSource; });
+
+            sales.forEach(sale => {
+                const saleTime = Number(sale.timestamp || 0);
+                const candidates = commissions
+                    .filter(item => !item.linkedToSaleSource && item.company === sale.company && Math.abs(Number(item.timestamp || 0) - saleTime) <= 5000)
+                    .sort((a, b) => Math.abs(Number(a.timestamp || 0) - saleTime) - Math.abs(Number(b.timestamp || 0) - saleTime));
+                if (!candidates.length) return;
+
+                let sum = 0;
+                const chosen = [];
+                for (const item of candidates) {
+                    if (sum + Number(item.originalValue || 0) > Number(sale.originalValue || 0) + 0.02) continue;
+                    chosen.push(item);
+                    sum += Number(item.originalValue || 0);
+                    if (Math.abs(sum - Number(sale.originalValue || 0)) <= 0.02) break;
+                }
+                if (!chosen.length || Math.abs(sum - Number(sale.originalValue || 0)) > 0.02) return;
+
+                sale.shadowedByCommission = true;
+                sale.commissionEpass = this.money(chosen.reduce((acc, item) => acc + this.effectiveCommission(item), 0));
+                sale.commissionPercent = sale.originalValue ? this.money((sale.commissionEpass / sale.originalValue) * 100) : sale.commissionPercent;
+                sale.linkedCommissionKeys = chosen.map(item => item.sourceKey);
+                chosen.forEach(item => {
+                    item.saleId = sale.saleId || item.saleId;
+                    item.identifier = sale.saleId || item.identifier;
+                    item.passenger = item.passenger || sale.passenger;
+                    item.companyCode = item.companyCode || sale.companyCode;
+                    item.mergedIntoSaleSource = sale.sourceKey;
+                    item.linkedToSaleSource = sale.sourceKey;
+                });
+            });
+            return list;
+        },
+
+        syncFromCurrentPage({ quiet = false } = {}) {
+            if (!EH.Config.FINANCE_AUTO_REGISTER && quiet) return { added: 0, updated: 0, total: this.load().length };
+            const snapshot = EH.FinanceReader?.snapshot?.();
+            if (!snapshot) {
+                if (!quiet) EH.Toast.warning('Abra a tela de Caixa ou Comissões para atualizar os dados.');
+                return { added: 0, updated: 0, total: this.load().length };
+            }
+
+            let records = this.load();
+            let added = 0;
+            let updated = 0;
+            const meta = this.loadMeta();
+
+            if (snapshot.page === 'caixa') {
+                (snapshot.sales || []).forEach(sale => {
+                    const result = this.upsert(this.recordFromCaixa(sale), records);
+                    records = result.list;
+                    result.added ? added++ : updated++;
+                });
+                meta.lastCaixa = {
+                    capturedAt: Date.now(),
+                    header: snapshot.header || null,
+                    commissionSummary: snapshot.commissionSummary || []
+                };
+            }
+
+            if (snapshot.page === 'comissoes') {
+                const occurrences = new Map();
+                (snapshot.history || []).forEach(row => {
+                    if (row.isPriorBalance) return;
+                    const base = this.makeCommissionBaseKey(row);
+                    const occurrence = (occurrences.get(base) || 0) + 1;
+                    occurrences.set(base, occurrence);
+                    const result = this.upsert(this.recordFromCommission(row, occurrence), records);
+                    records = result.list;
+                    result.added ? added++ : updated++;
+                });
+                meta.lastCommissionSummary = {
+                    capturedAt: Date.now(),
+                    summary: snapshot.summary || []
+                };
+            }
+
+            records = this.reconcile(records);
+            this.save(records);
+            this.saveMeta(meta);
+            if (!quiet) EH.Toast.success(`Financeiro atualizado: ${added} novo${added === 1 ? '' : 's'} • ${updated} conferido${updated === 1 ? '' : 's'}.`);
+            EH.UI?.renderAutomation?.(EH.Pages?.detect?.() || 'desconhecida');
+            return { added, updated, total: records.length };
+        },
+
+        addMerchandise(data = {}) {
+            const type = data.category === 'MERCADORIA_ENVIADA' ? 'MERCADORIA_ENVIADA' : 'MERCADORIA_RECEBIDA';
+            const company = this.normalizeCompany(data.company || 'NÃO INFORMADA');
+            const value = this.money(data.originalValue);
+            if (!(value > 0)) throw new Error('Informe um valor maior que zero.');
+            const date = this.parseDateTime(data.dateTime) || new Date();
+            const id = data.id || `manual|${date.getTime()}|${Math.random().toString(36).slice(2,8)}`;
+            const percent = Number.isFinite(Number(data.commissionPercent)) ? Number(data.commissionPercent) : this.commissionPercentFor(company);
+            const record = {
+                id,
+                sourceKey: id,
+                source: 'manual',
+                sourceOrigin: 'manual',
+                category: type,
+                status: 'ATIVO',
+                operationStatus: '',
+                dateTime: this.formatDateTime(date),
+                timestamp: date.getTime(),
+                dayKey: this.dayKey(date),
+                monthKey: this.monthKey(date),
+                company,
+                companyCode: '',
+                passenger: '',
+                cpfMasked: '',
+                identifier: id,
+                saleId: '',
+                originalValue: value,
+                commissionPercent: this.money(percent),
+                commissionEpass: null,
+                commissionEstimated: this.money(value * percent / 100),
+                nature: ['entrada','saida','neutro'].includes(data.nature) ? data.nature : 'neutro',
+                description: EH.Utils.clean(data.description || ''),
+                operator: '',
+                rawReference: '',
+                createdAt: Date.now(),
+                updatedAt: Date.now()
+            };
+            let records = this.load();
+            const index = records.findIndex(item => item.id === id);
+            if (index >= 0) records[index] = { ...records[index], ...record, createdAt: records[index].createdAt || record.createdAt };
+            else records.push(record);
+            this.save(records);
+            EH.UI?.renderAutomation?.(EH.Pages?.detect?.() || 'desconhecida');
+            return record;
+        },
+
+        deleteManual(id) {
+            let records = this.load();
+            const record = records.find(item => item.id === id);
+            if (!record || record.sourceOrigin !== 'manual') return false;
+            records = records.filter(item => item.id !== id);
+            this.save(records);
+            EH.UI?.renderAutomation?.(EH.Pages?.detect?.() || 'desconhecida');
+            return true;
+        },
+
+        visibleRecords() {
+            return this.load().filter(record => !record.deleted && !record.shadowedByCommission);
+        },
+
+        recordsForPeriod({ start = null, end = null, monthKey = '', dayKey = '' } = {}) {
+            return this.visibleRecords().filter(record => {
+                if (dayKey && record.dayKey !== dayKey) return false;
+                if (monthKey && record.monthKey !== monthKey) return false;
+                if (start && Number(record.timestamp || 0) < start.getTime()) return false;
+                if (end && Number(record.timestamp || 0) > end.getTime()) return false;
+                return true;
+            });
+        },
+
+        summary(records = this.visibleRecords()) {
+            const valid = Array.isArray(records) ? records : [];
+            const result = {
+                operations: 0,
+                passageCount: 0,
+                passageValue: 0,
+                merchandiseReceivedCount: 0,
+                merchandiseReceivedValue: 0,
+                merchandiseSentCount: 0,
+                merchandiseSentValue: 0,
+                movement: 0,
+                commission: 0,
+                entradas: 0,
+                saidas: 0,
+                byCompany: {}
+            };
+            valid.forEach(record => {
+                const movement = this.isCountableMovement(record) ? this.money(record.originalValue) : 0;
+                const commission = this.isCommissionEffect(record) ? this.effectiveCommission(record) : 0;
+                if (movement || commission) result.operations += 1;
+                if (record.category === 'PASSAGEM' && this.isCountableMovement(record)) {
+                    result.passageCount += 1;
+                    result.passageValue += movement;
+                } else if (record.category === 'MERCADORIA_RECEBIDA' && this.isCountableMovement(record)) {
+                    result.merchandiseReceivedCount += 1;
+                    result.merchandiseReceivedValue += movement;
+                } else if (record.category === 'MERCADORIA_ENVIADA' && this.isCountableMovement(record)) {
+                    result.merchandiseSentCount += 1;
+                    result.merchandiseSentValue += movement;
+                }
+                result.movement += movement;
+                result.commission += commission;
+                if (record.nature === 'entrada') result.entradas += movement;
+                if (record.nature === 'saida') result.saidas += movement;
+
+                const company = this.normalizeCompany(record.company);
+                if (!result.byCompany[company]) result.byCompany[company] = { company, operations: 0, passageValue: 0, merchandiseValue: 0, movement: 0, commission: 0, percents: [] };
+                const bucket = result.byCompany[company];
+                if (movement || commission) bucket.operations += 1;
+                if (record.category === 'PASSAGEM') bucket.passageValue += movement;
+                if (record.category === 'MERCADORIA_RECEBIDA' || record.category === 'MERCADORIA_ENVIADA') bucket.merchandiseValue += movement;
+                bucket.movement += movement;
+                bucket.commission += commission;
+                if (record.originalValue > 0) {
+                    const pct = record.commissionEpass !== null && record.commissionEpass !== undefined
+                        ? (Number(record.commissionEpass) / Number(record.originalValue)) * 100
+                        : Number(record.commissionPercent || 0);
+                    if (Number.isFinite(pct)) bucket.percents.push(pct);
+                }
+            });
+            ['passageValue','merchandiseReceivedValue','merchandiseSentValue','movement','commission','entradas','saidas'].forEach(key => result[key] = this.money(result[key]));
+            Object.values(result.byCompany).forEach(bucket => {
+                bucket.passageValue = this.money(bucket.passageValue);
+                bucket.merchandiseValue = this.money(bucket.merchandiseValue);
+                bucket.movement = this.money(bucket.movement);
+                bucket.commission = this.money(bucket.commission);
+                bucket.averagePercent = bucket.percents.length ? this.money(bucket.percents.reduce((a,b)=>a+b,0) / bucket.percents.length) : 0;
+                delete bucket.percents;
+            });
+            return result;
+        },
+
+        todaySummary() {
+            return this.summary(this.recordsForPeriod({ dayKey: this.dayKey(new Date()) }));
+        },
+
+        monthSummary(monthKey = this.monthKey(new Date())) {
+            return this.summary(this.recordsForPeriod({ monthKey }));
+        },
+
+        companies() {
+            const set = new Set(['EXPRESSO MAIA','JOTAMAR','NOVO HORIZONTE','CENTRAL BAHIA']);
+            this.load().forEach(record => record.company && set.add(this.normalizeCompany(record.company)));
+            return Array.from(set).filter(Boolean).sort((a,b)=>a.localeCompare(b,'pt-BR'));
+        },
+
+        officialCommissionByCompany() {
+            const meta = this.loadMeta();
+            const rows = meta.lastCommissionSummary?.summary || meta.lastCaixa?.commissionSummary || [];
+            const map = {};
+            rows.forEach(item => { map[this.normalizeCompany(item.company)] = this.money(item.amount); });
+            return map;
+        },
+
+        exportCsv() {
+            const rows = this.visibleRecords().slice().sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0));
+            const header = ['data_hora','categoria','status','empresa','valor_original','comissao_epass','comissao_helper','percentual','natureza','identificador','passageiro','origem'];
+            const escape = value => `"${String(value ?? '').replace(/"/g,'""')}"`;
+            const lines = [header.join(';')];
+            rows.forEach(record => lines.push([
+                record.dateTime, record.category, record.status, record.company,
+                Number(record.originalValue||0).toFixed(2).replace('.',','),
+                record.commissionEpass === null || record.commissionEpass === undefined ? '' : Number(record.commissionEpass).toFixed(2).replace('.',','),
+                Number(record.commissionEstimated||0).toFixed(2).replace('.',','),
+                Number(record.commissionPercent||0).toFixed(2).replace('.',','),
+                record.nature, record.identifier, record.passenger, record.sourceOrigin
+            ].map(escape).join(';')));
+            const blob = new Blob(['\ufeff'+lines.join('\n')], { type: 'text/csv;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `epass-helper-financeiro-${this.dayKey(new Date())}.csv`;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(()=>URL.revokeObjectURL(url),1000);
+        },
+
+        exportBackup() {
+            const payload = { version: 1, exportedAt: new Date().toISOString(), records: this.load(), meta: this.loadMeta() };
+            const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `epass-helper-financeiro-backup-${this.dayKey(new Date())}.json`;
+            document.body.appendChild(a); a.click(); a.remove();
+            setTimeout(()=>URL.revokeObjectURL(url),1000);
         }
     };
 
@@ -9786,6 +10344,119 @@
             return command;
         },
 
+        financeMiniSummary() {
+            const wrap = document.createElement('div');
+            wrap.className = 'eh-finance-mini';
+            const today = EH.FinanceLedger.todaySummary();
+            const month = EH.FinanceLedger.monthSummary();
+            const kpis = document.createElement('div');
+            kpis.className = 'eh-finance-kpis';
+            const item = (label, value) => {
+                const box = document.createElement('div'); box.className = 'eh-finance-kpi';
+                const s = document.createElement('small'); s.textContent = label;
+                const b = document.createElement('strong'); b.textContent = EH.Utils.formatMoney(value);
+                box.append(s,b); return box;
+            };
+            kpis.append(item('Hoje • movimentado', today.movement), item('Hoje • comissão', today.commission), item('Mês • passagens', month.passageValue), item('Mês • comissão', month.commission));
+            wrap.appendChild(kpis);
+            const top = Object.values(month.byCompany || {}).sort((a,b)=>b.commission-a.commission).slice(0,4);
+            top.forEach(company => {
+                const line = document.createElement('div'); line.className = 'eh-finance-company-line';
+                const name = document.createElement('span'); name.textContent = company.company;
+                const value = document.createElement('b'); value.textContent = EH.Utils.formatMoney(company.commission);
+                line.append(name,value); wrap.appendChild(line);
+            });
+            return wrap;
+        },
+
+        showMerchandiseModal(existing = null) {
+            document.querySelector('#eh-finance-merch-overlay')?.remove();
+            const overlay = document.createElement('div'); overlay.className = 'eh-overlay'; overlay.id = 'eh-finance-merch-overlay';
+            const modal = document.createElement('div'); modal.className = 'eh-modal'; modal.style.width = 'min(520px, 94vw)';
+            const head = document.createElement('div'); head.className = 'eh-modal-head';
+            const title = document.createElement('div'); title.className = 'eh-modal-title'; title.textContent = existing ? 'Editar mercadoria' : 'Nova mercadoria';
+            const closeTop = document.createElement('button'); closeTop.type='button'; closeTop.className='eh-modal-close'; closeTop.textContent='✕'; head.append(title, closeTop);
+            const content = document.createElement('div'); content.className = 'eh-modal-content';
+            const grid = document.createElement('div'); grid.className='eh-settings-grid';
+            const makeField=(labelText,input)=>{ const f=document.createElement('div');f.className='eh-field';const l=document.createElement('label');l.textContent=labelText;f.append(l,input);return f; };
+            const type=document.createElement('select'); type.innerHTML='<option value="MERCADORIA_RECEBIDA">Recebida</option><option value="MERCADORIA_ENVIADA">Enviada</option>'; type.value=existing?.category||'MERCADORIA_RECEBIDA';
+            const company=document.createElement('select'); EH.FinanceLedger.companies().forEach(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;company.appendChild(o);}); const other=document.createElement('option');other.value='OUTRA';other.textContent='Outra empresa';company.appendChild(other); company.value=existing?.company && Array.from(company.options).some(o=>o.value===existing.company) ? existing.company : (EH.FinanceLedger.companies()[0]||'EXPRESSO MAIA');
+            const customCompany=document.createElement('input'); customCompany.type='text'; customCompany.placeholder='Nome da empresa'; customCompany.hidden=company.value!=='OUTRA';
+            company.addEventListener('change',()=>{customCompany.hidden=company.value!=='OUTRA';});
+            const value=document.createElement('input');value.type='number';value.min='0';value.step='0.01';value.placeholder='0,00';value.value=existing?.originalValue||'';
+            const nature=document.createElement('select');nature.innerHTML='<option value="neutro">Não definir</option><option value="entrada">Entrada</option><option value="saida">Saída</option>';nature.value=existing?.nature||'neutro';
+            const date=document.createElement('input');date.type='date'; const baseDate=existing?.timestamp?new Date(existing.timestamp):new Date(); date.value=`${baseDate.getFullYear()}-${String(baseDate.getMonth()+1).padStart(2,'0')}-${String(baseDate.getDate()).padStart(2,'0')}`;
+            const percent=document.createElement('input');percent.type='number';percent.min='0';percent.max='100';percent.step='0.1';percent.value=existing?.commissionPercent ?? EH.Config.FINANCE_COMMISSION_PERCENT;
+            const description=document.createElement('input');description.type='text';description.placeholder='Opcional';description.value=existing?.description||'';
+            grid.append(makeField('Tipo',type),makeField('Empresa',company),makeField('Outra empresa',customCompany),makeField('Valor',value),makeField('Natureza financeira',nature),makeField('Data',date),makeField('Comissão (%)',percent),makeField('Descrição',description));
+            content.appendChild(grid);
+            const actions=document.createElement('div');actions.className='eh-modal-actions';
+            const save=document.createElement('button');save.type='button';save.className='eh-modal-btn primary';save.textContent='Salvar';
+            const cancel=document.createElement('button');cancel.type='button';cancel.className='eh-modal-btn';cancel.textContent='Cancelar';
+            const close=()=>overlay.remove(); closeTop.addEventListener('click',close);cancel.addEventListener('click',close);overlay.addEventListener('click',e=>{if(e.target===overlay)close();});
+            save.addEventListener('click',()=>{
+                try {
+                    const selectedCompany=company.value==='OUTRA'?EH.Utils.clean(customCompany.value):company.value;
+                    if (EH.Config.FINANCE_ASK_COMPANY_MERCH && !selectedCompany) throw new Error('Informe a empresa.');
+                    const now=new Date(); const d=EH.FinanceLedger.parseDateTime(`${date.value} ${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`)||now;
+                    EH.FinanceLedger.addMerchandise({ id:existing?.id, category:type.value, company:selectedCompany||'NÃO INFORMADA', originalValue:Number(value.value), nature:nature.value, dateTime:EH.FinanceLedger.formatDateTime(d), commissionPercent:Number(percent.value), description:description.value });
+                    EH.Toast.success(existing?'Mercadoria atualizada.':'Mercadoria registrada.'); close(); this.showFinanceModal?.('mercadorias');
+                } catch(error){EH.Toast.error(error.message||'Não foi possível salvar.');}
+            });
+            actions.append(save,cancel);modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);
+        },
+
+        showFinanceModal(initialTab='resumo') {
+            document.querySelector('#eh-finance-overlay')?.remove();
+            const overlay=document.createElement('div');overlay.className='eh-overlay';overlay.id='eh-finance-overlay';
+            const modal=document.createElement('div');modal.className='eh-modal';modal.style.width='min(980px,96vw)';
+            const head=document.createElement('div');head.className='eh-modal-head';const title=document.createElement('div');title.className='eh-modal-title';title.textContent='Caixa / Comissões — Controle do Helper';const closeTop=document.createElement('button');closeTop.type='button';closeTop.className='eh-modal-close';closeTop.textContent='✕';head.append(title,closeTop);
+            const content=document.createElement('div');content.className='eh-modal-content';
+            const shell=document.createElement('div');shell.className='eh-settings-shell';const tabs=document.createElement('div');tabs.className='eh-settings-tabs';const panes=document.createElement('div');panes.className='eh-settings-panes';shell.append(tabs,panes);content.appendChild(shell);
+            const paneMap={};
+            const makePane=(id,label)=>{const tab=document.createElement('button');tab.type='button';tab.className='eh-settings-tab';tab.textContent=label;const pane=document.createElement('section');pane.className='eh-settings-pane';paneMap[id]={tab,pane};tabs.appendChild(tab);panes.appendChild(pane);tab.addEventListener('click',()=>activate(id));return pane;};
+            const activate=id=>Object.entries(paneMap).forEach(([key,obj])=>{obj.tab.classList.toggle('active',key===id);obj.pane.classList.toggle('active',key===id);});
+            const monthState={key:EH.FinanceLedger.monthKey(new Date())};
+            const monthLabel=key=>{const [y,m]=key.split('-').map(Number);return new Date(y,m-1,1).toLocaleDateString('pt-BR',{month:'long',year:'numeric'}).replace(/^./,c=>c.toUpperCase());};
+            const shiftMonth=delta=>{const [y,m]=monthState.key.split('-').map(Number);const d=new Date(y,m-1+delta,1);monthState.key=EH.FinanceLedger.monthKey(d);renderSummary();renderCompanies();};
+
+            const summaryPane=makePane('resumo','Resumo');
+            const historyPane=makePane('historico','Histórico');
+            const companiesPane=makePane('empresas','Empresas');
+            const merchPane=makePane('mercadorias','Mercadorias');
+
+            const renderSummary=()=>{
+                summaryPane.innerHTML=''; const today=EH.FinanceLedger.todaySummary(); const month=EH.FinanceLedger.monthSummary(monthState.key);
+                const nav=document.createElement('div');nav.className='eh-finance-month-nav';const prev=document.createElement('button');prev.className='eh-modal-btn';prev.textContent='‹';const lbl=document.createElement('strong');lbl.textContent=monthLabel(monthState.key);const next=document.createElement('button');next.className='eh-modal-btn';next.textContent='›';prev.addEventListener('click',()=>shiftMonth(-1));next.addEventListener('click',()=>shiftMonth(1));nav.append(prev,lbl,next);
+                const grid=document.createElement('div');grid.className='eh-finance-summary-grid';
+                const stat=(label,value,sub)=>{const el=document.createElement('div');el.className='eh-finance-stat';const s=document.createElement('small');s.textContent=label;const b=document.createElement('strong');b.textContent=EH.Utils.formatMoney(value);const sp=document.createElement('span');sp.textContent=sub||'';el.append(s,b,sp);return el;};
+                grid.append(stat('Hoje • Passagens',today.passageValue,`${today.passageCount} operação(ões)`),stat('Hoje • Mercadorias',today.merchandiseReceivedValue+today.merchandiseSentValue,`${today.merchandiseReceivedCount} recebidas • ${today.merchandiseSentCount} enviadas`),stat('Hoje • Movimentação',today.movement,`Entradas ${EH.Utils.formatMoney(today.entradas)} • Saídas ${EH.Utils.formatMoney(today.saidas)}`),stat('Hoje • Comissão',today.commission,'Comissão efetiva/estimada'),stat('Mês • Passagens',month.passageValue,`${month.passageCount} operação(ões)`),stat('Mês • Mercadorias',month.merchandiseReceivedValue+month.merchandiseSentValue,`${month.merchandiseReceivedCount+month.merchandiseSentCount} operação(ões)`),stat('Mês • Movimentação',month.movement,monthLabel(monthState.key)),stat('Mês • Comissão',month.commission,monthLabel(monthState.key)));
+                summaryPane.append(nav,grid);
+                const official=EH.FinanceLedger.officialCommissionByCompany(); const companyWrap=document.createElement('div');companyWrap.style.marginTop='12px';
+                Object.values(month.byCompany||{}).sort((a,b)=>b.commission-a.commission).forEach(company=>{const card=document.createElement('div');card.className='eh-finance-company-card';const h=document.createElement('h4');h.textContent=company.company;const row=document.createElement('div');row.className='eh-finance-company-grid';const c=(l,v)=>{const d=document.createElement('div');d.textContent=l;const b=document.createElement('b');b.textContent=v;d.appendChild(b);return d;};row.append(c('Operações',String(company.operations)),c('Movimentado',EH.Utils.formatMoney(company.movement)),c('Comissão',EH.Utils.formatMoney(company.commission)),c('Percentual médio',`${company.averagePercent.toFixed(2).replace('.',',')}%`));card.append(h,row);if(Object.prototype.hasOwnProperty.call(official,company.company)){const diff=Math.abs(company.commission-official[company.company]);const note=document.createElement('div');note.className='eh-settings-note';note.textContent=`Helper: ${EH.Utils.formatMoney(company.commission)} • E-Pass: ${EH.Utils.formatMoney(official[company.company])} ${diff<=0.02?'✓ Conferido':'⚠ Conferir'}`;card.appendChild(note);}companyWrap.appendChild(card);}); summaryPane.appendChild(companyWrap);
+            };
+
+            const renderHistory=()=>{
+                historyPane.innerHTML=''; const toolbar=document.createElement('div');toolbar.className='eh-finance-toolbar';
+                const period=document.createElement('select');period.innerHTML='<option value="today">Hoje</option><option value="yesterday">Ontem</option><option value="month" selected>Este mês</option><option value="previous">Mês anterior</option><option value="custom">Período personalizado</option><option value="all">Tudo</option>';
+                const type=document.createElement('select');type.innerHTML='<option value="all">Todas</option><option value="PASSAGEM">Passagens</option><option value="MERCH">Mercadorias</option><option value="MERCADORIA_RECEBIDA">Recebidas</option><option value="MERCADORIA_ENVIADA">Enviadas</option>';
+                const company=document.createElement('select');company.innerHTML='<option value="all">Todas as empresas</option>';EH.FinanceLedger.companies().forEach(name=>{const o=document.createElement('option');o.value=name;o.textContent=name;company.appendChild(o);});
+                const startDate=document.createElement('input');startDate.type='date';startDate.hidden=true;const endDate=document.createElement('input');endDate.type='date';endDate.hidden=true;
+                const search=document.createElement('input');search.type='search';search.placeholder='Pesquisar empresa, passageiro, ID, valor…';
+                const toggleCustom=()=>{const custom=period.value==='custom';startDate.hidden=!custom;endDate.hidden=!custom;};
+                toolbar.append(period,type,company,startDate,endDate,search);const list=document.createElement('div');list.className='eh-finance-list';historyPane.append(toolbar,list);
+                const refresh=()=>{let records=EH.FinanceLedger.visibleRecords();const now=new Date();let wantedMonth=EH.FinanceLedger.monthKey(now);let wantedDay='';if(period.value==='today')wantedDay=EH.FinanceLedger.dayKey(now);else if(period.value==='yesterday'){const d=new Date(now);d.setDate(d.getDate()-1);wantedDay=EH.FinanceLedger.dayKey(d);}else if(period.value==='previous'){const d=new Date(now.getFullYear(),now.getMonth()-1,1);wantedMonth=EH.FinanceLedger.monthKey(d);}if(period.value==='today'||period.value==='yesterday')records=records.filter(r=>r.dayKey===wantedDay);else if(period.value==='month'||period.value==='previous')records=records.filter(r=>r.monthKey===wantedMonth);else if(period.value==='custom'&&startDate.value&&endDate.value){const start=EH.FinanceLedger.parseDateTime(`${startDate.value} 00:00:00`);const end=EH.FinanceLedger.parseDateTime(`${endDate.value} 23:59:59`);if(start&&end)records=records.filter(r=>Number(r.timestamp||0)>=start.getTime()&&Number(r.timestamp||0)<=end.getTime());}if(type.value==='PASSAGEM')records=records.filter(r=>r.category==='PASSAGEM');else if(type.value==='MERCH')records=records.filter(r=>r.category==='MERCADORIA_RECEBIDA'||r.category==='MERCADORIA_ENVIADA');else if(type.value!=='all')records=records.filter(r=>r.category===type.value);if(company.value!=='all')records=records.filter(r=>r.company===company.value);const q=EH.Utils.normalize(search.value||'');if(q)records=records.filter(r=>EH.Utils.normalize([r.company,r.passenger,r.identifier,r.dateTime,r.originalValue,r.status,r.description].join(' ')).includes(q));records.sort((a,b)=>Number(b.timestamp||0)-Number(a.timestamp||0));list.innerHTML='';records.forEach(record=>{const op=document.createElement('div');op.className='eh-finance-op';const hd=document.createElement('div');hd.className='eh-finance-op-head';const strong=document.createElement('strong');strong.textContent=`${record.category.replace(/_/g,' ')} • ${record.company}`;const time=document.createElement('time');time.textContent=record.dateTime;hd.append(strong,time);const vals=document.createElement('div');vals.className='eh-finance-op-values';const v=document.createElement('span');v.textContent=EH.Utils.formatMoney(record.originalValue);const c=document.createElement('b');c.textContent=`Comissão ${EH.Utils.formatMoney(EH.FinanceLedger.effectiveCommission(record))}`;const st=document.createElement('span');st.textContent=record.status||'';vals.append(v,c,st);const details=document.createElement('details');const sum=document.createElement('summary');sum.textContent='Detalhes';const body=document.createElement('div');body.textContent=[record.identifier?`ID: ${record.identifier}`:'',record.passenger?`Passageiro: ${record.passenger}`:'',`Origem: ${record.sourceOrigin}`,record.nature?`Natureza: ${record.nature}`:'',record.description].filter(Boolean).join(' • ');details.append(sum,body);if(record.sourceOrigin==='manual'){const actions=document.createElement('div');actions.className='eh-settings-inline-actions';const edit=document.createElement('button');edit.className='eh-modal-btn';edit.textContent='Editar';edit.addEventListener('click',()=>this.showMerchandiseModal(record));const del=document.createElement('button');del.className='eh-modal-btn';del.textContent='Excluir';del.addEventListener('click',()=>{if(EH.Config.FINANCE_CONFIRM_DELETE&&!confirm('Excluir este lançamento manual?'))return;EH.FinanceLedger.deleteManual(record.id);refresh();});actions.append(edit,del);details.appendChild(actions);}op.append(hd,vals,details);list.appendChild(op);});if(!records.length){const empty=document.createElement('div');empty.className='eh-help-box';empty.textContent='Nenhuma operação encontrada para este filtro.';list.appendChild(empty);}};
+                period.addEventListener('change',()=>{toggleCustom();refresh();});[type,company,startDate,endDate].forEach(el=>el.addEventListener('change',refresh));search.addEventListener('input',EH.Utils.debounce(refresh,150));toggleCustom();refresh();
+            };
+
+            const renderCompanies=()=>{companiesPane.innerHTML='';const nav=document.createElement('div');nav.className='eh-finance-month-nav';const prev=document.createElement('button');prev.className='eh-modal-btn';prev.textContent='‹';const lbl=document.createElement('strong');lbl.textContent=monthLabel(monthState.key);const next=document.createElement('button');next.className='eh-modal-btn';next.textContent='›';prev.addEventListener('click',()=>shiftMonth(-1));next.addEventListener('click',()=>shiftMonth(1));nav.append(prev,lbl,next);companiesPane.appendChild(nav);const summary=EH.FinanceLedger.monthSummary(monthState.key);Object.values(summary.byCompany||{}).sort((a,b)=>b.movement-a.movement).forEach(company=>{const card=document.createElement('div');card.className='eh-finance-company-card';const h=document.createElement('h4');h.textContent=company.company;const row=document.createElement('div');row.className='eh-finance-company-grid';const cell=(l,v)=>{const d=document.createElement('div');d.textContent=l;const b=document.createElement('b');b.textContent=v;d.appendChild(b);return d;};row.append(cell('Operações',String(company.operations)),cell('Passagens',EH.Utils.formatMoney(company.passageValue)),cell('Mercadorias',EH.Utils.formatMoney(company.merchandiseValue)),cell('Total movimentado',EH.Utils.formatMoney(company.movement)),cell('Comissão',EH.Utils.formatMoney(company.commission)),cell('Percentual médio',`${company.averagePercent.toFixed(2).replace('.',',')}%`));card.append(h,row);companiesPane.appendChild(card);});};
+
+            const renderMerch=()=>{merchPane.innerHTML='';const actions=document.createElement('div');actions.className='eh-finance-toolbar';const add=document.createElement('button');add.className='eh-modal-btn primary';add.textContent='+ Nova mercadoria';add.addEventListener('click',()=>this.showMerchandiseModal());const filter=document.createElement('select');filter.innerHTML='<option value="all">Todas</option><option value="MERCADORIA_RECEBIDA">Recebidas</option><option value="MERCADORIA_ENVIADA">Enviadas</option>';actions.append(add,filter);merchPane.appendChild(actions);const list=document.createElement('div');list.className='eh-finance-list';merchPane.appendChild(list);const refresh=()=>{let records=EH.FinanceLedger.visibleRecords().filter(r=>r.category==='MERCADORIA_RECEBIDA'||r.category==='MERCADORIA_ENVIADA');if(filter.value!=='all')records=records.filter(r=>r.category===filter.value);records.sort((a,b)=>Number(b.timestamp||0)-Number(a.timestamp||0));const sum=EH.FinanceLedger.summary(records);const info=document.createElement('div');info.className='eh-help-box';info.textContent=`${records.length} operação(ões) • ${EH.Utils.formatMoney(sum.movement)} • Comissão ${EH.Utils.formatMoney(sum.commission)}`;list.innerHTML='';list.appendChild(info);records.forEach(record=>{const op=document.createElement('div');op.className='eh-finance-op';const hd=document.createElement('div');hd.className='eh-finance-op-head';const s=document.createElement('strong');s.textContent=`${record.category==='MERCADORIA_RECEBIDA'?'RECEBIDA':'ENVIADA'} • ${record.company}`;const t=document.createElement('time');t.textContent=record.dateTime;hd.append(s,t);const vals=document.createElement('div');vals.className='eh-finance-op-values';vals.innerHTML=`<span>${EH.Utils.formatMoney(record.originalValue)}</span><b>Comissão ${EH.Utils.formatMoney(EH.FinanceLedger.effectiveCommission(record))}</b>`;const details=document.createElement('details');const sm=document.createElement('summary');sm.textContent='Detalhes / editar';const body=document.createElement('div');body.textContent=`Natureza: ${record.nature}${record.description?` • ${record.description}`:''}`;const btns=document.createElement('div');btns.className='eh-settings-inline-actions';const edit=document.createElement('button');edit.className='eh-modal-btn';edit.textContent='Editar';edit.addEventListener('click',()=>this.showMerchandiseModal(record));const del=document.createElement('button');del.className='eh-modal-btn';del.textContent='Excluir';del.addEventListener('click',()=>{if(EH.Config.FINANCE_CONFIRM_DELETE&&!confirm('Excluir este lançamento manual?'))return;EH.FinanceLedger.deleteManual(record.id);refresh();});btns.append(edit,del);details.append(sm,body,btns);op.append(hd,vals,details);list.appendChild(op);});};filter.addEventListener('change',refresh);refresh();};
+
+            renderSummary();renderHistory();renderCompanies();renderMerch();activate(paneMap[initialTab]?initialTab:'resumo');
+            const actions=document.createElement('div');actions.className='eh-modal-actions';const sync=document.createElement('button');sync.className='eh-modal-btn primary';sync.textContent='Atualizar dados';sync.addEventListener('click',()=>{EH.FinanceLedger.syncFromCurrentPage();renderSummary();renderHistory();renderCompanies();renderMerch();});const csv=document.createElement('button');csv.className='eh-modal-btn';csv.textContent='Exportar CSV';csv.addEventListener('click',()=>EH.FinanceLedger.exportCsv());const backup=document.createElement('button');backup.className='eh-modal-btn';backup.textContent='Backup JSON';backup.addEventListener('click',()=>EH.FinanceLedger.exportBackup());const closeBottom=document.createElement('button');closeBottom.className='eh-modal-btn';closeBottom.textContent='Fechar';const close=()=>overlay.remove();closeTop.addEventListener('click',close);closeBottom.addEventListener('click',close);overlay.addEventListener('click',e=>{if(e.target===overlay)close();});actions.append(sync,csv,backup,closeBottom);modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);
+        },
+
         contextButton(label, cls, handler) {
             const btn = document.createElement('button');
             btn.type = 'button';
@@ -9902,6 +10573,18 @@
                 if (capturedBlock) this.contextBox.appendChild(capturedBlock);
                 this.contextBox.append(actions);
                 return;
+            } else if (page === 'caixa' || page === 'comissoes') {
+                title.textContent = page === 'caixa' ? 'Caixa' : 'Comissões';
+                info.textContent = 'Controle local do Helper. Os valores oficiais do E-Pass permanecem intactos.';
+                if (EH.Config.FINANCE_SHOW_CAIXA_SUMMARY) this.contextBox.append(title, info, this.financeMiniSummary());
+                else this.contextBox.append(title, info);
+                actions.append(
+                    this.contextButton('🔄 Atualizar dados', 'primary', () => EH.FinanceLedger.syncFromCurrentPage()),
+                    this.contextButton('📦 + Mercadoria', 'success', () => this.showMerchandiseModal()),
+                    this.contextButton('📊 Mais', '', () => this.showFinanceModal('resumo'))
+                );
+                this.contextBox.append(actions);
+                return;
             } else if (page === 'requisicao') {
                 title.textContent = 'Requisição';
                 info.textContent = 'Passageiros, mercados e códigos ficam disponíveis abaixo conforme a solicitação.';
@@ -9936,6 +10619,7 @@
             const isPassagens = page === 'passagens';
             const isPagamento = page === 'pagamento';
             const isRequisicao = page === 'requisicao';
+            const isFinanceiro = page === 'caixa' || page === 'comissoes';
 
             // O painel é contextual: a ação principal fica no cartão da etapa atual.
             // Os botões genéricos antigos permanecem no código apenas para compatibilidade,
@@ -9946,7 +10630,7 @@
 
             if (this.quickTitle) this.quickTitle.hidden = !isPesquisa;
             if (this.quickRoutes) this.quickRoutes.hidden = !isPesquisa;
-            if (this.flowSection) this.flowSection.hidden = isRequisicao;
+            if (this.flowSection) this.flowSection.hidden = isRequisicao || isFinanceiro;
 
             this.buttons.horarios.hidden = true;
             this.buttons.reserva.hidden = true;
@@ -9967,7 +10651,7 @@
             const secondary = [this.buttons.resumo, this.buttons.detalhes, this.buttons.rotas, this.buttons.historico];
             if (this.moreTools) this.moreTools.hidden = !secondary.some(button => button && !button.hidden);
 
-            const activeContext = isPesquisa || isReserva || isConfirmacao || isPassagens || isPagamento || isRequisicao;
+            const activeContext = isPesquisa || isReserva || isConfirmacao || isPassagens || isPagamento || isRequisicao || isFinanceiro;
             this.statusDot.classList.toggle('active', activeContext);
             this.statusText.textContent = isPesquisa
                 ? 'Horários'
@@ -9981,7 +10665,9 @@
                                 ? 'Bilhetes'
                                 : isRequisicao
                                     ? 'Requisição'
-                                    : 'Aguardando etapa';
+                                    : isFinanceiro
+                                        ? (page === 'caixa' ? 'Caixa' : 'Comissões')
+                                        : 'Aguardando etapa';
 
             this.renderSaleSummary(page);
             this.renderAutomation(page);
@@ -11130,6 +11816,7 @@
                 whatsapp: makePane('whatsapp', 'WhatsApp', 'Visualização do painel integrado e mensagens automáticas do atendimento.'),
                 zoom: makePane('zoom', 'Tela e Zoom', 'Escala dos overlays e posição vertical. Nenhum zoom é aplicado ao E-Pass.'),
                 valores: makePane('valores', 'Valores e Captura', 'Taxas existentes e qualidade das imagens geradas pelo Helper.'),
+                financeiro: makePane('financeiro', 'Financeiro', 'Comissão e comportamento do controle local de Caixa e Comissões.'),
                 avancado: makePane('avancado', 'Avançado', 'Diagnóstico e opções técnicas que normalmente não precisam ser alteradas.')
             };
 
@@ -11281,6 +11968,22 @@
             captureCard.appendChild(captureGrid);
             sections.valores.pane.appendChild(captureCard);
 
+            // FINANCEIRO
+            const financeCard = card('Caixa e Comissões');
+            const financeGrid = grid();
+            financeGrid.append(
+                numberField('financePercent', 'Comissão padrão (%)', EH.Config.FINANCE_COMMISSION_PERCENT, { min: 0, max: 100, step: 0.1, hint: 'Usada somente quando o E-Pass não informar uma comissão real.' })
+            );
+            financeCard.append(
+                financeGrid,
+                checkField('financeAutoRegister', 'Registrar vendas automaticamente ao abrir Caixa/Comissões', EH.Config.FINANCE_AUTO_REGISTER),
+                checkField('financeShowSummary', 'Mostrar resumo financeiro no contexto do Caixa', EH.Config.FINANCE_SHOW_CAIXA_SUMMARY),
+                checkField('financeAskCompany', 'Perguntar empresa ao cadastrar mercadoria', EH.Config.FINANCE_ASK_COMPANY_MERCH),
+                checkField('financeConfirmDelete', 'Confirmar antes de excluir lançamento manual', EH.Config.FINANCE_CONFIRM_DELETE),
+                note('O controle financeiro é local e auxiliar. Nada nesta aba altera Entradas, Saídas, Saldo, Sangria, Fechamento ou Comissão oficial do E-Pass.')
+            );
+            sections.financeiro.pane.appendChild(financeCard);
+
             // AVANÇADO
             const advancedCard = card('Diagnóstico');
             const debugWrap = checkField('debug', 'Ativar logs de depuração no console', EH.Config.DEBUG, 'Use apenas quando precisar investigar algum problema.');
@@ -11390,6 +12093,11 @@
                 fields.msgReserva.value = d.MESSAGES.reserva;
                 fields.msgResumo.value = d.MESSAGES.resumo;
                 fields.msgBilhete.value = d.MESSAGES.bilhete;
+                fields.financePercent.value = String(d.FINANCE_COMMISSION_PERCENT);
+                fields.financeAutoRegister.checked = Boolean(d.FINANCE_AUTO_REGISTER);
+                fields.financeShowSummary.checked = Boolean(d.FINANCE_SHOW_CAIXA_SUMMARY);
+                fields.financeAskCompany.checked = Boolean(d.FINANCE_ASK_COMPANY_MERCH);
+                fields.financeConfirmDelete.checked = Boolean(d.FINANCE_CONFIRM_DELETE);
                 fields.debug.checked = Boolean(d.DEBUG);
                 Object.entries(presetButtons).forEach(([name, button]) => button.classList.toggle('active', name === 'padrao'));
                 EH.Toast.info('Padrões carregados. Clique em “Salvar configurações” para aplicar.');
@@ -11457,6 +12165,11 @@
                 EH.Config.AUTO_COPY_IMAGES = fields.autoCopy.checked;
                 EH.Config.APLICAR_TAXAS_ORIGEM = fields.autoFees.checked;
                 EH.Config.TAXAS_ORIGEM = taxas;
+                EH.Config.FINANCE_COMMISSION_PERCENT = clamp(fields.financePercent.value, 0, 100, 10);
+                EH.Config.FINANCE_AUTO_REGISTER = fields.financeAutoRegister.checked;
+                EH.Config.FINANCE_SHOW_CAIXA_SUMMARY = fields.financeShowSummary.checked;
+                EH.Config.FINANCE_ASK_COMPANY_MERCH = fields.financeAskCompany.checked;
+                EH.Config.FINANCE_CONFIRM_DELETE = fields.financeConfirmDelete.checked;
                 EH.Config.DEBUG = fields.debug.checked;
                 EH.Config.WHATSAPP_MODE = 'web';
 
@@ -11490,6 +12203,11 @@
                     taxaIpora: taxas.IPORA,
                     aplicarTaxaIpora: fields.autoFees.checked,
                     whatsappMode: 'web',
+                    financeCommissionPercent: EH.Config.FINANCE_COMMISSION_PERCENT,
+                    financeAutoRegister: EH.Config.FINANCE_AUTO_REGISTER,
+                    financeShowCaixaSummary: EH.Config.FINANCE_SHOW_CAIXA_SUMMARY,
+                    financeAskCompanyMerch: EH.Config.FINANCE_ASK_COMPANY_MERCH,
+                    financeConfirmDelete: EH.Config.FINANCE_CONFIRM_DELETE,
                     debug: fields.debug.checked
                 };
                 Object.entries(settingsToSave).forEach(([key, value]) => EH.Storage.set(key, value));
