@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.58.0
+// @version      5.59.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -34,10 +34,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.58.0',
+        VERSION: '5.59.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 5,
+        STORAGE_SCHEMA_VERSION: 6,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -235,7 +235,11 @@
         debug(...args) {
             if (EH.Config.DEBUG) console.debug('[EPass Helper]', ...args);
         },
+        trace(scope, ...args) {
+            if (EH.Config.DEBUG) console.debug(`[EH][${String(scope || 'Diagnóstico')}]`, ...args);
+        },
         info(...args) {
+            // Log normal permanece enxuto: somente mensagens de ciclo de vida realmente úteis.
             console.info('[EPass Helper]', ...args);
         },
         warn(...args) {
@@ -281,14 +285,18 @@
         loadSettings() {
             const taxasPadrao = { ...EH.Config.TAXAS_ORIGEM };
             const taxasSalvas = this.get('taxasOrigem', null);
-            const taxaIporaLegada = Number(this.get('taxaIpora', taxasPadrao.IPORA)) || 0;
+            const taxaIporaLegada = EH.Utils.parseMoney(this.get('taxaIpora', taxasPadrao.IPORA));
             if (taxasSalvas && typeof taxasSalvas === 'object') {
-                EH.Config.TAXAS_ORIGEM = { ...taxasPadrao, ...taxasSalvas };
+                EH.Config.TAXAS_ORIGEM = Object.fromEntries(
+                    Object.entries({ ...taxasPadrao, ...taxasSalvas })
+                        .map(([key, value]) => [key, Math.max(0, EH.Utils.parseMoney(value))])
+                );
             } else {
-                EH.Config.TAXAS_ORIGEM = { ...taxasPadrao, IPORA: taxaIporaLegada };
+                EH.Config.TAXAS_ORIGEM = { ...taxasPadrao, IPORA: Math.max(0, taxaIporaLegada) };
             }
-            EH.Config.APLICAR_TAXAS_ORIGEM = Boolean(
-                this.get('aplicarTaxasOrigem', this.get('aplicarTaxaIpora', EH.Config.APLICAR_TAXAS_ORIGEM))
+            EH.Config.APLICAR_TAXAS_ORIGEM = EH.Utils.parseBoolean(
+                this.get('aplicarTaxasOrigem', this.get('aplicarTaxaIpora', EH.Config.APLICAR_TAXAS_ORIGEM)),
+                EH.Config.APLICAR_TAXAS_ORIGEM
             );
             EH.Config.CAPTURE_SCALE = Number(
                 this.get('captureScale', EH.Config.CAPTURE_SCALE)
@@ -300,8 +308,8 @@
             if (savedMessages && typeof savedMessages === 'object') {
                 EH.Config.MESSAGES = { ...EH.Config.MESSAGES, ...savedMessages };
             }
-            EH.Config.AUTO_COPY_IMAGES = Boolean(this.get('autoCopyImages', EH.Config.AUTO_COPY_IMAGES));
-            EH.Config.AUTO_ROUTE_CAPTURE = Boolean(this.get('autoRouteCapture', EH.Config.AUTO_ROUTE_CAPTURE));
+            EH.Config.AUTO_COPY_IMAGES = EH.Utils.parseBoolean(this.get('autoCopyImages', EH.Config.AUTO_COPY_IMAGES), EH.Config.AUTO_COPY_IMAGES);
+            EH.Config.AUTO_ROUTE_CAPTURE = EH.Utils.parseBoolean(this.get('autoRouteCapture', EH.Config.AUTO_ROUTE_CAPTURE), EH.Config.AUTO_ROUTE_CAPTURE);
             // Esta versão usa somente o WhatsApp integrado/Web para evitar fluxos duplicados.
             EH.Config.WHATSAPP_MODE = 'web';
             EH.Config.PANEL_ZOOM = Math.min(2, Math.max(0.75, Number(this.get('panelZoom', EH.Config.PANEL_ZOOM)) || 1.5));
@@ -326,24 +334,30 @@
             EH.Config.PANEL_RADIUS = Math.min(22, Math.max(8, Number(this.get('panelRadius', EH.Config.PANEL_RADIUS)) || 15));
             const shadow = String(this.get('shadowLevel', EH.Config.SHADOW_LEVEL) || 'normal');
             EH.Config.SHADOW_LEVEL = ['none', 'suave', 'normal'].includes(shadow) ? shadow : 'normal';
-            EH.Config.FINANCE_COMMISSION_PERCENT = Math.min(100, Math.max(0, Number(this.get('financeCommissionPercent', EH.Config.FINANCE_COMMISSION_PERCENT)) || 10));
-            EH.Config.FINANCE_AUTO_REGISTER = Boolean(this.get('financeAutoRegister', EH.Config.FINANCE_AUTO_REGISTER));
-            EH.Config.FINANCE_SHOW_CAIXA_SUMMARY = Boolean(this.get('financeShowCaixaSummary', EH.Config.FINANCE_SHOW_CAIXA_SUMMARY));
-            EH.Config.FINANCE_ASK_COMPANY_MERCH = Boolean(this.get('financeAskCompanyMerch', EH.Config.FINANCE_ASK_COMPANY_MERCH));
-            EH.Config.FINANCE_CONFIRM_DELETE = Boolean(this.get('financeConfirmDelete', EH.Config.FINANCE_CONFIRM_DELETE));
+            {
+                const value = EH.Utils.parseFiniteNumber(this.get('financeCommissionPercent', EH.Config.FINANCE_COMMISSION_PERCENT), EH.Config.FINANCE_COMMISSION_PERCENT);
+                EH.Config.FINANCE_COMMISSION_PERCENT = Math.min(100, Math.max(0, value));
+            }
+            EH.Config.FINANCE_AUTO_REGISTER = EH.Utils.parseBoolean(this.get('financeAutoRegister', EH.Config.FINANCE_AUTO_REGISTER), EH.Config.FINANCE_AUTO_REGISTER);
+            EH.Config.FINANCE_SHOW_CAIXA_SUMMARY = EH.Utils.parseBoolean(this.get('financeShowCaixaSummary', EH.Config.FINANCE_SHOW_CAIXA_SUMMARY), EH.Config.FINANCE_SHOW_CAIXA_SUMMARY);
+            EH.Config.FINANCE_ASK_COMPANY_MERCH = EH.Utils.parseBoolean(this.get('financeAskCompanyMerch', EH.Config.FINANCE_ASK_COMPANY_MERCH), EH.Config.FINANCE_ASK_COMPANY_MERCH);
+            EH.Config.FINANCE_CONFIRM_DELETE = EH.Utils.parseBoolean(this.get('financeConfirmDelete', EH.Config.FINANCE_CONFIRM_DELETE), EH.Config.FINANCE_CONFIRM_DELETE);
 
             // Operação / Carros — horário/nome são configuração; Serviço é dado detectado do dia.
-            EH.Config.OPERATION_CARS_ENABLED = Boolean(this.get('operationCarsEnabled', EH.Config.OPERATION_CARS_ENABLED));
+            EH.Config.OPERATION_CARS_ENABLED = EH.Utils.parseBoolean(this.get('operationCarsEnabled', EH.Config.OPERATION_CARS_ENABLED), EH.Config.OPERATION_CARS_ENABLED);
             EH.Config.OPERATION_AGENCY_CODE = String(this.get('operationAgencyCode', EH.Config.OPERATION_AGENCY_CODE) || '287').replace(/\D/g, '') || '287';
-            EH.Config.OPERATION_SORT_BY_SEAT = Boolean(this.get('operationSortBySeat', EH.Config.OPERATION_SORT_BY_SEAT));
-            EH.Config.OPERATION_DOCK_ENABLED = Boolean(this.get('operationDockEnabled', EH.Config.OPERATION_DOCK_ENABLED));
-            EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = Math.min(90, Math.max(0, Number(this.get('operationTimeToleranceMinutes', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES)) || 20));
-            EH.Config.REMINDER_CREATE_AFTER_TICKET = Boolean(this.get('reminderCreateAfterTicket', EH.Config.REMINDER_CREATE_AFTER_TICKET));
-            EH.Config.REMINDER_ASK_AFTER_TICKET = Boolean(this.get('reminderAskAfterTicket', EH.Config.REMINDER_ASK_AFTER_TICKET));
-            EH.Config.REMINDER_MASK_CPF = Boolean(this.get('reminderMaskCpf', EH.Config.REMINDER_MASK_CPF));
-            EH.Config.REMINDER_HIGHLIGHT_TODAY = Boolean(this.get('reminderHighlightToday', EH.Config.REMINDER_HIGHLIGHT_TODAY));
+            EH.Config.OPERATION_SORT_BY_SEAT = EH.Utils.parseBoolean(this.get('operationSortBySeat', EH.Config.OPERATION_SORT_BY_SEAT), EH.Config.OPERATION_SORT_BY_SEAT);
+            EH.Config.OPERATION_DOCK_ENABLED = EH.Utils.parseBoolean(this.get('operationDockEnabled', EH.Config.OPERATION_DOCK_ENABLED), EH.Config.OPERATION_DOCK_ENABLED);
+            {
+                const value = EH.Utils.parseFiniteNumber(this.get('operationTimeToleranceMinutes', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES), EH.Config.OPERATION_TIME_TOLERANCE_MINUTES);
+                EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = Math.min(90, Math.max(0, value));
+            }
+            EH.Config.REMINDER_CREATE_AFTER_TICKET = EH.Utils.parseBoolean(this.get('reminderCreateAfterTicket', EH.Config.REMINDER_CREATE_AFTER_TICKET), EH.Config.REMINDER_CREATE_AFTER_TICKET);
+            EH.Config.REMINDER_ASK_AFTER_TICKET = EH.Utils.parseBoolean(this.get('reminderAskAfterTicket', EH.Config.REMINDER_ASK_AFTER_TICKET), EH.Config.REMINDER_ASK_AFTER_TICKET);
+            EH.Config.REMINDER_MASK_CPF = EH.Utils.parseBoolean(this.get('reminderMaskCpf', EH.Config.REMINDER_MASK_CPF), EH.Config.REMINDER_MASK_CPF);
+            EH.Config.REMINDER_HIGHLIGHT_TODAY = EH.Utils.parseBoolean(this.get('reminderHighlightToday', EH.Config.REMINDER_HIGHLIGHT_TODAY), EH.Config.REMINDER_HIGHLIGHT_TODAY);
             EH.Config.SYNC_PROVIDER = String(this.get('syncProvider', EH.Config.SYNC_PROVIDER) || 'none');
-            EH.Config.SYNC_ENABLED = Boolean(this.get('syncEnabled', EH.Config.SYNC_ENABLED));
+            EH.Config.SYNC_ENABLED = EH.Utils.parseBoolean(this.get('syncEnabled', EH.Config.SYNC_ENABLED), EH.Config.SYNC_ENABLED);
             EH.Config.SYNC_SUPABASE_URL = String(this.get('syncSupabaseUrl', EH.Config.SYNC_SUPABASE_URL) || '').trim();
             EH.Config.SYNC_SUPABASE_KEY = String(this.get('syncSupabaseKey', EH.Config.SYNC_SUPABASE_KEY) || '').trim();
             EH.Config.SYNC_SUPABASE_EMAIL = String(this.get('syncSupabaseEmail', EH.Config.SYNC_SUPABASE_EMAIL) || '').trim();
@@ -363,7 +377,9 @@
                         id: uniqueId,
                         name: name || `Carro ${index + 1}`,
                         operationalTime: /^\d{1,2}:\d{2}$/.test(time) ? time.padStart(5, '0') : '',
-                        active: item?.active !== undefined ? Boolean(item.active) : (fallback.active !== undefined ? Boolean(fallback.active) : true),
+                        active: item?.active !== undefined
+                            ? EH.Utils.parseBoolean(item.active, true)
+                            : (fallback.active !== undefined ? EH.Utils.parseBoolean(fallback.active, true) : true),
                         originHint: EH.Utils.clean(item?.originHint || fallback.originHint || ''),
                         destinationHint: EH.Utils.clean(item?.destinationHint || fallback.destinationHint || ''),
                         companyHint: EH.Utils.clean(item?.companyHint || fallback.companyHint || ''),
@@ -373,13 +389,13 @@
                 if (normalized.length) EH.Config.OPERATION_ROUTINES = normalized;
             }
 
-            EH.Config.DEBUG = Boolean(this.get('debug', EH.Config.DEBUG));
+            EH.Config.DEBUG = EH.Utils.parseBoolean(this.get('debug', EH.Config.DEBUG), EH.Config.DEBUG);
         }
     };
 
 
     // ============================================================
-    // VERSIONAMENTO DOS DADOS — v5.58
+    // VERSIONAMENTO DOS DADOS — v5.59
     // O namespace de dados é estável e NÃO depende da versão do script.
     // Migrações são sempre não destrutivas.
     // ============================================================
@@ -409,7 +425,8 @@
                 const shortKey = String(fullKey).slice(prefix.length);
                 if (!includeEphemeral && skip.some(part => shortKey.includes(part))) return;
                 if (shortKey.startsWith(this.BACKUP_PREFIX)) return;
-                try { values[shortKey] = GM_getValue(fullKey); } catch (error) {}
+                try { values[shortKey] = GM_getValue(fullKey); }
+                catch (error) { EH.Logger.debug('Backup: não foi possível ler', shortKey, error); }
             });
             return {
                 schemaVersion: this.CURRENT_VERSION,
@@ -437,8 +454,8 @@
                 next[panelKey] = {
                     ...current,
                     handleY: Number.isFinite(Number(current.handleY)) ? Number(current.handleY) : [30, 55, 80][index],
-                    allowDrag: current.allowDrag !== undefined ? Boolean(current.allowDrag) : true,
-                    allowResize: current.allowResize !== undefined ? Boolean(current.allowResize) : true
+                    allowDrag: current.allowDrag !== undefined ? EH.Utils.parseBoolean(current.allowDrag, true) : true,
+                    allowResize: current.allowResize !== undefined ? EH.Utils.parseBoolean(current.allowResize, true) : true
                 };
             });
             EH.Storage.set(key, next);
@@ -471,7 +488,7 @@
             if (Array.isArray(EH.Storage.get('operationRoutines', null)) && EH.Storage.get('operationRoutines', []).length) return;
             const old = EH.Storage.get('operationServices', []);
             const source = Array.isArray(old) ? old : [];
-            const preferred = source.filter(item => Boolean(item?.attends) || String(item?.operationalTime || '') === '21:30');
+            const preferred = source.filter(item => EH.Utils.parseBoolean(item?.attends, false) || String(item?.operationalTime || '') === '21:30');
             const defaults = JSON.parse(JSON.stringify(EH.ConfigDefaults?.OPERATION_ROUTINES || []));
             const parseName = value => {
                 const parts = String(value || '').split(/\s*[→>-]\s*/).map(v => EH.Utils.clean(v)).filter(Boolean);
@@ -492,7 +509,43 @@
                 };
             });
             EH.Storage.set('operationRoutines', migrated);
-            EH.Storage.set('operationTimeToleranceMinutes', Number(EH.Config.OPERATION_TIME_TOLERANCE_MINUTES || 20));
+            EH.Storage.set('operationTimeToleranceMinutes', EH.Utils.parseFiniteNumber(EH.Config.OPERATION_TIME_TOLERANCE_MINUTES, 20));
+        },
+
+        migrateSettingsTypes() {
+            const taxes = EH.Storage.get('taxasOrigem', null);
+            if (taxes && typeof taxes === 'object' && !Array.isArray(taxes)) {
+                const normalized = {};
+                Object.entries(taxes).forEach(([key, value]) => {
+                    normalized[key] = Math.max(0, EH.Utils.parseMoney(value));
+                });
+                EH.Storage.set('taxasOrigem', normalized);
+            }
+            const legacyFee = EH.Storage.get('taxaIpora', undefined);
+            if (legacyFee !== undefined) EH.Storage.set('taxaIpora', Math.max(0, EH.Utils.parseMoney(legacyFee)));
+
+            [
+                ['aplicarTaxasOrigem', true], ['aplicarTaxaIpora', true],
+                ['autoCopyImages', true], ['autoRouteCapture', true],
+                ['financeAutoRegister', true], ['financeShowCaixaSummary', true],
+                ['financeAskCompanyMerch', true], ['financeConfirmDelete', true],
+                ['operationCarsEnabled', true], ['operationSortBySeat', true],
+                ['operationDockEnabled', true], ['reminderCreateAfterTicket', true],
+                ['reminderAskAfterTicket', true], ['reminderMaskCpf', true],
+                ['reminderHighlightToday', true], ['syncEnabled', false], ['debug', false]
+            ].forEach(([key, fallback]) => {
+                const raw = EH.Storage.get(key, undefined);
+                if (raw !== undefined) EH.Storage.set(key, EH.Utils.parseBoolean(raw, fallback));
+            });
+
+            const commission = EH.Storage.get('financeCommissionPercent', undefined);
+            if (commission !== undefined) {
+                EH.Storage.set('financeCommissionPercent', Math.min(100, Math.max(0, EH.Utils.parseFiniteNumber(commission, 10))));
+            }
+            const tolerance = EH.Storage.get('operationTimeToleranceMinutes', undefined);
+            if (tolerance !== undefined) {
+                EH.Storage.set('operationTimeToleranceMinutes', Math.min(90, Math.max(0, EH.Utils.parseFiniteNumber(tolerance, 20))));
+            }
         },
 
         migrate() {
@@ -505,6 +558,7 @@
             this.migratePanels();
             this.migrateReminders();
             this.migrateOperationRoutines();
+            this.migrateSettingsTypes();
 
             const next = {
                 schemaVersion: this.CURRENT_VERSION,
@@ -618,7 +672,8 @@
         off(key) {
             const item = this.listeners.get(key);
             if (!item) return;
-            try { item.target.removeEventListener(item.type, item.handler, item.options); } catch (error) {}
+            try { item.target.removeEventListener(item.type, item.handler, item.options); }
+            catch (error) { EH.Logger.debug('Listener não pôde ser removido:', key, error); }
             this.listeners.delete(key);
         },
 
@@ -659,6 +714,31 @@
     };
 
     // ============================================================
+    // NAVEGAÇÃO ANGULAR
+    // Garante atualização de contexto também em pushState/replaceState.
+    // ============================================================
+    EH.Navigation = {
+        started: false,
+        EVENT: 'epass-helper-routechange',
+        start() {
+            if (this.started || EH.WhatsAppBridge?.isWhatsAppHost?.()) return;
+            this.started = true;
+            ['pushState', 'replaceState'].forEach(method => {
+                const original = history[method];
+                if (typeof original !== 'function' || original.__ehWrapped) return;
+                const wrapped = function (...args) {
+                    const result = original.apply(this, args);
+                    try { window.dispatchEvent(new Event(EH.Navigation.EVENT)); }
+                    catch (error) { EH.Logger.debug('Não foi possível sinalizar navegação Angular:', error); }
+                    return result;
+                };
+                wrapped.__ehWrapped = true;
+                history[method] = wrapped;
+            });
+        }
+    };
+
+    // ============================================================
     // ESTADO GLOBAL DA INTERFACE
     // Um único estado decide expansão/recolhimento dos dois painéis.
     // ============================================================
@@ -671,8 +751,8 @@
 
         load() {
             if (this.loaded) return this.panels;
-            this.panels.leftOpen = !Boolean(EH.Storage.get('collapsed', true));
-            this.panels.rightOpen = !Boolean(EH.Storage.get('waDockCollapsed', false));
+            this.panels.leftOpen = !EH.Utils.parseBoolean(EH.Storage.get('collapsed', true), true);
+            this.panels.rightOpen = !EH.Utils.parseBoolean(EH.Storage.get('waDockCollapsed', false), false);
             this.loaded = true;
             return this.panels;
         },
@@ -853,35 +933,39 @@
             let changed = false;
             const observerTarget = oldTable?.parentElement || document.querySelector('app-pesquisa') || document.body;
             const localObserver = new MutationObserver(() => { changed = true; });
-            try { localObserver.observe(observerTarget, { childList: true, subtree: true, characterData: true }); } catch (error) {}
+            try { localObserver.observe(observerTarget, { childList: true, subtree: true, characterData: true }); }
+            catch (error) { EH.Logger.debug('Observer local da pesquisa não pôde ser iniciado:', error); }
 
-            const button = this.findSearchButton();
-            if (!button) throw new Error('Não encontrei o botão Pesquisar da consulta.');
-            EH.Toast.info('Rota preenchida. Pesquisando horários…');
-            button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+            try {
+                const button = this.findSearchButton();
+                if (!button) throw new Error('Não encontrei o botão Pesquisar da consulta.');
+                EH.Toast.info('Rota preenchida. Pesquisando horários…');
+                button.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
 
-            const startedAt = Date.now();
-            const table = await EH.Utils.waitFor(() => {
-                const current = EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
-                if (!current) return null;
-                const rows = current.querySelectorAll('tbody tr');
-                if (!rows.length) return null;
-                const fp = EH.Utils.clean(current.innerText).slice(0, 1400);
-                const elapsed = Date.now() - startedAt;
-                if (!oldFingerprint || fp !== oldFingerprint || changed || elapsed > 2600) return current;
-                return null;
-            }, 14000, 180);
-            localObserver.disconnect();
-            if (!table || !table.querySelectorAll('tbody tr').length) {
-                throw new Error('A pesquisa foi feita, mas não encontrei horários para capturar.');
+                const startedAt = Date.now();
+                const table = await EH.Utils.waitFor(() => {
+                    const current = EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
+                    if (!current) return null;
+                    const rows = current.querySelectorAll('tbody tr');
+                    if (!rows.length) return null;
+                    const fp = EH.Utils.clean(current.innerText).slice(0, 1400);
+                    const elapsed = Date.now() - startedAt;
+                    if (!oldFingerprint || fp !== oldFingerprint || changed || elapsed > 2600) return current;
+                    return null;
+                }, 14000, 180);
+                if (!table || !table.querySelectorAll('tbody tr').length) {
+                    throw new Error('A pesquisa foi feita, mas não encontrei horários para capturar.');
+                }
+                EH.Workflow?.setStage('horarios');
+                await EH.Utils.sleep(220);
+                if (!autoCapture) {
+                    EH.Toast.success('Horários pesquisados.');
+                    return { table };
+                }
+                return EH.UI.captureAction('pesquisa', { automatic: true, showPreview: 'ifFailed' });
+            } finally {
+                localObserver.disconnect();
             }
-            EH.Workflow?.setStage('horarios');
-            await EH.Utils.sleep(220);
-            if (!autoCapture) {
-                EH.Toast.success('Horários pesquisados.');
-                return { table };
-            }
-            return EH.UI.captureAction('pesquisa', { automatic: true, showPreview: 'ifFailed' });
         },
 
         async apply(route, options = {}) {
@@ -1012,7 +1096,7 @@
                 if (!nome) continue;
                 const nomeNormalizado = this.normalize(nome);
                 if (normalized.includes(nomeNormalizado)) {
-                    return { nome, valor: Number(valor) || 0 };
+                    return { nome, valor: Math.max(0, this.parseMoney(valor)) };
                 }
             }
             return { nome: '', valor: 0 };
@@ -1049,36 +1133,65 @@
             const minutes = Number(match[1]) * 60 + Number(match[2]);
             return minutes < EH.Config.SORT_DAY_START_MINUTES ? minutes + 1440 : minutes;
         },
-        parseMoney(text) {
-            let raw = String(text || '')
+        parseBoolean(value, fallback = false) {
+            if (typeof value === 'boolean') return value;
+            if (typeof value === 'number') return Number.isFinite(value) ? value !== 0 : Boolean(fallback);
+            if (value === null || value === undefined || value === '') return Boolean(fallback);
+            const normalized = this.normalize(value);
+            if (['TRUE', '1', 'SIM', 'YES', 'ON', 'ATIVO'].includes(normalized)) return true;
+            if (['FALSE', '0', 'NAO', 'NÃO', 'NO', 'OFF', 'INATIVO'].includes(normalized)) return false;
+            return Boolean(fallback);
+        },
+        parseMoneyStrict(text) {
+            if (typeof text === 'number') return Number.isFinite(text) ? text : null;
+            let raw = String(text ?? '')
+                .trim()
                 .replace(/\s/g, '')
                 .replace(/R\$/gi, '')
                 .replace(/[^\d,.-]/g, '');
 
-            if (!raw) return 0;
+            if (!raw || !/[\d]/.test(raw)) return null;
 
             const negative = raw.startsWith('-');
             raw = raw.replace(/-/g, '');
 
-            let normalized;
+            let normalized = raw;
             if (raw.includes(',')) {
+                // Formato brasileiro: 1.234,56 / 106,00
                 normalized = raw.replace(/\./g, '').replace(',', '.');
             } else {
-                const parts = raw.split('.');
-                if (parts.length > 2) {
-                    const decimal = parts.pop();
-                    normalized = parts.join('') + '.' + decimal;
-                } else {
-                    normalized = raw;
+                const dots = (raw.match(/\./g) || []).length;
+                if (dots > 1) {
+                    // Ex.: 1.234.567.89 -> último grupo de 2 dígitos é decimal;
+                    // caso contrário, pontos são separadores de milhar.
+                    const parts = raw.split('.');
+                    const tail = parts[parts.length - 1];
+                    normalized = tail.length === 2
+                        ? `${parts.slice(0, -1).join('')}.${tail}`
+                        : parts.join('');
+                } else if (dots === 1) {
+                    const [head, tail] = raw.split('.');
+                    // 106.00 = decimal; 1.234 = milhar.
+                    normalized = tail.length === 3 && head.length <= 3 ? `${head}${tail}` : raw;
                 }
             }
 
             const number = Number.parseFloat(normalized);
-            if (!Number.isFinite(number)) return 0;
+            if (!Number.isFinite(number)) return null;
             return negative ? -number : number;
         },
+        parseMoney(text) {
+            const value = this.parseMoneyStrict(text);
+            return value === null ? 0 : value;
+        },
+        parseFiniteNumber(value, fallback = 0) {
+            if (typeof value === 'number') return Number.isFinite(value) ? value : Number(fallback) || 0;
+            const parsed = this.parseMoneyStrict(value);
+            return parsed === null ? (Number.isFinite(Number(fallback)) ? Number(fallback) : 0) : parsed;
+        },
         formatMoney(value) {
-            const number = Number(value) || 0;
+            const parsed = typeof value === 'number' ? value : this.parseMoneyStrict(value);
+            const number = Number.isFinite(parsed) ? parsed : 0;
             return number.toLocaleString('pt-BR', {
                 style: 'currency',
                 currency: 'BRL',
@@ -1184,10 +1297,14 @@
             await Promise.all(images.map(image => {
                 if (image.complete) return Promise.resolve();
                 return new Promise(resolve => {
-                    const finish = () => resolve();
+                    let safetyTimer = null;
+                    const finish = () => {
+                        if (safetyTimer !== null) clearTimeout(safetyTimer);
+                        resolve();
+                    };
                     image.addEventListener('load', finish, { once: true });
                     image.addEventListener('error', finish, { once: true });
-                    setTimeout(finish, 4000);
+                    safetyTimer = setTimeout(finish, 4000);
                 });
             }));
         },
@@ -1212,6 +1329,60 @@
                 clearTimeout(timer);
                 timer = setTimeout(() => fn(...args), wait);
             };
+        }
+    };
+
+    // ============================================================
+    // VALORES / TARIFAS — FONTE ÚNICA PARA HORÁRIOS
+    // Mantém valor-base, taxa e valor final separados.
+    // ============================================================
+    EH.Fares = {
+        round(value) {
+            const number = Number(value);
+            return Number.isFinite(number) ? Math.round((number + Number.EPSILON) * 100) / 100 : 0;
+        },
+
+        calculate(baseValue, origem, { applyFee = EH.Config.APLICAR_TAXAS_ORIGEM } = {}) {
+            const parsedBase = EH.Utils.parseMoneyStrict(baseValue);
+            if (parsedBase === null || parsedBase < 0) {
+                return {
+                    success: false,
+                    error: 'Valor base inválido.',
+                    valorBaseNum: 0,
+                    taxaEmbarqueNum: 0,
+                    valorFinalNum: 0,
+                    taxaOrigem: ''
+                };
+            }
+            const feeInfo = applyFee ? EH.Utils.getTaxaOrigem(origem) : { nome: '', valor: 0 };
+            const taxa = Math.max(0, EH.Utils.parseMoney(feeInfo?.valor));
+            const base = this.round(parsedBase);
+            const final = this.round(base + taxa);
+            return {
+                success: true,
+                error: '',
+                valorBaseNum: base,
+                taxaEmbarqueNum: taxa,
+                valorFinalNum: final,
+                taxaOrigem: taxa > 0 ? EH.Utils.clean(feeInfo?.nome || '') : '',
+                valorBase: base > 0 ? EH.Utils.formatMoney(base) : '',
+                taxaEmbarque: taxa > 0 ? EH.Utils.formatMoney(taxa) : '',
+                valorFinal: final > 0 ? EH.Utils.formatMoney(final) : ''
+            };
+        },
+
+        finalNumber(item) {
+            const candidates = [item?.valorFinalNum, item?.precoNum, item?.valorBaseNum];
+            for (const value of candidates) {
+                const number = Number(value);
+                if (Number.isFinite(number) && number > 0) return this.round(number);
+            }
+            return 0;
+        },
+
+        display(item, fallback = '') {
+            const number = this.finalNumber(item);
+            return number > 0 ? EH.Utils.formatMoney(number) : fallback;
         }
     };
 
@@ -1754,7 +1925,8 @@
             let input = Array.from(document.querySelectorAll('input[type="file"]')).find(el => /image|video/i.test(el.accept || '')) || null;
             if (!input) {
                 const attach = document.querySelector('[data-icon="plus-rounded"], [data-icon="attach-menu-plus"], button[aria-label*="Anexar" i], button[title*="Anexar" i], button[aria-label*="Attach" i]');
-                try { (attach?.closest('button') || attach)?.click(); } catch (error) {}
+                try { (attach?.closest('button') || attach)?.click(); }
+                catch (error) { EH.Logger.debug('WhatsApp: botão de anexo não pôde ser acionado:', error); }
                 input = await EH.Utils.waitFor(() => Array.from(document.querySelectorAll('input[type="file"]')).find(el => /image|video/i.test(el.accept || '')) || null, 3500, 180);
             }
             if (!input || typeof DataTransfer === 'undefined') return false;
@@ -2636,10 +2808,10 @@
                 width: Math.min(limits.maxW, Math.max(limits.minW, Number(value.width) || fallback.width)),
                 height: Math.min(limits.maxH, Math.max(limits.minH, Number(value.height) || fallback.height)),
                 zoom: Math.min(150, Math.max(75, Number(value.zoom) || fallback.zoom)),
-                dynamic: value.dynamic !== undefined ? Boolean(value.dynamic) : Boolean(fallback.dynamic),
-                handleY: Math.min(90, Math.max(10, Number(value.handleY) || fallback.handleY || 50)),
-                allowDrag: value.allowDrag !== undefined ? Boolean(value.allowDrag) : Boolean(fallback.allowDrag),
-                allowResize: value.allowResize !== undefined ? Boolean(value.allowResize) : Boolean(fallback.allowResize)
+                dynamic: value.dynamic !== undefined ? EH.Utils.parseBoolean(value.dynamic, fallback.dynamic) : EH.Utils.parseBoolean(fallback.dynamic, false),
+                handleY: (() => { const n = Number(value.handleY); const base = Number.isFinite(n) ? n : Number(fallback.handleY); return Math.min(90, Math.max(10, Number.isFinite(base) ? base : 50)); })(),
+                allowDrag: value.allowDrag !== undefined ? EH.Utils.parseBoolean(value.allowDrag, fallback.allowDrag) : EH.Utils.parseBoolean(fallback.allowDrag, true),
+                allowResize: value.allowResize !== undefined ? EH.Utils.parseBoolean(value.allowResize, fallback.allowResize) : EH.Utils.parseBoolean(fallback.allowResize, true)
             };
         },
 
@@ -2725,14 +2897,14 @@
 
         resolvedHandleY(key, cfg = this.get(key)) {
             const side = this.fixedSide(key, cfg);
-            let y = Math.min(90, Math.max(10, Number(cfg?.handleY) || 50));
+            { const n = Number(cfg?.handleY); var y = Math.min(90, Math.max(10, Number.isFinite(n) ? n : 50)); }
             const all = this.load();
             const occupied = [];
             ['main','whatsapp','operation'].forEach(otherKey => {
                 if (otherKey === key) return;
                 const other = all[otherKey];
                 if (this.fixedSide(otherKey, other) !== side) return;
-                occupied.push(Number(other?.handleY) || 50);
+                { const n = Number(other?.handleY); occupied.push(Math.min(90, Math.max(10, Number.isFinite(n) ? n : 50))); }
             });
             occupied.sort((a,b) => a-b);
             for (let i = 0; i < 8; i++) {
@@ -2988,7 +3160,8 @@
                     cfg: { ...cfg },
                     started: false
                 };
-                try { header.setPointerCapture?.(event.pointerId); } catch (error) {}
+                try { header.setPointerCapture?.(event.pointerId); }
+                catch (error) { EH.Logger.debug('Painel: pointer capture indisponível no início do arraste:', error); }
             });
 
             header.addEventListener('pointermove', event => {
@@ -3036,7 +3209,8 @@
                 if (!drag || drag.key !== key) return;
                 this.drag = null;
                 document.documentElement.classList.remove('eh-panel-dragging');
-                try { header.releasePointerCapture?.(event.pointerId); } catch (error) {}
+                try { header.releasePointerCapture?.(event.pointerId); }
+                catch (error) { EH.Logger.debug('Painel: pointer capture já estava liberado:', error); }
                 if (!drag.started) return; // clique normal: ZERO alterações.
 
                 const el = this.element(key);
@@ -3092,7 +3266,8 @@
                     handle.dataset.ehHandleDraggedAt = String(Date.now());
                 }
                 this.handleDrag = null;
-                try { handle.releasePointerCapture?.(event.pointerId); } catch (error) {}
+                try { handle.releasePointerCapture?.(event.pointerId); }
+                catch (error) { EH.Logger.debug('Seta lateral: pointer capture já estava liberado:', error); }
             };
             handle.addEventListener('pointerup', finish);
             handle.addEventListener('pointercancel', finish);
@@ -3130,7 +3305,8 @@
                     cfg: { ...cfg },
                     started: false
                 };
-                try { grip.setPointerCapture?.(event.pointerId); } catch (error) {}
+                try { grip.setPointerCapture?.(event.pointerId); }
+                catch (error) { EH.Logger.debug('Resize: pointer capture indisponível:', error); }
                 event.stopPropagation();
             });
 
@@ -3175,7 +3351,8 @@
                 if (!resize || resize.key !== key) return;
                 this.resize = null;
                 document.documentElement.classList.remove('eh-panel-resizing');
-                try { grip.releasePointerCapture?.(event.pointerId); } catch (error) {}
+                try { grip.releasePointerCapture?.(event.pointerId); }
+                catch (error) { EH.Logger.debug('Resize: pointer capture já estava liberado:', error); }
                 if (!resize.started) return;
 
                 const el = this.element(key);
@@ -4924,13 +5101,20 @@
                 this.current = page;
                 EH.Logger.debug('Página detectada:', page);
             }
-            EH.SaleCpfs?.captureFromDom?.();
-            EH.RequisitionManager?.scanDom?.();
-            EH.UI.updateState(page);
-            EH.OperationCars?.onPageUpdate?.(page);
-            EH.Reminders?.onPageUpdate?.(page);
-            EH.WhatsAppDock?.renderOrganizer?.(page);
-            EH.PanelManager?.bindAll?.();
+            const safe = (scope, callback) => {
+                try { return callback(); }
+                catch (error) {
+                    EH.Logger.error(`[${scope}] atualização isolada falhou:`, error);
+                    return null;
+                }
+            };
+            safe('Contexto de vendas', () => EH.SaleCpfs?.captureFromDom?.());
+            safe('Requisições', () => EH.RequisitionManager?.scanDom?.());
+            safe('Atendimento', () => EH.UI?.updateState?.(page));
+            safe('Mapa dos carros', () => EH.OperationCars?.onPageUpdate?.(page));
+            safe('Lembretes', () => EH.Reminders?.onPageUpdate?.(page));
+            safe('WhatsApp', () => EH.WhatsAppDock?.renderOrganizer?.(page));
+            safe('Painéis', () => EH.PanelManager?.bindAll?.());
             if ((page === 'caixa' || page === 'comissoes') && EH.Config.FINANCE_AUTO_REGISTER) {
                 const now = Date.now();
                 if (!this.lastFinanceSyncAt || (now - this.lastFinanceSyncAt) > 1800) {
@@ -5294,7 +5478,7 @@
             const key = this.normalizeCompany(company);
             const specific = Number(map[key]);
             if (Number.isFinite(specific) && specific >= 0) return specific;
-            return Number(EH.Config.FINANCE_COMMISSION_PERCENT) || 10;
+            return Math.max(0, EH.Utils.parseFiniteNumber(EH.Config.FINANCE_COMMISSION_PERCENT, 10));
         },
 
         estimateCommission(value, company) {
@@ -5306,6 +5490,16 @@
                 return this.money(record.commissionEpass);
             }
             return this.money(record?.commissionEstimated || 0);
+        },
+
+        effectiveMovement(record) {
+            const base = this.money(record?.originalValue || 0);
+            // Quando Caixa e Comissões representam a mesma venda, o E-Pass pode
+            // usar uma base comissionável menor que o total efetivamente cobrado
+            // (ex.: taxa de embarque). O ajuste é guardado separadamente para não
+            // adulterar `originalValue`, mas entra uma única vez no movimento.
+            const caixaAdjustment = this.money(record?.caixaAdjustment || 0);
+            return this.money(base + caixaAdjustment);
         },
 
         isCountableMovement(record) {
@@ -5365,6 +5559,8 @@
                 identifier: '',
                 saleId: '',
                 originalValue: original,
+                caixaValue: null,
+                caixaAdjustment: 0,
                 commissionPercent: original ? this.money((commission / original) * 100) : this.commissionPercentFor(company),
                 commissionEpass: commission,
                 commissionEstimated: original ? this.estimateCommission(original, company) : 0,
@@ -5401,6 +5597,8 @@
                 identifier: sale.saleId || '',
                 saleId: sale.saleId || '',
                 originalValue: value,
+                caixaValue: value,
+                caixaAdjustment: 0,
                 commissionPercent: this.commissionPercentFor(company),
                 commissionEpass: null,
                 commissionEstimated: this.estimateCommission(value, company),
@@ -5432,38 +5630,89 @@
                 if (record.source === 'epass_caixa') {
                     delete record.mergedInto;
                     record.shadowedByCommission = false;
+                    delete record.linkedCommissionKeys;
+                }
+                if (record.source === 'epass_comissoes') {
+                    delete record.linkedToSaleSource;
+                    delete record.mergedIntoSaleSource;
+                    delete record.saleId;
+                    delete record.identifier;
+                    delete record.passenger;
+                    delete record.companyCode;
+                    record.caixaValue = null;
+                    record.caixaAdjustment = 0;
+                    delete record.reconciliationMode;
                 }
             });
             const sales = list.filter(record => record.source === 'epass_caixa' && record.status === 'VENDA' && !record.deleted);
             const commissions = list.filter(record => record.source === 'epass_comissoes' && record.category === 'PASSAGEM' && record.status === 'VENDA' && !record.deleted);
-            commissions.forEach(record => { delete record.linkedToSaleSource; });
 
             sales.forEach(sale => {
                 const saleTime = Number(sale.timestamp || 0);
+                const saleValue = this.money(sale.originalValue || sale.caixaValue || 0);
+                if (!(saleValue > 0)) return;
                 const candidates = commissions
                     .filter(item => !item.linkedToSaleSource && item.company === sale.company && Math.abs(Number(item.timestamp || 0) - saleTime) <= 5000)
                     .sort((a, b) => Math.abs(Number(a.timestamp || 0) - saleTime) - Math.abs(Number(b.timestamp || 0) - saleTime));
                 if (!candidates.length) return;
 
+                // 1) Preferência máxima: soma exata da base comissionável = total do Caixa.
                 let sum = 0;
-                const chosen = [];
+                let chosen = [];
                 for (const item of candidates) {
-                    if (sum + Number(item.originalValue || 0) > Number(sale.originalValue || 0) + 0.02) continue;
+                    const value = this.money(item.originalValue || 0);
+                    if (!(value > 0)) continue;
+                    if (sum + value > saleValue + 0.02) continue;
                     chosen.push(item);
-                    sum += Number(item.originalValue || 0);
-                    if (Math.abs(sum - Number(sale.originalValue || 0)) <= 0.02) break;
+                    sum = this.money(sum + value);
+                    if (Math.abs(sum - saleValue) <= 0.02) break;
                 }
-                if (!chosen.length || Math.abs(sum - Number(sale.originalValue || 0)) > 0.02) return;
+                let reconciliationMode = 'exact';
+                let adjustment = 0;
+
+                // 2) Caso real do E-Pass: Caixa pode conter taxa que não faz parte
+                // da base de comissão. Só aceitamos essa conciliação quando TODOS
+                // os eventos muito próximos (<=2,5 s) cabem no total e a diferença
+                // positiva é pequena. Isso evita esconder vendas apenas por horário.
+                if (!chosen.length || Math.abs(sum - saleValue) > 0.02) {
+                    const veryClose = candidates.filter(item =>
+                        Math.abs(Number(item.timestamp || 0) - saleTime) <= 2500
+                        && this.money(item.originalValue || 0) > 0
+                    );
+                    const closeSum = this.money(veryClose.reduce((acc, item) => acc + this.money(item.originalValue || 0), 0));
+                    const gap = this.money(saleValue - closeSum);
+                    const maxGap = this.money(Math.min(15, Math.max(0.50, saleValue * 0.12)));
+                    if (veryClose.length && closeSum > 0 && gap > 0.02 && gap <= maxGap) {
+                        chosen = veryClose;
+                        sum = closeSum;
+                        adjustment = gap;
+                        reconciliationMode = 'caixa-vs-base-comissionavel';
+                    } else {
+                        return;
+                    }
+                }
 
                 sale.shadowedByCommission = true;
+                sale.caixaValue = saleValue;
                 sale.commissionEpass = this.money(chosen.reduce((acc, item) => acc + this.effectiveCommission(item), 0));
-                sale.commissionPercent = sale.originalValue ? this.money((sale.commissionEpass / sale.originalValue) * 100) : sale.commissionPercent;
+                // Percentual real continua calculado sobre a BASE comissionável,
+                // nunca sobre a taxa adicional do Caixa.
+                const commissionBase = this.money(chosen.reduce((acc, item) => acc + this.money(item.originalValue || 0), 0));
+                sale.commissionPercent = commissionBase > 0 ? this.money((sale.commissionEpass / commissionBase) * 100) : sale.commissionPercent;
                 sale.linkedCommissionKeys = chosen.map(item => item.sourceKey);
-                chosen.forEach(item => {
+                sale.reconciliationMode = reconciliationMode;
+                sale.caixaAdjustment = adjustment;
+
+                chosen.forEach((item, index) => {
                     item.saleId = sale.saleId || item.saleId;
                     item.identifier = sale.saleId || item.identifier;
                     item.passenger = item.passenger || sale.passenger;
                     item.companyCode = item.companyCode || sale.companyCode;
+                    item.caixaValue = saleValue;
+                    // A diferença Caixa - base é aplicada UMA ÚNICA VEZ ao primeiro
+                    // evento; os demais continuam com sua base individual intacta.
+                    item.caixaAdjustment = index === 0 ? adjustment : 0;
+                    item.reconciliationMode = reconciliationMode;
                     item.mergedIntoSaleSource = sale.sourceKey;
                     item.linkedToSaleSource = sale.sourceKey;
                 });
@@ -5609,7 +5858,7 @@
                 byCompany: {}
             };
             valid.forEach(record => {
-                const movement = this.isCountableMovement(record) ? this.money(record.originalValue) : 0;
+                const movement = this.isCountableMovement(record) ? this.effectiveMovement(record) : 0;
                 const commission = this.isCommissionEffect(record) ? this.effectiveCommission(record) : 0;
                 if (movement || commission) result.operations += 1;
                 if (record.category === 'PASSAGEM' && this.isCountableMovement(record)) {
@@ -5766,7 +6015,12 @@
             const origemElement = EH.Utils.first(EH.Selectors.ORIGEM);
             const destinoElement = EH.Utils.first(EH.Selectors.DESTINO);
             const dateElement = EH.Utils.first(EH.Selectors.DATA);
-            const table = EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
+            const candidateTables = Array.from(document.querySelectorAll('app-pesquisa-venda table, app-pesquisa table, table.table-hover, table.table-striped'));
+            const tableByHeaders = candidateTables.find(item => {
+                const headers = Array.from(item.querySelectorAll('thead th')).map(th => EH.Utils.normalize(th.textContent));
+                return headers.some(h => h.includes('HORARIO DE SAIDA')) && headers.includes('LINHA') && headers.includes('VALOR');
+            });
+            const table = tableByHeaders || EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
 
             const dados = {
                 origem: EH.Utils.text(origemElement),
@@ -5779,30 +6033,57 @@
 
             const groups = new Map();
             const rows = EH.Utils.all(EH.Selectors.TABLE_ROWS, table);
+            const headers = Array.from(table.querySelectorAll('thead th')).map(th => EH.Utils.normalize(th.textContent));
+            const headerIndex = (...patterns) => headers.findIndex(header => patterns.some(pattern => pattern instanceof RegExp ? pattern.test(header) : header === pattern));
+            const indexes = {
+                servico: headerIndex('SERVICO'),
+                saida: headerIndex(/HORARIO DE SAIDA/),
+                linha: headerIndex('LINHA'),
+                chegada: headerIndex(/HORARIO DE CHEGADA/),
+                valor: headerIndex('VALOR')
+            };
+            const cellAt = (row, index, fallbackSelector) => {
+                if (index >= 0) return Array.from(row.children || []).filter(el => el.tagName === 'TD')[index] || null;
+                return fallbackSelector ? row.querySelector(fallbackSelector) : null;
+            };
 
             rows.forEach(row => {
-                const saida = EH.Utils.extractTime(EH.Utils.text(row.querySelector(EH.Selectors.CELULA_SAIDA)));
-                const chegada = EH.Utils.extractTime(EH.Utils.text(row.querySelector(EH.Selectors.CELULA_CHEGADA)));
-                const badge = EH.Utils.text(row.querySelector(EH.Selectors.CELULA_LINHA_BADGE));
-                const lineCell = EH.Utils.text(row.querySelector(EH.Selectors.CELULA_LINHA));
-                const linha = EH.Utils.mapLine(badge || lineCell);
-                const valueCell = row.querySelector(EH.Selectors.CELULA_VALOR);
+                const serviceCell = cellAt(row, indexes.servico, 'td:first-child');
+                const saidaCell = cellAt(row, indexes.saida, EH.Selectors.CELULA_SAIDA);
+                const lineElement = cellAt(row, indexes.linha, EH.Selectors.CELULA_LINHA);
+                const chegadaCell = cellAt(row, indexes.chegada, EH.Selectors.CELULA_CHEGADA);
+                const valueCell = cellAt(row, indexes.valor, EH.Selectors.CELULA_VALOR);
+                const servico = EH.Utils.clean(EH.Utils.text(serviceCell)).match(/\d+/)?.[0] || '';
+                const saida = EH.Utils.extractTime(EH.Utils.text(saidaCell));
+                const chegada = EH.Utils.extractTime(EH.Utils.text(chegadaCell));
+                const badge = EH.Utils.text(lineElement?.querySelector?.('.badge'));
+                const lineCell = EH.Utils.text(lineElement);
+                const empresa = EH.Utils.mapLine(badge || '');
+                const linhaReal = badge && EH.Utils.normalize(lineCell).startsWith(EH.Utils.normalize(badge))
+                    ? EH.Utils.clean(lineCell.slice(badge.length))
+                    : EH.Utils.clean(lineCell);
+                // Compatibilidade: `linha` sempre foi o nome comercial exibido ao cliente.
+                // A linha técnica real fica preservada separadamente em `linhaReal`.
+                const linha = empresa || EH.Utils.mapLine(lineCell);
                 const valueText = EH.Utils.text(valueCell);
-                let precoNum = EH.Utils.parseMoney(valueText);
-                let taxaAplicada = 0;
-                let taxaOrigem = '';
+                const valorBaseNum = EH.Utils.parseMoneyStrict(valueText);
+                const fare = valorBaseNum === null
+                    ? { success:false, valorBaseNum:0, taxaEmbarqueNum:0, valorFinalNum:0, taxaOrigem:'', valorBase:'', taxaEmbarque:'', valorFinal:'' }
+                    : EH.Fares.calculate(valorBaseNum, dados.origem);
+                const precoNum = fare.valorFinalNum;
+                const preco = fare.valorFinal;
+                const taxaAplicada = fare.taxaEmbarqueNum;
+                const taxaOrigem = fare.taxaOrigem;
 
-                if (precoNum > 0 && EH.Config.APLICAR_TAXAS_ORIGEM) {
-                    const taxaConfig = EH.Utils.getTaxaOrigem(dados.origem);
-                    if (taxaConfig.valor > 0) {
-                        taxaAplicada = taxaConfig.valor;
-                        taxaOrigem = taxaConfig.nome;
-                        precoNum += taxaAplicada;
-                    }
+                if (EH.Config.DEBUG && valorBaseNum !== null) {
+                    EH.Logger.trace('Valores',
+                        `origem=${dados.origem || '—'}`,
+                        `base=${fare.valorBaseNum.toFixed(2)}`,
+                        `taxa=${fare.taxaEmbarqueNum.toFixed(2)}`,
+                        `final=${fare.valorFinalNum.toFixed(2)}`
+                    );
                 }
-
-                const preco = precoNum > 0 ? EH.Utils.formatMoney(precoNum) : '';
-                const typeElement = row.querySelector(EH.Selectors.CELULA_TIPO);
+                const typeElement = valueCell?.querySelector?.('small') || row.querySelector(EH.Selectors.CELULA_TIPO);
                 const typeRaw = EH.Utils.extractVehicleType(EH.Utils.text(typeElement), valueText);
                 const typeNormalized = EH.Utils.normalize(typeRaw);
                 let tipo = typeRaw;
@@ -5822,6 +6103,17 @@
                         saida,
                         chegada,
                         linha,
+                        empresa,
+                        linhaReal,
+                        servicos: servico ? [servico] : [],
+                        // Campos novos são a fonte de verdade; aliases preco/precoNum
+                        // permanecem para compatibilidade com módulos antigos.
+                        valorBaseNum: fare.valorBaseNum,
+                        taxaEmbarqueNum: fare.taxaEmbarqueNum,
+                        valorFinalNum: fare.valorFinalNum,
+                        valorBase: fare.valorBase,
+                        taxaEmbarque: fare.taxaEmbarque,
+                        valorFinal: fare.valorFinal,
                         preco,
                         precoNum,
                         taxaAplicada,
@@ -5832,6 +6124,9 @@
                 }
 
                 const item = groups.get(key);
+                if (servico && !item.servicos.includes(servico)) item.servicos.push(servico);
+                if (!item.linhaReal && linhaReal) item.linhaReal = linhaReal;
+                if (!item.empresa && empresa) item.empresa = empresa;
                 if (andar) item.andares.push(andar);
                 if (!item.tipo && tipo) item.tipo = tipo;
             });
@@ -5849,6 +6144,11 @@
 
             dados.horarios.sort((a, b) => {
                 return EH.Utils.timeToMinutes(a.saida) - EH.Utils.timeToMinutes(b.saida);
+            });
+            EH.Logger.trace('Horarios', `${dados.horarios.length} horário(s) normalizado(s)`, {
+                origem: dados.origem,
+                destino: dados.destino,
+                taxaAtiva: EH.Config.APLICAR_TAXAS_ORIGEM
             });
 
             return dados;
@@ -5989,17 +6289,17 @@
                 return lines.join('\n').trim();
             }
 
-            const prices = horarios.map(item => Math.round((Number(item.precoNum) || 0) * 100));
+            const prices = horarios.map(item => Math.round(EH.Fares.finalNumber(item) * 100));
             const validPrices = prices.filter(value => value > 0);
             const samePrice = validPrices.length === horarios.length && new Set(validPrices).size === 1;
 
             if (samePrice) {
                 const times = EH.Utils.unique(horarios.map(item => item.saida).filter(Boolean));
                 lines.push(`🕐 ${times.join(' | ')}`);
-                lines.push(`💰 ${horarios[0].preco || EH.Utils.formatMoney(validPrices[0] / 100)}`);
+                lines.push(`💰 ${EH.Fares.display(horarios[0], EH.Utils.formatMoney(validPrices[0] / 100))}`);
             } else {
                 horarios.forEach(item => {
-                    const value = item.preco || (item.precoNum > 0 ? EH.Utils.formatMoney(item.precoNum) : 'Consulte o valor');
+                    const value = EH.Fares.display(item, 'Consulte o valor');
                     lines.push(`🕐 ${item.saida} — ${value}`);
                 });
             }
@@ -6031,7 +6331,8 @@
                 lines.push(`${number} ${timeParts.join(' | ')}`.trim());
                 if (item.linha) lines.push(`🚌 ${item.linha}`);
                 if (item.tipo) lines.push(`💺 ${item.tipo}`);
-                if (item.preco) lines.push(`💰 ${item.preco}`);
+                const finalPrice = EH.Fares.display(item, '');
+                if (finalPrice) lines.push(`💰 ${finalPrice}`);
             });
 
             return lines.join('\n');
@@ -7715,7 +8016,9 @@
             try {
                 sessionStorage.removeItem(this.KEY);
                 sessionStorage.removeItem(this.LEGACY_KEY);
-            } catch (error) {}
+            } catch (error) {
+                EH.Logger.debug('Não foi possível limpar o contexto temporário da venda:', error);
+            }
             EH.Tickets?.clearSelection?.();
             EH.Tickets?.clearStoredCaptures?.({ quiet: true });
             EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
@@ -8383,7 +8686,9 @@
             try {
                 if (!value) sessionStorage.removeItem(this.ACTIVE_KEY);
                 else sessionStorage.setItem(this.ACTIVE_KEY, JSON.stringify({ ...value, updatedAt: Date.now() }));
-            } catch (error) {}
+            } catch (error) {
+                EH.Logger.debug('Não foi possível atualizar a emissão temporária da requisição:', error);
+            }
         },
 
         getActiveEmission() {
@@ -9370,7 +9675,7 @@
                     typeLines: typeLinesRaw,
                     saida: item.saida || '—',
                     chegada: item.chegada || '—',
-                    preco: item.preco || 'Consultar'
+                    preco: EH.Fares.display(item, 'Consultar')
                 };
             });
 
@@ -9914,7 +10219,7 @@
                 const price = document.createElement('td');
                 const priceValue = document.createElement('span');
                 priceValue.className = 'eh-price-value';
-                priceValue.textContent = item.preco || 'Consultar';
+                priceValue.textContent = EH.Fares.display(item, 'Consultar');
                 price.appendChild(priceValue);
 
                 row.append(company, departure, arrival, price);
@@ -10412,6 +10717,27 @@
     // DIAGNÓSTICO
     // ============================================================
     EH.Diagnostics = {
+        runSelfCheck() {
+            const checks = [];
+            const add = (name, ok, detail = '') => checks.push({ name, ok: Boolean(ok), detail: EH.Utils.clean(detail || '') });
+            const sample = EH.Fares.calculate(96.17, 'IPORA - GO', { applyFee: false });
+            add('Config carregada', Boolean(EH.Config && EH.Config.VERSION), `v${EH.Config.VERSION}`);
+            add('Parser monetário BR', Math.abs(EH.Utils.parseMoney('R$ 1.234,56') - 1234.56) < 0.001, String(EH.Utils.parseMoney('R$ 1.234,56')));
+            add('Parser decimal com vírgula', Math.abs(EH.Utils.parseMoney('6,69') - 6.69) < 0.001, String(EH.Utils.parseMoney('6,69')));
+            add('Cálculo de tarifa', sample.success && Math.abs(sample.valorFinalNum - 96.17) < 0.001, String(sample.valorFinalNum));
+            add('Storage', typeof GM_getValue === 'function' && typeof GM_setValue === 'function');
+            add('Runtime listeners', Boolean(EH.Runtime?.listeners instanceof Map), String(EH.Runtime?.listeners?.size || 0));
+            add('Observer único', Boolean(EH.Observer && ('observer' in EH.Observer)), EH.Observer?.observer ? 'ativo' : 'aguardando');
+            add('WhatsApp Bridge', Boolean(EH.WhatsAppBridge?.makeCommand && EH.WhatsAppBridge?.send));
+            add('Financeiro', Boolean(EH.FinanceLedger?.summary && EH.FinanceReader?.snapshot));
+            add('Mapa 287', Boolean(EH.OperationCars?.agencySummary && EH.OperationCars?.readVehicleMap));
+            return {
+                success: checks.every(item => item.ok),
+                checks,
+                failed: checks.filter(item => !item.ok).map(item => item.name)
+            };
+        },
+
         report() {
             const table = EH.Utils.first(EH.Selectors.TABLE_HORARIOS);
             const map = EH.Utils.first(EH.Selectors.MAPA_POLTRONAS);
@@ -10478,6 +10804,7 @@
                     listeners: EH.Runtime?.listeners?.size || 0,
                     intervals: EH.Runtime?.intervals?.size || 0,
                     timeouts: EH.Runtime?.timeouts?.size || 0,
+                    selfCheck: this.runSelfCheck(),
                     observerActive: Boolean(EH.Observer?.observer)
                 }
             };
@@ -11528,7 +11855,7 @@
         root:null, body:null, host:null, launcher:null, collapsed:false,
         init(){
             if(this.root || !EH.Config.OPERATION_DOCK_ENABLED || !document.body)return;
-            this.collapsed=Boolean(EH.Storage.get('operationDockCollapsed',false));
+            this.collapsed=EH.Utils.parseBoolean(EH.Storage.get('operationDockCollapsed',false), false);
             const root=document.createElement('aside'); root.id='eh-operation-dock'; root.classList.toggle('eh-operation-dock-collapsed',this.collapsed);
             const head=document.createElement('div'); head.className='eh-operation-dock-head';
             const brand=document.createElement('div'); brand.className='eh-operation-dock-brand'; brand.innerHTML='<span>OPERAÇÃO</span><strong>🚌 Carros</strong>';
@@ -11568,6 +11895,11 @@
         visibleScheduleRecords: [],
         rowButtonsBound: new WeakSet(),
         mapButtons: new Map(),
+        lastScheduleTable: null,
+        lastScheduleFingerprint: '',
+        lastMapModal: null,
+        lastMapDomFingerprint: '',
+        lastMapDomRecords: [],
 
         normalize(value) {
             return EH.Utils.normalize(value || '');
@@ -11713,7 +12045,7 @@
                         id,
                         name: name || `Carro ${index+1}`,
                         operationalTime: /^\d{1,2}:\d{2}$/.test(time) ? time.padStart(5, '0') : '',
-                        active: item?.active !== undefined ? Boolean(item.active) : true,
+                        active: item?.active !== undefined ? EH.Utils.parseBoolean(item.active, true) : true,
                         originHint: EH.Utils.clean(item?.originHint || ''),
                         destinationHint: EH.Utils.clean(item?.destinationHint || ''),
                         companyHint: EH.Utils.clean(item?.companyHint || ''),
@@ -11725,7 +12057,7 @@
         },
 
         routeMatchScore(record, routine) {
-            const tolerance = Math.max(0, Number(EH.Config.OPERATION_TIME_TOLERANCE_MINUTES) || 20);
+            const tolerance = Math.max(0, EH.Utils.parseFiniteNumber(EH.Config.OPERATION_TIME_TOLERANCE_MINUTES, 20));
             const diff = this.timeDistance(record?.time || record?.departure || '', routine?.operationalTime || '');
             if (!Number.isFinite(diff) || diff > tolerance) return null;
 
@@ -11838,8 +12170,9 @@
             if (record?.resultKey) this.mapButtons.set(String(record.resultKey), button);
             if (this.rowButtonsBound.has(button)) return;
             this.rowButtonsBound.add(button);
+            // pointerdown registra o serviço ANTES do clique original do Angular abrir o mapa.
+            // Não duplicar a mesma seleção também no click.
             button.addEventListener('pointerdown', () => this.selectCar(record, { quiet:true }), true);
-            button.addEventListener('click', () => this.selectCar(record, { quiet:true }), true);
         },
 
         openScheduleMap(record) {
@@ -11862,6 +12195,8 @@
             });
             if (!table) {
                 this.visibleScheduleRecords = [];
+                this.lastScheduleTable = null;
+                this.lastScheduleFingerprint = '';
                 return [];
             }
 
@@ -11873,6 +12208,17 @@
                 arrival: headers.findIndex(h => h.includes('HORARIO DE CHEGADA'))
             };
             const context = this.searchContext();
+            const tableFingerprint = [
+                context.origin, context.destination, context.date,
+                EH.Utils.clean(table.textContent || '').slice(0, 12000)
+            ].join('|');
+            if (this.lastScheduleTable === table
+                && this.lastScheduleFingerprint === tableFingerprint
+                && this.visibleScheduleRecords.length) {
+                return this.visibleScheduleRecords;
+            }
+            this.lastScheduleTable = table;
+            this.lastScheduleFingerprint = tableFingerprint;
             const now = Date.now();
             this.mapButtons.clear();
 
@@ -12223,10 +12569,23 @@
 
         readVehicleMap() {
             const modal=EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
-            if(!modal)return[];
+            if(!modal){
+                this.lastMapModal=null;
+                this.lastMapDomFingerprint='';
+                this.lastMapDomRecords=[];
+                return[];
+            }
+            const fingerprint=EH.Utils.clean(modal.textContent||'').slice(0,40000);
+            if(this.lastMapModal===modal&&this.lastMapDomFingerprint===fingerprint&&this.lastMapDomRecords.length){
+                return this.lastMapDomRecords;
+            }
             const sections=this.findMapSections(modal);
             const schedules=this.assignSchedulesToSections(sections);
-            return sections.map((section,index)=>this.buildRecord(section,schedules[index]||null)).filter(record=>record.date&&record.service);
+            const records=sections.map((section,index)=>this.buildRecord(section,schedules[index]||null)).filter(record=>record.date&&record.service);
+            this.lastMapModal=modal;
+            this.lastMapDomFingerprint=fingerprint;
+            this.lastMapDomRecords=records;
+            return records;
         },
 
         parseCurrentMap() {
@@ -12668,6 +13027,7 @@
         reminderBox: null,
         buttons: {},
         busy: false,
+        pixSendPendingId: '',
 
         init() {
             if (document.querySelector('#eh-root')) return;
@@ -12872,6 +13232,8 @@
                     } else if (this.lastWaCommandPurpose === 'pix') {
                         if (ack.ok) EH.Toast.success('✅ PIX enviado em duas mensagens.');
                         else EH.Toast.error('Não foi possível enviar o PIX pelo WhatsApp integrado.');
+                        if (this.pixSendPendingId === ack.id) this.pixSendPendingId = '';
+                        EH.Runtime.clearTimeout('pix-send-guard');
                     }
                     this.lastWaCommandPurpose = '';
                     this.refreshWhatsAppConnection();
@@ -12965,6 +13327,10 @@
         },
 
         sendPixPairToWhatsApp() {
+            if (this.pixSendPendingId) {
+                EH.Toast.info('O PIX atual já está sendo enviado. Aguarde a confirmação antes de clicar novamente.');
+                return null;
+            }
             // Captura novamente no EXATO momento do clique para nunca reutilizar PIX de uma venda anterior.
             const pix = EH.Payment.parsePix();
             const payload = EH.Payment.payload(pix);
@@ -12998,6 +13364,13 @@
             this.lastWaCommandId = command.id;
             this.lastWaCommandHasImage = false;
             this.lastWaCommandPurpose = 'pix';
+            this.pixSendPendingId = command.id;
+            EH.Runtime.timeout('pix-send-guard', () => {
+                if (this.pixSendPendingId === command.id) {
+                    this.pixSendPendingId = '';
+                    EH.Logger.trace('PIX', 'Proteção contra clique duplo liberada por timeout de segurança.');
+                }
+            }, 25000);
             EH.Toast.info('Enviando instrução e PIX em duas mensagens…');
             return command;
         },
@@ -14541,6 +14914,28 @@
                 fields[key] = input;
                 return field;
             };
+            const moneyField = (key, labelText, value, hint = '') => {
+                const field = document.createElement('div');
+                field.className = 'eh-field';
+                const label = document.createElement('label');
+                label.textContent = labelText;
+                const input = document.createElement('input');
+                input.type = 'text';
+                input.inputMode = 'decimal';
+                input.autocomplete = 'off';
+                input.placeholder = '0,00';
+                const parsed = EH.Utils.parseMoneyStrict(value);
+                input.value = parsed === null ? '' : EH.Fares.round(Math.max(0, parsed)).toFixed(2).replace('.', ',');
+                field.append(label, input);
+                if (hint) {
+                    const small = document.createElement('div');
+                    small.className = 'eh-settings-note';
+                    small.textContent = hint;
+                    field.appendChild(small);
+                }
+                fields[key] = input;
+                return field;
+            };
             const selectField = (key, labelText, value, options, hint = '') => {
                 const field = document.createElement('div');
                 field.className = 'eh-field';
@@ -14740,7 +15135,7 @@
             const restoreAllPanels=document.createElement('button'); restoreAllPanels.type='button'; restoreAllPanels.className='eh-modal-btn'; restoreAllPanels.textContent='Restaurar todos';
             panelControlActions.append(fitPanel,restorePanel,restoreAllPanels); controlCard.append(panelControlActions,note('Arraste somente pelo cabeçalho. Botões e campos não iniciam movimento. O modo Livre é salvo após soltar.'));
             sections.paineis.pane.appendChild(controlCard);
-            const capturePanelDraft=()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,zoom:Number(fields.managedZoom.value)||100,handleY:Number(fields.managedHandleY.value)||50,dynamic:fields.managedDynamic.checked,allowDrag:fields.managedAllowDrag.checked,allowResize:fields.managedAllowResize.checked}; };
+            const capturePanelDraft=()=>{ const key=fields.managedPanel.value; const rawHandleY=Number(fields.managedHandleY.value); panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,zoom:Number(fields.managedZoom.value)||100,handleY:Number.isFinite(rawHandleY)?Math.max(0,Math.min(100,rawHandleY)):50,dynamic:fields.managedDynamic.checked,allowDrag:fields.managedAllowDrag.checked,allowResize:fields.managedAllowResize.checked}; };
             const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedZoom.value=String(cfg.zoom); fields.managedHandleY.value=String(cfg.handleY); fields.managedDynamic.checked=Boolean(cfg.dynamic); fields.managedAllowDrag.checked=Boolean(cfg.allowDrag); fields.managedAllowResize.checked=Boolean(cfg.allowResize); };
             let previousManagedPanel='main'; fields.managedPanel.addEventListener('change',()=>{ const next=fields.managedPanel.value; fields.managedPanel.value=previousManagedPanel; capturePanelDraft(); fields.managedPanel.value=next; previousManagedPanel=next; loadPanelDraft(next); });
             ['managedMode','managedWidth','managedHeight','managedZoom','managedHandleY','managedDynamic','managedAllowDrag','managedAllowResize'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
@@ -14794,7 +15189,12 @@
             const feesCard = card('Taxas por origem');
             const feesGrid = grid();
             const createFee = (key, labelText) => {
-                const field = numberField(`fee_${key}`, labelText, Number(EH.Config.TAXAS_ORIGEM[key] || 0).toFixed(2), { min: 0, max: 9999, step: 0.01 });
+                const field = moneyField(
+                    `fee_${key}`,
+                    labelText,
+                    EH.Config.TAXAS_ORIGEM[key] || 0,
+                    'Aceita 6,69 ou 6.69. O valor é aplicado no próximo horário gerado, sem precisar atualizar a página.'
+                );
                 taxaFields[key] = fields[`fee_${key}`];
                 return field;
             };
@@ -14875,7 +15275,7 @@
                 const line=makeRoutineInput('Linha (opcional)',item.lineHint||'');
                 const company=makeRoutineInput('Empresa (opcional)',item.companyHint||'');
                 const activeWrap=document.createElement('label');activeWrap.className='eh-check';
-                const active=document.createElement('input');active.type='checkbox';active.checked=item.active!==undefined?Boolean(item.active):true;
+                const active=document.createElement('input');active.type='checkbox';active.checked=item.active!==undefined?EH.Utils.parseBoolean(item.active,true):true;
                 const activeText=document.createElement('span');activeText.textContent='Ativo';activeWrap.append(active,activeText);
                 const remove=document.createElement('button');remove.type='button';remove.className='eh-modal-btn eh-remove-routine';remove.textContent='Excluir';
                 const entry={row,time:time.input,name:name.input,origin:origin.input,destination:destination.input,line:line.input,company:company.input,active,id:String(item.id||`rotina-${Date.now()}-${index}`)};
@@ -15082,7 +15482,9 @@
                 fields.captureScale.value = String(d.CAPTURE_SCALE);
                 fields.ticketWidth.value = String(d.TICKET_CAPTURE_WIDTH);
                 fields.autoFees.checked = Boolean(d.APLICAR_TAXAS_ORIGEM);
-                Object.keys(taxaFields).forEach(key => { taxaFields[key].value = Number(d.TAXAS_ORIGEM[key] || 0).toFixed(2); });
+                Object.keys(taxaFields).forEach(key => {
+                    taxaFields[key].value = EH.Fares.round(Math.max(0, EH.Utils.parseMoney(d.TAXAS_ORIGEM[key] || 0))).toFixed(2).replace('.', ',');
+                });
                 fields.msgPesquisa.value = d.MESSAGES.pesquisa;
                 fields.msgReserva.value = d.MESSAGES.reserva;
                 fields.msgResumo.value = d.MESSAGES.resumo;
@@ -15108,7 +15510,7 @@
                 const defaultPanels = EH.PanelManager.defaults();
                 Object.keys(defaultPanels).forEach(key => panelDrafts[key] = { ...defaultPanels[key] });
                 loadPanelDraft(fields.managedPanel.value);
-                fields.operationTolerance.value = String(d.OPERATION_TIME_TOLERANCE_MINUTES || 20);
+                fields.operationTolerance.value = String(EH.Utils.parseFiniteNumber(d.OPERATION_TIME_TOLERANCE_MINUTES, 20));
                 rebuildRoutineRows(d.OPERATION_ROUTINES || []);
                 fields.debug.checked = Boolean(d.DEBUG);
                 Object.entries(presetButtons).forEach(([name, button]) => button.classList.toggle('active', name === 'padrao'));
@@ -15133,13 +15535,26 @@
                     if (!n) return 0;
                     return Math.min(max, Math.max(min, n));
                 };
-                const taxas = {
-                    IPORA: Math.max(0, Number(taxaFields.IPORA.value) || 0),
-                    GOIANIA: Math.max(0, Number(taxaFields.GOIANIA.value) || 0),
-                    'BARRA DO GARCAS': Math.max(0, Number(taxaFields['BARRA DO GARCAS'].value) || 0),
-                    ARAGARCAS: Math.max(0, Number(taxaFields.ARAGARCAS.value) || 0),
-                    'SAO LUIS DE MONTES BELOS': Math.max(0, Number(taxaFields['SAO LUIS DE MONTES BELOS'].value) || 0)
+                const parseFeeField = (input, label) => {
+                    const raw = String(input?.value ?? '').trim();
+                    if (!raw) return 0;
+                    const parsed = EH.Utils.parseMoneyStrict(raw);
+                    if (parsed === null || parsed < 0) throw new Error(`Taxa inválida em ${label}.`);
+                    return EH.Fares.round(parsed);
                 };
+                let taxas;
+                try {
+                    taxas = {
+                        IPORA: parseFeeField(taxaFields.IPORA, 'Iporá'),
+                        GOIANIA: parseFeeField(taxaFields.GOIANIA, 'Goiânia'),
+                        'BARRA DO GARCAS': parseFeeField(taxaFields['BARRA DO GARCAS'], 'Barra do Garças'),
+                        ARAGARCAS: parseFeeField(taxaFields.ARAGARCAS, 'Aragarças'),
+                        'SAO LUIS DE MONTES BELOS': parseFeeField(taxaFields['SAO LUIS DE MONTES BELOS'], 'São Luís de Montes Belos')
+                    };
+                } catch (error) {
+                    EH.Toast.error(error.message || 'Confira os valores das taxas de embarque.');
+                    return;
+                }
                 const values = {
                     preset: selectedPreset,
                     density: ['compacto', 'padrao', 'confortavel'].includes(fields.density.value) ? fields.density.value : 'padrao',
@@ -15348,6 +15763,7 @@
             this.observer.observe(target, { childList: true, subtree: true });
             EH.Runtime.on('app-popstate', window, 'popstate', update);
             EH.Runtime.on('app-hashchange', window, 'hashchange', update);
+            EH.Runtime.on('app-routechange', window, EH.Navigation.EVENT, update);
         }
     };
 
@@ -15371,21 +15787,33 @@
                 return;
             }
 
-            EH.Style.inject();
-            EH.Toast.init();
-            EH.UI.init();
-            EH.Reminders.init();
-            EH.Sync?.start?.();
-            EH.OperationDock.init();
-            EH.OperationCars.init();
-            EH.SaleCpfs.init();
-            EH.RequisitionManager.init();
-            EH.WhatsAppDock.init();
-            EH.Layout.sync();
-            EH.PanelManager.bindAll();
+            const safeInit = (scope, callback) => {
+                try {
+                    return callback();
+                } catch (error) {
+                    EH.Logger.error(`[${scope}] Falha isolada de inicialização:`, error);
+                    try { EH.Toast?.error?.(`${scope} indisponível. O restante do Helper continuará funcionando.`); }
+                    catch (_toastError) { EH.Logger.debug('Aviso visual de falha também ficou indisponível:', _toastError); }
+                    return null;
+                }
+            };
+
+            safeInit('Estilo', () => EH.Style.inject());
+            safeInit('Avisos', () => EH.Toast.init());
+            safeInit('Atendimento', () => EH.UI.init());
+            safeInit('Lembretes', () => EH.Reminders.init());
+            safeInit('Sincronização', () => EH.Sync?.start?.());
+            safeInit('Operação', () => EH.OperationDock.init());
+            safeInit('Mapa dos carros', () => EH.OperationCars.init());
+            safeInit('Contexto de vendas', () => EH.SaleCpfs.init());
+            safeInit('Requisições', () => EH.RequisitionManager.init());
+            safeInit('WhatsApp', () => EH.WhatsAppDock.init());
+            safeInit('Layout', () => EH.Layout.sync());
+            safeInit('Painéis', () => EH.PanelManager.bindAll());
             EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => { EH.Layout.sync(); EH.PanelManager.applyAll(); }, 140));
-            EH.Observer.start();
-            EH.Pages.update();
+            safeInit('Navegação', () => EH.Navigation.start());
+            safeInit('Observer', () => EH.Observer.start());
+            safeInit('Página atual', () => EH.Pages.update());
             EH.Runtime.timeout('pending-route', () => EH.Routes.applyPending(), 800);
             EH.Runtime.on('app-shortcuts', document, 'keydown', event => {
                 if (event.altKey && !event.ctrlKey && !event.shiftKey && String(event.key || '').toLowerCase() === 'a') {
@@ -15400,7 +15828,10 @@
             });
             EH.Runtime.on('app-pagehide', window, 'pagehide', () => EH.Layout.reset());
 
-            if (EH.Config.DEBUG) window.EPassHelper = EH;
+            if (EH.Config.DEBUG) {
+                window.EPassHelper = EH;
+                EH.Logger.trace('SelfCheck', EH.Diagnostics.runSelfCheck());
+            }
             EH.Logger.info(`EPass Helper ${EH.Config.VERSION} iniciado.`);
         }
     };
