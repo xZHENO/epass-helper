@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.60.0
+// @version      5.61.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -34,10 +34,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.60.0',
+        VERSION: '5.61.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 7,
+        STORAGE_SCHEMA_VERSION: 8,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -82,7 +82,7 @@
         SYNC_SUPABASE_URL: '',
         SYNC_SUPABASE_KEY: '',
         SYNC_SUPABASE_EMAIL: '',
-        SYNC_INTERVAL_MS: 60000,
+        SYNC_INTERVAL_MS: 30000,
         SYNC_REMINDERS: true,
         SYNC_REQUISITIONS: true,
         SYNC_EMISSION_DATA: true,
@@ -568,6 +568,9 @@
             this.migrateOperationRoutines();
             this.migrateSettingsTypes();
             EH.BoardingFeeManager?.migrateLegacy?.();
+            // v8: a memória persistente de emissões reaproveita a venda temporária
+            // sem apagar sessionStorage ou formatos antigos. A migração final acontece
+            // depois que todos os módulos já estiverem inicializados.
 
             const next = {
                 schemaVersion: this.CURRENT_VERSION,
@@ -4605,6 +4608,7 @@
                     text-transform:uppercase;
                 }
                 #eh-root .eh-sale-passenger-row {
+                #eh-root .eh-emission-row-actions{display:flex;gap:4px;align-items:center;flex-wrap:wrap} #eh-root .eh-emission-row-actions .eh-context-btn{width:auto;min-width:58px;padding:5px 7px} #eh-root .eh-emission-persistent{border-color:#cddcf0;background:#f8fbff} #eh-root .eh-emission-pending-summary{border-color:#cddcf0;background:#f8fbff}
                     display:grid;
                     grid-template-columns:minmax(0,1fr) 58px;
                     align-items:center;
@@ -5282,6 +5286,7 @@
             safe('Atendimento', () => EH.UI?.updateState?.(page));
             safe('Mapa dos carros', () => EH.OperationCars?.onPageUpdate?.(page));
             safe('Lembretes', () => EH.Reminders?.onPageUpdate?.(page));
+            safe('Memória de emissões', () => EH.EmissionMemory?.onPageUpdate?.(page));
             safe('Conferência de bilhetes', () => EH.TicketVerificationQueue?.onPageUpdate?.(page));
             safe('WhatsApp', () => EH.WhatsAppDock?.renderOrganizer?.(page));
             safe('Painéis', () => EH.PanelManager?.bindAll?.());
@@ -8090,6 +8095,11 @@
             } catch (error) {
                 EH.Logger.warn('Não foi possível salvar a venda atual.');
             }
+            // v5.61: a sessão visual continua temporária, mas cada passageiro passa
+            // imediatamente para a memória persistente. O envio remoto ocorre pelo
+            // SyncManager/Sync periódico, nunca a cada tecla digitada.
+            try { EH.EmissionMemory?.captureSale?.(next, { page: EH.Pages?.detect?.() || 'desconhecida' }); }
+            catch (error) { EH.Logger.debug('Memória persistente da emissão será atualizada no próximo ciclo:', error); }
             EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
             return next;
         },
@@ -8184,7 +8194,9 @@
         },
 
         clear() {
+            const saleBeforeClear = this.loadSale();
             try {
+                if (saleBeforeClear?.passengers?.length) EH.EmissionMemory?.finalizeSale?.(saleBeforeClear.id);
                 sessionStorage.removeItem(this.KEY);
                 sessionStorage.removeItem(this.LEGACY_KEY);
             } catch (error) {
@@ -8896,7 +8908,11 @@
         setActiveEmission(value) {
             try {
                 if (!value) sessionStorage.removeItem(this.ACTIVE_KEY);
-                else sessionStorage.setItem(this.ACTIVE_KEY, JSON.stringify({ ...value, updatedAt: Date.now() }));
+                else {
+                    const next = { ...value, updatedAt: Date.now() };
+                    sessionStorage.setItem(this.ACTIVE_KEY, JSON.stringify(next));
+                    EH.EmissionMemory?.attachRequestData?.(next);
+                }
             } catch (error) {
                 EH.Logger.debug('Não foi possível atualizar a emissão temporária da requisição:', error);
             }
@@ -11477,6 +11493,9 @@
         busy: false,
         applyingRemote: false,
         lastStatus: { state: 'local', pending: 0, message: 'Somente local' },
+        lastRemoteReceivedAt: 0,
+        lastServerConfirmedAt: 0,
+        failCount: 0,
 
         config() {
             return {
@@ -11499,12 +11518,21 @@
         configured(){const cfg=this.config();return cfg.enabled&&cfg.provider==='supabase'&&Boolean(cfg.url&&cfg.key);},
         pendingIds(){const rows=EH.Storage.get(this.PENDING_KEY,[]);return Array.isArray(rows)?rows:[];},
         pendingCount(){return this.pendingIds().length;},
+        shouldSyncType(type){
+            const cfg=this.config(),kind=String(type||'');
+            if(!cfg.enabled||cfg.provider!=='supabase')return false;
+            if(kind==='reminder')return cfg.reminders;
+            if(kind==='requisition')return cfg.requisitions;
+            if(kind==='passenger'||kind==='emission')return cfg.emission;
+            if(kind==='config')return cfg.settings;
+            return false;
+        },
         recordKey(type,id){
             const kind=String(type||'record'),safeId=String(id||'');
             // Compatibilidade com a v5.57-v5.59: lembretes já existentes no Supabase usam o ID original.
             return kind==='reminder' ? safeId : `${kind}:${safeId}`;
         },
-        markPendingRecord(type,id){if(this.applyingRemote||!id)return;const key=this.recordKey(type,id);const set=new Set(this.pendingIds());set.add(key);EH.Storage.set(this.PENDING_KEY,Array.from(set).slice(-3000));this.lastStatus={...(this.status()||{}),pending:set.size};},
+        markPendingRecord(type,id){if(this.applyingRemote||!id||!this.shouldSyncType(type))return;const key=this.recordKey(type,id);const set=new Set(this.pendingIds());set.add(key);EH.Storage.set(this.PENDING_KEY,Array.from(set).slice(-3000));this.lastStatus={...(this.status()||{}),pending:set.size};},
         clearPending(keys=[]){const remove=new Set(keys);EH.Storage.set(this.PENDING_KEY,this.pendingIds().filter(key=>!remove.has(key)));},
 
         async request(path,options={}, {auth=true}={}){
@@ -11658,18 +11686,26 @@
             this.busy=true;this.setStatus('syncing','Sincronizando…');
             try{
                 const userId=this.auth()?.userId;
+                // REGRA CRÍTICA: sempre PULL antes de qualquer PUSH. Um PC vazio nunca
+                // envia "vazio" como substituição do remoto; esta sincronização é por registro.
                 const remoteRows=await this.request(`/rest/v1/${this.TABLE}?select=id,payload,updated_at,device_id&order=updated_at.asc`,{method:'GET',headers:{Accept:'application/json'}});
                 const remoteMap=new Map((Array.isArray(remoteRows)?remoteRows:[]).map(row=>{const env=this.normalizeRemote(row);return[env.id,env];}));
+                this.lastRemoteReceivedAt=Date.now();
+                EH.Storage.set('sync.lastRemoteReceivedAt',this.lastRemoteReceivedAt);
+
                 const before=this.collectLocalRecords(),localMap=new Map(before.map(local=>[local.id,local]));
-                // Merge por registro: dados úteis dos dois lados são preservados. Requisições fazem merge por CPF + ida/volta.
+                let received=0;
                 remoteMap.forEach(remote=>{
                     const local=localMap.get(remote.id);
-                    if(!local){this.applyEnvelope(remote);return;}
+                    if(!local){this.applyEnvelope(remote);received+=1;return;}
                     const mergedData=this.mergeRecordData(remote.recordType,local.data||{},remote.data||{},local.updatedAt,remote.updatedAt);
                     if(!this.sameData(local.data,mergedData)||Number(remote.updatedAt||0)>Number(local.updatedAt||0)){
                         this.applyEnvelope({...remote,data:mergedData,updatedAt:Math.max(Number(local.updatedAt||0),Number(remote.updatedAt||0))});
+                        received+=1;
                     }
                 });
+
+                // Somente DEPOIS do pull/merge calculamos alterações locais a enviar.
                 const localAfter=this.collectLocalRecords(),push=[];
                 localAfter.forEach(local=>{
                     const remote=remoteMap.get(local.id);
@@ -11685,12 +11721,44 @@
                     }
                 });
                 if(push.length)await this.request(`/rest/v1/${this.TABLE}?on_conflict=user_id,id`,{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(push)});
-                this.clearPending(this.pendingIds());
-                EH.Reminders?.render?.();EH.OperationCars?.render?.();EH.TicketVerificationQueue?.render?.();
-                const status=this.setStatus('synced','Sincronizado',0);
-                if(!quiet)EH.Toast?.success?.('Dados operacionais sincronizados entre os computadores.');
+
+                // Não declare "Sincronizado" só porque POST respondeu. Faz uma leitura de
+                // confirmação e só remove da fila aquilo que realmente existe no servidor.
+                const verifyRows=await this.request(`/rest/v1/${this.TABLE}?select=id,payload,updated_at,device_id&order=updated_at.asc`,{method:'GET',headers:{Accept:'application/json'}});
+                const verifyMap=new Map((Array.isArray(verifyRows)?verifyRows:[]).map(row=>{const env=this.normalizeRemote(row);return[env.id,env];}));
+                const confirmed=[];
+                this.collectLocalRecords().forEach(local=>{
+                    const remote=verifyMap.get(local.id);
+                    if(!remote)return;
+                    const merged=this.mergeRecordData(local.recordType,local.data||{},remote.data||{},local.updatedAt,remote.updatedAt);
+                    const serverHasLocal=Number(remote.updatedAt||0)>=Number(local.updatedAt||0)&&this.sameData(merged,remote.data||{});
+                    if(serverHasLocal){confirmed.push(local.id);this.applyEnvelope(remote);}
+                });
+                this.clearPending(confirmed);
+                this.lastServerConfirmedAt=Date.now();
+                EH.Storage.set('sync.lastServerConfirmedAt',this.lastServerConfirmedAt);
+                this.failCount=0;
+
+                // Dados recebidos precisam reconstruir a interface imediatamente.
+                const page=EH.Pages?.detect?.()||'desconhecida';
+                EH.Reminders?.render?.();
+                EH.OperationCars?.render?.();
+                EH.TicketVerificationQueue?.render?.();
+                EH.UI?.renderAutomation?.(page);
+                EH.UI?.renderSaleSummary?.(page);
+
+                const pending=this.pendingCount();
+                const message=pending
+                    ? `Servidor confirmado • ${pending} alteração(ões) ainda pendente(s)`
+                    : `Sincronizado • ${received} recebido(s) • ${push.length} enviado(s)`;
+                const status=this.setStatus(pending?'pending':'synced',message,pending);
+                if(!quiet){
+                    if(pending)EH.Toast?.warning?.(message);
+                    else EH.Toast?.success?.('Dados operacionais confirmados no servidor e reconstruídos neste computador.');
+                }
                 return status;
             }catch(error){
+                this.failCount=Math.min(8,Number(this.failCount||0)+1);
                 const status=this.setStatus(navigator.onLine===false?'offline':'error',navigator.onLine===false?'Sem conexão • dados preservados localmente.':`Falha na sincronização: ${error.message}`);
                 if(!quiet)EH.Toast?.warning?.(status.message);
                 return status;
@@ -11993,20 +12061,37 @@
     // ============================================================
     EH.EmissionMemory = {
         KEY: 'emissionMemory.v1',
+        MIGRATION_KEY: 'emissionMemory.migrated.v561',
+        searchBusy: false,
         load() {
             const rows = EH.Storage.get(this.KEY, []);
             return Array.isArray(rows) ? rows : [];
         },
+        normalizeCpf(value) { return String(value || '').replace(/\D/g, '').slice(0, 11); },
+        statusRank(value) {
+            const status=String(value||'pending').toLowerCase();
+            return status==='pending'?0:status==='checked'?1:status==='printed'?2:(status==='completed'||status==='concluded')?3:0;
+        },
+        issueRank(value) {
+            const status=String(value||'draft').toLowerCase();
+            return status==='draft'?0:status==='confirmed'?1:status==='payment'?2:status==='issued'?3:status==='captured'?4:0;
+        },
         normalize(item = {}) {
-            const cpf = String(item.cpf || '').replace(/\D/g, '').slice(0, 11);
+            const cpf = this.normalizeCpf(item.cpf);
             const ticketNumber = EH.Utils.clean(item.ticketNumber || item.ticket || '');
             const origin = EH.Utils.clean(item.origin || '');
             const destination = EH.Utils.clean(item.destination || '');
             const travelDate = EH.Utils.clean(item.travelDate || '');
-            const id = String(item.id || (ticketNumber ? `ticket:${ticketNumber}` : `trip:${cpf}|${travelDate}|${EH.Utils.normalize(origin)}|${EH.Utils.normalize(destination)}`));
+            const saleId=EH.Utils.clean(item.saleId||'');
+            const salePassengerId=EH.Utils.clean(item.salePassengerId||'');
+            const fallbackId = saleId && salePassengerId
+                ? `sale:${saleId}:${salePassengerId}`
+                : (ticketNumber ? `ticket:${ticketNumber}` : `trip:${cpf}|${travelDate}|${EH.Utils.normalize(origin)}|${EH.Utils.normalize(destination)}`);
             return {
-                id, cpf,
+                id: String(item.id || fallbackId),
+                saleId, salePassengerId, cpf,
                 name: EH.Utils.clean(item.name || ''),
+                birthDate: EH.Utils.clean(item.birthDate || ''),
                 origin, destination, travelDate,
                 travelDateBr: EH.Utils.clean(item.travelDateBr || ''),
                 travelTime: EH.Utils.clean(item.travelTime || ''),
@@ -12016,11 +12101,20 @@
                 seat: EH.Utils.clean(item.seat || ''),
                 ticketNumber,
                 locator: EH.Utils.clean(item.locator || ''),
-                saleId: EH.Utils.clean(item.saleId || ''),
-                status: EH.Utils.clean(item.status || 'issued') || 'issued',
+                transactionId: EH.Utils.clean(item.transactionId || ''),
+                saleReference: EH.Utils.clean(item.saleReference || item.saleIdReal || ''),
+                requestCodes: item.requestCodes && typeof item.requestCodes==='object' ? { ...item.requestCodes } : {},
+                benefit: EH.Utils.clean(item.benefit || ''),
+                issueStatus: EH.Utils.clean(item.issueStatus || item.status || 'draft').toLowerCase() || 'draft',
+                ticketStatus: EH.Utils.clean(item.ticketStatus || 'pending').toLowerCase() || 'pending',
+                printStatus: EH.Utils.clean(item.printStatus || 'pending').toLowerCase() || 'pending',
+                checkStatus: EH.Utils.clean(item.checkStatus || 'pending').toLowerCase() || 'pending',
+                saleFinalized: Boolean(item.saleFinalized),
                 createdAt: Number(item.createdAt || Date.now()),
                 updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
-                deviceId: String(item.deviceId || EH.Device.id())
+                deviceId: String(item.deviceId || EH.Device.id()),
+                sourceDevice: String(item.sourceDevice || item.deviceId || EH.Device.id()),
+                syncState: EH.Utils.clean(item.syncState || 'local') || 'local'
             };
         },
         merge(oldItem = {}, incoming = {}) {
@@ -12028,54 +12122,205 @@
             const newer = Number(next.updatedAt || 0) >= Number(old.updatedAt || 0);
             const preferred = newer ? next : old, secondary = newer ? old : next;
             const useful = (a,b) => EH.Sync?.usefulText?.(a,b) || EH.Utils.clean(a || b || '');
+            const requestCodes={...(secondary.requestCodes||{}),...(preferred.requestCodes||{})};
+            const issueStatus=this.issueRank(next.issueStatus)>=this.issueRank(old.issueStatus)?next.issueStatus:old.issueStatus;
+            const printStatus=this.statusRank(next.printStatus)>=this.statusRank(old.printStatus)?next.printStatus:old.printStatus;
+            const checkStatus=this.statusRank(next.checkStatus)>=this.statusRank(old.checkStatus)?next.checkStatus:old.checkStatus;
             return {
                 ...secondary, ...preferred,
-                id: preferred.id || secondary.id,
+                id: old.id || next.id,
+                saleId: preferred.saleId || secondary.saleId,
+                salePassengerId: preferred.salePassengerId || secondary.salePassengerId,
                 cpf: preferred.cpf || secondary.cpf,
                 name: useful(preferred.name, secondary.name),
+                birthDate: useful(preferred.birthDate, secondary.birthDate),
                 origin: useful(preferred.origin, secondary.origin),
                 destination: useful(preferred.destination, secondary.destination),
                 travelDate: preferred.travelDate || secondary.travelDate,
                 travelDateBr: preferred.travelDateBr || secondary.travelDateBr,
                 travelTime: preferred.travelTime || secondary.travelTime,
+                travelTimestamp: Math.max(Number(old.travelTimestamp||0),Number(next.travelTimestamp||0)),
                 service: preferred.service || secondary.service,
                 line: useful(preferred.line, secondary.line),
                 seat: preferred.seat || secondary.seat,
                 ticketNumber: preferred.ticketNumber || secondary.ticketNumber,
                 locator: preferred.locator || secondary.locator,
-                saleId: preferred.saleId || secondary.saleId,
+                transactionId: preferred.transactionId || secondary.transactionId,
+                saleReference: preferred.saleReference || secondary.saleReference,
+                requestCodes,
+                benefit: useful(preferred.benefit,secondary.benefit),
+                issueStatus,
+                ticketStatus: this.issueRank(next.ticketStatus)>=this.issueRank(old.ticketStatus)?next.ticketStatus:old.ticketStatus,
+                printStatus,
+                checkStatus,
+                saleFinalized: Boolean(old.saleFinalized||next.saleFinalized),
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
                 updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
-                deviceId: preferred.deviceId || secondary.deviceId || EH.Device.id()
+                deviceId: preferred.deviceId || secondary.deviceId || EH.Device.id(),
+                sourceDevice: secondary.sourceDevice || preferred.sourceDevice || EH.Device.id(),
+                syncState: preferred.syncState || secondary.syncState || 'local'
             };
         },
+        findMatch(rows, next) {
+            let index=rows.findIndex(row=>String(row.id)===String(next.id));
+            if(index>=0)return index;
+            if(next.ticketNumber){
+                index=rows.findIndex(row=>EH.Utils.clean(row.ticketNumber||'')===next.ticketNumber);
+                if(index>=0)return index;
+            }
+            if(next.saleId&&next.salePassengerId){
+                index=rows.findIndex(row=>String(row.saleId||'')===next.saleId&&String(row.salePassengerId||'')===next.salePassengerId);
+                if(index>=0)return index;
+            }
+            if(next.cpf.length===11){
+                const candidates=rows.map((row,i)=>({row:this.normalize(row),i})).filter(x=>x.row.cpf===next.cpf&&!x.row.ticketNumber);
+                const compatible=candidates.filter(x=>{
+                    if(next.travelDate&&x.row.travelDate&&next.travelDate!==x.row.travelDate)return false;
+                    if(next.origin&&x.row.origin&&EH.Utils.normalize(next.origin)!==EH.Utils.normalize(x.row.origin))return false;
+                    if(next.destination&&x.row.destination&&EH.Utils.normalize(next.destination)!==EH.Utils.normalize(x.row.destination))return false;
+                    return true;
+                });
+                if(compatible.length===1)return compatible[0].i;
+            }
+            return -1;
+        },
         upsert(item = {}, { fromSync = false } = {}) {
-            const next = this.normalize(item);
+            let next = this.normalize(item);
             if (!next.id || (!next.ticketNumber && next.cpf.length !== 11)) return null;
             const rows = this.load();
-            const index = rows.findIndex(row => String(row.id) === next.id);
+            const index = this.findMatch(rows,next);
+            if(index>=0)next={...next,id:String(rows[index].id||next.id)};
             const merged = index >= 0 ? this.merge(rows[index], next) : next;
             const before = index >= 0 ? JSON.stringify(rows[index]) : '';
-            if (!fromSync) merged.updatedAt = Date.now();
+            if (!fromSync) { merged.updatedAt = Date.now(); merged.deviceId=EH.Device.id(); merged.syncState=EH.Sync?.configured?.()?'pending':'local'; }
+            else merged.syncState='synced';
             if (index >= 0) rows[index] = merged; else rows.push(merged);
             if (index < 0 || before !== JSON.stringify(merged)) {
-                EH.Storage.set(this.KEY, rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0, 2000));
+                EH.Storage.set(this.KEY, rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0, 3000));
                 if (!fromSync) EH.Sync?.markPendingRecord?.('emission', merged.id);
             }
-            if (merged.cpf) EH.PassengerMemory?.upsert?.({ cpf:merged.cpf, name:merged.name, updatedAt:merged.updatedAt }, { fromSync });
+            if (merged.cpf) EH.PassengerMemory?.upsert?.({ cpf:merged.cpf, name:merged.name, birthDate:merged.birthDate, updatedAt:merged.updatedAt }, { fromSync });
             return merged;
+        },
+        issueStatusForPage(page='') {
+            return page==='passagens'?'issued':page==='pagamento'?'payment':page==='confirmacao'?'confirmed':'draft';
+        },
+        captureSale(sale, { page = '' } = {}) {
+            if(!sale?.id||!Array.isArray(sale.passengers)||!sale.passengers.length)return 0;
+            const issueStatus=this.issueStatusForPage(page||EH.Pages?.detect?.()||'');
+            let count=0;
+            sale.passengers.forEach(passenger=>{
+                const cpf=this.normalizeCpf(passenger?.cpf||'');
+                if(cpf.length!==11)return;
+                const saved=this.upsert({
+                    id:`sale:${sale.id}:${passenger.id||`p-${cpf}`}`,
+                    saleId:String(sale.id),salePassengerId:String(passenger.id||`p-${cpf}`),
+                    cpf,name:passenger.name,birthDate:passenger.birthDate,
+                    ticketStatus:passenger.ticketStatus||'pending',
+                    issueStatus,printStatus:'pending',checkStatus:'pending',
+                    createdAt:Number(passenger.createdAt||sale.createdAt||Date.now()),
+                    updatedAt:Number(passenger.updatedAt||sale.updatedAt||Date.now()),
+                    sourceDevice:EH.Device.id()
+                });
+                if(saved)count+=1;
+            });
+            return count;
+        },
+        finalizeSale(saleId) {
+            const id=String(saleId||'');if(!id)return 0;
+            const rows=this.load();let changed=0;
+            rows.forEach((row,index)=>{if(String(row.saleId||'')!==id)return;const next=this.normalize(row);if(next.saleFinalized)return;next.saleFinalized=true;next.updatedAt=Date.now();next.deviceId=EH.Device.id();next.syncState=EH.Sync?.configured?.()?'pending':'local';rows[index]=next;EH.Sync?.markPendingRecord?.('emission',next.id);changed+=1;});
+            if(changed)EH.Storage.set(this.KEY,rows);
+            return changed;
+        },
+        attachRequestData(active={}) {
+            const cpf=this.normalizeCpf(active.cpf||'');if(cpf.length!==11)return null;
+            const rows=this.load().map(row=>this.normalize(row)).filter(row=>row.cpf===cpf).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+            if(!rows.length)return null;
+            const target=rows[0];
+            const tipo=String(active.tipo||'').toLowerCase();
+            const key=tipo.includes('volta')?'volta':tipo.includes('ida')?'ida':'atual';
+            return this.upsert({...target,requestCodes:{...(target.requestCodes||{}),[key]:EH.Utils.clean(active.codigo||'')},updatedAt:Date.now()});
         },
         captureItems(items = []) {
             const candidates = EH.Reminders?.candidateItems?.(items) || [];
             let count = 0;
             candidates.forEach(candidate => {
-                const saved = this.upsert({ ...candidate, status:'issued' });
+                const saved = this.upsert({ ...candidate, issueStatus:'captured', ticketStatus:'captured', printStatus:'pending' });
                 if (saved) count += 1;
             });
             return count;
         },
+        markStatus(id,status) {
+            const rows=this.load();const index=rows.findIndex(row=>String(row.id)===String(id));if(index<0)return null;
+            const current=this.normalize(rows[index]),requested=String(status||'').toLowerCase();
+            if(requested==='printed')current.printStatus='printed';
+            else if(requested==='checked')current.checkStatus='checked';
+            else if(requested==='completed'){current.printStatus='completed';current.checkStatus='completed';}
+            else if(requested==='pending')current.printStatus='pending';
+            current.updatedAt=Date.now();current.deviceId=EH.Device.id();current.syncState=EH.Sync?.configured?.()?'pending':'local';rows[index]=current;EH.Storage.set(this.KEY,rows);EH.Sync?.markPendingRecord?.('emission',current.id);EH.Sync?.syncAll?.({quiet:true});
+            const reminder=EH.Reminders?.matchPassenger?.({cpf:current.cpf,ticket:current.ticketNumber},{service:current.service,date:current.travelDate});
+            if(reminder&&(requested==='printed'||requested==='checked'||requested==='completed'))EH.Reminders?.markStatus?.(reminder.id,requested==='completed'?'completed':requested);
+            EH.UI?.renderAutomation?.(EH.Pages?.detect?.()||'desconhecida');EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.()||'desconhecida');
+            return current;
+        },
+        isIssued(row) { const item=this.normalize(row);return this.issueRank(item.issueStatus)>=this.issueRank('issued')||Boolean(item.ticketNumber); },
+        isPending(row) { const item=this.normalize(row);return this.isIssued(item)&&this.statusRank(item.printStatus)<this.statusRank('printed'); },
+        pending({ excludeSaleId = '' } = {}) {
+            const excluded=String(excludeSaleId||'');
+            return this.load().map(row=>this.normalize(row)).filter(row=>this.isPending(row)&&(!excluded||row.saleId!==excluded)).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+        },
+        maskCpf(cpf){return EH.SaleContext?.maskCpfPublic?.(cpf)||'CPF não identificado';},
+        async searchTicket(item){
+            const cpf=this.normalizeCpf(item?.cpf);if(cpf.length!==11)return EH.Toast.warning('CPF não disponível nesta emissão.');
+            if(EH.Pages?.detect?.()==='passagens')return EH.SaleContext.searchTicket({cpf,name:item.name});
+            EH.Storage.set('emissionMemory.pendingSearch.v1',{cpf,emissionId:item.id,expiresAt:Date.now()+60000});EH.SaleContext.navigateToPassagens();
+        },
+        async runPendingSearch(){
+            if(this.searchBusy)return;const pending=EH.Storage.get('emissionMemory.pendingSearch.v1',null);if(!pending?.cpf||Number(pending.expiresAt||0)<Date.now()){EH.Storage.remove('emissionMemory.pendingSearch.v1');return;}if(EH.Pages?.detect?.()!=='passagens')return;
+            this.searchBusy=true;try{await EH.SaleContext.searchTicket({cpf:pending.cpf,name:'Emissão sincronizada'});EH.Storage.remove('emissionMemory.pendingSearch.v1');}finally{this.searchBusy=false;}
+        },
+        renderPendingBlock({ excludeSaleId = '' } = {}) {
+            const items=this.pending({excludeSaleId});if(!items.length)return null;
+            const block=document.createElement('div');block.className='eh-sale-cpfs eh-emission-persistent';
+            const label=document.createElement('div');label.className='eh-sale-block-title';label.textContent=`Emissões pendentes • ${items.length}`;block.appendChild(label);
+            items.slice(0,20).forEach((item,index)=>{
+                const row=document.createElement('div');row.className='eh-sale-passenger-row';
+                const text=document.createElement('div');text.className='eh-sale-passenger-text';
+                const strong=document.createElement('strong');strong.textContent=`☁ ${item.name||`Passageiro ${index+1}`}`;
+                const sub=document.createElement('small');const route=[item.origin,item.destination].filter(Boolean).join(' → ');sub.textContent=`${this.maskCpf(item.cpf)}${route?` • ${route}`:''}`;text.append(strong,sub);
+                const buttons=document.createElement('div');buttons.className='eh-emission-row-actions';
+                const search=document.createElement('button');search.type='button';search.className='eh-context-btn primary';search.textContent='Buscar';search.addEventListener('click',()=>this.searchTicket(item));
+                const printed=document.createElement('button');printed.type='button';printed.className='eh-context-btn';printed.textContent='✓ Impresso';printed.addEventListener('click',()=>this.markStatus(item.id,'printed'));
+                buttons.append(search,printed);row.append(text,buttons);block.appendChild(row);
+            });
+            if(items.length>20){const more=document.createElement('small');more.textContent=`+ ${items.length-20} registro(s) no histórico operacional.`;block.appendChild(more);}
+            return block;
+        },
+        renderPendingCard({ excludeSaleId = '' } = {}) {
+            const items=this.pending({excludeSaleId});if(!items.length)return null;
+            const wrap=document.createElement('div');wrap.className='eh-sale-summary eh-emission-pending-summary';
+            const head=document.createElement('div');head.className='eh-sale-summary-head';head.innerHTML=`<strong>Emissões pendentes</strong><span>${items.length} passageiro${items.length===1?'':'s'} • sincronizável</span>`;wrap.appendChild(head);
+            items.slice(0,8).forEach(item=>{const row=document.createElement('div');row.className='eh-sale-summary-row';row.textContent=`☁ ${item.name||this.maskCpf(item.cpf)}`;wrap.appendChild(row);});
+            return wrap;
+        },
+        migrateCurrentSale() {
+            if(EH.Storage.get(this.MIGRATION_KEY,false))return 0;
+            let count=0;try{const sale=EH.SaleContext?.loadSale?.();if(sale?.passengers?.length)count+=this.captureSale(sale,{page:EH.Pages?.detect?.()||'passagens'});}catch(error){EH.Logger.debug('Migração da venda atual adiada:',error);}EH.Storage.set(this.MIGRATION_KEY,{at:Date.now(),count});return count;
+        },
+        init(){
+            this.migrateCurrentSale();
+            const page=EH.Pages?.detect?.()||'desconhecida';
+            if(page==='passagens')this.captureSale(EH.SaleContext?.loadSale?.(),{page:'passagens'});
+            this.runPendingSearch();
+        },
+        onPageUpdate(page){
+            if(['confirmacao','pagamento','passagens'].includes(page))this.captureSale(EH.SaleContext?.loadSale?.(),{page});
+            if(page==='passagens')this.runPendingSearch();
+        },
         applyRemote(item = {}) { return this.upsert(item, { fromSync:true }); }
     };
+
 
 
     // ============================================================
@@ -14132,14 +14377,17 @@
             const showSale = page === 'passagens' || page === 'confirmacao' || page === 'pagamento';
             const showRequisition = page === 'requisicao' || page === 'confirmacao' || page === 'pagamento';
             const saleCard = showSale ? EH.SaleContext?.renderSaleCard?.() : null;
+            const currentSaleId = showSale ? String(EH.SaleContext?.loadSale?.()?.id || '') : '';
+            const persistentSaleCard = showSale ? EH.EmissionMemory?.renderPendingCard?.({ excludeSaleId: saleCard ? currentSaleId : '' }) : null;
             const requisitionCard = showRequisition ? EH.RequisitionManager?.renderCard?.() : null;
 
-            if (!saleCard && !requisitionCard) {
+            if (!saleCard && !persistentSaleCard && !requisitionCard) {
                 this.saleBox.hidden = true;
                 return;
             }
             this.saleBox.hidden = false;
             if (saleCard) this.saleBox.appendChild(saleCard);
+            if (persistentSaleCard) this.saleBox.appendChild(persistentSaleCard);
             if (requisitionCard) this.saleBox.appendChild(requisitionCard);
         },
 
@@ -14214,11 +14462,16 @@
             } else if (page === 'passagens') {
                 title.textContent = 'Bilhetes';
                 const passengers = EH.SaleContext.load();
+                const currentSale = EH.SaleContext.loadSale();
+                const persistentPending = EH.EmissionMemory?.pending?.({ excludeSaleId: currentSale?.id || '' }) || [];
                 const capturedEntries = EH.Tickets.listStoredCaptures();
                 info.textContent = passengers.length
-                    ? 'Busque um passageiro por vez, capture o bilhete e depois una os selecionados, mesmo com CPFs diferentes.'
-                    : 'Pesquise um CPF, capture o bilhete e ele ficará guardado para ser unido com os próximos.';
+                    ? 'Busque um passageiro por vez. A venda atual é temporária, mas as emissões também ficam na memória persistente/sincronizada.'
+                    : persistentPending.length
+                        ? `${persistentPending.length} emissão(ões) pendente(s) recuperada(s) da memória operacional. Busque pelo CPF e capture o bilhete quando necessário.`
+                        : 'Pesquise um CPF, capture o bilhete e ele ficará guardado para ser unido com os próximos.';
                 const cpfBlock = EH.SaleContext.renderBlock();
+                const persistentBlock = EH.EmissionMemory?.renderPendingBlock?.({ excludeSaleId: currentSale?.id || '' });
                 const capturedBlock = EH.Tickets.renderCapturedBlock();
                 actions.append(this.contextButton('🎫 Capturar bilhete', 'primary', () => EH.Tickets.activateSelection()));
                 if (capturedEntries.length) {
@@ -14229,6 +14482,7 @@
                 }
                 this.contextBox.append(title, info);
                 if (cpfBlock) this.contextBox.appendChild(cpfBlock);
+                if (persistentBlock) this.contextBox.appendChild(persistentBlock);
                 if (capturedBlock) this.contextBox.appendChild(capturedBlock);
                 this.contextBox.append(actions);
                 return;
@@ -16323,6 +16577,7 @@
             safeInit('Avisos', () => EH.Toast.init());
             safeInit('Atendimento', () => EH.UI.init());
             safeInit('Lembretes', () => EH.Reminders.init());
+            safeInit('Memória persistente de emissões', () => EH.EmissionMemory?.init?.());
             safeInit('Conferência de bilhetes', () => EH.TicketVerificationQueue?.init?.());
             safeInit('Sincronização', () => EH.Sync?.start?.());
             safeInit('Operação', () => EH.OperationDock.init());
