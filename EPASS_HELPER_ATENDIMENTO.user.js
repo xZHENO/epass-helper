@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.59.0
+// @version      5.60.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -34,10 +34,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.59.0',
+        VERSION: '5.60.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 6,
+        STORAGE_SCHEMA_VERSION: 7,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -83,6 +83,10 @@
         SYNC_SUPABASE_KEY: '',
         SYNC_SUPABASE_EMAIL: '',
         SYNC_INTERVAL_MS: 60000,
+        SYNC_REMINDERS: true,
+        SYNC_REQUISITIONS: true,
+        SYNC_EMISSION_DATA: true,
+        SYNC_SETTINGS: false,
         // Rotina operacional: horário/nome são configuração; SERVIÇO é sempre dado detectado do dia.
         OPERATION_TIME_TOLERANCE_MINUTES: 20,
         OPERATION_ROUTINES: [
@@ -361,6 +365,10 @@
             EH.Config.SYNC_SUPABASE_URL = String(this.get('syncSupabaseUrl', EH.Config.SYNC_SUPABASE_URL) || '').trim();
             EH.Config.SYNC_SUPABASE_KEY = String(this.get('syncSupabaseKey', EH.Config.SYNC_SUPABASE_KEY) || '').trim();
             EH.Config.SYNC_SUPABASE_EMAIL = String(this.get('syncSupabaseEmail', EH.Config.SYNC_SUPABASE_EMAIL) || '').trim();
+            EH.Config.SYNC_REMINDERS = EH.Utils.parseBoolean(this.get('syncReminders', EH.Config.SYNC_REMINDERS), EH.Config.SYNC_REMINDERS);
+            EH.Config.SYNC_REQUISITIONS = EH.Utils.parseBoolean(this.get('syncRequisitions', EH.Config.SYNC_REQUISITIONS), EH.Config.SYNC_REQUISITIONS);
+            EH.Config.SYNC_EMISSION_DATA = EH.Utils.parseBoolean(this.get('syncEmissionData', EH.Config.SYNC_EMISSION_DATA), EH.Config.SYNC_EMISSION_DATA);
+            EH.Config.SYNC_SETTINGS = EH.Utils.parseBoolean(this.get('syncSettings', EH.Config.SYNC_SETTINGS), EH.Config.SYNC_SETTINGS);
 
             const savedRoutines = this.get('operationRoutines', null);
             if (Array.isArray(savedRoutines) && savedRoutines.length) {
@@ -559,6 +567,7 @@
             this.migrateReminders();
             this.migrateOperationRoutines();
             this.migrateSettingsTypes();
+            EH.BoardingFeeManager?.migrateLegacy?.();
 
             const next = {
                 schemaVersion: this.CURRENT_VERSION,
@@ -576,14 +585,15 @@
                 'overlaySide','overlayTopOffset','panelCustomWidth','panelHeightPercent',
                 'whatsappCustomWidth','whatsappHeightPercent','panelZoom','whatsappDockZoom',
                 'captureScale','ticketCaptureWidth','autoRouteCapture','autoCopyImages',
-                'aplicarTaxasOrigem','taxasOrigem','messages',
+                'aplicarTaxasOrigem','taxasOrigem','boardingFees.v2','messages',
                 'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
                 'financeAskCompanyMerch','financeConfirmDelete',
                 'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
                 'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes',
                 'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
                 'reminderHighlightToday','panelManager.v1',
-                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail'
+                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail',
+                'syncReminders','syncRequisitions','syncEmissionData','syncSettings'
             ];
             const values = {};
             keys.forEach(key => {
@@ -620,14 +630,15 @@
                 'overlaySide','overlayTopOffset','panelCustomWidth','panelHeightPercent',
                 'whatsappCustomWidth','whatsappHeightPercent','panelZoom','whatsappDockZoom',
                 'captureScale','ticketCaptureWidth','autoRouteCapture','autoCopyImages',
-                'aplicarTaxasOrigem','taxasOrigem','messages',
+                'aplicarTaxasOrigem','taxasOrigem','boardingFees.v2','messages',
                 'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
                 'financeAskCompanyMerch','financeConfirmDelete',
                 'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
                 'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes',
                 'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
                 'reminderHighlightToday','panelManager.v1',
-                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail'
+                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail',
+                'syncReminders','syncRequisitions','syncEmissionData','syncSettings'
             ]));
             Object.entries(payload.values).forEach(([key, value]) => {
                 if (allowed.has(key)) EH.Storage.set(key, value);
@@ -649,6 +660,78 @@
                 EH.Storage.set(this.KEY, id);
             }
             return String(id);
+        }
+    };
+
+
+    // ============================================================
+    // MEMÓRIA COMUM DO PASSAGEIRO — v5.60
+    // Uma identidade reaproveitável entre emissão, requisição, lembrete e mapa.
+    // Viagens/bilhetes continuam em seus módulos próprios; CPF não identifica uma viagem.
+    // ============================================================
+    EH.PassengerMemory = {
+        KEY: 'passengerMemory.v1',
+        normalizeCpf(value) { return String(value || '').replace(/\D/g, '').slice(0, 11); },
+        load() {
+            const rows = EH.Storage.get(this.KEY, []);
+            return Array.isArray(rows) ? rows : [];
+        },
+        usefulText(incoming, current = '') {
+            const next = EH.Utils.clean(incoming || '');
+            const old = EH.Utils.clean(current || '');
+            if (!next) return old;
+            if (/[*Xx•]{2,}/.test(next) && old && !/[*Xx•]{2,}/.test(old)) return old;
+            return next.length >= old.length ? next : old;
+        },
+        normalize(item = {}) {
+            const cpf = this.normalizeCpf(item.cpf);
+            return {
+                id: item.id || (cpf ? `cpf:${cpf}` : ''),
+                cpf,
+                name: EH.Utils.clean(item.name || item.nome || ''),
+                birthDate: EH.Utils.clean(item.birthDate || item.dataNascimento || ''),
+                createdAt: Number(item.createdAt || Date.now()),
+                updatedAt: Number(item.updatedAt || Date.now()),
+                deviceId: String(item.deviceId || EH.Device.id())
+            };
+        },
+        merge(oldItem = {}, incoming = {}) {
+            const old = this.normalize(oldItem);
+            const next = this.normalize(incoming);
+            return {
+                ...old,
+                ...next,
+                id: next.id || old.id,
+                cpf: next.cpf || old.cpf,
+                name: this.usefulText(next.name, old.name),
+                birthDate: this.usefulText(next.birthDate, old.birthDate),
+                createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
+                updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
+                deviceId: next.deviceId || old.deviceId || EH.Device.id()
+            };
+        },
+        upsert(item = {}, { quiet = true, fromSync = false } = {}) {
+            const next = this.normalize(item);
+            if (next.cpf.length !== 11) return null;
+            const rows = this.load();
+            const index = rows.findIndex(row => this.normalizeCpf(row.cpf) === next.cpf);
+            const current = index >= 0 ? this.normalize(rows[index]) : null;
+            const merged = current ? this.merge(current, next) : { ...next, createdAt: Date.now(), updatedAt: Number(next.updatedAt || Date.now()) };
+            const changed = !current || current.name !== merged.name || current.birthDate !== merged.birthDate;
+            if (changed && !fromSync) merged.updatedAt = Date.now();
+            if (!changed && current) return rows[index];
+            if (index >= 0) rows[index] = merged; else rows.push(merged);
+            EH.Storage.set(this.KEY, rows.slice(-1500));
+            if (!fromSync) EH.Sync?.markPendingRecord?.('passenger', merged.id);
+            if (!quiet) EH.Toast?.success?.('Dados do passageiro memorizados.');
+            return merged;
+        },
+        findByCpf(cpf) {
+            const digits = this.normalizeCpf(cpf);
+            return this.load().find(row => this.normalizeCpf(row.cpf) === digits) || null;
+        },
+        applyRemote(item = {}) {
+            return this.upsert(item, { quiet: true, fromSync: true });
         }
     };
 
@@ -1086,6 +1169,7 @@
             return String(text || '').replace(/\s+/g, ' ').trim();
         },
         getTaxaOrigem(origem) {
+            if (EH.BoardingFeeManager?.find) return EH.BoardingFeeManager.find(origem);
             const normalized = this.normalize(origem)
                 .replace(/(^|\s)[A-Z]{2}(?=\s|$)/g, ' ')
                 .replace(/\s+-\s+/g, ' ')
@@ -1096,10 +1180,10 @@
                 if (!nome) continue;
                 const nomeNormalizado = this.normalize(nome);
                 if (normalized.includes(nomeNormalizado)) {
-                    return { nome, valor: Math.max(0, this.parseMoney(valor)) };
+                    return { nome, city:nome, uf:'', valor: Math.max(0, this.parseMoney(valor)), found:true };
                 }
             }
-            return { nome: '', valor: 0 };
+            return { nome: '', city:'', uf:'', valor: 0, found:false };
         },
         first(selectors, root = document) {
             const list = Array.isArray(selectors) ? selectors : [selectors];
@@ -1332,6 +1416,91 @@
         }
     };
 
+
+    // ============================================================
+    // TAXAS DE EMBARQUE POR ORIGEM — v5.60
+    // Cidade + UF são a chave. Acentos/espaços/hífens não afetam a comparação.
+    // ============================================================
+    EH.BoardingFeeManager = {
+        KEY: 'boardingFees.v2',
+        knownUfs: {
+            IPORA:'GO', GOIANIA:'GO', ARENOPOLIS:'GO', ARAGARCAS:'GO',
+            'SAO LUIS DE MONTES BELOS':'GO', 'BARRA DO GARCAS':'MT'
+        },
+        parsePlace(value = '') {
+            const raw = EH.Utils.clean(value || '').replace(/\s+-\s+\d+\s*$/, '');
+            const displayMatch = raw.match(/^(.*?)\s*-\s*([A-Za-z]{2})$/);
+            if (displayMatch) {
+                return { city:EH.Utils.clean(displayMatch[1]), uf:String(displayMatch[2]||'').toUpperCase(), raw };
+            }
+            return { city:raw, uf:'', raw };
+        },
+        key(city, uf = '') {
+            const c = EH.Utils.normalize(city || '').replace(/\s+/g, ' ').trim();
+            const u = EH.Utils.normalize(uf || '').replace(/[^A-Z]/g, '').slice(0,2);
+            return `${c}|${u}`;
+        },
+        normalizeEntry(item = {}) {
+            const place = this.parsePlace(item.city || item.nome || item.name || item.localidade || '');
+            const city = place.city;
+            const uf = EH.Utils.normalize(item.uf || place.uf || this.knownUfs[EH.Utils.normalize(city)] || '').replace(/[^A-Z]/g,'').slice(0,2);
+            const value = Math.max(0, EH.Utils.parseMoney(item.value ?? item.valor ?? item.taxa ?? 0));
+            return { id:this.key(city,uf), city, uf, value, label:[city,uf].filter(Boolean).join(' - ') };
+        },
+        legacyDefaults() {
+            return Object.entries(EH.Config.TAXAS_ORIGEM || {}).map(([city,value]) => this.normalizeEntry({city,uf:this.knownUfs[EH.Utils.normalize(city)]||'',value}));
+        },
+        load() {
+            const saved = EH.Storage.get(this.KEY, null);
+            const source = Array.isArray(saved) ? saved : this.legacyDefaults();
+            const map = new Map();
+            source.forEach(item => {
+                const row = this.normalizeEntry(item);
+                if (row.city) map.set(row.id, row);
+            });
+            return Array.from(map.values()).sort((a,b)=>a.label.localeCompare(b.label,'pt-BR'));
+        },
+        save(rows = [], { fromSync = false } = {}) {
+            const map = new Map();
+            (Array.isArray(rows)?rows:[]).forEach(item => { const row=this.normalizeEntry(item); if(row.city) map.set(row.id,row); });
+            const safe = Array.from(map.values()).sort((a,b)=>a.label.localeCompare(b.label,'pt-BR'));
+            EH.Storage.set(this.KEY, safe);
+            if (!fromSync) EH.Storage.set('boardingFees.updatedAt', Date.now());
+            // Compatibilidade: módulos antigos que ainda consultem TAXAS_ORIGEM veem os mesmos valores.
+            EH.Config.TAXAS_ORIGEM = Object.fromEntries(safe.map(row => [row.city, row.value]));
+            EH.Storage.set('taxasOrigem', EH.Config.TAXAS_ORIGEM);
+            if (!fromSync) EH.Sync?.markPendingRecord?.('config', 'boarding-fees');
+            return safe;
+        },
+        find(origin) {
+            const place = this.parsePlace(origin);
+            const rows = this.load();
+            const exact = rows.find(row => this.key(row.city,row.uf) === this.key(place.city,place.uf));
+            const cityOnly = rows.filter(row => this.key(row.city,'') === this.key(place.city,''));
+            const chosen = exact || (cityOnly.length === 1 ? cityOnly[0] : null);
+            if (!chosen) {
+                EH.Logger?.trace?.('Tarifa', `Sem taxa para ${[place.city,place.uf].filter(Boolean).join(' - ') || 'origem não identificada'}`);
+                return { nome:'', city:place.city, uf:place.uf, valor:0, found:false };
+            }
+            return { nome:chosen.label, city:chosen.city, uf:chosen.uf, valor:chosen.value, found:true };
+        },
+        upsert(city, uf, value) {
+            const row = this.normalizeEntry({city,uf,value});
+            if (!row.city) throw new Error('Informe a cidade da origem.');
+            if (!row.uf || row.uf.length !== 2) throw new Error('Informe a UF com 2 letras.');
+            const rows = this.load();
+            const index = rows.findIndex(item => item.id === row.id);
+            if (index >= 0) rows[index] = row; else rows.push(row);
+            return this.save(rows);
+        },
+        remove(id) { return this.save(this.load().filter(row => row.id !== id)); },
+        migrateLegacy() {
+            const saved = EH.Storage.get(this.KEY, null);
+            if (Array.isArray(saved)) { this.save(saved, {fromSync:true}); return; }
+            this.save(this.legacyDefaults(), {fromSync:true});
+        }
+    };
+
     // ============================================================
     // VALORES / TARIFAS — FONTE ÚNICA PARA HORÁRIOS
     // Mantém valor-base, taxa e valor final separados.
@@ -1364,7 +1533,7 @@
                 valorBaseNum: base,
                 taxaEmbarqueNum: taxa,
                 valorFinalNum: final,
-                taxaOrigem: taxa > 0 ? EH.Utils.clean(feeInfo?.nome || '') : '',
+                taxaOrigem: feeInfo?.found ? EH.Utils.clean(feeInfo?.nome || '') : '',
                 valorBase: base > 0 ? EH.Utils.formatMoney(base) : '',
                 taxaEmbarque: taxa > 0 ? EH.Utils.formatMoney(taxa) : '',
                 valorFinal: final > 0 ? EH.Utils.formatMoney(final) : ''
@@ -5113,6 +5282,7 @@
             safe('Atendimento', () => EH.UI?.updateState?.(page));
             safe('Mapa dos carros', () => EH.OperationCars?.onPageUpdate?.(page));
             safe('Lembretes', () => EH.Reminders?.onPageUpdate?.(page));
+            safe('Conferência de bilhetes', () => EH.TicketVerificationQueue?.onPageUpdate?.(page));
             safe('WhatsApp', () => EH.WhatsAppDock?.renderOrganizer?.(page));
             safe('Painéis', () => EH.PanelManager?.bindAll?.());
             if ((page === 'caixa' || page === 'comissoes') && EH.Config.FINANCE_AUTO_REGISTER) {
@@ -7969,6 +8139,7 @@
                 if (changed) passenger.updatedAt = Date.now();
             }
             if (changed) this.saveSale(sale);
+            EH.PassengerMemory?.upsert?.({ cpf: passenger.cpf, name: passenger.name, birthDate: passenger.birthDate, updatedAt: passenger.updatedAt || Date.now() });
             return passenger;
         },
 
@@ -8373,7 +8544,8 @@
                     .map(passenger => this.normalizePassenger(passenger))
                     .filter(passenger => passenger.cpf.length === 11),
                 createdAt: Number(item.createdAt || now),
-                updatedAt: Number(item.updatedAt || now)
+                updatedAt: Number(item.updatedAt || now),
+                deviceId: String(item.deviceId || EH.Device.id())
             };
         },
 
@@ -8388,14 +8560,53 @@
         },
 
         saveStore(items) {
+            const previousRaw = EH.Storage.get(this.STORAGE_KEY, { version: 1, items: [] });
+            const previousById = new Map((Array.isArray(previousRaw?.items) ? previousRaw.items : []).map(item => [String(item?.id || ''), item]));
             const normalized = (items || [])
                 .map(item => this.normalizeRequest(item))
                 .filter(item => item.passengers.length)
                 .sort((a, b) => b.updatedAt - a.updatedAt)
                 .slice(0, 80);
             EH.Storage.set(this.STORAGE_KEY, { version: 1, updatedAt: Date.now(), items: normalized });
+            normalized.forEach(request => {
+                (request.passengers || []).forEach(passenger => EH.PassengerMemory?.upsert?.({ cpf:passenger.cpf, name:passenger.nome, birthDate:passenger.dataNascimento, updatedAt:request.updatedAt }, { fromSync:Boolean(EH.Sync?.applyingRemote) }));
+                if (!EH.Sync?.applyingRemote) {
+                    const previous = previousById.get(String(request.id || ''));
+                    const changed = !previous || Number(request.updatedAt || 0) > Number(previous.updatedAt || 0) || JSON.stringify(previous) !== JSON.stringify(request);
+                    if (changed) EH.Sync?.markPendingRecord?.('requisition', request.id);
+                }
+            });
             EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
             return normalized;
+        },
+
+        codesForCpf(cpf) {
+            const digits = this.normalizeCpf(cpf);
+            if (digits.length !== 11) return [];
+            const rows = [];
+            this.loadStore().forEach(request => {
+                (request.passengers || []).forEach(passenger => {
+                    if (this.normalizeCpf(passenger.cpf) !== digits) return;
+                    (passenger.legs || []).forEach(leg => {
+                        if (!leg.codigo) return;
+                        rows.push({
+                            requestId: request.id,
+                            numeroLogico: request.numeroLogico || '',
+                            tipo: leg.tipo || 'ida',
+                            codigo: EH.Utils.clean(leg.codigo || ''),
+                            origem: EH.Utils.clean(leg.origem || ''),
+                            destino: EH.Utils.clean(leg.destino || ''),
+                            updatedAt: Number(leg.updatedAt || request.updatedAt || 0)
+                        });
+                    });
+                });
+            });
+            const unique = new Map();
+            rows.sort((a,b)=>b.updatedAt-a.updatedAt).forEach(row => {
+                const key = `${row.tipo}|${EH.Utils.normalize(row.origem)}|${EH.Utils.normalize(row.destino)}|${row.codigo}`;
+                if (!unique.has(key)) unique.set(key,row);
+            });
+            return Array.from(unique.values());
         },
 
         requestFingerprint(request) {
@@ -11259,326 +11470,239 @@
     // ============================================================
     EH.Sync = {
         AUTH_KEY: 'sync.supabase.auth.v1',
-        STATUS_KEY: 'sync.status.v1',
+        STATUS_KEY: 'sync.status.v2',
+        PENDING_KEY: 'sync.pendingRecords.v1',
+        TABLE: 'epass_reminders', // tabela já criada nas versões anteriores; agora funciona como envelope genérico.
         timer: null,
         busy: false,
+        applyingRemote: false,
         lastStatus: { state: 'local', pending: 0, message: 'Somente local' },
 
         config() {
             return {
-                enabled: Boolean(EH.Config.SYNC_ENABLED),
-                provider: String(EH.Config.SYNC_PROVIDER || 'none'),
-                url: String(EH.Config.SYNC_SUPABASE_URL || '').replace(/\/+$/, ''),
-                key: String(EH.Config.SYNC_SUPABASE_KEY || '').trim(),
-                email: String(EH.Config.SYNC_SUPABASE_EMAIL || '').trim()
+                enabled: Boolean(EH.Config.SYNC_ENABLED), provider: String(EH.Config.SYNC_PROVIDER || 'none'),
+                url: String(EH.Config.SYNC_SUPABASE_URL || '').replace(/\/+$/, ''), key: String(EH.Config.SYNC_SUPABASE_KEY || '').trim(),
+                email: String(EH.Config.SYNC_SUPABASE_EMAIL || '').trim(), reminders:Boolean(EH.Config.SYNC_REMINDERS),
+                requisitions:Boolean(EH.Config.SYNC_REQUISITIONS), emission:Boolean(EH.Config.SYNC_EMISSION_DATA), settings:Boolean(EH.Config.SYNC_SETTINGS)
             };
         },
-
         safeKey(key) {
-            const raw = String(key || '').trim();
-            if (!raw) return '';
-            if (raw.startsWith('sb_secret_')) throw new Error('Não use uma chave secret do Supabase no UserScript.');
-            if (raw.split('.').length === 3) {
-                try {
-                    const segment = raw.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
-                    const payload = JSON.parse(atob(segment + '='.repeat((4 - segment.length % 4) % 4)));
-                    if (String(payload?.role || '').toLowerCase() === 'service_role') {
-                        throw new Error('Não use service_role no navegador. Use apenas a publishable/anon key com RLS.');
-                    }
-                } catch (error) {
-                    if (String(error?.message || '').includes('service_role')) throw error;
-                }
-            }
+            const raw=String(key||'').trim(); if(!raw)return'';
+            if(raw.startsWith('sb_secret_'))throw new Error('Não use uma chave secret do Supabase no UserScript.');
+            if(raw.split('.').length===3){try{const segment=raw.split('.')[1].replace(/-/g,'+').replace(/_/g,'/');const payload=JSON.parse(atob(segment+'='.repeat((4-segment.length%4)%4)));if(String(payload?.role||'').toLowerCase()==='service_role')throw new Error('Não use service_role no navegador. Use apenas a publishable/anon key com RLS.');}catch(error){if(String(error?.message||'').includes('service_role'))throw error;}}
             return raw;
         },
-
-        normalizeUrl(url) {
-            const value = String(url || '').trim().replace(/\/+$/, '');
-            if (!value) return '';
-            if (!/^https:\/\/[a-z0-9.-]+/i.test(value)) throw new Error('Use a URL HTTPS do projeto Supabase.');
-            return value;
+        normalizeUrl(url){const value=String(url||'').trim().replace(/\/+$/,'');if(!value)return'';if(!/^https:\/\/[a-z0-9.-]+/i.test(value))throw new Error('Use a URL HTTPS do projeto Supabase.');return value;},
+        auth(){const auth=EH.Storage.get(this.AUTH_KEY,null);return auth&&typeof auth==='object'?auth:null;},
+        setStatus(state,message='',pending=null){const status={state,message,pending:pending===null?this.pendingCount():Number(pending||0),at:Date.now()};this.lastStatus=status;EH.Storage.set(this.STATUS_KEY,status);EH.Reminders?.render?.();return status;},
+        status(){return this.lastStatus?.at?this.lastStatus:(EH.Storage.get(this.STATUS_KEY,null)||this.lastStatus);},
+        configured(){const cfg=this.config();return cfg.enabled&&cfg.provider==='supabase'&&Boolean(cfg.url&&cfg.key);},
+        pendingIds(){const rows=EH.Storage.get(this.PENDING_KEY,[]);return Array.isArray(rows)?rows:[];},
+        pendingCount(){return this.pendingIds().length;},
+        recordKey(type,id){
+            const kind=String(type||'record'),safeId=String(id||'');
+            // Compatibilidade com a v5.57-v5.59: lembretes já existentes no Supabase usam o ID original.
+            return kind==='reminder' ? safeId : `${kind}:${safeId}`;
         },
+        markPendingRecord(type,id){if(this.applyingRemote||!id)return;const key=this.recordKey(type,id);const set=new Set(this.pendingIds());set.add(key);EH.Storage.set(this.PENDING_KEY,Array.from(set).slice(-3000));this.lastStatus={...(this.status()||{}),pending:set.size};},
+        clearPending(keys=[]){const remove=new Set(keys);EH.Storage.set(this.PENDING_KEY,this.pendingIds().filter(key=>!remove.has(key)));},
 
-        auth() {
-            const auth = EH.Storage.get(this.AUTH_KEY, null);
-            return auth && typeof auth === 'object' ? auth : null;
+        async request(path,options={}, {auth=true}={}){
+            const cfg=this.config(),url=this.normalizeUrl(cfg.url),key=this.safeKey(cfg.key);if(!url||!key)throw new Error('Sincronização Supabase ainda não configurada.');
+            const headers={'Content-Type':'application/json',apikey:key,...(options.headers||{})};if(auth){const token=await this.ensureToken();if(!token)throw new Error('Entre na conta de sincronização primeiro.');headers.Authorization=`Bearer ${token}`;}
+            const target=`${url}${path}`,method=String(options.method||'GET').toUpperCase(),body=options.body??null;let status=0,raw='';
+            if(typeof GM_xmlhttpRequest==='function'){const response=await new Promise((resolve,reject)=>GM_xmlhttpRequest({method,url:target,headers,data:body,timeout:15000,onload:resolve,onerror:error=>{const detail=String(error?.error||error?.message||'').trim();reject(new Error(`Falha de rede ao acessar o Supabase${detail?`: ${detail}`:''}. Verifique a permissão @connect, a URL do projeto e sua conexão.`));},ontimeout:()=>reject(new Error('Tempo esgotado ao acessar o Supabase.'))}));status=Number(response?.status||0);raw=String(response?.responseText||'');}
+            else{const response=await fetch(target,{method,headers,body});status=response.status;raw=await response.text();}
+            let data=null;if(raw){try{data=JSON.parse(raw);}catch(_error){data=raw;}}if(status<200||status>=300){const message=data?.msg||data?.message||data?.error_description||data?.error||`HTTP ${status}`;throw new Error(String(message));}return data;
         },
+        async login(email,password){const cfg=this.config(),normalizedEmail=String(email||cfg.email||'').trim(),pwd=String(password||'');if(!normalizedEmail||!pwd)throw new Error('Informe e-mail e senha da conta de sincronização.');const data=await this.request('/auth/v1/token?grant_type=password',{method:'POST',body:JSON.stringify({email:normalizedEmail,password:pwd})},{auth:false});EH.Storage.set(this.AUTH_KEY,{accessToken:data?.access_token||'',refreshToken:data?.refresh_token||'',expiresAt:Date.now()+Math.max(60,Number(data?.expires_in||3600))*1000,userId:data?.user?.id||'',email:data?.user?.email||normalizedEmail});EH.Config.SYNC_SUPABASE_EMAIL=normalizedEmail;EH.Storage.set('syncSupabaseEmail',normalizedEmail);this.setStatus('connected','Conta conectada.');await this.syncAll({quiet:true});return data;},
+        logout(){EH.Storage.remove(this.AUTH_KEY);this.setStatus(this.configured()?'auth-required':'local',this.configured()?'Entre para sincronizar.':'Somente local');},
+        async ensureToken(){const auth=this.auth();if(!auth?.accessToken)return'';if(Number(auth.expiresAt||0)>Date.now()+60000)return String(auth.accessToken);if(!auth.refreshToken)return'';try{const data=await this.request('/auth/v1/token?grant_type=refresh_token',{method:'POST',body:JSON.stringify({refresh_token:auth.refreshToken})},{auth:false});const next={...auth,accessToken:data?.access_token||'',refreshToken:data?.refresh_token||auth.refreshToken,expiresAt:Date.now()+Math.max(60,Number(data?.expires_in||3600))*1000,userId:data?.user?.id||auth.userId||'',email:data?.user?.email||auth.email||''};EH.Storage.set(this.AUTH_KEY,next);return next.accessToken;}catch(_error){this.logout();return'';}},
 
-        setStatus(state, message = '', pending = null) {
-            const status = {
-                state,
-                message,
-                pending: pending === null ? this.pendingCount() : Number(pending || 0),
-                at: Date.now()
-            };
-            this.lastStatus = status;
-            EH.Storage.set(this.STATUS_KEY, status);
-            EH.Reminders?.render?.();
-            return status;
+        usefulText(incoming,current=''){const next=EH.Utils.clean(incoming||''),old=EH.Utils.clean(current||'');if(!next)return old;if(/[*Xx•]{2,}/.test(next)&&old&&!/[*Xx•]{2,}/.test(old))return old;return next.length>=old.length?next:old;},
+        smartMerge(oldData={},newData={}){
+            if(Array.isArray(oldData)||Array.isArray(newData))return Array.isArray(newData)&&newData.length?newData:(Array.isArray(oldData)?oldData:[]);
+            if(!oldData||typeof oldData!=='object'||!newData||typeof newData!=='object')return newData??oldData;
+            const result={...oldData};Object.entries(newData).forEach(([key,value])=>{const old=result[key];if(typeof value==='string'){result[key]=this.usefulText(value,typeof old==='string'?old:'');}else if(Array.isArray(value)){result[key]=value.length?value:(Array.isArray(old)?old:[]);}else if(value&&typeof value==='object'){result[key]=this.smartMerge(old&&typeof old==='object'?old:{},value);}else if(value!==undefined&&value!==null){result[key]=value;}});return result;
         },
-
-        status() {
-            return this.lastStatus?.at ? this.lastStatus : (EH.Storage.get(this.STATUS_KEY, null) || this.lastStatus);
+        statusRank(status) {
+            const value=String(status||'').toLowerCase();
+            return value==='pending'?0:value==='checked'?1:value==='printed'?2:(value==='completed'||value==='concluded')?3:0;
         },
-
-        pendingCount() {
-            const items = EH.Reminders?.load?.() || [];
-            return items.filter(item => item?.syncState === 'pending' || item?.syncState === 'error').length;
+        requestStatusRank(status) {
+            const value=String(status||'').toLowerCase();
+            return value==='pending'?0:(value==='analyzed'||value==='analysed')?1:value==='approved'?2:0;
         },
-
-        configured() {
-            const cfg = this.config();
-            return cfg.enabled && cfg.provider === 'supabase' && Boolean(cfg.url && cfg.key);
+        mergeReminderData(localData={},remoteData={},localTs=0,remoteTs=0) {
+            const remoteNewer=Number(remoteTs||0)>=Number(localTs||0);
+            const merged=remoteNewer?this.smartMerge(localData,remoteData):this.smartMerge(remoteData,localData);
+            const localStatus=String(localData?.status||'pending').toLowerCase(), remoteStatus=String(remoteData?.status||'pending').toLowerCase();
+            merged.status=this.statusRank(remoteStatus)>this.statusRank(localStatus)?remoteStatus:localStatus;
+            merged.completedAt=Math.max(Number(localData?.completedAt||0),Number(remoteData?.completedAt||0));
+            merged.createdAt=Math.min(Number(localData?.createdAt||Date.now()),Number(remoteData?.createdAt||Date.now()));
+            merged.updatedAt=Math.max(Number(localTs||localData?.updatedAt||0),Number(remoteTs||remoteData?.updatedAt||0));
+            return merged;
         },
-
-        async request(path, options = {}, { auth = true } = {}) {
-            const cfg = this.config();
-            const url = this.normalizeUrl(cfg.url);
-            const key = this.safeKey(cfg.key);
-            if (!url || !key) throw new Error('Sincronização Supabase ainda não configurada.');
-            const headers = {
-                'Content-Type': 'application/json',
-                apikey: key,
-                ...(options.headers || {})
-            };
-            if (auth) {
-                const token = await this.ensureToken();
-                if (!token) throw new Error('Entre na conta de sincronização primeiro.');
-                headers.Authorization = `Bearer ${token}`;
-            }
-            const target=`${url}${path}`;
-            const method=String(options.method||'GET').toUpperCase();
-            const body=options.body ?? null;
-
-            let status=0;
-            let raw='';
-            if (typeof GM_xmlhttpRequest === 'function') {
-                const response = await new Promise((resolve,reject)=>{
-                    GM_xmlhttpRequest({
-                        method,
-                        url:target,
-                        headers,
-                        data:body,
-                        timeout:15000,
-                        onload:resolve,
-                        onerror:(error)=>{
-                            const detail = String(error?.error || error?.message || '').trim();
-                            reject(new Error(`Falha de rede ao acessar o Supabase${detail ? `: ${detail}` : ''}. Verifique a permissão @connect, a URL do projeto e sua conexão.`));
-                        },
-                        ontimeout:()=>reject(new Error('Tempo esgotado ao acessar o Supabase. Verifique a URL do projeto e sua conexão.'))
-                    });
-                });
-                status=Number(response?.status||0);
-                raw=String(response?.responseText||'');
-            } else {
-                const response=await fetch(target,{method,headers,body});
-                status=response.status;
-                raw=await response.text();
-            }
-
-            let data=null;
-            if(raw){
-                try{data=JSON.parse(raw);}catch(error){data=raw;}
-            }
-            if(status<200 || status>=300){
-                const message=data?.msg||data?.message||data?.error_description||data?.error||`HTTP ${status}`;
-                throw new Error(String(message));
-            }
-            return data;
+        legKey(leg={}) {
+            const tipo=String(leg.tipo||'ida').toLowerCase();
+            const market=EH.Utils.normalize(leg.mercadoCompleto||'');
+            const route=`${EH.Utils.normalize(leg.origem||'')}→${EH.Utils.normalize(leg.destino||'')}`;
+            return `${tipo}|${market||route}`;
         },
-
-        async login(email, password) {
-            const cfg = this.config();
-            const normalizedEmail = String(email || cfg.email || '').trim();
-            const pwd = String(password || '');
-            if (!normalizedEmail || !pwd) throw new Error('Informe e-mail e senha da conta de sincronização.');
-            const data = await this.request('/auth/v1/token?grant_type=password', {
-                method: 'POST',
-                body: JSON.stringify({ email: normalizedEmail, password: pwd })
-            }, { auth: false });
-            const now = Date.now();
-            EH.Storage.set(this.AUTH_KEY, {
-                accessToken: data?.access_token || '',
-                refreshToken: data?.refresh_token || '',
-                expiresAt: now + Math.max(60, Number(data?.expires_in || 3600)) * 1000,
-                userId: data?.user?.id || '',
-                email: data?.user?.email || normalizedEmail
-            });
-            EH.Config.SYNC_SUPABASE_EMAIL = normalizedEmail;
-            EH.Storage.set('syncSupabaseEmail', normalizedEmail);
-            this.setStatus('connected', 'Conta conectada.');
-            await this.syncReminders({ quiet: true });
-            return data;
-        },
-
-        logout() {
-            EH.Storage.remove(this.AUTH_KEY);
-            this.setStatus(this.configured() ? 'auth-required' : 'local', this.configured() ? 'Entre para sincronizar.' : 'Somente local');
-        },
-
-        async ensureToken() {
-            const auth = this.auth();
-            if (!auth?.accessToken) return '';
-            if (Number(auth.expiresAt || 0) > Date.now() + 60000) return String(auth.accessToken);
-            if (!auth.refreshToken) return '';
-            try {
-                const data = await this.request('/auth/v1/token?grant_type=refresh_token', {
-                    method: 'POST',
-                    body: JSON.stringify({ refresh_token: auth.refreshToken })
-                }, { auth: false });
-                const next = {
-                    ...auth,
-                    accessToken: data?.access_token || '',
-                    refreshToken: data?.refresh_token || auth.refreshToken,
-                    expiresAt: Date.now() + Math.max(60, Number(data?.expires_in || 3600)) * 1000,
-                    userId: data?.user?.id || auth.userId || '',
-                    email: data?.user?.email || auth.email || ''
-                };
-                EH.Storage.set(this.AUTH_KEY, next);
-                return next.accessToken;
-            } catch (error) {
-                this.logout();
-                return '';
-            }
-        },
-
-        sanitizeReminder(item = {}) {
-            const createdAt = Number(item.createdAt || Date.now());
-            const updatedAt = Number(item.updatedAt || item.completedAt || createdAt);
+        mergeLeg(localLeg={},remoteLeg={}) {
+            const l=EH.RequisitionManager?.normalizeLeg?.(localLeg)||localLeg, r=EH.RequisitionManager?.normalizeLeg?.(remoteLeg)||remoteLeg;
+            const remoteNewer=Number(r.updatedAt||0)>=Number(l.updatedAt||0);
+            const preferred=remoteNewer?r:l, secondary=remoteNewer?l:r;
             return {
-                id: String(item.id || ''),
-                name: EH.Utils.clean(item.name || ''),
-                cpf: String(item.cpf || '').replace(/\D/g, '').slice(0, 11),
-                origin: EH.Utils.clean(item.origin || ''),
-                destination: EH.Utils.clean(item.destination || ''),
-                travelDate: String(item.travelDate || ''),
-                travelDateBr: String(item.travelDateBr || ''),
-                travelTime: String(item.travelTime || ''),
-                travelTimestamp: Number(item.travelTimestamp || 0),
-                service: String(item.service || '').replace(/\D/g, ''),
-                seat: EH.Utils.clean(item.seat || ''),
-                mapFoundAt: Number(item.mapFoundAt || 0),
-                ticketNumber: EH.Utils.clean(item.ticketNumber || ''),
-                passengerId: item.passengerId || null,
-                status: item.status === 'completed' ? 'completed' : 'pending',
-                source: EH.Utils.clean(item.source || 'epass-ticket'),
-                createdAt,
-                updatedAt,
-                completedAt: Number(item.completedAt || 0),
-                deviceId: String(item.deviceId || EH.Device.id())
+                ...secondary,...preferred,
+                tipo: preferred.tipo||secondary.tipo||'ida',
+                mercadoCompleto:this.usefulText(preferred.mercadoCompleto,secondary.mercadoCompleto),
+                origem:this.usefulText(preferred.origem,secondary.origem),
+                destino:this.usefulText(preferred.destino,secondary.destino),
+                codigo:this.usefulText(preferred.codigo,secondary.codigo),
+                updatedAt:Math.max(Number(l.updatedAt||0),Number(r.updatedAt||0))
             };
         },
-
-        mergeRecords(localItems, remoteItems) {
-            const map = new Map();
-            (Array.isArray(localItems) ? localItems : []).forEach(item => {
-                const safe = this.sanitizeReminder(item);
-                if (safe.id) map.set(safe.id, { ...item, ...safe });
-            });
-            (Array.isArray(remoteItems) ? remoteItems : []).forEach(remote => {
-                const safe = this.sanitizeReminder(remote?.payload || remote || {});
-                if (!safe.id) return;
-                const current = map.get(safe.id);
-                const currentUpdated = Number(current?.updatedAt || current?.createdAt || 0);
-                const remoteUpdated = Number(safe.updatedAt || safe.createdAt || 0);
-                if (!current || remoteUpdated > currentUpdated || (remoteUpdated === currentUpdated && safe.deviceId > String(current.deviceId || ''))) {
-                    map.set(safe.id, { ...safe, syncState: 'synced', syncedAt: Date.now() });
-                }
-            });
-            return Array.from(map.values()).slice(-1000);
+        mergeRequestPassenger(localPassenger={},remotePassenger={}) {
+            const l=EH.RequisitionManager?.normalizePassenger?.(localPassenger)||localPassenger, r=EH.RequisitionManager?.normalizePassenger?.(remotePassenger)||remotePassenger;
+            const legs=new Map();
+            (l.legs||[]).forEach(leg=>legs.set(this.legKey(leg),leg));
+            (r.legs||[]).forEach(leg=>{const key=this.legKey(leg);legs.set(key,legs.has(key)?this.mergeLeg(legs.get(key),leg):leg);});
+            return {
+                ...l,...r,
+                cpf:String(r.cpf||l.cpf||'').replace(/\D/g,'').slice(0,11),
+                nome:this.usefulText(r.nome,l.nome),
+                dataNascimento:this.usefulText(r.dataNascimento,l.dataNascimento),
+                legs:Array.from(legs.values())
+            };
         },
-
-        async syncReminders({ quiet = false } = {}) {
-            if (this.busy) return this.status();
-            if (!this.configured()) {
-                return this.setStatus('local', 'Sincronização entre computadores não configurada.');
+        mergeRequisitionData(localData={},remoteData={},localTs=0,remoteTs=0) {
+            const remoteNewer=Number(remoteTs||0)>=Number(localTs||0);
+            const preferred=remoteNewer?remoteData:localData, secondary=remoteNewer?localData:remoteData;
+            const merged=this.smartMerge(secondary,preferred);
+            const passengers=new Map();
+            (localData.passengers||[]).forEach(p=>{const cpf=String(p?.cpf||'').replace(/\D/g,'').slice(0,11);if(cpf)passengers.set(cpf,p);});
+            (remoteData.passengers||[]).forEach(p=>{const cpf=String(p?.cpf||'').replace(/\D/g,'').slice(0,11);if(!cpf)return;passengers.set(cpf,passengers.has(cpf)?this.mergeRequestPassenger(passengers.get(cpf),p):p);});
+            merged.passengers=Array.from(passengers.values());
+            const lStatus=String(localData.status||'pending'),rStatus=String(remoteData.status||'pending');
+            merged.status=this.requestStatusRank(rStatus)>this.requestStatusRank(lStatus)?rStatus:lStatus;
+            merged.numeroLogico=this.usefulText(preferred.numeroLogico,secondary.numeroLogico);
+            merged.createdAt=Math.min(Number(localData.createdAt||Date.now()),Number(remoteData.createdAt||Date.now()));
+            merged.updatedAt=Math.max(Number(localTs||localData.updatedAt||0),Number(remoteTs||remoteData.updatedAt||0));
+            merged.deviceId=remoteNewer?(remoteData.deviceId||localData.deviceId||EH.Device.id()):(localData.deviceId||remoteData.deviceId||EH.Device.id());
+            return merged;
+        },
+        mergeRecordData(type,localData={},remoteData={},localTs=0,remoteTs=0) {
+            if(type==='reminder')return this.mergeReminderData(localData,remoteData,localTs,remoteTs);
+            if(type==='requisition')return this.mergeRequisitionData(localData,remoteData,localTs,remoteTs);
+            if(type==='emission'){
+                if(EH.EmissionMemory?.merge)return EH.EmissionMemory.merge({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs});
             }
-            const auth = this.auth();
-            if (!auth?.userId || !(await this.ensureToken())) {
-                return this.setStatus('auth-required', 'Entre na conta Supabase para sincronizar.');
+            const remoteNewer=Number(remoteTs||0)>=Number(localTs||0);
+            const merged=remoteNewer?this.smartMerge(localData,remoteData):this.smartMerge(remoteData,localData);
+            merged.updatedAt=Math.max(Number(localTs||localData?.updatedAt||0),Number(remoteTs||remoteData?.updatedAt||0));
+            return merged;
+        },
+        sameData(a,b){try{return JSON.stringify(a||{})===JSON.stringify(b||{});}catch(_error){return false;}},
+        envelope(type,id,data,updatedAt=0){const safeId=String(id||'');const ts=Number(updatedAt||data?.updatedAt||data?.createdAt||Date.now());return{id:this.recordKey(type,safeId),recordType:type,recordId:safeId,data,updatedAt:ts,deviceId:String(data?.deviceId||EH.Device.id())};},
+        normalizeRemote(row={}){const p=row?.payload||{};if(p?.recordType&&p?.recordId)return this.envelope(p.recordType,p.recordId,p.data||{},p.updatedAt||Date.parse(row.updated_at)||0);const legacyId=String(p.id||row.id||'');return this.envelope('reminder',legacyId,p,Number(p.updatedAt||Date.parse(row.updated_at)||0));},
+        collectLocalRecords(){
+            const cfg=this.config(),rows=[];
+            if(cfg.reminders)(EH.Reminders?.load?.()||[]).forEach(item=>rows.push(this.envelope('reminder',item.id,EH.SyncLegacyReminder?.sanitize?.(item)||item,item.updatedAt||item.createdAt)));
+            if(cfg.requisitions)(EH.RequisitionManager?.loadStore?.()||[]).forEach(item=>rows.push(this.envelope('requisition',item.id,item,item.updatedAt||item.createdAt)));
+            if(cfg.emission){
+                (EH.PassengerMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('passenger',item.id||`cpf:${item.cpf}`,item,item.updatedAt||item.createdAt)));
+                (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,item,item.updatedAt||item.createdAt)));
             }
-
-            this.busy = true;
-            this.setStatus('syncing', 'Sincronizando…');
-            try {
-                const userId = this.auth()?.userId;
-                const remoteRows = await this.request('/rest/v1/epass_reminders?select=id,payload,updated_at,device_id&order=updated_at.asc', {
-                    method: 'GET',
-                    headers: { Accept: 'application/json' }
+            if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,updatedAt:opUpdated},opUpdated));}
+            return rows.filter(row=>row.recordId);
+        },
+        applyEnvelope(env){
+            if(!env?.recordType||!env?.recordId)return;
+            this.applyingRemote=true;
+            try{
+                if(env.recordType==='reminder'){
+                    const local=EH.Reminders?.load?.()||[],idx=local.findIndex(x=>String(x.id)===env.recordId),current=idx>=0?local[idx]:{};
+                    const merged=this.mergeReminderData(current,env.data||{},Number(current.updatedAt||0),Number(env.updatedAt||0));
+                    merged.id=env.recordId;merged.syncState='synced';
+                    if(idx>=0)local[idx]=merged;else local.push(merged);
+                    EH.Storage.set(EH.Reminders.KEY,local.slice(-1000));
+                } else if(env.recordType==='requisition'){
+                    const rows=EH.RequisitionManager?.loadStore?.()||[],idx=rows.findIndex(x=>String(x.id)===env.recordId),current=idx>=0?rows[idx]:{};
+                    const merged=this.mergeRequisitionData(current,env.data||{},Number(current.updatedAt||0),Number(env.updatedAt||0));
+                    merged.id=env.recordId;
+                    if(idx>=0)rows[idx]=merged;else rows.push(merged);
+                    EH.RequisitionManager?.saveStore?.(rows);
+                } else if(env.recordType==='passenger'){
+                    EH.PassengerMemory?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
+                } else if(env.recordType==='emission'){
+                    EH.EmissionMemory?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
+                } else if(env.recordType==='config'&&this.config().settings){
+                    if(env.recordId==='boarding-fees'&&Array.isArray(env.data?.fees))EH.BoardingFeeManager?.save?.(env.data.fees,{fromSync:true});
+                    if(env.recordId==='operation'){
+                        if(env.data?.agencyCode)EH.Config.OPERATION_AGENCY_CODE=String(env.data.agencyCode).replace(/\D/g,'')||EH.Config.OPERATION_AGENCY_CODE;
+                        if(Array.isArray(env.data?.routines)&&env.data.routines.length)EH.Config.OPERATION_ROUTINES=env.data.routines;
+                        if(Number.isFinite(Number(env.data?.tolerance)))EH.Config.OPERATION_TIME_TOLERANCE_MINUTES=Number(env.data.tolerance);
+                        EH.Storage.set('operationAgencyCode',EH.Config.OPERATION_AGENCY_CODE);
+                        EH.Storage.set('operationRoutines',EH.Config.OPERATION_ROUTINES);
+                        EH.Storage.set('operationTimeToleranceMinutes',EH.Config.OPERATION_TIME_TOLERANCE_MINUTES);
+                    }
+                }
+            } finally { this.applyingRemote=false; }
+        },
+        async syncAll({quiet=false}={}){
+            if(this.busy)return this.status();
+            if(!this.configured())return this.setStatus('local','Sincronização entre computadores não configurada.');
+            const auth=this.auth();
+            if(!auth?.userId||!(await this.ensureToken()))return this.setStatus('auth-required','Entre na conta Supabase para sincronizar.');
+            this.busy=true;this.setStatus('syncing','Sincronizando…');
+            try{
+                const userId=this.auth()?.userId;
+                const remoteRows=await this.request(`/rest/v1/${this.TABLE}?select=id,payload,updated_at,device_id&order=updated_at.asc`,{method:'GET',headers:{Accept:'application/json'}});
+                const remoteMap=new Map((Array.isArray(remoteRows)?remoteRows:[]).map(row=>{const env=this.normalizeRemote(row);return[env.id,env];}));
+                const before=this.collectLocalRecords(),localMap=new Map(before.map(local=>[local.id,local]));
+                // Merge por registro: dados úteis dos dois lados são preservados. Requisições fazem merge por CPF + ida/volta.
+                remoteMap.forEach(remote=>{
+                    const local=localMap.get(remote.id);
+                    if(!local){this.applyEnvelope(remote);return;}
+                    const mergedData=this.mergeRecordData(remote.recordType,local.data||{},remote.data||{},local.updatedAt,remote.updatedAt);
+                    if(!this.sameData(local.data,mergedData)||Number(remote.updatedAt||0)>Number(local.updatedAt||0)){
+                        this.applyEnvelope({...remote,data:mergedData,updatedAt:Math.max(Number(local.updatedAt||0),Number(remote.updatedAt||0))});
+                    }
                 });
-                const remoteById = new Map((Array.isArray(remoteRows) ? remoteRows : []).map(row => [
-                    String(row.id || row?.payload?.id || ''),
-                    this.sanitizeReminder(row.payload || {})
-                ]));
-
-                let local = this.mergeRecords(EH.Reminders?.load?.() || [], remoteRows || []);
-                const push = [];
-                local.forEach(item => {
-                    const safe = this.sanitizeReminder(item);
-                    const remote = remoteById.get(safe.id);
-                    if (!remote || Number(safe.updatedAt || 0) > Number(remote.updatedAt || 0)) {
+                const localAfter=this.collectLocalRecords(),push=[];
+                localAfter.forEach(local=>{
+                    const remote=remoteMap.get(local.id);
+                    const needsPush=!remote||Number(local.updatedAt||0)>Number(remote.updatedAt||0)||!this.sameData(local.data,remote.data);
+                    if(needsPush){
                         push.push({
-                            user_id: userId,
-                            id: safe.id,
-                            payload: safe,
-                            updated_at: new Date(safe.updatedAt || Date.now()).toISOString(),
-                            device_id: safe.deviceId
+                            user_id:userId,
+                            id:local.recordType==='reminder'?local.recordId:local.id,
+                            payload:{recordType:local.recordType,recordId:local.recordId,data:local.data,updatedAt:local.updatedAt,deviceId:local.deviceId},
+                            updated_at:new Date(local.updatedAt||Date.now()).toISOString(),
+                            device_id:local.deviceId
                         });
                     }
                 });
-
-                if (push.length) {
-                    await this.request('/rest/v1/epass_reminders?on_conflict=user_id,id', {
-                        method: 'POST',
-                        headers: {
-                            Prefer: 'resolution=merge-duplicates,return=minimal'
-                        },
-                        body: JSON.stringify(push)
-                    });
-                }
-
-                const syncedAt = Date.now();
-                local = local.map(item => ({ ...item, syncState: 'synced', syncedAt }));
-                EH.Storage.set(EH.Reminders.KEY, local);
-                EH.Reminders.render();
-                const status = this.setStatus('synced', 'Sincronizado', 0);
-                if (!quiet) EH.Toast?.success?.('Lembretes sincronizados entre os dispositivos.');
+                if(push.length)await this.request(`/rest/v1/${this.TABLE}?on_conflict=user_id,id`,{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(push)});
+                this.clearPending(this.pendingIds());
+                EH.Reminders?.render?.();EH.OperationCars?.render?.();EH.TicketVerificationQueue?.render?.();
+                const status=this.setStatus('synced','Sincronizado',0);
+                if(!quiet)EH.Toast?.success?.('Dados operacionais sincronizados entre os computadores.');
                 return status;
-            } catch (error) {
-                const local = (EH.Reminders?.load?.() || []).map(item => ({
-                    ...item,
-                    syncState: item.status ? 'pending' : (item.syncState || 'pending')
-                }));
-                EH.Storage.set(EH.Reminders.KEY, local);
-                EH.Reminders?.render?.();
-                const status = this.setStatus(navigator.onLine === false ? 'offline' : 'error', navigator.onLine === false ? 'Sem conexão • alterações salvas localmente.' : `Falha na sincronização: ${error.message}`);
-                if (!quiet) EH.Toast?.warning?.(status.message);
+            }catch(error){
+                const status=this.setStatus(navigator.onLine===false?'offline':'error',navigator.onLine===false?'Sem conexão • dados preservados localmente.':`Falha na sincronização: ${error.message}`);
+                if(!quiet)EH.Toast?.warning?.(status.message);
                 return status;
-            } finally {
-                this.busy = false;
-            }
+            }finally{this.busy=false;}
         },
+        syncReminders(options={}){return this.syncAll(options);},
+        start(){if(this.timer)clearInterval(this.timer);const cfg=this.config();if(!cfg.enabled||cfg.provider!=='supabase'){this.setStatus('local','Somente local');return;}this.setStatus(this.auth()?.accessToken?'connected':'auth-required',this.auth()?.accessToken?'Conta conectada.':'Entre para sincronizar.');EH.Runtime.timeout('sync-first-run',()=>this.syncAll({quiet:true}),2500);this.timer=setInterval(()=>this.syncAll({quiet:true}),Math.max(30000,Number(EH.Config.SYNC_INTERVAL_MS||60000)));EH.Runtime?.on?.('sync-online',window,'online',()=>this.syncAll({quiet:true}),{passive:true});}
+    };
 
-        markPending(items = []) {
-            if (!this.configured()) return items;
-            return (Array.isArray(items) ? items : []).map(item => ({
-                ...item,
-                syncState: item.syncState === 'synced' ? 'pending' : (item.syncState || 'pending')
-            }));
-        },
-
-        start() {
-            if (this.timer) clearInterval(this.timer);
-            const cfg = this.config();
-            if (!cfg.enabled || cfg.provider !== 'supabase') {
-                this.setStatus('local', 'Somente local');
-                return;
-            }
-            this.setStatus(this.auth()?.accessToken ? 'connected' : 'auth-required', this.auth()?.accessToken ? 'Conta conectada.' : 'Entre para sincronizar.');
-            EH.Runtime.timeout('sync-first-run', () => this.syncReminders({ quiet: true }), 2500);
-            this.timer = setInterval(() => this.syncReminders({ quiet: true }), Math.max(30000, Number(EH.Config.SYNC_INTERVAL_MS || 60000)));
-            EH.Runtime?.on?.('sync-online', window, 'online', () => this.syncReminders({ quiet: true }), { passive: true });
-        }
+    // Sanitização compatível com lembretes antigos.
+    EH.SyncLegacyReminder = {
+        sanitize(item={}){const createdAt=Number(item.createdAt||Date.now()),updatedAt=Number(item.updatedAt||item.completedAt||createdAt),{syncState:_syncState,...rest}=item;return{...rest,id:String(item.id||''),name:EH.Utils.clean(item.name||''),cpf:String(item.cpf||'').replace(/\D/g,'').slice(0,11),origin:EH.Utils.clean(item.origin||''),destination:EH.Utils.clean(item.destination||''),service:String(item.service||'').replace(/\D/g,''),seat:EH.Utils.clean(item.seat||''),ticketNumber:EH.Utils.clean(item.ticketNumber||''),status:['pending','printed','checked','completed'].includes(String(item.status||'').toLowerCase())?String(item.status).toLowerCase():'pending',createdAt,updatedAt,completedAt:Number(item.completedAt||0),deviceId:String(item.deviceId||EH.Device.id())};}
     };
 
     EH.Reminders = {
@@ -11595,6 +11719,10 @@
         save(items) {
             const safe = (Array.isArray(items) ? items : []).slice(-1000);
             EH.Storage.set(this.KEY, safe);
+            safe.forEach(item => {
+                if (item?.cpf) EH.PassengerMemory?.upsert?.({ cpf:item.cpf, name:item.name, updatedAt:item.updatedAt || item.createdAt || Date.now() });
+                if (!EH.Sync?.applyingRemote && item?.id) EH.Sync?.markPendingRecord?.('reminder', item.id);
+            });
             this.render();
             return safe;
         },
@@ -11645,6 +11773,7 @@
             return result;
         },
         captureItems(items=[]) {
+            EH.EmissionMemory?.captureItems?.(items);
             if (!EH.Config.REMINDER_CREATE_AFTER_TICKET) return 0;
             const candidates=this.candidateItems(items);
             if (!candidates.length) return 0;
@@ -11661,25 +11790,27 @@
             EH.Toast?.success?.(`${fresh.length} lembrete(s) de passagem criado(s).`);
             return fresh.length;
         },
-        complete(id) {
-            const items=this.load();
-            const item=items.find(x=>x.id===id);
-            if (!item) return;
-            item.status='completed'; item.completedAt=Date.now(); item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local';
-            this.save(items);
-            EH.Sync?.syncReminders?.({ quiet: true });
-            EH.Toast?.success?.('Lembrete marcado como impresso/concluído.');
-        },
-        reopen(id) {
-            const items=this.load(); const item=items.find(x=>x.id===id); if(!item)return;
-            item.status='pending'; item.completedAt=0; item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local'; this.save(items); EH.Sync?.syncReminders?.({ quiet: true });
-        },
+        complete(id) { const item=this.markStatus(id,'printed'); if(item) EH.Toast?.success?.('Lembrete marcado como impresso.'); },
+        reopen(id) { this.markStatus(id,'pending'); },
         todayKey(offset=0) {
             const d=new Date(); d.setDate(d.getDate()+offset);
             return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
         },
-        pending() { return this.load().filter(x=>x.status!=='completed').sort((a,b)=>(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15)||a.createdAt-b.createdAt); },
+        pending() { return this.load().filter(x=>!this.isDoneStatus(x.status)).sort((a,b)=>(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15)||a.createdAt-b.createdAt); },
         maskCpf(cpf) { return EH.Config.REMINDER_MASK_CPF ? EH.SaleContext.maskCpfPublic(cpf) : EH.SaleContext.maskCpf(cpf); },
+        isDoneStatus(status) { return ['printed','checked','completed','concluded'].includes(String(status || '').toLowerCase()); },
+        statusRank(status) {
+            const value=String(status||'').toLowerCase();
+            return value==='pending'?0:value==='checked'?1:value==='printed'?2:(value==='completed'||value==='concluded')?3:0;
+        },
+        markStatus(id, status) {
+            const items=this.load(); const item=items.find(x=>x.id===id); if(!item)return null;
+            const allowed=['pending','printed','checked','completed'];
+            const requested=allowed.includes(String(status||'').toLowerCase())?String(status).toLowerCase():'pending';
+            item.status=requested==='pending'?'pending':(this.statusRank(requested)>=this.statusRank(item.status)?requested:String(item.status||'pending').toLowerCase());
+            item.completedAt=this.isDoneStatus(item.status)?Date.now():0; item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local';
+            this.save(items); EH.Sync?.syncAll?.({quiet:true}); return item;
+        },
         async copyCpf(item) {
             const cpf=this.normalizeCpf(item?.cpf); if(cpf.length!==11) return EH.Toast.warning('CPF não disponível neste lembrete.');
             await EH.Clipboard.copyText(cpf); EH.Toast.success('CPF copiado.');
@@ -11719,7 +11850,7 @@
             const service = String(record?.service || '').replace(/\D/g, '');
             const date = String(record?.date || '');
             const candidates = this.load().filter(item => {
-                if (item.status === 'completed' && !ticket && !cpf) return false;
+                if (this.isDoneStatus(item.status) && !ticket && !cpf) return false;
                 if (ticket && item.ticketNumber && EH.Utils.clean(item.ticketNumber) === ticket) return true;
                 if (cpf && this.normalizeCpf(item.cpf) === cpf) {
                     if (service && item.service && String(item.service) !== service) return false;
@@ -11788,23 +11919,27 @@
             const close=document.createElement('button'); close.type='button'; close.className='eh-modal-close'; close.textContent='✕'; head.append(title,close);
             const content=document.createElement('div'); content.className='eh-modal-content eh-reminder-list';
             const renderList=()=>{
-                content.innerHTML=''; const items=this.load().slice().sort((a,b)=>(a.status==='completed')-(b.status==='completed')||(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15));
+                content.innerHTML=''; const items=this.load().slice().sort((a,b)=>(this.isDoneStatus(a.status)?1:0)-(this.isDoneStatus(b.status)?1:0)||(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15));
                 if(!items.length){ const empty=document.createElement('div'); empty.className='eh-reminder-empty'; empty.textContent='Nenhum lembrete salvo.'; content.appendChild(empty); return; }
                 items.forEach(item=>{
-                    const card=document.createElement('div'); card.className=`eh-reminder-card ${item.status==='completed'?'completed':''}`;
+                    const card=document.createElement('div'); card.className=`eh-reminder-card ${this.isDoneStatus(item.status)?'completed':''}`;
                     const top=document.createElement('div'); top.className='eh-reminder-card-top';
                     const when=document.createElement('strong'); when.textContent=this.labelFor(item);
-                    const state=document.createElement('span'); state.textContent=item.status==='completed'?'✓ IMPRESSO':'PENDENTE'; top.append(when,state);
+                    const state=document.createElement('span'); state.textContent=this.isDoneStatus(item.status)?(String(item.status).toLowerCase()==='checked'?'✓ CONFERIDO':'✓ IMPRESSO'):'PENDENTE'; top.append(when,state);
                     const name=document.createElement('b'); name.textContent=item.name || 'Passageiro';
                     const cpf=document.createElement('div'); cpf.className='eh-reminder-cpf'; cpf.textContent=`CPF: ${this.maskCpf(item.cpf)}`;
                     const route=document.createElement('small'); route.textContent=[item.origin,item.destination].filter(Boolean).join(' → ') || 'Trecho não identificado';
                     const id=document.createElement('small'); id.textContent=item.ticketNumber?`Bilhete ${item.ticketNumber}`:'Identificador por CPF + trecho + data';
                     const mapInfo=document.createElement('small'); mapInfo.textContent=[item.service?`Serviço ${item.service}`:'',item.seat?`Poltrona ${item.seat}`:''].filter(Boolean).join(' • '); mapInfo.hidden=!mapInfo.textContent;
+                    const requestCodes=EH.RequisitionManager?.codesForCpf?.(item.cpf)||[];
+                    const requestInfo=document.createElement('small');
+                    requestInfo.textContent=requestCodes.length?`Requisição: ${requestCodes.map(row=>`${String(row.tipo||'ida').toUpperCase()} ${row.codigo}`).join(' • ')}`:'';
+                    requestInfo.hidden=!requestInfo.textContent;
                     const actions=document.createElement('div'); actions.className='eh-reminder-actions';
                     const copy=document.createElement('button'); copy.type='button'; copy.className='eh-modal-btn'; copy.textContent='Copiar CPF'; copy.addEventListener('click',()=>this.copyCpf(item));
                     const search=document.createElement('button'); search.type='button'; search.className='eh-modal-btn primary'; search.textContent='Buscar passagem'; search.addEventListener('click',()=>this.searchTicket(item));
-                    const done=document.createElement('button'); done.type='button'; done.className='eh-modal-btn'; done.textContent=item.status==='completed'?'Reabrir':'✓ Impresso'; done.addEventListener('click',()=>{ item.status==='completed'?this.reopen(item.id):this.complete(item.id); renderList(); });
-                    actions.append(copy,search,done); card.append(top,name,cpf,route,id,mapInfo,actions); content.appendChild(card);
+                    const done=document.createElement('button'); done.type='button'; done.className='eh-modal-btn'; done.textContent=this.isDoneStatus(item.status)?'Reabrir':'✓ Impresso'; done.addEventListener('click',()=>{ this.isDoneStatus(item.status)?this.reopen(item.id):this.complete(item.id); renderList(); });
+                    actions.append(copy,search,done); card.append(top,name,cpf,route,id,mapInfo,requestInfo,actions); content.appendChild(card);
                 });
             }; renderList();
             const foot=document.createElement('div'); foot.className='eh-modal-actions'; const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar'; foot.appendChild(close2);
@@ -11817,7 +11952,7 @@
             if(!pending.length){ host.hidden=true; host.innerHTML=''; return; }
             host.hidden=false; host.innerHTML='';
             const today=pending.filter(x=>x.travelDate===this.todayKey(0)); const tomorrow=pending.filter(x=>x.travelDate===this.todayKey(1));
-            const title=document.createElement('div'); title.className='eh-reminder-host-title'; title.innerHTML='<span>EMBARQUES</span><strong>Passagens para imprimir</strong>';
+            const title=document.createElement('div'); title.className='eh-reminder-host-title'; title.innerHTML='<span>PENDÊNCIAS</span><strong>Embarques e requisições</strong>';
             const syncStatus=EH.Sync?.status?.() || {state:'local',pending:0};
             const syncLine=document.createElement('small'); syncLine.className=`eh-reminder-sync ${syncStatus.state||'local'}`;
             syncLine.textContent = syncStatus.state==='synced' ? '☁ Sincronizado'
@@ -11829,8 +11964,10 @@
             const summary=document.createElement('div'); summary.className='eh-reminder-host-summary';
             const todayBtn=document.createElement('button'); todayBtn.type='button'; todayBtn.textContent=`Hoje ${today.length}`;
             const tomorrowBtn=document.createElement('button'); tomorrowBtn.type='button'; tomorrowBtn.textContent=`Amanhã ${tomorrow.length}`;
-            const totalBtn=document.createElement('button'); totalBtn.type='button'; totalBtn.textContent=`Pendentes ${pending.length}`;
-            [todayBtn,tomorrowBtn,totalBtn].forEach(btn=>btn.addEventListener('click',()=>this.openModal())); summary.append(todayBtn,tomorrowBtn,totalBtn);
+            const totalBtn=document.createElement('button'); totalBtn.type='button'; totalBtn.textContent=`Impressão ${pending.length}`;
+            const reqPending=(EH.RequisitionManager?.loadStore?.()||[]).filter(request=>(request.passengers||[]).some(passenger=>(passenger.legs||[]).some(leg=>!leg.codigo))).length;
+            const reqBtn=document.createElement('button'); reqBtn.type='button'; reqBtn.textContent=`Requisições ${reqPending}`; reqBtn.addEventListener('click',()=>EH.Toast.info(reqPending?'Abra a tela de Requisições para concluir os códigos pendentes.':'Nenhuma requisição aguardando código.'));
+            [todayBtn,tomorrowBtn,totalBtn].forEach(btn=>btn.addEventListener('click',()=>this.openModal())); summary.append(todayBtn,tomorrowBtn,totalBtn,reqBtn);
             const next=pending[0]; const nextLine=document.createElement('div'); nextLine.className='eh-reminder-next';
             const main=document.createElement('strong'); main.textContent=`${next.travelTime||'—'} • ${next.name||'Passageiro'}`;
             const sub=document.createElement('small'); sub.textContent=`${this.maskCpf(next.cpf)} • ${[next.origin,next.destination].filter(Boolean).join(' → ')}`; nextLine.append(main,sub);
@@ -11841,11 +11978,307 @@
             GM_addStyle(`
                 #eh-root .eh-reminder-host{display:grid;gap:6px;margin:7px 0;padding:8px;border:1px solid #e1d7bd;border-radius:9px;background:#fffaf0;color:#303946}
                 #eh-root .eh-reminder-host[hidden]{display:none!important}.eh-reminder-host-title{display:grid;gap:1px}.eh-reminder-host-title span{font-size:7px;font-weight:950;letter-spacing:.5px;color:#92703a}.eh-reminder-host-title strong{font-size:10px;color:#334155}
-                .eh-reminder-sync{font-size:7.4px;color:#7a6c54}.eh-reminder-sync.synced{color:#2f7a5f}.eh-reminder-sync.offline,.eh-reminder-sync.error{color:#a36535}.eh-reminder-host-summary{display:grid;grid-template-columns:repeat(3,1fr);gap:4px}.eh-reminder-host-summary button{min-height:27px;border:1px solid #e4d7ba;border-radius:7px;background:#fff;color:#6b5734;font-size:8px;font-weight:850;cursor:pointer}.eh-reminder-next{display:grid;gap:2px;padding-top:5px;border-top:1px solid #eee2c9}.eh-reminder-next strong{font-size:9px}.eh-reminder-next small{font-size:7.8px;color:#746956;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+                .eh-reminder-sync{font-size:7.4px;color:#7a6c54}.eh-reminder-sync.synced{color:#2f7a5f}.eh-reminder-sync.offline,.eh-reminder-sync.error{color:#a36535}.eh-reminder-host-summary{display:grid;grid-template-columns:repeat(2,1fr);gap:4px}.eh-reminder-host-summary button{min-height:27px;border:1px solid #e4d7ba;border-radius:7px;background:#fff;color:#6b5734;font-size:8px;font-weight:850;cursor:pointer}.eh-reminder-next{display:grid;gap:2px;padding-top:5px;border-top:1px solid #eee2c9}.eh-reminder-next strong{font-size:9px}.eh-reminder-next small{font-size:7.8px;color:#746956;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
                 .eh-reminder-list{display:grid;gap:8px}.eh-reminder-card{display:grid;gap:5px;padding:11px;border:1px solid #dfe5eb;border-radius:10px;background:#fff}.eh-reminder-card.completed{opacity:.68;background:#f7f9fa}.eh-reminder-card-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.eh-reminder-card-top strong{font-size:12px;color:#253348}.eh-reminder-card-top span{font-size:8px;font-weight:900;color:#697687}.eh-reminder-card>b{font-size:12px}.eh-reminder-cpf{font-size:11px;font-weight:800;color:#334155}.eh-reminder-card small{font-size:10px;color:#6d7888}.eh-reminder-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px}.eh-reminder-empty{padding:25px;text-align:center;color:#718092}
             `);
         },
         init(){ this.injectStyles(); this.render(); }
+    };
+
+
+
+    // ============================================================
+    // MEMÓRIA DE EMISSÕES — v5.60
+    // Guarda somente dados operacionais úteis da passagem; nunca imagens/documentos.
+    // ============================================================
+    EH.EmissionMemory = {
+        KEY: 'emissionMemory.v1',
+        load() {
+            const rows = EH.Storage.get(this.KEY, []);
+            return Array.isArray(rows) ? rows : [];
+        },
+        normalize(item = {}) {
+            const cpf = String(item.cpf || '').replace(/\D/g, '').slice(0, 11);
+            const ticketNumber = EH.Utils.clean(item.ticketNumber || item.ticket || '');
+            const origin = EH.Utils.clean(item.origin || '');
+            const destination = EH.Utils.clean(item.destination || '');
+            const travelDate = EH.Utils.clean(item.travelDate || '');
+            const id = String(item.id || (ticketNumber ? `ticket:${ticketNumber}` : `trip:${cpf}|${travelDate}|${EH.Utils.normalize(origin)}|${EH.Utils.normalize(destination)}`));
+            return {
+                id, cpf,
+                name: EH.Utils.clean(item.name || ''),
+                origin, destination, travelDate,
+                travelDateBr: EH.Utils.clean(item.travelDateBr || ''),
+                travelTime: EH.Utils.clean(item.travelTime || ''),
+                travelTimestamp: Number(item.travelTimestamp || 0),
+                service: String(item.service || '').replace(/\D/g, ''),
+                line: EH.Utils.clean(item.line || ''),
+                seat: EH.Utils.clean(item.seat || ''),
+                ticketNumber,
+                locator: EH.Utils.clean(item.locator || ''),
+                saleId: EH.Utils.clean(item.saleId || ''),
+                status: EH.Utils.clean(item.status || 'issued') || 'issued',
+                createdAt: Number(item.createdAt || Date.now()),
+                updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
+                deviceId: String(item.deviceId || EH.Device.id())
+            };
+        },
+        merge(oldItem = {}, incoming = {}) {
+            const old = this.normalize(oldItem), next = this.normalize(incoming);
+            const newer = Number(next.updatedAt || 0) >= Number(old.updatedAt || 0);
+            const preferred = newer ? next : old, secondary = newer ? old : next;
+            const useful = (a,b) => EH.Sync?.usefulText?.(a,b) || EH.Utils.clean(a || b || '');
+            return {
+                ...secondary, ...preferred,
+                id: preferred.id || secondary.id,
+                cpf: preferred.cpf || secondary.cpf,
+                name: useful(preferred.name, secondary.name),
+                origin: useful(preferred.origin, secondary.origin),
+                destination: useful(preferred.destination, secondary.destination),
+                travelDate: preferred.travelDate || secondary.travelDate,
+                travelDateBr: preferred.travelDateBr || secondary.travelDateBr,
+                travelTime: preferred.travelTime || secondary.travelTime,
+                service: preferred.service || secondary.service,
+                line: useful(preferred.line, secondary.line),
+                seat: preferred.seat || secondary.seat,
+                ticketNumber: preferred.ticketNumber || secondary.ticketNumber,
+                locator: preferred.locator || secondary.locator,
+                saleId: preferred.saleId || secondary.saleId,
+                createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
+                updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
+                deviceId: preferred.deviceId || secondary.deviceId || EH.Device.id()
+            };
+        },
+        upsert(item = {}, { fromSync = false } = {}) {
+            const next = this.normalize(item);
+            if (!next.id || (!next.ticketNumber && next.cpf.length !== 11)) return null;
+            const rows = this.load();
+            const index = rows.findIndex(row => String(row.id) === next.id);
+            const merged = index >= 0 ? this.merge(rows[index], next) : next;
+            const before = index >= 0 ? JSON.stringify(rows[index]) : '';
+            if (!fromSync) merged.updatedAt = Date.now();
+            if (index >= 0) rows[index] = merged; else rows.push(merged);
+            if (index < 0 || before !== JSON.stringify(merged)) {
+                EH.Storage.set(this.KEY, rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0, 2000));
+                if (!fromSync) EH.Sync?.markPendingRecord?.('emission', merged.id);
+            }
+            if (merged.cpf) EH.PassengerMemory?.upsert?.({ cpf:merged.cpf, name:merged.name, updatedAt:merged.updatedAt }, { fromSync });
+            return merged;
+        },
+        captureItems(items = []) {
+            const candidates = EH.Reminders?.candidateItems?.(items) || [];
+            let count = 0;
+            candidates.forEach(candidate => {
+                const saved = this.upsert({ ...candidate, status:'issued' });
+                if (saved) count += 1;
+            });
+            return count;
+        },
+        applyRemote(item = {}) { return this.upsert(item, { fromSync:true }); }
+    };
+
+
+    // ============================================================
+    // FILA DE CONFERÊNCIA DE BILHETES — v5.60
+    // Persiste a lista do mapa ao navegar para Passagens e permite conferir um CPF por vez.
+    // ============================================================
+    EH.TicketVerificationQueue = {
+        KEY:'ticketVerificationQueue.v2',
+        LEGACY_KEY:'ticketVerificationQueue.v1',
+        SEARCH_KEY:'ticketVerificationQueue.search.v1',
+        searchBusy:false,
+
+        load() {
+            let value=EH.Storage.get(this.KEY,null);
+            if(!value){
+                const legacy=EH.Storage.get(this.LEGACY_KEY,null);
+                if(legacy&&typeof legacy==='object'){
+                    value={
+                        ...legacy,
+                        activeKind:legacy.kind==='alight'?'alight':'board',
+                        lists:{
+                            board:legacy.kind==='alight'?[]:(Array.isArray(legacy.passengers)?legacy.passengers:[]),
+                            alight:legacy.kind==='alight'?(Array.isArray(legacy.passengers)?legacy.passengers:[]):[]
+                        }
+                    };
+                    EH.Storage.set(this.KEY,value);
+                }
+            }
+            return value&&typeof value==='object'?value:null;
+        },
+        save(queue) {
+            if(!queue){EH.Storage.remove(this.KEY);return null;}
+            queue.activeKind=queue.activeKind==='alight'?'alight':'board';
+            queue.lists=queue.lists&&typeof queue.lists==='object'?queue.lists:{board:[],alight:[]};
+            queue.lists.board=Array.isArray(queue.lists.board)?queue.lists.board:[];
+            queue.lists.alight=Array.isArray(queue.lists.alight)?queue.lists.alight:[];
+            queue.updatedAt=Date.now();
+            EH.Storage.set(this.KEY,queue);
+            return queue;
+        },
+        passengerId(item,index=0,kind='board') {
+            const cpf=String(item?.cpf||'').replace(/\D/g,'').slice(0,11),ticket=EH.Utils.clean(item?.ticket||'');
+            return ticket?`${kind}:ticket:${ticket}`:cpf?`${kind}:cpf:${cpf}|${item?.seat||''}`:`${kind}:row:${index}|${item?.seat||''}|${EH.Utils.normalize(item?.name||'')}`;
+        },
+        statusRank(status) {
+            const value=String(status||'pending').toLowerCase();
+            return value==='pending'?0:value==='checked'?1:value==='printed'?2:0;
+        },
+        buildList(records=[],kind='board',oldList=[]) {
+            const previous=new Map((oldList||[]).map(item=>[String(item.id||''),item]));
+            const passengers=[];
+            (records||[]).forEach(record=>{
+                const list=kind==='alight'?(record?.agency?.alighters||[]):(record?.agency?.boarders||[]);
+                list.forEach((item,index)=>{
+                    const id=this.passengerId(item,index,kind);
+                    if(passengers.some(p=>p.id===id))return;
+                    const reminder=EH.Reminders?.matchPassenger?.(item,record);
+                    let reminderStatus='pending';
+                    if(EH.Reminders?.isDoneStatus?.(reminder?.status)){
+                        reminderStatus=String(reminder?.status||'').toLowerCase()==='checked'?'checked':'printed';
+                    }
+                    const old=previous.get(id);
+                    const oldStatus=old?.status||'pending';
+                    const status=this.statusRank(oldStatus)>=this.statusRank(reminderStatus)?oldStatus:reminderStatus;
+                    passengers.push({
+                        id,
+                        name:EH.Utils.clean(item.name||old?.name||''),
+                        cpf:String(item.cpf||old?.cpf||'').replace(/\D/g,'').slice(0,11),
+                        seat:EH.Utils.clean(item.seat||old?.seat||''),
+                        ticket:EH.Utils.clean(item.ticket||old?.ticket||''),
+                        origin:item.origin||old?.origin||null,
+                        destination:item.destination||old?.destination||null,
+                        service:String(record.service||old?.service||''),
+                        floor:EH.Utils.clean(record.floor||old?.floor||''),
+                        status,
+                        reminderId:reminder?.id||old?.reminderId||'',
+                        checkedAt:Number(old?.checkedAt||0),
+                        printedAt:Number(old?.printedAt||0)
+                    });
+                });
+            });
+            return passengers;
+        },
+        fromRecords(records=[],kind='board',meta={}) {
+            const valid=(records||[]).filter(Boolean);
+            if(!valid.length)return null;
+            const date=meta.date||valid[0]?.date||'',routineId=meta.routineId||valid[0]?.routineId||'';
+            const queueId=`${date}|${routineId||meta.operationalTime||valid.map(r=>r.service).join('+')}`;
+            const existing=this.load(),same=existing&&String(existing.id||'')===queueId?existing:null;
+            const lists={
+                board:this.buildList(valid,'board',same?.lists?.board||[]),
+                alight:this.buildList(valid,'alight',same?.lists?.alight||[])
+            };
+            return this.save({
+                id:queueId,date,
+                operationalTime:meta.operationalTime||valid[0]?.operationalTime||'',
+                name:meta.name||valid[0]?.operationalName||'',
+                activeKind:kind==='alight'?'alight':'board',
+                services:Array.from(new Set(valid.map(r=>String(r.service||'')).filter(Boolean))),
+                lists,
+                createdAt:Number(same?.createdAt||Date.now()),
+                updatedAt:Date.now()
+            });
+        },
+        activeList(queue=this.load()) {
+            if(!queue)return[];
+            const kind=queue.activeKind==='alight'?'alight':'board';
+            return Array.isArray(queue?.lists?.[kind])?queue.lists[kind]:[];
+        },
+        switchKind(kind) {
+            const q=this.load();if(!q)return;
+            q.activeKind=kind==='alight'?'alight':'board';this.save(q);this.render();
+        },
+        findPassenger(queue,id) {
+            if(!queue)return null;
+            for(const kind of ['board','alight']){
+                const item=(queue.lists?.[kind]||[]).find(p=>p.id===id);
+                if(item)return{item,kind};
+            }
+            return null;
+        },
+        setStatus(id,status) {
+            const q=this.load(),found=this.findPassenger(q,id);if(!found)return;
+            const requested=['pending','checked','printed'].includes(String(status||'').toLowerCase())?String(status).toLowerCase():'pending';
+            if(requested==='pending'||this.statusRank(requested)>=this.statusRank(found.item.status))found.item.status=requested;
+            if(found.item.status==='checked')found.item.checkedAt=Date.now();
+            if(found.item.status==='printed')found.item.printedAt=Date.now();
+            this.save(q);
+            if(found.item.reminderId){
+                if(found.item.status==='printed')EH.Reminders?.markStatus?.(found.item.reminderId,'printed');
+                else if(found.item.status==='checked')EH.Reminders?.markStatus?.(found.item.reminderId,'checked');
+            }
+            this.render();
+        },
+        nextPending() {
+            const q=this.load();
+            return this.activeList(q).find(p=>p.status==='pending')||null;
+        },
+        async copyCpf(item) {
+            const cpf=String(item?.cpf||'').replace(/\D/g,'').slice(0,11);
+            if(cpf.length!==11)return EH.Toast.warning('CPF não disponível no mapa.');
+            await EH.Clipboard.copyText(cpf);EH.Toast.success('CPF copiado.');
+        },
+        search(item) {
+            const cpf=String(item?.cpf||'').replace(/\D/g,'').slice(0,11);
+            if(cpf.length!==11)return EH.Toast.warning('CPF não disponível para busca.');
+            EH.Storage.set(this.SEARCH_KEY,{cpf,passengerId:item.id,expiresAt:Date.now()+120000});
+            if(EH.Pages.detect()==='passagens')this.runPendingSearch();else EH.SaleContext.navigateToPassagens();
+        },
+        async runPendingSearch() {
+            if(this.searchBusy)return;
+            const pending=EH.Storage.get(this.SEARCH_KEY,null);
+            if(!pending?.cpf||Number(pending.expiresAt||0)<Date.now()){EH.Storage.remove(this.SEARCH_KEY);return;}
+            const input=EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT);if(!input)return;
+            this.searchBusy=true;
+            try{
+                EH.SaleContext.setNativeValue(input,EH.SaleContext.maskCpf(pending.cpf));
+                input.focus();await EH.Utils.sleep(80);input.blur();
+                const button=EH.SaleContext.findSearchButton(input),form=input.closest('form');
+                if(button)button.click();else if(form?.requestSubmit)form.requestSubmit();else form?.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+                EH.Storage.remove(this.SEARCH_KEY);
+                EH.Toast.success('CPF preenchido e busca iniciada.');
+            }finally{this.searchBusy=false;}
+        },
+        next() {
+            const item=this.nextPending();
+            if(!item)return EH.Toast.info('Não há passageiro pendente nesta lista.');
+            this.search(item);
+        },
+        render() {
+            const existing=document.querySelector('#eh-ticket-verification-queue'),q=this.load();
+            if(EH.Pages.detect()!=='passagens'||!q||(q.lists?.board?.length||0)+(q.lists?.alight?.length||0)===0){existing?.remove();return;}
+            let box=existing;
+            if(!box){box=document.createElement('div');box.id='eh-ticket-verification-queue';box.className='eh-verification-queue';document.body.append(box);}
+            box.innerHTML='';
+            const title=document.createElement('strong');title.textContent=`CONFERÊNCIA DO CARRO • ${q.operationalTime||'—'} • ${q.name||''}`;
+            const tabs=document.createElement('div');tabs.className='eh-verification-tabs';
+            ['board','alight'].forEach(kind=>{
+                const label=kind==='board'?'Embarques':'Desembarques',list=q.lists?.[kind]||[],pending=list.filter(p=>p.status==='pending').length;
+                const btn=document.createElement('button');btn.className=q.activeKind===kind?'active':'';btn.textContent=`${label} ${pending}/${list.length}`;btn.addEventListener('click',()=>this.switchKind(kind));tabs.append(btn);
+            });
+            box.append(title,tabs);
+            const active=this.activeList(q);
+            if(!active.length){const empty=document.createElement('small');empty.textContent=q.activeKind==='alight'?'Nenhum desembarque da agência 287 nesta fila.':'Nenhum embarque da agência 287 nesta fila.';box.append(empty);}
+            active.forEach(item=>{
+                const row=document.createElement('div');row.className='eh-verification-row';
+                const text=document.createElement('span');text.textContent=`${item.status==='pending'?'○':item.status==='printed'?'🖨':'✓'} ${EH.OperationCars?.seatLabel?.(item.seat)||item.seat||'—'} — ${item.name||'Passageiro'}${item.floor?` • ${item.floor}`:''}`;
+                const cpf=document.createElement('button');cpf.textContent='CPF';cpf.addEventListener('click',()=>this.copyCpf(item));
+                const search=document.createElement('button');search.textContent='Buscar';search.addEventListener('click',()=>this.search(item));
+                const checked=document.createElement('button');checked.textContent='✓';checked.title='Marcar conferido';checked.addEventListener('click',()=>this.setStatus(item.id,'checked'));
+                const printed=document.createElement('button');printed.textContent='🖨';printed.title='Marcar impresso';printed.addEventListener('click',()=>this.setStatus(item.id,'printed'));
+                row.append(text,cpf,search,checked,printed);box.append(row);
+            });
+            const next=document.createElement('button');next.className='eh-modal-btn';next.textContent='Próximo pendente';next.addEventListener('click',()=>this.next());box.append(next);
+        },
+        onPageUpdate(page) {
+            if(page==='passagens'){EH.Runtime.timeout('verification-search',()=>this.runPendingSearch(),350);this.render();}
+            else document.querySelector('#eh-ticket-verification-queue')?.remove();
+        },
+        injectStyles() {
+            GM_addStyle(`#eh-ticket-verification-queue{position:fixed;right:18px;bottom:18px;z-index:2147482900;width:min(430px,calc(100vw - 36px));max-height:58vh;overflow:auto;display:grid;gap:6px;padding:10px;border:1px solid #d8e0e8;border-radius:11px;background:#fff;color:#253348;box-shadow:0 14px 36px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif;font-size:10px}.eh-verification-tabs{display:grid;grid-template-columns:1fr 1fr;gap:5px}.eh-verification-tabs button{min-height:28px;border:1px solid #d4dde6;border-radius:7px;background:#f8fafc;font-size:9px;font-weight:800;cursor:pointer}.eh-verification-tabs button.active{border-color:#8fb1cf;background:#edf5fb;color:#245b86}.eh-verification-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto auto;gap:5px;align-items:center;padding:5px 0;border-top:1px solid #eef1f4}.eh-verification-row button{min-height:27px;border:1px solid #d4dde6;border-radius:6px;background:#f8fafc;font-size:8px;cursor:pointer}`);
+        },
+        init(){this.injectStyles();this.render();}
     };
 
     // ============================================================
@@ -12108,7 +12541,7 @@
         },
 
         routineStates(date = this.todayKey()) {
-            const rows = this.searchScheduleRecords('').filter(item => !date || !item.date || item.date === date);
+            const rows = this.searchScheduleRecords('', date).filter(item => !date || !item.date || item.date === date);
             return this.routineConfigs().filter(item => item.active).map(routine => {
                 const matches = rows
                     .map(record => ({ record, match: this.routeMatchScore(record, routine) }))
@@ -12120,7 +12553,7 @@
         },
 
         routineForService(service, date = this.todayKey()) {
-            const rows = this.searchScheduleRecords('').filter(item =>
+            const rows = this.searchScheduleRecords('', date).filter(item =>
                 String(item.service || '') === String(service || '') && (!date || !item.date || item.date === date)
             );
             for (const row of rows) {
@@ -12280,7 +12713,7 @@
             return this.readScheduleResults();
         },
 
-        searchScheduleRecords(query = '') {
+        searchScheduleRecords(query = '', date = this.todayKey()) {
             const q = this.normalize(query);
             const visible = this.visibleScheduleRecords?.length ? this.visibleScheduleRecords : [];
             const stored = this.loadScheduleRecords();
@@ -12290,8 +12723,8 @@
                 const key = item.resultKey || [item.service,item.date||'',item.departure||'',this.normalize(item.lineRaw||''),this.normalize(item.floor||'')].join('|');
                 if (!map.has(key)) map.set(key,item);
             });
-            const today = this.todayKey();
-            let rows = Array.from(map.values()).filter(item => !item.date || item.date === today);
+            const targetDate = date || this.todayKey();
+            let rows = Array.from(map.values()).filter(item => !item.date || item.date === targetDate);
             if (!q) return rows.sort((a,b)=>Number(a.timestamp||0)-Number(b.timestamp||0)||String(a.service).localeCompare(String(b.service)));
             const digits = q.replace(/\D/g,'');
             const exactService = digits ? rows.filter(item => String(item.service) === digits) : [];
@@ -12479,11 +12912,30 @@
             else{
                 const matches=distinct.filter(item=>Number(item.board)===boarders.length&&Number(item.alight)===alighters.length);
                 if(matches.length===1){selected=matches[0];resolution='code-plus-passenger-counts';}
-                else warning=`Mais de um registro diferente com código ${code} foi encontrado e nenhum pôde ser confirmado somente pelos passageiros do código ${code}.`;
+                else {
+                    // Alguns mapas reais repetem o MESMO código de agência em localidades diferentes.
+                    // Embarque/desembarque podem ser agregados SOMENTE quando a soma fecha exatamente
+                    // com a tabela individual de passageiros do código. Saldo nunca é somado aqui.
+                    const movementKnown=distinct.every(item=>Number.isFinite(Number(item.board))&&Number.isFinite(Number(item.alight)));
+                    const totalBoard=movementKnown?distinct.reduce((sum,item)=>sum+Number(item.board||0),0):null;
+                    const totalAlight=movementKnown?distinct.reduce((sum,item)=>sum+Number(item.alight||0),0):null;
+                    if(movementKnown&&totalBoard===boarders.length&&totalAlight===alighters.length){
+                        return{
+                            exists:true,multiple:false,rows,row:null,board:totalBoard,alight:totalAlight,balance:null,
+                            balanceRows:distinct.map(item=>({ locality:EH.Utils.clean(item.location?.raw||''), balance:item.balance })),
+                            boarders,alighters,
+                            warning:`Código ${code} aparece em ${distinct.length} linhas. Embarques/desembarques foram agregados porque conferem com a tabela de passageiros; os saldos permanecem separados.`,
+                            resolution:'aggregate-code-passenger-counts',code,
+                            matchedLocality:distinct.map(item=>EH.Utils.clean(item.location?.raw||'')).filter(Boolean).join(' • '),
+                            countsMatchPassengers:true
+                        };
+                    }
+                    warning=`Mais de um registro diferente com código ${code} foi encontrado e nenhum pôde ser confirmado com segurança pelos passageiros do código ${code}.`;
+                }
             }
-            if(!selected)return{exists:true,multiple:true,rows,row:null,board:null,alight:null,balance:null,boarders,alighters,warning,resolution:'ambiguous',countsMatchPassengers:null,code};
+            if(!selected)return{exists:true,multiple:true,rows,row:null,board:null,alight:null,balance:null,balanceRows:distinct.map(item=>({locality:EH.Utils.clean(item.location?.raw||''),balance:item.balance})),boarders,alighters,warning,resolution:'ambiguous',countsMatchPassengers:null,code};
             return{
-                exists:true,multiple:false,rows,row:selected,board:selected.board,alight:selected.alight,balance:selected.balance,
+                exists:true,multiple:false,rows,row:selected,board:selected.board,alight:selected.alight,balance:selected.balance,balanceRows:[{locality:EH.Utils.clean(selected.location?.raw||''),balance:selected.balance}],
                 boarders,alighters,warning,resolution,code,matchedLocality:EH.Utils.clean(selected.location?.raw||''),
                 countsMatchPassengers:Number(selected.board)===boarders.length&&Number(selected.alight)===alighters.length
             };
@@ -12746,7 +13198,10 @@
                 const name=document.createElement('strong');name.textContent=item.name||'Passageiro sem nome';
                 const route=document.createElement('small');route.textContent=this.passengerSecondary(item,kind);info.append(name,route);
                 const reminder=EH.Reminders?.matchPassenger?.(item,record);
-                if(reminder){const pending=document.createElement('small');pending.className=`eh-operation-reminder-state ${reminder.status==='completed'?'done':'pending'}`;pending.textContent=reminder.status==='completed'?'✓ Bilhete já impresso/concluído':`⚠ Precisa imprimir passagem${reminder.cpf?` • CPF ${EH.Reminders.maskCpf(reminder.cpf)}`:''}`;info.appendChild(pending);}
+                if(reminder){const pending=document.createElement('small');pending.className=`eh-operation-reminder-state ${EH.Reminders.isDoneStatus(reminder.status)?'done':'pending'}`;pending.textContent=EH.Reminders.isDoneStatus(reminder.status)?'✓ Bilhete já impresso/concluído':`⚠ Precisa imprimir passagem${reminder.cpf?` • CPF ${EH.Reminders.maskCpf(reminder.cpf)}`:''}`;info.appendChild(pending);}
+                const quick=document.createElement('div');quick.className='eh-operation-detail-actions';
+                const cpfBtn=document.createElement('button');cpfBtn.className='eh-modal-btn';cpfBtn.textContent='CPF';cpfBtn.addEventListener('click',()=>EH.TicketVerificationQueue.copyCpf(item));
+                const ticketBtn=document.createElement('button');ticketBtn.className='eh-modal-btn primary';ticketBtn.textContent='Ver passagem';ticketBtn.addEventListener('click',()=>{const queue=EH.TicketVerificationQueue.fromRecords([record],kind,{date:record.date,operationalTime:record.operationalTime,name:this.displayName(record),routineId:record.routineId});const active=EH.TicketVerificationQueue.activeList(queue);const target=active.find(p=>p.cpf&&p.cpf===String(item.cpf||'').replace(/\D/g,'').slice(0,11))||active.find(p=>p.seat===EH.Utils.clean(item.seat||''));if(target)EH.TicketVerificationQueue.search(target);});quick.append(cpfBtn,ticketBtn);info.appendChild(quick);
                 row.append(seat,info);content.appendChild(row);
             });
             const foot=document.createElement('div');foot.className='eh-modal-actions';const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(close2);
@@ -12795,6 +13250,20 @@
                 if(exact)return exact;
             }
             return maps[0]||null;
+        },
+
+        vehicleGroups(date=this.todayKey()) {
+            return this.routineStates(date).map(state=>{
+                const maps=[];state.matches.forEach(schedule=>{this.mapsForService(schedule.service,date).forEach(record=>{if(schedule.resultKey&&record.scheduleResultKey&&record.scheduleResultKey!==schedule.resultKey)return;if(!maps.some(x=>x.mapKey===record.mapKey))maps.push(record);});});
+                const valid=maps.filter(record=>record?.agency?.exists&&!record?.agency?.multiple);
+                return {routine:state.routine,schedules:state.matches,maps,board:valid.reduce((sum,r)=>sum+Number(r.agency.board||0),0),alight:valid.reduce((sum,r)=>sum+Number(r.agency.alight||0),0),hasMap:maps.length>0,hasAgency:valid.length>0};
+            });
+        },
+        groupForRecord(record){if(!record)return null;const groups=this.vehicleGroups(record.date||this.todayKey());return groups.find(g=>g.maps.some(m=>m.mapKey===record.mapKey)||g.schedules.some(s=>String(s.service)===String(record.service)))||null;},
+        showGroupPassengers(group,kind='board') { if(!group?.maps?.length)return EH.Toast.info('Nenhum mapa deste horário foi lido.'); const records=group.maps.filter(r=>r?.agency?.exists&&!r?.agency?.multiple); const q=EH.TicketVerificationQueue.fromRecords(records,kind,{date:records[0]?.date,operationalTime:group.routine?.operationalTime,name:group.routine?.name,routineId:group.routine?.id}); if(!EH.TicketVerificationQueue.activeList(q).length)return EH.Toast.info(`Nenhum ${kind==='alight'?'desembarque':'embarque'} da agência ${this.agencyCode()} encontrado nos mapas lidos.`); this.showPassengersCombined(records,kind,group); },
+        showPassengersCombined(records=[],kind='board',group=null){
+            document.querySelector('#eh-operation-passengers-modal')?.remove();const overlay=document.createElement('div');overlay.id='eh-operation-passengers-modal';overlay.className='eh-overlay eh-operation-overlay';const modal=document.createElement('div');modal.className='eh-modal eh-operation-modal';const head=document.createElement('div');head.className='eh-modal-head';const title=document.createElement('div');title.className='eh-modal-title';title.textContent=`${kind==='alight'?'DESEMBARQUES':'EMBARQUES'} — ${group?.routine?.operationalTime||'—'} — AGÊNCIA ${this.agencyCode()}`;const close=document.createElement('button');close.className='eh-modal-close';close.textContent='×';head.append(title,close);const content=document.createElement('div');content.className='eh-modal-content eh-operation-passenger-list';
+            const items=[];records.forEach(record=>(kind==='alight'?(record.agency.alighters||[]):(record.agency.boarders||[])).forEach(item=>items.push({item,record})));items.sort((a,b)=>Number(a.item.seat||999)-Number(b.item.seat||999));items.forEach(({item,record})=>{const row=document.createElement('div');row.className='eh-operation-passenger';const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(item.seat);const info=document.createElement('div');info.className='eh-operation-passenger-info';const name=document.createElement('strong');name.textContent=item.name||'Passageiro';const route=document.createElement('small');route.textContent=`${this.passengerSecondary(item,kind)}${record.floor?` • ${record.floor}`:''} • Serviço ${record.service}`;const reminder=EH.Reminders?.matchPassenger?.(item,record);if(reminder){const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders.isDoneStatus(reminder.status)?'done':'pending'}`;state.textContent=EH.Reminders.isDoneStatus(reminder.status)?'✓ Bilhete impresso/concluído':'⚠ Impressão pendente';info.append(name,route,state);}else info.append(name,route);const buttons=document.createElement('div');buttons.className='eh-operation-detail-actions';const cpf=document.createElement('button');cpf.className='eh-modal-btn';cpf.textContent='CPF';cpf.addEventListener('click',()=>EH.TicketVerificationQueue.copyCpf(item));const ver=document.createElement('button');ver.className='eh-modal-btn primary';ver.textContent='Ver passagem';ver.addEventListener('click',()=>{const q=EH.TicketVerificationQueue.fromRecords(records,kind,{date:record.date,operationalTime:group?.routine?.operationalTime,name:group?.routine?.name,routineId:group?.routine?.id});const target=EH.TicketVerificationQueue.activeList(q).find(p=>p.cpf&&p.cpf===String(item.cpf||'').replace(/\\D/g,'').slice(0,11));if(target)EH.TicketVerificationQueue.search(target);});buttons.append(cpf,ver);info.append(buttons);row.append(seat,info);content.append(row);});const foot=document.createElement('div');foot.className='eh-modal-actions';const queueBtn=document.createElement('button');queueBtn.className='eh-modal-btn primary';queueBtn.textContent='Abrir fila de conferência';queueBtn.addEventListener('click',()=>{EH.TicketVerificationQueue.fromRecords(records,kind,{date:records[0]?.date,operationalTime:group?.routine?.operationalTime,name:group?.routine?.name,routineId:group?.routine?.id});EH.SaleContext.navigateToPassagens();});const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(queueBtn,close2);modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);const dismiss=()=>overlay.remove();close.onclick=dismiss;close2.onclick=dismiss;overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
         showCarSearch() {
@@ -12872,16 +13341,24 @@
                     if(!map)detail.textContent=`#${item.service}${item.floor?` • ${item.floor}`:''} • Agência ${this.agencyCode()} aguardando mapa`;
                     else if(!map.agency?.exists)detail.textContent=`#${item.service} • Agência ${this.agencyCode()} não encontrada`;
                     else if(map.agency?.multiple)detail.textContent=`#${item.service} • ⚠ leitura 287 ambígua`;
+                    else if(map.agency?.resolution==='aggregate-code-passenger-counts')detail.textContent=`#${item.service}${item.floor?` • ${item.floor}`:''} • ↑ ${map.agency.board??'—'} ↓ ${map.agency.alight??'—'} • 🚌 saldos separados`;
                     else detail.textContent=`#${item.service}${item.floor?` • ${item.floor}`:''} • ↑ ${map.agency.board??'—'} ↓ ${map.agency.alight??'—'} 🚌 ${map.agency.balance??'—'}`;
                     info.append(detail);
                 });
                 const validMaps=state.matches.map(item=>this.mapForSchedule(item)).filter(map=>map?.agency?.exists&&!map.agency.multiple);
-                if(validMaps.length>1){
-                    const total=document.createElement('small');total.className='eh-operation-total-movement';
-                    const boardTotal=validMaps.reduce((sum,map)=>sum+Number(map.agency.board||0),0);
-                    const alightTotal=validMaps.reduce((sum,map)=>sum+Number(map.agency.alight||0),0);
-                    total.textContent=`Total de movimento na ${this.agencyCode()}: ↑ ${boardTotal} ↓ ${alightTotal} • saldos preservados por mapa/andar`;
-                    info.append(total);
+                if(validMaps.length){
+                    if(validMaps.length>1){
+                        const total=document.createElement('small');total.className='eh-operation-total-movement';
+                        const boardTotal=validMaps.reduce((sum,map)=>sum+Number(map.agency.board||0),0);
+                        const alightTotal=validMaps.reduce((sum,map)=>sum+Number(map.agency.alight||0),0);
+                        total.textContent=`Total de movimento na ${this.agencyCode()}: ↑ ${boardTotal} ↓ ${alightTotal} • saldos preservados por mapa/andar`;
+                        info.append(total);
+                    }
+                    const quick=document.createElement('div');quick.className='eh-operation-detail-actions';
+                    const group={routine:state.routine,schedules:state.matches,maps:validMaps};
+                    const boardBtn=document.createElement('button');boardBtn.className='eh-modal-btn';boardBtn.textContent=`↑ Embarques (${validMaps.reduce((sum,map)=>sum+Number(map.agency.board||0),0)})`;boardBtn.addEventListener('click',event=>{event.stopPropagation();this.showGroupPassengers(group,'board');});
+                    const alightBtn=document.createElement('button');alightBtn.className='eh-modal-btn';alightBtn.textContent=`↓ Desembarques (${validMaps.reduce((sum,map)=>sum+Number(map.agency.alight||0),0)})`;alightBtn.addEventListener('click',event=>{event.stopPropagation();this.showGroupPassengers(group,'alight');});
+                    quick.append(boardBtn,alightBtn);info.append(quick);
                 }
                 const action=document.createElement('button');action.className='eh-modal-btn';
                 const canOpen=Boolean(state.primary&&this.mapButtons.get(String(state.primary.resultKey||''))?.isConnected);
@@ -12930,6 +13407,17 @@
             const routine=schedule?this.routineForSchedule(schedule):(last?this.routineForService(last.service,last.date):next?.routine);
             const record=selectedMap||last||(schedule?this.mapForSchedule(schedule):null);
             const agency=record?.agency||null;
+            const group=routine?this.vehicleGroups(record?.date||schedule?.serviceDate||this.todayKey()).find(item=>item.routine?.id===routine.id):null;
+            const groupMaps=(group?.maps||[]).filter(map=>map?.agency?.exists&&!map?.agency?.multiple);
+            const grouped=groupMaps.length>1;
+            const agencyView=grouped?{
+                exists:true,multiple:false,
+                board:groupMaps.reduce((sum,map)=>sum+Number(map.agency.board||0),0),
+                alight:groupMaps.reduce((sum,map)=>sum+Number(map.agency.alight||0),0),
+                balance:null,
+                boarders:groupMaps.flatMap(map=>map.agency.boarders||[]),
+                alighters:groupMaps.flatMap(map=>map.agency.alighters||[])
+            }:agency;
 
             const searchRow=document.createElement('div');searchRow.className='eh-operation-search-row';
             const searchButton=document.createElement('button');searchButton.className='eh-context-btn primary';searchButton.textContent='🔎 Pesquisar carro';searchButton.addEventListener('click',()=>this.showCarSearch());
@@ -12937,7 +13425,7 @@
 
             const head=document.createElement('div');head.className='eh-operation-head';const eyebrow=document.createElement('span');eyebrow.textContent=selected?'CARRO SELECIONADO':record?'MAPA ATUAL':'PRÓXIMO DA ROTINA';
             const heading=document.createElement('div');heading.className='eh-operation-heading';const service=document.createElement('strong');
-            service.textContent=schedule?.service?`Serviço ${schedule.service}`:(routine?'Serviço hoje: —':'CARROS');
+            service.textContent=grouped?`${groupMaps.length} serviços`:(schedule?.service?`Serviço ${schedule.service}`:(routine?'Serviço hoje: —':'CARROS'));
             const route=document.createElement('span');route.textContent=routine?.name||record?.operationalName||record?.lineRaw||'Faça uma pesquisa de horários';heading.append(service,route);head.append(eyebrow,heading);
 
             if(routine){const tag=document.createElement('div');tag.className='eh-operation-service-tag attends';tag.textContent=`${routine.operationalTime} • HORÁRIO OPERACIONAL`;head.append(tag);}
@@ -12945,19 +13433,29 @@
             const agencyTitle=document.createElement('div');agencyTitle.className='eh-operation-agency-title';agencyTitle.textContent=`AGÊNCIA ${this.agencyCode()}`;
             const metrics=document.createElement('div');metrics.className='eh-operation-metrics';
             const metricButton=(kind,label,value,enabled)=>{const button=document.createElement('button');button.className=`eh-operation-metric ${kind}`;button.disabled=!enabled;const s=document.createElement('span');s.textContent=label;const b=document.createElement('strong');b.textContent=value===null||value===undefined?'—':String(value);button.append(s,b);return button;};
-            const canUse=Boolean(record&&agency?.exists&&!agency?.multiple);
-            const board=metricButton('board','↑ Embarques',canUse?agency.board:null,canUse),alight=metricButton('alight','↓ Desembarques',canUse?agency.alight:null,canUse);
-            const balance=document.createElement('div');balance.className='eh-operation-metric balance';const bl=document.createElement('span');bl.textContent='🚌 Sai com';const bv=document.createElement('strong');bv.textContent=canUse&&agency.balance!==null&&agency.balance!==undefined?String(agency.balance):'—';balance.append(bl,bv);metrics.append(board,alight,balance);
-            if(canUse){board.addEventListener('click',()=>this.showPassengers(record,'board'));alight.addEventListener('click',()=>this.showPassengers(record,'alight'));}
+            const canUse=Boolean((grouped&&groupMaps.length)||record&&agencyView?.exists&&!agencyView?.multiple);
+            const board=metricButton('board','↑ Embarques',canUse?agencyView?.board:null,canUse),alight=metricButton('alight','↓ Desembarques',canUse?agencyView?.alight:null,canUse);
+            const balance=document.createElement('div');balance.className='eh-operation-metric balance';const bl=document.createElement('span');bl.textContent=grouped?'🚌 Saldos':'🚌 Sai com';const bv=document.createElement('strong');bv.textContent=grouped?'por andar':(canUse&&agencyView?.balance!==null&&agencyView?.balance!==undefined?String(agencyView.balance):'—');balance.append(bl,bv);metrics.append(board,alight,balance);
+            if(canUse){
+                board.addEventListener('click',()=>grouped?this.showGroupPassengers(group,'board'):this.showPassengers(record,'board'));
+                alight.addEventListener('click',()=>grouped?this.showGroupPassengers(group,'alight'):this.showPassengers(record,'alight'));
+            }
 
             const message=document.createElement('div');message.className='eh-operation-meta';
             if(!schedule&&!record)message.textContent=`Agência ${this.agencyCode()} aguardando pesquisa de horários`;
             else if(!record)message.textContent=`${routine?.operationalTime||schedule?.time||'—'} • ${schedule?.service?`Serviço ${schedule.service} • `:''}Agência ${this.agencyCode()} aguardando mapa`;
-            else if(!agency?.exists)message.textContent=`Serviço ${record.service} • Agência ${this.agencyCode()} não encontrada neste mapa.`;
-            else if(agency.multiple){message.classList.add('warning');message.textContent=`⚠ ${agency.warning}`;}
+            else if(grouped){
+                const services=groupMaps.map(map=>`${map.service}${map.floor?` (${map.floor})`:''}`).join(' • ');
+                const pending=groupMaps.flatMap(map=>(map.agency.boarders||[]).map(p=>EH.Reminders?.matchPassenger?.(p,map))).filter(r=>r&&!EH.Reminders?.isDoneStatus?.(r.status)).length;
+                const parts=[routine?.operationalTime,`${groupMaps.length} mapas/serviços: ${services}`,'saldos preservados por andar'].filter(Boolean);
+                if(pending)parts.push(`${pending} precisa(m) imprimir`);
+                message.textContent=parts.join(' • ');
+            } else if(!agencyView?.exists)message.textContent=`Serviço ${record.service} • Agência ${this.agencyCode()} não encontrada neste mapa.`;
+            else if(agencyView.multiple){message.classList.add('warning');message.textContent=`⚠ ${agencyView.warning}`;}
             else{
                 const parts=[routine?.operationalTime||record.operationalTime,`Serviço ${record.service}`,record.floor,record.lineCode?`Linha ${record.lineCode}`:'',`Atualizado às ${this.formatUpdatedAt(record.updatedAt)}`].filter(Boolean);
-                const pending=(agency.boarders||[]).map(p=>EH.Reminders?.matchPassenger?.(p,record)).filter(r=>r&&r.status!=='completed').length;
+                const pending=(agencyView.boarders||[]).map(p=>EH.Reminders?.matchPassenger?.(p,record)).filter(r=>r&&!EH.Reminders?.isDoneStatus?.(r.status)).length;
+                if(agencyView?.resolution==='aggregate-code-passenger-counts')parts.push('movimento 287 conferido • saldos separados');
                 if(pending)parts.push(`${pending} precisa(m) imprimir`);
                 message.textContent=parts.join(' • ');
             }
@@ -12972,7 +13470,7 @@
 
             const actions=document.createElement('div');actions.className='eh-operation-actions';
             const update=document.createElement('button');update.className='eh-context-btn';update.textContent='↻ Ler mapa';update.addEventListener('click',()=>this.scanCurrentMap({quiet:false}));
-            const passengers=document.createElement('button');passengers.className='eh-context-btn';passengers.textContent='Passageiros';passengers.disabled=!canUse;passengers.addEventListener('click',()=>this.showDetails(record));
+            const passengers=document.createElement('button');passengers.className='eh-context-btn';passengers.textContent=grouped?'Embarques':'Passageiros';passengers.disabled=!canUse;passengers.addEventListener('click',()=>grouped?this.showGroupPassengers(group,'board'):this.showDetails(record));
             const all=document.createElement('button');all.className='eh-context-btn';all.textContent='Carros ›';all.addEventListener('click',()=>this.showCars());actions.append(update,passengers,all);
             host.append(searchRow,head,agencyTitle,metrics,message,principal,actions);
         },
@@ -15022,10 +15520,11 @@
                 paineis: makePane('paineis', 'Painéis', 'Posição e dimensões dos overlays. O E-Pass original permanece intacto.'),
                 whatsapp: makePane('whatsapp', 'WhatsApp', 'Visualização do painel integrado e mensagens automáticas do atendimento.'),
                 zoom: makePane('zoom', 'Tela e Zoom', 'Escala dos overlays e posição vertical. Nenhum zoom é aplicado ao E-Pass.'),
-                valores: makePane('valores', 'Valores e Captura', 'Taxas existentes e qualidade das imagens geradas pelo Helper.'),
+                valores: makePane('valores', 'Atendimento', 'Taxas de embarque por origem e qualidade das capturas usadas no atendimento.'),
                 financeiro: makePane('financeiro', 'Financeiro', 'Comissão e comportamento do controle local de Caixa e Comissões.'),
                 carros: makePane('carros', 'Carros / Operação', 'Agência 287 e serviços usados na consulta rápida do Mapa de Viagem.'),
                 lembretes: makePane('lembretes', 'Lembretes', 'Passagens emitidas/capturadas que precisam ser localizadas e impressas posteriormente.'),
+                sincronizacao: makePane('sincronizacao', 'Sincronização', 'Dados operacionais compartilhados entre os computadores autorizados.'),
                 avancado: makePane('avancado', 'Avançado', 'Diagnóstico e opções técnicas que normalmente não precisam ser alteradas.')
             };
 
@@ -15184,31 +15683,23 @@
             zoomCard.appendChild(zoomWarning);
             sections.zoom.pane.appendChild(zoomCard);
 
-            // VALORES E CAPTURA — mantém as preferências já existentes.
-            const taxaFields = {};
-            const feesCard = card('Taxas por origem');
-            const feesGrid = grid();
-            const createFee = (key, labelText) => {
-                const field = moneyField(
-                    `fee_${key}`,
-                    labelText,
-                    EH.Config.TAXAS_ORIGEM[key] || 0,
-                    'Aceita 6,69 ou 6.69. O valor é aplicado no próximo horário gerado, sem precisar atualizar a página.'
-                );
-                taxaFields[key] = fields[`fee_${key}`];
-                return field;
+            // VALORES E CAPTURA — taxas por cidade/UF, editáveis e expansíveis.
+            const feeRows = [];
+            const feesCard = card('Taxas de embarque por origem');
+            const feesList = document.createElement('div'); feesList.className='eh-settings-list';
+            const addFeeRow = (item={}) => {
+                const normalized = EH.BoardingFeeManager.normalizeEntry(item);
+                const row=document.createElement('div');row.className='eh-operation-settings-service';row.style.gridTemplateColumns='minmax(150px,1.4fr) 70px 110px auto';
+                const cityWrap=textField(`feeCity_${feeRows.length}`,'Cidade / Localidade',normalized.city||'');
+                const ufWrap=textField(`feeUf_${feeRows.length}`,'UF',normalized.uf||'');
+                const valueWrap=moneyField(`feeValue_${feeRows.length}`,'Taxa',normalized.value||0,'Aceita 6,69 ou 6.69.');
+                const remove=document.createElement('button');remove.type='button';remove.className='eh-modal-btn danger';remove.textContent='Excluir';
+                const rec={row,city:cityWrap.querySelector('input'),uf:ufWrap.querySelector('input'),value:valueWrap.querySelector('input'),remove,removed:false};
+                remove.addEventListener('click',()=>{rec.removed=true;row.remove();});row.append(cityWrap,ufWrap,valueWrap,remove);feesList.append(row);feeRows.push(rec);return rec;
             };
-            feesGrid.append(
-                createFee('IPORA', 'Iporá'),
-                createFee('GOIANIA', 'Goiânia'),
-                createFee('BARRA DO GARCAS', 'Barra do Garças'),
-                createFee('ARAGARCAS', 'Aragarças'),
-                createFee('SAO LUIS DE MONTES BELOS', 'São Luís de Montes Belos')
-            );
-            feesCard.append(
-                checkField('autoFees', 'Adicionar automaticamente a taxa conforme a origem configurada', EH.Config.APLICAR_TAXAS_ORIGEM),
-                feesGrid
-            );
+            EH.BoardingFeeManager.load().forEach(addFeeRow);
+            const addFee=document.createElement('button');addFee.type='button';addFee.className='eh-modal-btn';addFee.textContent='+ Adicionar cidade';addFee.addEventListener('click',()=>addFeeRow({}));
+            feesCard.append(checkField('autoFees','Adicionar automaticamente a taxa conforme a origem configurada',EH.Config.APLICAR_TAXAS_ORIGEM),feesList,addFee,note('A taxa é vinculada à ORIGEM (cidade + UF). Se não houver taxa cadastrada, o valor-base do E-Pass é preservado.'));
             sections.valores.pane.appendChild(feesCard);
 
             const captureCard = card('Captura');
@@ -15303,13 +15794,13 @@
                 checkField('reminderAsk','Perguntar antes de criar o lembrete',EH.Config.REMINDER_ASK_AFTER_TICKET),
                 checkField('reminderMaskCpf','Mostrar CPF mascarado no painel',EH.Config.REMINDER_MASK_CPF),
                 checkField('reminderHighlightToday','Destacar lembretes de hoje',EH.Config.REMINDER_HIGHLIGHT_TODAY),
-                note('O CPF completo permanece salvo localmente e é usado somente ao copiar ou buscar a passagem.')
+                note('O CPF completo é usado para copiar/buscar a passagem e, quando a sincronização de dados de emissão estiver ativa, integra o registro operacional sincronizado.')
             );
             sections.lembretes.pane.appendChild(reminderCard);
 
             const syncCard = card('Sincronização entre computadores');
             const syncGrid = grid();
-            const syncEnabledWrap = checkField('syncEnabled','Sincronizar lembretes entre dispositivos',EH.Config.SYNC_ENABLED,'Usa Supabase quando configurado. Sem configuração externa, os lembretes continuam somente neste computador.');
+            const syncEnabledWrap = checkField('syncEnabled','Sincronização geral entre computadores',EH.Config.SYNC_ENABLED,'Usa Supabase quando configurado. Sem configuração externa, os dados continuam somente neste computador.');
             const syncUrlWrap = textField('syncUrl','URL do projeto Supabase',EH.Config.SYNC_SUPABASE_URL,'Ex.: https://xxxxx.supabase.co');
             const syncKeyWrap = textField('syncKey','Publishable / anon key',EH.Config.SYNC_SUPABASE_KEY,'Nunca use service_role ou secret key no UserScript.');
             const syncEmailWrap = textField('syncEmail','E-mail da conta de sincronização',EH.Config.SYNC_SUPABASE_EMAIL,'Use a mesma conta autorizada no PC de casa e no guichê.');
@@ -15326,12 +15817,16 @@
             syncActions.append(syncLogin,syncNow,syncLogout);
             syncCard.append(
                 syncEnabledWrap,
+                checkField('syncReminders','Sincronizar lembretes / impressão',EH.Config.SYNC_REMINDERS),
+                checkField('syncRequisitions','Sincronizar requisições e códigos',EH.Config.SYNC_REQUISITIONS),
+                checkField('syncEmissionData','Sincronizar memória de passageiros/emissão',EH.Config.SYNC_EMISSION_DATA),
+                checkField('syncSettings','Sincronizar taxas e horários operacionais',EH.Config.SYNC_SETTINGS,'Posições/tamanhos dos painéis continuam locais para não misturar monitores diferentes.'),
                 syncGrid,
-                note('A sincronização real exige um projeto Supabase configurado com RLS. O Helper salva primeiro localmente; se a internet cair, a alteração fica pendente e é enviada depois.'),
+                note('A sincronização real usa o mesmo projeto Supabase. O Helper salva primeiro localmente; se a internet cair, a alteração fica pendente e é enviada depois.'),
                 syncStatusLine,
                 syncActions
             );
-            sections.lembretes.pane.appendChild(syncCard);
+            sections.sincronizacao.pane.appendChild(syncCard);
 
             const applySyncFields=()=>{
                 EH.Config.SYNC_PROVIDER=fields.syncEnabled.checked?'supabase':'none';
@@ -15339,11 +15834,19 @@
                 EH.Config.SYNC_SUPABASE_URL=String(fields.syncUrl.value||'').trim();
                 EH.Config.SYNC_SUPABASE_KEY=String(fields.syncKey.value||'').trim();
                 EH.Config.SYNC_SUPABASE_EMAIL=String(fields.syncEmail.value||'').trim();
+                EH.Config.SYNC_REMINDERS=Boolean(fields.syncReminders?.checked);
+                EH.Config.SYNC_REQUISITIONS=Boolean(fields.syncRequisitions?.checked);
+                EH.Config.SYNC_EMISSION_DATA=Boolean(fields.syncEmissionData?.checked);
+                EH.Config.SYNC_SETTINGS=Boolean(fields.syncSettings?.checked);
                 EH.Storage.set('syncProvider',EH.Config.SYNC_PROVIDER);
                 EH.Storage.set('syncEnabled',EH.Config.SYNC_ENABLED);
                 EH.Storage.set('syncSupabaseUrl',EH.Config.SYNC_SUPABASE_URL);
                 EH.Storage.set('syncSupabaseKey',EH.Config.SYNC_SUPABASE_KEY);
                 EH.Storage.set('syncSupabaseEmail',EH.Config.SYNC_SUPABASE_EMAIL);
+                EH.Storage.set('syncReminders',EH.Config.SYNC_REMINDERS);
+                EH.Storage.set('syncRequisitions',EH.Config.SYNC_REQUISITIONS);
+                EH.Storage.set('syncEmissionData',EH.Config.SYNC_EMISSION_DATA);
+                EH.Storage.set('syncSettings',EH.Config.SYNC_SETTINGS);
             };
             syncLogin.addEventListener('click',async()=>{
                 try{
@@ -15355,7 +15858,7 @@
                     EH.Toast.success('Conta de sincronização conectada.');
                 }catch(error){EH.Toast.error(error.message||'Não foi possível entrar na sincronização.');updateSyncStatus();}
             });
-            syncNow.addEventListener('click',async()=>{try{applySyncFields();await EH.Sync.syncReminders({quiet:false});updateSyncStatus();}catch(error){EH.Toast.error(error.message||'Falha ao sincronizar.');updateSyncStatus();}});
+            syncNow.addEventListener('click',async()=>{try{applySyncFields();await EH.Sync.syncAll({quiet:false});updateSyncStatus();}catch(error){EH.Toast.error(error.message||'Falha ao sincronizar.');updateSyncStatus();}});
             syncLogout.addEventListener('click',()=>{EH.Sync.logout();updateSyncStatus();});
 
             // AVANÇADO
@@ -15482,9 +15985,8 @@
                 fields.captureScale.value = String(d.CAPTURE_SCALE);
                 fields.ticketWidth.value = String(d.TICKET_CAPTURE_WIDTH);
                 fields.autoFees.checked = Boolean(d.APLICAR_TAXAS_ORIGEM);
-                Object.keys(taxaFields).forEach(key => {
-                    taxaFields[key].value = EH.Fares.round(Math.max(0, EH.Utils.parseMoney(d.TAXAS_ORIGEM[key] || 0))).toFixed(2).replace('.', ',');
-                });
+                feeRows.forEach(row => row.row.remove()); feeRows.splice(0, feeRows.length);
+                Object.entries(d.TAXAS_ORIGEM || {}).forEach(([city,value]) => addFeeRow({city,uf:EH.BoardingFeeManager.knownUfs[EH.Utils.normalize(city)]||'',value}));
                 fields.msgPesquisa.value = d.MESSAGES.pesquisa;
                 fields.msgReserva.value = d.MESSAGES.reserva;
                 fields.msgResumo.value = d.MESSAGES.resumo;
@@ -15507,6 +16009,10 @@
                 fields.syncKey.value = '';
                 fields.syncEmail.value = '';
                 fields.syncPassword.value = '';
+                fields.syncReminders.checked = Boolean(d.SYNC_REMINDERS);
+                fields.syncRequisitions.checked = Boolean(d.SYNC_REQUISITIONS);
+                fields.syncEmissionData.checked = Boolean(d.SYNC_EMISSION_DATA);
+                fields.syncSettings.checked = Boolean(d.SYNC_SETTINGS);
                 const defaultPanels = EH.PanelManager.defaults();
                 Object.keys(defaultPanels).forEach(key => panelDrafts[key] = { ...defaultPanels[key] });
                 loadPanelDraft(fields.managedPanel.value);
@@ -15542,19 +16048,21 @@
                     if (parsed === null || parsed < 0) throw new Error(`Taxa inválida em ${label}.`);
                     return EH.Fares.round(parsed);
                 };
-                let taxas;
+                let feeEntries;
                 try {
-                    taxas = {
-                        IPORA: parseFeeField(taxaFields.IPORA, 'Iporá'),
-                        GOIANIA: parseFeeField(taxaFields.GOIANIA, 'Goiânia'),
-                        'BARRA DO GARCAS': parseFeeField(taxaFields['BARRA DO GARCAS'], 'Barra do Garças'),
-                        ARAGARCAS: parseFeeField(taxaFields.ARAGARCAS, 'Aragarças'),
-                        'SAO LUIS DE MONTES BELOS': parseFeeField(taxaFields['SAO LUIS DE MONTES BELOS'], 'São Luís de Montes Belos')
-                    };
-                } catch (error) {
-                    EH.Toast.error(error.message || 'Confira os valores das taxas de embarque.');
-                    return;
-                }
+                    const seen=new Set();
+                    feeEntries=feeRows.filter(row=>!row.removed&&row.row.isConnected).map(row=>{
+                        const city=EH.Utils.clean(row.city.value||''); const uf=EH.Utils.normalize(row.uf.value||'').replace(/[^A-Z]/g,'').slice(0,2);
+                        const raw=String(row.value.value??'').trim(); const parsed=raw?EH.Utils.parseMoneyStrict(raw):0;
+                        if(!city) throw new Error('Informe a cidade em todas as taxas cadastradas.');
+                        if(uf.length!==2) throw new Error(`Informe a UF de ${city}.`);
+                        if(parsed===null||parsed<0) throw new Error(`Taxa inválida em ${city} - ${uf}.`);
+                        const entry=EH.BoardingFeeManager.normalizeEntry({city,uf,value:parsed});
+                        if(seen.has(entry.id)) throw new Error(`${city} - ${uf} já está cadastrada.`);
+                        seen.add(entry.id); return entry;
+                    });
+                } catch (error) { EH.Toast.error(error.message || 'Confira as taxas de embarque.'); return; }
+
                 const values = {
                     preset: selectedPreset,
                     density: ['compacto', 'padrao', 'confortavel'].includes(fields.density.value) ? fields.density.value : 'padrao',
@@ -15591,7 +16099,8 @@
                 EH.Config.AUTO_ROUTE_CAPTURE = fields.autoRoute.checked;
                 EH.Config.AUTO_COPY_IMAGES = fields.autoCopy.checked;
                 EH.Config.APLICAR_TAXAS_ORIGEM = fields.autoFees.checked;
-                EH.Config.TAXAS_ORIGEM = taxas;
+                EH.BoardingFeeManager.save(feeEntries);
+                const taxas = EH.Config.TAXAS_ORIGEM;
                 EH.Config.FINANCE_COMMISSION_PERCENT = clamp(fields.financePercent.value, 0, 100, 10);
                 EH.Config.FINANCE_AUTO_REGISTER = fields.financeAutoRegister.checked;
                 EH.Config.FINANCE_SHOW_CAIXA_SUMMARY = fields.financeShowSummary.checked;
@@ -15608,6 +16117,10 @@
                 EH.Config.SYNC_SUPABASE_URL = String(fields.syncUrl.value || '').trim();
                 EH.Config.SYNC_SUPABASE_KEY = String(fields.syncKey.value || '').trim();
                 EH.Config.SYNC_SUPABASE_EMAIL = String(fields.syncEmail.value || '').trim();
+                EH.Config.SYNC_REMINDERS = Boolean(fields.syncReminders?.checked);
+                EH.Config.SYNC_REQUISITIONS = Boolean(fields.syncRequisitions?.checked);
+                EH.Config.SYNC_EMISSION_DATA = Boolean(fields.syncEmissionData?.checked);
+                EH.Config.SYNC_SETTINGS = Boolean(fields.syncSettings?.checked);
                 const operationRoutines = operationRoutineFields
                     .filter(row => !row.removed && row.row.isConnected)
                     .map((row,index) => {
@@ -15637,6 +16150,8 @@
                 EH.Config.OPERATION_SORT_BY_SEAT = fields.operationSortBySeat.checked;
                 EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = clamp(fields.operationTolerance.value, 0, 90, 20);
                 EH.Config.OPERATION_ROUTINES = operationRoutines;
+                EH.Storage.set('operationConfig.updatedAt', Date.now());
+                EH.Sync?.markPendingRecord?.('config','operation');
                 EH.Config.DEBUG = fields.debug.checked;
                 EH.Config.WHATSAPP_MODE = 'web';
 
@@ -15667,7 +16182,8 @@
                     autoCopyImages: fields.autoCopy.checked,
                     aplicarTaxasOrigem: fields.autoFees.checked,
                     taxasOrigem: taxas,
-                    taxaIpora: taxas.IPORA,
+                    taxaIpora: taxas.IPORA || 0,
+                    boardingFeesV2: feeEntries,
                     aplicarTaxaIpora: fields.autoFees.checked,
                     whatsappMode: 'web',
                     financeCommissionPercent: EH.Config.FINANCE_COMMISSION_PERCENT,
@@ -15690,6 +16206,10 @@
                     syncSupabaseUrl: EH.Config.SYNC_SUPABASE_URL,
                     syncSupabaseKey: EH.Config.SYNC_SUPABASE_KEY,
                     syncSupabaseEmail: EH.Config.SYNC_SUPABASE_EMAIL,
+                    syncReminders: EH.Config.SYNC_REMINDERS,
+                    syncRequisitions: EH.Config.SYNC_REQUISITIONS,
+                    syncEmissionData: EH.Config.SYNC_EMISSION_DATA,
+                    syncSettings: EH.Config.SYNC_SETTINGS,
                     debug: fields.debug.checked
                 };
                 Object.entries(settingsToSave).forEach(([key, value]) => EH.Storage.set(key, value));
@@ -15778,6 +16298,7 @@
 
             EH.StorageSchema?.migrate?.();
             EH.Storage.loadSettings();
+            EH.BoardingFeeManager?.migrateLegacy?.();
 
             // Na aba do WhatsApp Web o script funciona apenas como uma ponte silenciosa.
             // Nenhum painel do E-Pass é desenhado dentro do WhatsApp.
@@ -15802,6 +16323,7 @@
             safeInit('Avisos', () => EH.Toast.init());
             safeInit('Atendimento', () => EH.UI.init());
             safeInit('Lembretes', () => EH.Reminders.init());
+            safeInit('Conferência de bilhetes', () => EH.TicketVerificationQueue?.init?.());
             safeInit('Sincronização', () => EH.Sync?.start?.());
             safeInit('Operação', () => EH.OperationDock.init());
             safeInit('Mapa dos carros', () => EH.OperationCars.init());
