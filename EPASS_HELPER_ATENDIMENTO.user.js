@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.61.1
+// @version      5.62.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -20,7 +20,10 @@
 // @grant        GM_listValues
 // @grant        GM_xmlhttpRequest
 // @connect      supabase.co
+// @connect      127.0.0.1
+// @connect      localhost
 // @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
+// @require      https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -34,7 +37,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.61.1',
+        VERSION: '5.62.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
         STORAGE_SCHEMA_VERSION: 8,
@@ -5301,6 +5304,7 @@
             };
             safe('Contexto de vendas', () => EH.SaleCpfs?.captureFromDom?.());
             safe('Requisições', () => EH.RequisitionManager?.scanDom?.());
+            safe('Requisição Prefeitura', () => EH.PrefeituraRequisition?.onPageUpdate?.(page));
             safe('Atendimento', () => EH.UI?.updateState?.(page));
             safe('Mapa dos carros', () => EH.OperationCars?.onPageUpdate?.(page));
             safe('Lembretes', () => EH.Reminders?.onPageUpdate?.(page));
@@ -8451,6 +8455,733 @@
     // Alias de compatibilidade: o restante do script continua usando o mesmo
     // módulo que antes se chamava SaleCpfs, sem criar um segundo armazenamento.
     EH.SaleCpfs = EH.SaleContext;
+
+    // ============================================================
+    // REQUISIÇÃO PREFEITURA — MODELO DOCX OFICIAL + GERADOR LOCAL
+    // O UserScript coleta e confere dados. A cópia/edição/renderização do DOCX
+    // acontece no serviço local, sempre a partir do modelo oficial permanente.
+    // ============================================================
+    EH.PrefeituraRequisition = {
+        SERVICE_URL: 'http://127.0.0.1:8716',
+        CLIENT_HEADER: 'requisicao-prefeitura-v1',
+        STORAGE_KEY: 'prefeituraRequisition.current.v1',
+        DOCUMENT_SESSION_KEY: 'epassHelper.prefeituraDocument.v1',
+        started: false,
+        serviceHealth: null,
+        statusHost: null,
+        modal: null,
+        documentDataUrl: '',
+        documentName: '',
+        preview: null,
+        generated: null,
+        ocrBusy: false,
+
+        init() {
+            if (this.started) return;
+            this.started = true;
+            this.injectStyles();
+            const saved = EH.Storage.get(this.STORAGE_KEY, null);
+            if (saved?.filename && saved?.finalUrl) this.generated = saved;
+            try {
+                const documentState = JSON.parse(sessionStorage.getItem(this.DOCUMENT_SESSION_KEY) || 'null');
+                if (documentState?.dataUrl?.startsWith('data:image/')) {
+                    this.documentDataUrl = documentState.dataUrl;
+                    this.documentName = String(documentState.name || 'documentacao.jpg');
+                }
+            } catch (_error) {}
+            this.checkService({ quiet: true }).finally(() => this.renderStatus());
+        },
+
+        injectStyles() {
+            GM_addStyle(`
+                .eh-pref-tool { display:flex; flex-direction:column; gap:7px; padding:9px; border:1px solid rgba(99,102,241,.18); border-radius:12px; background:linear-gradient(145deg,rgba(255,255,255,.95),rgba(238,242,255,.82)); }
+                .eh-pref-tool-title { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:10px; font-weight:900; letter-spacing:.08em; color:#475569; text-transform:uppercase; }
+                .eh-pref-tool-open { width:100%; border:0; border-radius:10px; padding:10px 11px; background:#312e81; color:#fff; font:800 11px/1.2 Arial,sans-serif; cursor:pointer; text-align:left; box-shadow:0 7px 16px rgba(49,46,129,.18); }
+                .eh-pref-tool-open:hover { background:#3730a3; }
+                .eh-pref-status { display:grid; gap:4px; font:700 9px/1.35 Arial,sans-serif; color:#475569; }
+                .eh-pref-status strong { color:#111827; font-size:10px; overflow-wrap:anywhere; }
+                .eh-pref-status-line { display:flex; align-items:center; gap:5px; }
+                .eh-pref-status-ready { color:#047857; }
+                .eh-pref-status-warn { color:#b45309; }
+                .eh-pref-overlay { position:fixed; inset:0; z-index:2147483000; display:flex; align-items:center; justify-content:center; padding:18px; background:rgba(15,23,42,.68); backdrop-filter:blur(5px); }
+                .eh-pref-modal { width:min(1080px,96vw); max-height:94vh; overflow:auto; border-radius:18px; background:#f8fafc; color:#0f172a; box-shadow:0 28px 80px rgba(15,23,42,.38); font:13px/1.45 Arial,sans-serif; }
+                .eh-pref-head { position:sticky; top:0; z-index:2; display:flex; align-items:center; justify-content:space-between; gap:16px; padding:16px 18px; background:#fff; border-bottom:1px solid #e2e8f0; }
+                .eh-pref-head div { display:grid; gap:2px; }
+                .eh-pref-head strong { font-size:17px; color:#1e1b4b; }
+                .eh-pref-head small { color:#64748b; }
+                .eh-pref-close { width:34px; height:34px; border:0; border-radius:50%; background:#eef2ff; color:#312e81; cursor:pointer; font-size:18px; }
+                .eh-pref-content { display:grid; grid-template-columns:minmax(300px,420px) minmax(0,1fr); gap:16px; padding:16px; }
+                .eh-pref-form, .eh-pref-preview { display:grid; align-content:start; gap:13px; }
+                .eh-pref-card { display:grid; gap:9px; padding:13px; background:#fff; border:1px solid #e2e8f0; border-radius:13px; box-shadow:0 4px 12px rgba(15,23,42,.04); }
+                .eh-pref-card h3 { margin:0; font-size:11px; letter-spacing:.08em; text-transform:uppercase; color:#4338ca; }
+                .eh-pref-current { display:grid; gap:3px; padding:9px; border-radius:10px; background:#eef2ff; color:#3730a3; }
+                .eh-pref-current strong { color:#1e1b4b; }
+                .eh-pref-grid { display:grid; grid-template-columns:1fr 1fr; gap:9px; }
+                .eh-pref-field { display:grid; gap:4px; min-width:0; }
+                .eh-pref-field.full { grid-column:1/-1; }
+                .eh-pref-field label { font-size:10px; font-weight:900; color:#475569; text-transform:uppercase; letter-spacing:.04em; }
+                .eh-pref-field input { min-width:0; width:100%; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:9px; padding:9px 10px; background:#fff; color:#0f172a; font:700 12px Arial,sans-serif; }
+                .eh-pref-field input:focus { outline:2px solid rgba(79,70,229,.22); border-color:#6366f1; }
+                .eh-pref-route-list { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+                .eh-pref-route { border:1px solid #c7d2fe; border-radius:8px; padding:7px; background:#eef2ff; color:#3730a3; font:800 9px Arial,sans-serif; cursor:pointer; }
+                .eh-pref-actions { display:flex; flex-wrap:wrap; gap:8px; }
+                .eh-pref-btn { border:1px solid #cbd5e1; border-radius:9px; padding:9px 11px; background:#fff; color:#334155; font:800 11px Arial,sans-serif; cursor:pointer; }
+                .eh-pref-btn.primary { border-color:#4f46e5; background:#4f46e5; color:#fff; }
+                .eh-pref-btn.success { border-color:#059669; background:#059669; color:#fff; }
+                .eh-pref-btn:disabled { opacity:.48; cursor:not-allowed; }
+                .eh-pref-help { padding:9px; border-radius:9px; background:#f1f5f9; color:#475569; font-size:11px; }
+                .eh-pref-alert { display:none; padding:10px; border:1px solid #fbbf24; border-radius:9px; background:#fffbeb; color:#92400e; white-space:pre-line; }
+                .eh-pref-alert.show { display:block; }
+                .eh-pref-ocr-review { display:none; gap:8px; padding:10px; border:1px solid #a7f3d0; border-radius:10px; background:#ecfdf5; }
+                .eh-pref-ocr-review.show { display:grid; }
+                .eh-pref-ocr-review strong { color:#065f46; }
+                .eh-pref-progress { color:#4338ca; font-weight:800; }
+                .eh-pref-preview-frame { display:flex; align-items:flex-start; justify-content:center; min-height:420px; padding:10px; border:1px solid #cbd5e1; border-radius:12px; background:#334155; overflow:auto; }
+                .eh-pref-preview-frame img { display:block; width:min(100%,660px); height:auto; background:#fff; box-shadow:0 8px 24px rgba(0,0,0,.28); }
+                .eh-pref-empty-preview { align-self:center; max-width:420px; color:#e2e8f0; text-align:center; }
+                .eh-pref-confirm { display:none; gap:10px; }
+                .eh-pref-confirm.show { display:grid; }
+                .eh-pref-confirm-grid { display:grid; grid-template-columns:1fr 1fr; gap:5px 12px; padding:10px; border-radius:10px; background:#eef2ff; }
+                .eh-pref-confirm-grid span { color:#475569; }
+                .eh-pref-confirm-grid b { display:block; color:#111827; overflow-wrap:anywhere; }
+                .eh-pref-checks { display:flex; flex-wrap:wrap; gap:6px; }
+                .eh-pref-check { padding:5px 7px; border-radius:99px; background:#ecfdf5; color:#047857; font-size:9px; font-weight:900; }
+                .eh-pref-ready { display:none; gap:9px; padding:12px; border:1px solid #a7f3d0; border-radius:11px; background:#ecfdf5; }
+                .eh-pref-ready.show { display:grid; }
+                .eh-pref-ready strong { color:#065f46; }
+                .eh-pref-ready code { white-space:normal; overflow-wrap:anywhere; color:#064e3b; }
+                .eh-pref-invalid-override { display:none; align-items:flex-start; gap:7px; color:#92400e; }
+                .eh-pref-invalid-override.show { display:flex; }
+                @media (max-width:820px) { .eh-pref-content { grid-template-columns:1fr; } .eh-pref-preview-frame { min-height:300px; } }
+                @media (max-width:520px) { .eh-pref-grid, .eh-pref-route-list, .eh-pref-confirm-grid { grid-template-columns:1fr; } }
+            `);
+        },
+
+        mount(host, button) {
+            this.statusHost = host || this.statusHost;
+            if (button && !button.dataset.ehPrefBound) {
+                button.dataset.ehPrefBound = '1';
+                button.addEventListener('click', () => this.open());
+            }
+            this.renderStatus();
+        },
+
+        clean(value) {
+            return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+        },
+
+        cpfDigits(value) {
+            return String(value || '').replace(/\D/g, '').slice(0, 11);
+        },
+
+        formatCpf(value) {
+            const digits = this.cpfDigits(value);
+            if (digits.length <= 3) return digits;
+            if (digits.length <= 6) return `${digits.slice(0, 3)}.${digits.slice(3)}`;
+            if (digits.length <= 9) return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6)}`;
+            return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}-${digits.slice(9)}`;
+        },
+
+        validCpf(value) {
+            const digits = this.cpfDigits(value);
+            if (digits.length !== 11 || /^(\d)\1{10}$/.test(digits)) return false;
+            for (const size of [9, 10]) {
+                let total = 0;
+                for (let index = 0; index < size; index += 1) total += Number(digits[index]) * (size + 1 - index);
+                let check = (total * 10) % 11;
+                if (check === 10) check = 0;
+                if (check !== Number(digits[size])) return false;
+            }
+            return true;
+        },
+
+        cityDisplay(value) {
+            const raw = this.clean(value).replace(/\s*[-–—]\s*[A-Z]{2}\s*$/i, '').trim();
+            const key = EH.Utils.normalize(raw);
+            const known = {
+                ARENOPOLIS: 'Arenópolis', GOIANIA: 'Goiânia', 'BARRA DO GARCAS': 'Barra do Garças',
+                IPORA: 'Iporá', ARAGARCAS: 'Aragarças', 'SAO LUIS DE MONTES BELOS': 'São Luís de Montes Belos',
+                BRASILIA: 'Brasília', CUIABA: 'Cuiabá'
+            };
+            if (known[key]) return known[key];
+            const small = new Set(['da', 'de', 'do', 'das', 'dos', 'e']);
+            return raw.toLocaleLowerCase('pt-BR').split(/\s+/).map((part, index) => {
+                if (index && small.has(part)) return part;
+                return part ? part[0].toLocaleUpperCase('pt-BR') + part.slice(1) : '';
+            }).join(' ');
+        },
+
+        defaults() {
+            const now = new Date();
+            const two = value => String(value).padStart(2, '0');
+            const months = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+            return {
+                nome: '', cpf: '', origem: '', destino: '',
+                data: `${two(now.getDate())}/${two(now.getMonth() + 1)}/${now.getFullYear()}`,
+                mesAno: `${months[now.getMonth()]}/${now.getFullYear()}`,
+                acceptInvalidCpf: false
+            };
+        },
+
+        currentContext() {
+            const sale = EH.SaleContext?.loadSale?.();
+            const passenger = sale?.passengers?.find(item => item.id === sale.activePassengerId)
+                || sale?.passengers?.slice?.(-1)?.[0]
+                || null;
+            const workflowRoute = EH.Workflow?.route || EH.Storage.get('workflowRoute', null) || {};
+            const originDom = EH.Utils.first(EH.Selectors.ORIGEM)?.textContent || '';
+            const destinationDom = EH.Utils.first(EH.Selectors.DESTINO)?.textContent || '';
+            return {
+                nome: this.clean(passenger?.name || ''),
+                cpf: this.formatCpf(passenger?.cpf || ''),
+                origem: this.cityDisplay(workflowRoute.origem || originDom),
+                destino: this.cityDisplay(workflowRoute.destino || destinationDom)
+            };
+        },
+
+        request(method, path, body = null, responseType = 'json') {
+            return new Promise((resolve, reject) => {
+                if (typeof GM_xmlhttpRequest !== 'function') {
+                    reject(new Error('O gerenciador do UserScript não liberou acesso ao gerador local.'));
+                    return;
+                }
+                GM_xmlhttpRequest({
+                    method,
+                    url: `${this.SERVICE_URL}${path}`,
+                    headers: body ? { 'Content-Type': 'application/json', 'X-EPass-Helper': this.CLIENT_HEADER } : undefined,
+                    data: body ? JSON.stringify(body) : undefined,
+                    responseType,
+                    timeout: 150000,
+                    onload: response => {
+                        let payload = response.response;
+                        if (responseType === 'json' && (!payload || typeof payload !== 'object')) {
+                            try { payload = JSON.parse(response.responseText || '{}'); }
+                            catch (_error) { payload = null; }
+                        }
+                        if (response.status >= 200 && response.status < 300) {
+                            resolve(payload);
+                            return;
+                        }
+                        const error = new Error(payload?.error || `Gerador local respondeu ${response.status}.`);
+                        error.details = payload?.details || null;
+                        error.status = response.status;
+                        reject(error);
+                    },
+                    onerror: () => reject(new Error('Gerador local não encontrado. Inicie “iniciar-helper.cmd”.')),
+                    ontimeout: () => reject(new Error('A renderização excedeu o tempo limite.'))
+                });
+            });
+        },
+
+        async checkService({ quiet = false } = {}) {
+            try {
+                this.serviceHealth = await this.request('GET', '/health');
+                if (!quiet && !this.serviceHealth?.ok) {
+                    EH.Toast.warning(this.serviceHealth?.template?.ok
+                        ? 'Gerador local ativo, mas o LibreOffice não foi encontrado.'
+                        : 'O modelo oficial do gerador local está ausente ou alterado.');
+                }
+            } catch (error) {
+                this.serviceHealth = { ok: false, error: error.message };
+                if (!quiet) EH.Toast.warning(error.message);
+            }
+            this.renderStatus();
+            return this.serviceHealth;
+        },
+
+        saveGenerated(record) {
+            this.generated = record;
+            EH.Storage.set(this.STORAGE_KEY, record);
+            this.renderStatus();
+        },
+
+        renderStatus() {
+            if (!this.statusHost) return;
+            this.statusHost.innerHTML = '';
+            const wrap = document.createElement('div');
+            wrap.className = 'eh-pref-status';
+            const service = document.createElement('div');
+            service.className = `eh-pref-status-line ${this.serviceHealth?.ok ? 'eh-pref-status-ready' : 'eh-pref-status-warn'}`;
+            service.textContent = this.serviceHealth?.ok ? '● Gerador local pronto' : '○ Gerador local não confirmado';
+            wrap.appendChild(service);
+            const record = this.generated || EH.Storage.get(this.STORAGE_KEY, null);
+            if (record?.filename) {
+                const name = document.createElement('strong');
+                name.textContent = record.data?.nome || 'Solicitação Prefeitura';
+                const state = document.createElement('div');
+                state.className = 'eh-pref-status-line eh-pref-status-ready';
+                state.textContent = `✓ Requisição pronta • ${record.filename}`;
+                const docs = document.createElement('div');
+                docs.className = `eh-pref-status-line ${record.documentLoaded ? 'eh-pref-status-ready' : 'eh-pref-status-warn'}`;
+                docs.textContent = record.documentLoaded ? '✓ Documentação carregada' : '○ Documentação não carregada';
+                wrap.append(name, docs, state);
+            } else if (this.documentDataUrl) {
+                const docs = document.createElement('div');
+                docs.className = 'eh-pref-status-line eh-pref-status-ready';
+                docs.textContent = '✓ Documentação carregada • requisição pendente';
+                wrap.appendChild(docs);
+            }
+            this.statusHost.appendChild(wrap);
+        },
+
+        persistDocument() {
+            try {
+                if (this.documentDataUrl.length <= 8 * 1024 * 1024) {
+                    sessionStorage.setItem(this.DOCUMENT_SESSION_KEY, JSON.stringify({
+                        dataUrl: this.documentDataUrl,
+                        name: this.documentName,
+                        savedAt: Date.now()
+                    }));
+                }
+            } catch (_error) {
+                EH.Toast.warning('A documentação ficará disponível apenas enquanto este painel estiver aberto.');
+            }
+            this.renderStatus();
+        },
+
+        readFile(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(new Error('Não foi possível ler a imagem selecionada.'));
+                reader.readAsDataURL(file);
+            });
+        },
+
+        extractOcr(text, data = {}) {
+            const raw = String(text || '').replace(/\r/g, '');
+            const lines = raw.split('\n').map(line => this.clean(line)).filter(Boolean);
+            const compact = raw.replace(/[^0-9]/g, ' ');
+            const formattedMatches = raw.match(/\b\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2}\b/g) || [];
+            const cpfCandidates = [...formattedMatches, ...compact.split(/\s+/).filter(value => value.length === 11)]
+                .map(value => this.cpfDigits(value)).filter(value => value.length === 11);
+            const cpfDigits = cpfCandidates.find(value => this.validCpf(value)) || '';
+
+            const excluded = /\b(CPF|RG|IDENTIDADE|NASCIMENTO|FILIAÇÃO|FILIACAO|BRASIL|REPÚBLICA|REPUBLICA|CARTEIRA|DOCUMENTO|VALIDADE|ASSINATURA|REGISTRO|NACIONAL|ESTADO|SECRETARIA)\b/i;
+            let name = '';
+            const labelIndex = lines.findIndex(line => /\bNOME\b/i.test(line));
+            if (labelIndex >= 0) {
+                const inline = this.clean(lines[labelIndex].replace(/^.*?\bNOME\b\s*[:\-]?\s*/i, ''));
+                if (inline.split(' ').length >= 2 && !excluded.test(inline)) name = inline;
+                else if (lines[labelIndex + 1] && lines[labelIndex + 1].split(' ').length >= 2 && !excluded.test(lines[labelIndex + 1])) name = lines[labelIndex + 1];
+            }
+            if (!name) {
+                name = lines.filter(line => {
+                    const letters = line.replace(/[^A-Za-zÀ-ÿ]/g, '');
+                    return line.split(/\s+/).length >= 2 && letters.length >= 8 && !excluded.test(line) && !/\d/.test(line);
+                }).sort((a, b) => b.length - a.length)[0] || '';
+            }
+            const confidence = Number(data?.confidence || 0);
+            const safeName = confidence >= 55 && name ? name.toLocaleUpperCase('pt-BR') : '';
+            return { nome: safeName, cpf: cpfDigits ? this.formatCpf(cpfDigits) : '', confidence };
+        },
+
+        async runOcr(dataUrl, ui) {
+            if (this.ocrBusy) return;
+            this.ocrBusy = true;
+            ui.progress.textContent = 'Lendo a documentação localmente… 0%';
+            ui.progress.hidden = false;
+            ui.ocrReview.classList.remove('show');
+            try {
+                if (typeof Tesseract !== 'object' || typeof Tesseract.createWorker !== 'function') {
+                    throw new Error('Leitor OCR não carregado.');
+                }
+                const worker = await Tesseract.createWorker('por', 1, {
+                    workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+                    corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+                    langPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/por@1.0.0/4.0.0_best_int',
+                    logger: message => {
+                        if (message?.status === 'recognizing text') {
+                            ui.progress.textContent = `Lendo a documentação localmente… ${Math.round(Number(message.progress || 0) * 100)}%`;
+                        }
+                    }
+                });
+                let result;
+                try { result = await worker.recognize(dataUrl); }
+                finally { await worker.terminate(); }
+                const identified = this.extractOcr(result?.data?.text, result?.data || {});
+                if (!identified.nome || !identified.cpf) {
+                    ui.ocrMessage.textContent = 'Não foi possível identificar nome e CPF com segurança. Preencha manualmente ou envie outra foto.';
+                    ui.ocrName.value = identified.nome || '';
+                    ui.ocrCpf.value = identified.cpf || '';
+                } else {
+                    ui.ocrMessage.textContent = 'DADOS IDENTIFICADOS — confira obrigatoriamente antes de usar.';
+                    ui.ocrName.value = identified.nome;
+                    ui.ocrCpf.value = identified.cpf;
+                }
+                ui.ocrReview.classList.add('show');
+            } catch (error) {
+                ui.ocrMessage.textContent = 'Não foi possível identificar os dados com segurança. Preencha manualmente ou envie outra foto.';
+                ui.ocrName.value = '';
+                ui.ocrCpf.value = '';
+                ui.ocrReview.classList.add('show');
+                EH.Logger.warn('OCR da documentação indisponível:', error);
+            } finally {
+                ui.progress.hidden = true;
+                this.ocrBusy = false;
+            }
+        },
+
+        collect(ui) {
+            return {
+                nome: this.clean(ui.nome.value),
+                cpf: this.formatCpf(ui.cpf.value),
+                origem: this.cityDisplay(ui.origem.value),
+                destino: this.cityDisplay(ui.destino.value),
+                data: this.clean(ui.data.value),
+                mesAno: this.clean(ui.mesAno.value),
+                acceptInvalidCpf: Boolean(ui.cpfOverride.checked)
+            };
+        },
+
+        validate(data) {
+            const missing = [];
+            [['Nome',data.nome],['CPF',this.cpfDigits(data.cpf)],['Origem',data.origem],['Destino',data.destino],['Data',data.data],['Mês/Ano',data.mesAno]]
+                .forEach(([label, value]) => { if (!value) missing.push(label); });
+            if (missing.length) return `Não foi possível gerar.\n\nFalta:\n${missing.map(item => `• ${item}`).join('\n')}`;
+            if (this.cpfDigits(data.cpf).length !== 11) return 'Confira o CPF antes de gerar. Ele precisa ter 11 dígitos.';
+            if (!/^\d{2}\/\d{2}\/\d{4}$/.test(data.data)) return 'Confira a data. Use dd/mm/aaaa.';
+            if (!/^[^/]+\/\d{4}$/.test(data.mesAno)) return 'Confira Mês/Ano. Use Mês/aaaa.';
+            return '';
+        },
+
+        setBusy(ui, busy, message = '') {
+            ui.modal.querySelectorAll('button').forEach(button => { if (!button.classList.contains('eh-pref-close')) button.disabled = Boolean(busy); });
+            if (message) ui.alert.textContent = message;
+        },
+
+        showAlert(ui, message) {
+            ui.alert.textContent = String(message || '');
+            ui.alert.classList.toggle('show', Boolean(message));
+        },
+
+        fillForm(ui, data) {
+            ui.nome.value = data.nome || '';
+            ui.cpf.value = this.formatCpf(data.cpf || '');
+            ui.origem.value = data.origem || '';
+            ui.destino.value = data.destino || '';
+            ui.data.value = data.data || ui.data.value;
+            ui.mesAno.value = data.mesAno || ui.mesAno.value;
+        },
+
+        showPreview(ui, result) {
+            this.preview = result;
+            ui.previewImage.src = `${result.previewUrl}?v=${Date.now()}`;
+            ui.emptyPreview.hidden = true;
+            ui.previewImage.hidden = false;
+            ui.confirm.classList.add('show');
+            ui.ready.classList.remove('show');
+            const data = result.data;
+            const entries = [
+                ['Nome', data.nome], ['CPF', data.cpf], ['Origem', data.origem],
+                ['Destino', data.destino], ['Data', data.data], ['Mês/Ano', data.mesAno]
+            ];
+            ui.confirmGrid.innerHTML = '';
+            entries.forEach(([label, value]) => {
+                const cell = document.createElement('div');
+                const name = document.createElement('span'); name.textContent = `${label}:`;
+                const content = document.createElement('b'); content.textContent = value;
+                cell.append(name, content); ui.confirmGrid.appendChild(cell);
+            });
+            ui.checks.innerHTML = '';
+            ['1 página', '3 imagens preservadas', 'Cabeçalho preservado', 'Rodapé preservado', 'PNG 300 DPI'].forEach(label => {
+                const chip = document.createElement('span'); chip.className = 'eh-pref-check'; chip.textContent = `✓ ${label}`; ui.checks.appendChild(chip);
+            });
+            this.showAlert(ui, '');
+        },
+
+        async previewRequest(ui) {
+            const data = this.collect(ui);
+            const validation = this.validate(data);
+            if (validation) return this.showAlert(ui, validation);
+            if (!this.validCpf(data.cpf) && !data.acceptInvalidCpf) {
+                ui.cpfOverrideWrap.classList.add('show');
+                return this.showAlert(ui, '⚠ O CPF não passou na validação matemática. Confira o número. Se for uma exceção legítima, marque a confirmação manual abaixo.');
+            }
+            ui.cpfOverrideWrap.classList.toggle('show', !this.validCpf(data.cpf));
+            this.setBusy(ui, true);
+            this.showAlert(ui, 'Gerando a prévia a partir do DOCX oficial…');
+            try {
+                const result = await this.request('POST', '/preview', { requisitionData: data });
+                this.showPreview(ui, result);
+            } catch (error) {
+                if (error.details?.requiresCpfOverride) ui.cpfOverrideWrap.classList.add('show');
+                this.showAlert(ui, error.message);
+            } finally {
+                this.setBusy(ui, false);
+            }
+        },
+
+        async generateRequest(ui) {
+            if (!this.preview?.previewId) return this.showAlert(ui, 'Gere e confira a prévia antes de finalizar.');
+            this.setBusy(ui, true);
+            this.showAlert(ui, 'Finalizando exatamente a prévia conferida…');
+            try {
+                const result = await this.request('POST', '/generate', { previewId: this.preview.previewId });
+                const record = {
+                    ...result,
+                    generatedAt: Date.now(),
+                    documentLoaded: Boolean(this.documentDataUrl),
+                    documentName: this.documentName || '',
+                    syncBinary: false
+                };
+                this.saveGenerated(record);
+                ui.readyName.textContent = result.filename;
+                ui.ready.classList.add('show');
+                ui.confirm.classList.remove('show');
+                this.showAlert(ui, '');
+                EH.Toast.success('✓ Requisição Prefeitura pronta');
+            } catch (error) {
+                this.showAlert(ui, error.message);
+            } finally {
+                this.setBusy(ui, false);
+            }
+        },
+
+        async imageBlob(url) {
+            const blob = await this.request('GET', url.replace(this.SERVICE_URL, ''), null, 'blob');
+            if (!(blob instanceof Blob)) throw new Error('O gerador não devolveu uma imagem válida.');
+            return blob;
+        },
+
+        async downloadGenerated(record = this.generated) {
+            if (!record?.finalUrl) return EH.Toast.warning('Nenhuma requisição pronta.');
+            try {
+                const blob = await this.imageBlob(record.finalUrl);
+                const url = URL.createObjectURL(blob);
+                const anchor = document.createElement('a');
+                anchor.href = url; anchor.download = record.filename || 'Requisicao_Prefeitura.png';
+                document.body.appendChild(anchor); anchor.click(); anchor.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 1500);
+            } catch (error) { EH.Toast.error(error.message); }
+        },
+
+        uploadCandidates(kind) {
+            const normalize = value => EH.Utils.normalize(value || '');
+            return Array.from(document.querySelectorAll('input[type="file"]')).map(input => {
+                const label = input.id ? document.querySelector(`label[for="${CSS.escape(input.id)}"]`) : null;
+                const holder = input.closest('.form-group,.card,.row,[class*="upload"],div');
+                const text = normalize([input.name,input.id,input.getAttribute('formcontrolname'),input.accept,label?.textContent,holder?.textContent].filter(Boolean).join(' '));
+                const requestScore = (/REQUISICAO/.test(text) ? 3 : 0) + (/PREFEITURA/.test(text) ? 2 : 0) + (/SOLICITACAO/.test(text) ? 1 : 0);
+                const documentScore = (/DOCUMENT/.test(text) ? 3 : 0) + (/IDENTIDADE|RG|CPF/.test(text) ? 2 : 0);
+                const score = kind === 'request' ? requestScore - (documentScore && !requestScore ? 4 : 0) : documentScore - (requestScore && !documentScore ? 4 : 0);
+                return { input, text, score };
+            }).filter(item => item.score > 0).sort((a, b) => b.score - a.score);
+        },
+
+        setInputFile(input, blob, filename) {
+            if (typeof DataTransfer !== 'function' || typeof File !== 'function') throw new Error('O navegador não permite preencher este upload com segurança.');
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([blob], filename, { type: blob.type || 'image/png', lastModified: Date.now() }));
+            input.files = transfer.files;
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+            input.dispatchEvent(new Event('change', { bubbles: true }));
+        },
+
+        async attachToRequest(kind = 'request') {
+            if (EH.Pages?.detect?.() !== 'requisicao') {
+                EH.Toast.warning('Abra primeiro a tela de Solicitações/Requisição do E-Pass.');
+                return;
+            }
+            const candidates = this.uploadCandidates(kind);
+            const best = candidates[0];
+            if (!best || (candidates[1] && candidates[1].score === best.score)) {
+                EH.Toast.warning(kind === 'request'
+                    ? 'Não identifiquei com segurança um único campo de upload da requisição. Baixe o PNG e anexe manualmente.'
+                    : 'Não identifiquei com segurança um único campo de documentação. Anexe manualmente.');
+                return;
+            }
+            try {
+                if (kind === 'request') {
+                    if (!this.generated?.finalUrl) throw new Error('Nenhuma requisição pronta.');
+                    const blob = await this.imageBlob(this.generated.finalUrl);
+                    this.setInputFile(best.input, blob, this.generated.filename);
+                    EH.Toast.success('Requisição anexada. Confira o campo antes de enviar manualmente.');
+                } else {
+                    if (!this.documentDataUrl) throw new Error('Nenhuma documentação carregada.');
+                    const blob = await (await fetch(this.documentDataUrl)).blob();
+                    this.setInputFile(best.input, blob, this.documentName || 'documentacao.jpg');
+                    EH.Toast.success('Documentação anexada. Confira o campo antes de enviar manualmente.');
+                }
+            } catch (error) { EH.Toast.warning(error.message); }
+        },
+
+        onPageUpdate() {
+            this.renderStatus();
+        },
+
+        close() {
+            this.modal?.remove();
+            this.modal = null;
+        },
+
+        open() {
+            this.close();
+            const defaults = this.defaults();
+            const current = this.currentContext();
+            const saved = this.generated?.data || EH.Storage.get(this.STORAGE_KEY, null)?.data || {};
+            const initial = { ...defaults, ...saved };
+
+            const overlay = document.createElement('div');
+            overlay.className = 'eh-pref-overlay';
+            const modal = document.createElement('div');
+            modal.className = 'eh-pref-modal';
+            modal.innerHTML = `
+                <div class="eh-pref-head">
+                    <div><strong>📄 REQUISIÇÃO PREFEITURA</strong><small>Modelo DOCX oficial • renderização local • envio final sempre manual</small></div>
+                    <button type="button" class="eh-pref-close" aria-label="Fechar">×</button>
+                </div>
+                <div class="eh-pref-content">
+                    <div class="eh-pref-form">
+                        <section class="eh-pref-card">
+                            <h3>Passageiro</h3>
+                            <div class="eh-pref-current"></div>
+                            <div class="eh-pref-actions">
+                                <button type="button" class="eh-pref-btn eh-pref-use-current">Usar passageiro atual</button>
+                                <button type="button" class="eh-pref-btn eh-pref-read-doc">📷 Enviar documentação</button>
+                                <button type="button" class="eh-pref-btn eh-pref-view-doc" hidden>Ver documento</button>
+                                <input type="file" class="eh-pref-doc-input" accept="image/*" hidden>
+                            </div>
+                            <div class="eh-pref-progress" hidden></div>
+                            <div class="eh-pref-ocr-review">
+                                <strong class="eh-pref-ocr-message">DADOS IDENTIFICADOS</strong>
+                                <div class="eh-pref-grid">
+                                    <div class="eh-pref-field full"><label>Nome identificado</label><input class="eh-pref-ocr-name" autocomplete="off"></div>
+                                    <div class="eh-pref-field full"><label>CPF identificado</label><input class="eh-pref-ocr-cpf" inputmode="numeric" autocomplete="off"></div>
+                                </div>
+                                <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-ocr-confirm">Confirmar dados</button><button type="button" class="eh-pref-btn eh-pref-ocr-manual">Corrigir manualmente</button></div>
+                            </div>
+                            <div class="eh-pref-grid">
+                                <div class="eh-pref-field full"><label>Nome</label><input class="eh-pref-name" maxlength="180" autocomplete="off"></div>
+                                <div class="eh-pref-field full"><label>CPF</label><input class="eh-pref-cpf" maxlength="14" inputmode="numeric" autocomplete="off"></div>
+                            </div>
+                        </section>
+                        <section class="eh-pref-card">
+                            <h3>Rota</h3>
+                            <div class="eh-pref-route-list"></div>
+                            <div class="eh-pref-grid">
+                                <div class="eh-pref-field"><label>Origem</label><input class="eh-pref-origin" maxlength="80"></div>
+                                <div class="eh-pref-field"><label>Destino</label><input class="eh-pref-destination" maxlength="80"></div>
+                            </div>
+                        </section>
+                        <section class="eh-pref-card">
+                            <h3>Documento</h3>
+                            <div class="eh-pref-grid">
+                                <div class="eh-pref-field"><label>Data</label><input class="eh-pref-date" maxlength="10" inputmode="numeric"></div>
+                                <div class="eh-pref-field"><label>Mês/Ano</label><input class="eh-pref-month" maxlength="30"></div>
+                            </div>
+                            <label class="eh-pref-invalid-override"><input type="checkbox" class="eh-pref-cpf-override"> Conferi manualmente e desejo usar este CPF mesmo sem validação matemática.</label>
+                            <div class="eh-pref-alert"></div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-health">Verificar gerador</button><button type="button" class="eh-pref-btn primary eh-pref-preview-btn">Pré-visualizar documento oficial</button></div>
+                            <div class="eh-pref-help">A prévia é gerada do próprio DOCX. Nenhum HTML desenha a requisição.</div>
+                        </section>
+                    </div>
+                    <div class="eh-pref-preview">
+                        <div class="eh-pref-preview-frame"><div class="eh-pref-empty-preview">A página oficial aparecerá aqui depois da renderização. Confira logos, assinatura, rodapé, nome, CPF, rota, TOTAL e data.</div><img class="eh-pref-preview-image" alt="Prévia da requisição oficial" hidden></div>
+                        <section class="eh-pref-card eh-pref-confirm">
+                            <h3>Confirme</h3>
+                            <div class="eh-pref-confirm-grid"></div>
+                            <div class="eh-pref-checks"></div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-correct">Corrigir</button><button type="button" class="eh-pref-btn success eh-pref-generate">Gerar requisição</button></div>
+                        </section>
+                        <section class="eh-pref-ready">
+                            <strong>✓ REQUISIÇÃO PRONTA</strong>
+                            <code class="eh-pref-ready-name"></code>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-download">Baixar PNG</button><button type="button" class="eh-pref-btn eh-pref-attach">Usar na solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach-doc">Usar documentação</button><button type="button" class="eh-pref-btn eh-pref-again">Gerar novamente</button></div>
+                            <small>O Helper não clica em “Enviar solicitação”. Confira os anexos e envie manualmente.</small>
+                        </section>
+                    </div>
+                </div>`;
+            overlay.appendChild(modal);
+            document.body.appendChild(overlay);
+            this.modal = overlay;
+
+            const q = selector => modal.querySelector(selector);
+            const ui = {
+                modal, form: q('.eh-pref-form'), nome: q('.eh-pref-name'), cpf: q('.eh-pref-cpf'),
+                origem: q('.eh-pref-origin'), destino: q('.eh-pref-destination'), data: q('.eh-pref-date'),
+                mesAno: q('.eh-pref-month'), cpfOverride: q('.eh-pref-cpf-override'), cpfOverrideWrap: q('.eh-pref-invalid-override'),
+                alert: q('.eh-pref-alert'), progress: q('.eh-pref-progress'), ocrReview: q('.eh-pref-ocr-review'),
+                ocrMessage: q('.eh-pref-ocr-message'), ocrName: q('.eh-pref-ocr-name'), ocrCpf: q('.eh-pref-ocr-cpf'),
+                previewImage: q('.eh-pref-preview-image'), emptyPreview: q('.eh-pref-empty-preview'), confirm: q('.eh-pref-confirm'),
+                confirmGrid: q('.eh-pref-confirm-grid'), checks: q('.eh-pref-checks'), ready: q('.eh-pref-ready'), readyName: q('.eh-pref-ready-name')
+            };
+            this.fillForm(ui, initial);
+            ui.cpf.addEventListener('input', () => { ui.cpf.value = this.formatCpf(ui.cpf.value); });
+            ui.ocrCpf.addEventListener('input', () => { ui.ocrCpf.value = this.formatCpf(ui.ocrCpf.value); });
+
+            const currentBox = q('.eh-pref-current');
+            if (current.nome || current.cpf) {
+                const title = document.createElement('strong'); title.textContent = 'Passageiro atual encontrado';
+                const name = document.createElement('span'); name.textContent = current.nome || 'Nome ainda não identificado';
+                const cpf = document.createElement('span'); cpf.textContent = current.cpf ? `CPF ***.***.***-${this.cpfDigits(current.cpf).slice(-2)}` : 'CPF ainda não identificado';
+                currentBox.append(title, name, cpf);
+            } else currentBox.textContent = 'Nenhum passageiro atual foi identificado. Envie a documentação ou preencha manualmente.';
+
+            const routeHost = q('.eh-pref-route-list');
+            [
+                ['Arenópolis','Goiânia'], ['Arenópolis','Barra do Garças'],
+                ['Arenópolis','Iporá'], ['Goiânia','Arenópolis']
+            ].forEach(([origin, destination]) => {
+                const button = document.createElement('button');
+                button.type = 'button'; button.className = 'eh-pref-route'; button.textContent = `${origin.toLocaleUpperCase('pt-BR')} → ${destination.toLocaleUpperCase('pt-BR')}`;
+                button.addEventListener('click', () => { ui.origem.value = origin; ui.destino.value = destination; });
+                routeHost.appendChild(button);
+            });
+
+            const docInput = q('.eh-pref-doc-input');
+            const viewDoc = q('.eh-pref-view-doc');
+            viewDoc.hidden = !this.documentDataUrl;
+            q('.eh-pref-read-doc').addEventListener('click', () => docInput.click());
+            viewDoc.addEventListener('click', () => {
+                if (!this.documentDataUrl) return;
+                const viewer = document.createElement('div'); viewer.className = 'eh-pref-overlay';
+                const image = document.createElement('img'); image.src = this.documentDataUrl; image.alt = 'Documentação'; image.style.cssText = 'max-width:94vw;max-height:92vh;object-fit:contain;background:#fff;border-radius:12px;';
+                viewer.appendChild(image); viewer.addEventListener('click', () => viewer.remove()); document.body.appendChild(viewer);
+            });
+            docInput.addEventListener('change', async () => {
+                const file = docInput.files?.[0];
+                if (!file) return;
+                if (!file.type.startsWith('image/')) return this.showAlert(ui, 'Envie uma foto ou imagem da documentação.');
+                try {
+                    this.documentDataUrl = await this.readFile(file);
+                    this.documentName = file.name || 'documentacao.jpg';
+                    this.persistDocument(); viewDoc.hidden = false;
+                    await this.runOcr(this.documentDataUrl, ui);
+                } catch (error) { this.showAlert(ui, error.message); }
+            });
+
+            q('.eh-pref-use-current').addEventListener('click', () => {
+                this.fillForm(ui, { ...initial, ...current });
+                this.showAlert(ui, current.nome || current.cpf ? '' : 'Nenhum passageiro atual foi encontrado.');
+            });
+            q('.eh-pref-ocr-confirm').addEventListener('click', () => {
+                const name = this.clean(ui.ocrName.value); const cpf = this.formatCpf(ui.ocrCpf.value);
+                if (!name || this.cpfDigits(cpf).length !== 11) return this.showAlert(ui, 'Confira nome e CPF identificados antes de confirmar.');
+                ui.nome.value = name; ui.cpf.value = cpf; ui.ocrReview.classList.remove('show'); this.showAlert(ui, '');
+            });
+            q('.eh-pref-ocr-manual').addEventListener('click', () => { ui.ocrReview.classList.remove('show'); ui.nome.focus(); });
+            q('.eh-pref-health').addEventListener('click', async () => {
+                const health = await this.checkService();
+                this.showAlert(ui, health?.ok ? '✓ Gerador local, modelo oficial e LibreOffice prontos.' : (health?.error || 'Gerador local incompleto.'));
+            });
+            q('.eh-pref-preview-btn').addEventListener('click', () => this.previewRequest(ui));
+            q('.eh-pref-correct').addEventListener('click', () => { ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null; ui.nome.focus(); });
+            q('.eh-pref-generate').addEventListener('click', () => this.generateRequest(ui));
+            q('.eh-pref-download').addEventListener('click', () => this.downloadGenerated());
+            q('.eh-pref-attach').addEventListener('click', () => this.attachToRequest('request'));
+            q('.eh-pref-attach-doc').addEventListener('click', () => this.attachToRequest('document'));
+            q('.eh-pref-again').addEventListener('click', () => { ui.ready.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null; ui.nome.focus(); });
+            q('.eh-pref-close').addEventListener('click', () => this.close());
+            overlay.addEventListener('click', event => { if (event.target === overlay) this.close(); });
+
+            if (this.generated?.filename) {
+                ui.readyName.textContent = this.generated.filename;
+                ui.ready.classList.add('show');
+            }
+            this.checkService({ quiet: true });
+        }
+    };
 
     // ============================================================
     // REQUISIÇÕES DE PREFEITURA — PASSAGEIRO + IDA/VOLTA + CÓDIGO POR TRECHO
@@ -13880,6 +14611,18 @@
             saleBox.className = 'eh-sale-host';
             saleBox.hidden = true;
 
+            const prefeituraTool = document.createElement('section');
+            prefeituraTool.className = 'eh-pref-tool';
+            const prefeituraToolTitle = document.createElement('div');
+            prefeituraToolTitle.className = 'eh-pref-tool-title';
+            prefeituraToolTitle.textContent = 'Ferramentas';
+            const prefeituraButton = document.createElement('button');
+            prefeituraButton.type = 'button';
+            prefeituraButton.className = 'eh-pref-tool-open';
+            prefeituraButton.textContent = '📄 Requisição Prefeitura';
+            const prefeituraStatus = document.createElement('div');
+            prefeituraTool.append(prefeituraToolTitle, prefeituraButton, prefeituraStatus);
+
             const context = document.createElement('div');
             context.className = 'eh-context-card';
 
@@ -13947,7 +14690,7 @@
             flowSummary.textContent = 'Fluxo do atendimento';
             flowSection.append(flowSummary, steps);
 
-            body.append(flowSection, context, reminderBox, operationBox, saleBox, quickTitle, quickRoutes, divider, toolsTitle, actions, more);
+            body.append(flowSection, context, reminderBox, operationBox, saleBox, prefeituraTool, quickTitle, quickRoutes, divider, toolsTitle, actions, more);
             panel.append(header, body, footer);
             root.appendChild(panel);
 
@@ -13981,6 +14724,10 @@
             this.toolsTitle = toolsTitle;
             this.primaryActions = actions;
             this.moreTools = more;
+            this.prefeituraTool = prefeituraTool;
+            this.prefeituraButton = prefeituraButton;
+            this.prefeituraStatus = prefeituraStatus;
+            EH.PrefeituraRequisition?.mount?.(prefeituraStatus, prefeituraButton);
             this.renderQuickRoutes();
             this.renderSaleSummary(EH.Pages?.detect?.() || 'desconhecida');
 
@@ -16559,7 +17306,7 @@
 
             const isOwnMutation = mutation => {
                 const target = mutation?.target instanceof Element ? mutation.target : mutation?.target?.parentElement;
-                return Boolean(target?.closest?.('#eh-root, #eh-wa-dock, #eh-operation-dock, #eh-operation-launcher, #eh-toast-area, .eh-overlay, .eh-capture-overlay'));
+                return Boolean(target?.closest?.('#eh-root, #eh-wa-dock, #eh-operation-dock, #eh-operation-launcher, #eh-toast-area, .eh-overlay, .eh-capture-overlay, .eh-pref-overlay'));
             };
 
             this.observer = new MutationObserver(mutations => {
@@ -16617,6 +17364,7 @@
             safeInit('Mapa dos carros', () => EH.OperationCars.init());
             safeInit('Contexto de vendas', () => EH.SaleCpfs.init());
             safeInit('Requisições', () => EH.RequisitionManager.init());
+            safeInit('Requisição Prefeitura', () => EH.PrefeituraRequisition.init());
             safeInit('WhatsApp', () => EH.WhatsAppDock.init());
             safeInit('Layout', () => EH.Layout.sync());
             safeInit('Painéis', () => EH.PanelManager.bindAll());
