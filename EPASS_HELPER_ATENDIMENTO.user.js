@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.61.0
+// @version      5.61.1
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -34,7 +34,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.61.0',
+        VERSION: '5.61.1',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
         STORAGE_SCHEMA_VERSION: 8,
@@ -4607,8 +4607,26 @@
                     letter-spacing:.25px;
                     text-transform:uppercase;
                 }
+                #eh-root .eh-emission-row-actions {
+                    display:flex;
+                    gap:4px;
+                    align-items:center;
+                    flex-wrap:wrap;
+                }
+                #eh-root .eh-emission-row-actions .eh-context-btn {
+                    width:auto;
+                    min-width:58px;
+                    padding:5px 7px;
+                }
+                #eh-root .eh-emission-persistent {
+                    border-color:#cddcf0;
+                    background:#f8fbff;
+                }
+                #eh-root .eh-emission-pending-summary {
+                    border-color:#cddcf0;
+                    background:#f8fbff;
+                }
                 #eh-root .eh-sale-passenger-row {
-                #eh-root .eh-emission-row-actions{display:flex;gap:4px;align-items:center;flex-wrap:wrap} #eh-root .eh-emission-row-actions .eh-context-btn{width:auto;min-width:58px;padding:5px 7px} #eh-root .eh-emission-persistent{border-color:#cddcf0;background:#f8fbff} #eh-root .eh-emission-pending-summary{border-color:#cddcf0;background:#f8fbff}
                     display:grid;
                     grid-template-columns:minmax(0,1fr) 58px;
                     align-items:center;
@@ -11631,7 +11649,12 @@
             merged.updatedAt=Math.max(Number(localTs||localData?.updatedAt||0),Number(remoteTs||remoteData?.updatedAt||0));
             return merged;
         },
-        sameData(a,b){try{return JSON.stringify(a||{})===JSON.stringify(b||{});}catch(_error){return false;}},
+        syncPayload(data={}){
+            if(!data||typeof data!=='object'||Array.isArray(data))return data;
+            const {syncState:_syncState,...payload}=data;
+            return payload;
+        },
+        sameData(a,b){try{return JSON.stringify(this.syncPayload(a)||{})===JSON.stringify(this.syncPayload(b)||{});}catch(_error){return false;}},
         envelope(type,id,data,updatedAt=0){const safeId=String(id||'');const ts=Number(updatedAt||data?.updatedAt||data?.createdAt||Date.now());return{id:this.recordKey(type,safeId),recordType:type,recordId:safeId,data,updatedAt:ts,deviceId:String(data?.deviceId||EH.Device.id())};},
         normalizeRemote(row={}){const p=row?.payload||{};if(p?.recordType&&p?.recordId)return this.envelope(p.recordType,p.recordId,p.data||{},p.updatedAt||Date.parse(row.updated_at)||0);const legacyId=String(p.id||row.id||'');return this.envelope('reminder',legacyId,p,Number(p.updatedAt||Date.parse(row.updated_at)||0));},
         collectLocalRecords(){
@@ -11640,7 +11663,7 @@
             if(cfg.requisitions)(EH.RequisitionManager?.loadStore?.()||[]).forEach(item=>rows.push(this.envelope('requisition',item.id,item,item.updatedAt||item.createdAt)));
             if(cfg.emission){
                 (EH.PassengerMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('passenger',item.id||`cpf:${item.cpf}`,item,item.updatedAt||item.createdAt)));
-                (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,item,item.updatedAt||item.createdAt)));
+                (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
             }
             if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,updatedAt:opUpdated},opUpdated));}
             return rows.filter(row=>row.recordId);
@@ -12184,6 +12207,15 @@
             }
             return -1;
         },
+        sameContent(left = {}, right = {}) {
+            const comparable = item => {
+                const normalized = this.normalize(item);
+                const { updatedAt:_updatedAt, deviceId:_deviceId, syncState:_syncState, ...content } = normalized;
+                return content;
+            };
+            try { return JSON.stringify(comparable(left)) === JSON.stringify(comparable(right)); }
+            catch (_error) { return false; }
+        },
         upsert(item = {}, { fromSync = false } = {}) {
             let next = this.normalize(item);
             if (!next.id || (!next.ticketNumber && next.cpf.length !== 11)) return null;
@@ -12192,6 +12224,7 @@
             if(index>=0)next={...next,id:String(rows[index].id||next.id)};
             const merged = index >= 0 ? this.merge(rows[index], next) : next;
             const before = index >= 0 ? JSON.stringify(rows[index]) : '';
+            if (!fromSync && index >= 0 && this.sameContent(rows[index], merged)) return rows[index];
             if (!fromSync) { merged.updatedAt = Date.now(); merged.deviceId=EH.Device.id(); merged.syncState=EH.Sync?.configured?.()?'pending':'local'; }
             else merged.syncState='synced';
             if (index >= 0) rows[index] = merged; else rows.push(merged);
