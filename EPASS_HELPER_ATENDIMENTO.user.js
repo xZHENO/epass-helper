@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.64.0
+// @version      5.65.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,7 +37,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.64.0',
+        VERSION: '5.65.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
         STORAGE_SCHEMA_VERSION: 9,
@@ -681,7 +681,7 @@
         normalizeCpf(value) { return String(value || '').replace(/\D/g, '').slice(0, 11); },
         load() {
             const rows = EH.Storage.get(this.KEY, []);
-            return Array.isArray(rows) ? rows : [];
+            return Array.isArray(rows) ? rows.map(row => this.normalize(row)) : [];
         },
         usefulText(incoming, current = '') {
             const next = EH.Utils.clean(incoming || '');
@@ -708,7 +708,7 @@
             return {
                 id: item.id || (cpf ? `cpf:${cpf}` : ''),
                 cpf,
-                name: EH.Utils.clean(item.name || item.nome || ''),
+                name: EH.PassengerIdentity?.formatPersonName?.(item.name || item.nome || '') || EH.Utils.clean(item.name || item.nome || ''),
                 birthDate: EH.Utils.clean(item.birthDate || item.dataNascimento || ''),
                 confirmed,
                 confirmedAt: Number(item.confirmedAt || 0),
@@ -5523,7 +5523,7 @@
                 return {
                     rowIndex,
                     saleId: saleMatch[1],
-                    passenger: EH.Utils.clean(saleMatch[2] || ''),
+                    passenger: EH.PassengerIdentity?.formatPersonName?.(saleMatch[2] || '') || EH.Utils.clean(saleMatch[2] || ''),
                     companyCode: badge,
                     dateTime,
                     agent,
@@ -5835,7 +5835,7 @@
                 monthKey: this.monthKey(date),
                 company,
                 companyCode: EH.Utils.clean(sale.companyCode || ''),
-                passenger: EH.Utils.clean(sale.passenger || ''),
+                passenger: EH.PassengerIdentity?.formatPersonName?.(sale.passenger || '') || EH.Utils.clean(sale.passenger || ''),
                 cpfMasked: '',
                 identifier: sale.saleId || '',
                 saleId: sale.saleId || '',
@@ -8098,7 +8098,7 @@
             return {
                 id: item.id || (cpf ? `p-${cpf}` : `p-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`),
                 cpf,
-                name: EH.Utils.clean(item.name || ''),
+                name: EH.PassengerIdentity?.formatPersonName?.(item.name || '') || EH.Utils.clean(item.name || ''),
                 birthDate: EH.Utils.clean(item.birthDate || ''),
                 confirmed: Boolean(item.confirmed || item.confirmedAt),
                 confirmedAt: Number(item.confirmedAt || 0),
@@ -8209,7 +8209,7 @@
                 changed = true;
             } else {
                 const identityMayChange = Boolean(data.confirmed) || !passenger.confirmed;
-                const nextName = identityMayChange && data.name ? EH.Utils.clean(data.name) : passenger.name;
+                const nextName = identityMayChange && data.name ? (EH.PassengerIdentity?.formatPersonName?.(data.name) || EH.Utils.clean(data.name)) : passenger.name;
                 const nextBirthDate = identityMayChange && data.birthDate ? EH.Utils.clean(data.birthDate) : passenger.birthDate;
                 if (nextName !== passenger.name) {
                     passenger.name = nextName;
@@ -8536,7 +8536,7 @@
         state: null,
 
         emptyField() {
-            return { value: '', display: '', confidence: 0, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false, evidence: null };
+            return { value: '', rawValue: '', display: '', confidence: 0, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false, evidence: null };
         },
 
         freshState() {
@@ -8565,6 +8565,27 @@
 
         normalized(value) {
             return EH.Utils.normalize(this.clean(value));
+        },
+
+        formatPersonName(value) {
+            const name = this.clean(value);
+            if (!name) return '';
+            const particles = new Set(['da', 'das', 'de', 'do', 'dos', 'e']);
+            const hasMixedCase = token => {
+                const letters = token.replace(/[^A-Za-zÀ-ÖØ-öø-ÿ]/g, '');
+                return letters && letters !== letters.toLocaleUpperCase('pt-BR') && letters !== letters.toLocaleLowerCase('pt-BR');
+            };
+            const capitalize = token => {
+                if (!token || hasMixedCase(token)) return token;
+                if (/^[IVXLCDM]{2,4}$/i.test(token)) return token.toLocaleUpperCase('pt-BR');
+                const lower = token.toLocaleLowerCase('pt-BR');
+                return lower.replace(/(^|[-'’])([a-zà-öø-ÿ])/g, (_match, separator, letter) => `${separator}${letter.toLocaleUpperCase('pt-BR')}`);
+            };
+            return name.split(' ').filter(Boolean).map((token, index) => {
+                const lower = token.toLocaleLowerCase('pt-BR');
+                if (index > 0 && particles.has(lower)) return lower;
+                return capitalize(token);
+            }).join(' ');
         },
 
         cpfDigits(value) {
@@ -8629,7 +8650,7 @@
             const resolved = record || this.state?.confirmed || (this.state?.allowMemoryFallback !== false ? this.currentConfirmed() : null);
             if (!resolved) return null;
             const data = {
-                nome: this.clean(resolved.name || resolved.nome),
+                nome: this.formatPersonName(resolved.name || resolved.nome),
                 cpf: this.formatCpf(resolved.cpf),
                 cpfDigits: this.cpfDigits(resolved.cpf),
                 nascimento: this.parseDate(resolved.birthDate || resolved.nascimento || resolved.dataNascimento).value,
@@ -8655,7 +8676,7 @@
             };
             this.state.allowMemoryFallback = true;
             this.state.fields = {
-                name: { ...this.emptyField(), value: data.nome, display: data.nome, confidence: 100, status: 'high', valid: true, reason: 'Dados confirmados.', source: 'confirmed', locked: true },
+                name: { ...this.emptyField(), value: data.nome, rawValue: data.nome, display: data.nome, confidence: 100, status: 'high', valid: true, reason: 'Dados confirmados.', source: 'confirmed', locked: true },
                 cpf: { ...this.emptyField(), value: data.cpfDigits, display: data.cpf, confidence: 100, status: 'high', valid: true, reason: 'CPF confirmado e válido.', source: 'confirmed', locked: true },
                 birthDate: { ...this.emptyField(), value: data.nascimento, display: data.nascimento, confidence: 100, status: 'high', valid: true, reason: 'Nascimento confirmado.', source: 'confirmed', locked: true }
             };
@@ -8700,11 +8721,11 @@
 
         labelSequences(kind = 'all') {
             const groups = {
-                name: [['NOME', 'COMPLETO'], ['NOME', 'CIVIL'], ['NOME', 'DO', 'TITULAR'], ['NOME'], ['NAME']],
-                cpf: [['CPF']],
-                birthDate: [['DATA', 'DE', 'NASCIMENTO'], ['DATA', 'NASCIMENTO'], ['DT', 'NASC'], ['DATA', 'NASC'], ['NASCIMENTO'], ['NASC']],
-                negativeName: [['FILIACAO'], ['MAE'], ['PAI'], ['GENITOR'], ['GENITORA'], ['RESPONSAVEL'], ['AUTORIDADE'], ['ORGAO', 'EMISSOR'], ['ASSINATURA']],
-                negativeDate: [['DATA', 'DE', 'EXPEDICAO'], ['DATA', 'EXPEDICAO'], ['EXPEDICAO'], ['EMISSAO'], ['VALIDADE'], ['VALIDO', 'ATE'], ['PRIMEIRA', 'HABILITACAO'], ['REGISTRO'], ['CASAMENTO']]
+                name: [['NOME', 'COMPLETO'], ['NOME', 'CIVIL'], ['NOME', 'DO', 'TITULAR'], ['FULL', 'NAME'], ['NOME'], ['NAME']],
+                cpf: [['REGISTRO', 'GERAL', 'CPF'], ['CPF', 'PERSONAL', 'NUMBER'], ['PERSONAL', 'NUMBER'], ['CPF']],
+                birthDate: [['DATA', 'DE', 'NASCIMENTO'], ['DATA', 'NASCIMENTO'], ['DATE', 'OF', 'BIRTH'], ['DT', 'NASC'], ['DATA', 'NASC'], ['NASCIMENTO'], ['BIRTH', 'DATE'], ['NASC']],
+                negativeName: [['FILIACAO'], ['MAE'], ['PAI'], ['GENITOR'], ['GENITORA'], ['RESPONSAVEL'], ['FILIATION'], ['MOTHER'], ['FATHER'], ['PARENTS'], ['AUTORIDADE'], ['ORGAO', 'EMISSOR'], ['ASSINATURA'], ['SIGNATURE']],
+                negativeDate: [['DATA', 'DE', 'EXPEDICAO'], ['DATA', 'EXPEDICAO'], ['DATE', 'OF', 'ISSUE'], ['ISSUE', 'DATE'], ['EXPEDICAO'], ['EMISSAO'], ['VALIDADE'], ['VALIDO', 'ATE'], ['EXPIRY', 'DATE'], ['EXPIRY'], ['EXPIRATION'], ['PRIMEIRA', 'HABILITACAO'], ['REGISTRO'], ['CASAMENTO']]
             };
             if (kind !== 'all') return groups[kind] || [];
             return Object.values(groups).flat().sort((a, b) => b.length - a.length);
@@ -8898,7 +8919,7 @@
 
         nameCandidate(value) {
             let name = this.clean(value)
-                .replace(/^(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|NAME|TITULAR)\s*[:\-]?\s*/i, '')
+                .replace(/^(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|FULL\s+NAME|NAME|TITULAR)\s*[:\-]?\s*/i, '')
                 .replace(/[|_[\]{}]+/g, ' ')
                 .replace(/\s+/g, ' ').trim();
             name = name.replace(/[.,;:]+$/g, '').trim();
@@ -8907,20 +8928,21 @@
             if (tokens.length < 2) return '';
             const letters = (name.match(/[A-Za-zÀ-ÿ]/g) || []).length;
             if (letters / Math.max(1, name.length) < 0.72) return '';
-            const forbidden = /\b(FILIACAO|MAE|PAI|GENITOR|GENITORA|AUTORIDADE|ORGAO|EMISSOR|ASSINATURA|REPUBLICA|BRASIL|SECRETARIA|IDENTIDADE|CARTEIRA|REGISTRO|VALIDADE|NASCIMENTO|CPF|RG)\b/;
+            const forbidden = /\b(FILIACAO|FILIATION|MAE|PAI|MOTHER|FATHER|PARENTS|GENITOR|GENITORA|AUTORIDADE|ORGAO|EMISSOR|ASSINATURA|SIGNATURE|REPUBLICA|BRASIL|SECRETARIA|IDENTIDADE|CARTEIRA|REGISTRO|VALIDADE|EXPIRY|NASCIMENTO|BIRTH|PERSONAL|NUMBER|NACIONALIDADE|NATIONALITY|SEXO|SEX|CPF|RG)\b/;
             if (forbidden.test(this.normalized(name))) return '';
             return name;
         },
 
         extractNameFallback(lines) {
-            const label = /\b(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|NAME|TITULAR)\b/;
-            const negative = /\b(?:FILIACAO|MAE|PAI|GENITOR|GENITORA|RESPONSAVEL|AUTORIDADE|ORGAO\s+EMISSOR)\b/;
+            const label = /\b(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|FULL\s+NAME|NAME|TITULAR)\b/;
+            const negative = /\b(?:FILIACAO|FILIATION|MAE|PAI|MOTHER|FATHER|PARENTS|GENITOR|GENITORA|RESPONSAVEL|AUTORIDADE|ORGAO\s+EMISSOR|ASSINATURA|SIGNATURE)\b/;
             const candidates = [];
             lines.forEach((line, index) => {
                 if (!label.test(line.norm) || /NOME\s+(?:DA\s+)?(?:MAE|DO\s+PAI)/.test(line.norm)) return;
                 const inline = this.nameCandidate(line.text);
                 if (inline && this.normalized(inline) !== line.norm) {
-                    candidates.push({ value: inline, display: inline, score: 91 + Math.min(7, line.confidence / 20), valid: true, line: index, reason: 'Próximo ao rótulo Nome.' });
+                    const formatted = this.formatPersonName(inline);
+                    candidates.push({ value: formatted, rawValue: inline, display: formatted, score: 91 + Math.min(7, line.confidence / 20), valid: true, line: index, reason: 'Próximo ao rótulo Nome.' });
                 }
                 for (let offset = 1; offset <= 2; offset += 1) {
                     const target = lines[index + offset];
@@ -8929,7 +8951,8 @@
                     if (negative.test(previousContext) && offset > 1) break;
                     const value = this.nameCandidate(target.text);
                     if (!value) continue;
-                    candidates.push({ value, display: value, score: 88 - ((offset - 1) * 11) + Math.min(6, target.confidence / 20), valid: true, line: index + offset, reason: 'Linha associada ao rótulo Nome.' });
+                    const formatted = this.formatPersonName(value);
+                    candidates.push({ value: formatted, rawValue: value, display: formatted, score: 88 - ((offset - 1) * 11) + Math.min(6, target.confidence / 20), valid: true, line: index + offset, reason: 'Linha associada ao rótulo Nome.' });
                     break;
                 }
             });
@@ -8944,14 +8967,15 @@
             const candidates = [];
             anchors.forEach(anchor => {
                 this.anchorFragments(model, anchor, { belowLines: 2 }).forEach(fragment => {
-                    const value = this.nameCandidate(fragment.text);
-                    if (!value) return;
-                    const heading = /\b(REPUBLICA|ESTADO|SECRETARIA|POLICIA|INSTITUTO|CARTEIRA|IDENTIDADE|FILIACAO|AUTORIDADE|ASSINATURA)\b/.test(this.normalized(value));
+                    const rawValue = this.nameCandidate(fragment.text);
+                    if (!rawValue) return;
+                    const heading = /\b(REPUBLICA|ESTADO|SECRETARIA|POLICIA|INSTITUTO|CARTEIRA|IDENTIDADE|FILIACAO|FILIATION|AUTORIDADE|ASSINATURA|SIGNATURE)\b/.test(this.normalized(rawValue));
                     if (heading) return;
+                    const value = this.formatPersonName(rawValue);
                     const compactness = fragment.words.length >= 2 ? 5 : 0;
                     const score = 71 + (fragment.relation === 'same-line' ? 20 : 14) + compactness + Math.min(5, fragment.confidence / 20);
                     candidates.push({
-                        value, display: value, score, valid: true, line: fragment.line,
+                        value, rawValue, display: value, score, valid: true, line: fragment.line,
                         reason: fragment.relation === 'same-line'
                             ? 'Valor delimitado pelas palavras à direita do rótulo Nome.'
                             : 'Valor delimitado na linha imediatamente associada ao rótulo Nome.',
@@ -8976,7 +9000,7 @@
         },
 
         extractCpfFallback(lines) {
-            const label = /\bCPF\b/;
+            const label = /\b(?:CPF|PERSONAL\s+NUMBER)\b/;
             const misleading = /\b(?:RG|REGISTRO|CNH|IDENTIDADE|SEGURANCA|DOCUMENTO)\b/;
             const candidates = [];
             lines.forEach((line, index) => {
@@ -9046,8 +9070,8 @@
         },
 
         extractBirthDateFallback(lines) {
-            const positive = /\b(?:DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC\.?|DT\.?\s*NASC\.?|DATA\s*NASC\.?)\b/;
-            const negative = /\b(?:EMISSAO|EXPEDICAO|VALIDADE|VALIDO\s+ATE|PRIMEIRA\s+HABILITACAO|1A\s+HABILITACAO|EMITIDO)\b/;
+            const positive = /\b(?:DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC\.?|DT\.?\s*NASC\.?|DATA\s*NASC\.?|DATE\s+OF\s+BIRTH|BIRTH\s+DATE)\b/;
+            const negative = /\b(?:EMISSAO|EXPEDICAO|VALIDADE|VALIDO\s+ATE|PRIMEIRA\s+HABILITACAO|1A\s+HABILITACAO|EMITIDO|DATE\s+OF\s+ISSUE|ISSUE\s+DATE|EXPIRY|EXPIRATION)\b/;
             const candidates = [];
             lines.forEach((line, index) => {
                 this.dateCandidates(line.text).forEach(raw => {
@@ -9098,11 +9122,16 @@
             });
             const negativeAnchors = this.findAnchors(model, 'negativeDate');
             const negativeLines = new Set(negativeAnchors.map(anchor => anchor.line.index));
+            negativeAnchors.forEach(anchor => {
+                this.anchorFragments(model, anchor, { belowLines: 2 }).forEach(fragment => {
+                    if (this.dateCandidates(fragment.text).length) negativeLines.add(fragment.line);
+                });
+            });
             model.lines.forEach(line => {
                 const fragments = line.segments.length ? line.segments : [line];
                 fragments.forEach(fragment => this.dateCandidates(fragment.text).forEach(raw => {
                     const parsed = this.parseDate(raw);
-                    const negative = negativeLines.has(line.index) || /\b(?:EMISSAO|EXPEDICAO|VALIDADE|VALIDO\s+ATE|HABILITACAO|REGISTRO|CASAMENTO)\b/.test(fragment.norm || this.normalized(fragment.text));
+                    const negative = negativeLines.has(line.index) || /\b(?:EMISSAO|EXPEDICAO|VALIDADE|VALIDO\s+ATE|HABILITACAO|REGISTRO|CASAMENTO|ISSUE|EXPIRY|EXPIRATION)\b/.test(fragment.norm || this.normalized(fragment.text));
                     let score = 28 + (parsed.valid ? 18 : 0) + (parsed.plausible ? 8 : 0) - (negative ? 46 : 0);
                     if (!parsed.valid) score = Math.min(score, 40);
                     candidates.push({
@@ -9131,6 +9160,7 @@
             const high = baseValid && Number(best.score || 0) >= 82 && !ambiguous;
             return {
                 value: best.value,
+                rawValue: best.rawValue || best.value,
                 display: best.display || best.value,
                 confidence: Math.max(0, Math.min(99, Math.round(Number(best.score || 0)))),
                 status: high ? 'high' : 'review',
@@ -9138,6 +9168,7 @@
                 reason: ambiguous ? 'Mais de um candidato semelhante foi encontrado. Escolha e confirme.' : best.reason,
                 candidates: candidates.map(candidate => ({
                     value: candidate.value,
+                    rawValue: candidate.rawValue || candidate.value,
                     display: candidate.display || candidate.value,
                     confidence: Math.max(0, Math.min(99, Math.round(Number(candidate.score || 0)))),
                     valid: Boolean(candidate.valid),
@@ -9448,7 +9479,7 @@
         },
 
         validateForConfirmation(input = {}) {
-            const nome = this.clean(input.nome || input.name);
+            const nome = this.formatPersonName(input.nome || input.name);
             const cpf = this.cpfDigits(input.cpf);
             const birth = this.parseDate(input.nascimento || input.birthDate || input.dataNascimento);
             const errors = [];
@@ -10282,6 +10313,7 @@
                     EH.PassengerIdentity.state.fields[fieldName] = {
                         ...EH.PassengerIdentity.state.fields[fieldName],
                         value,
+                        rawValue: input.value,
                         display: input.value,
                         confidence: valid ? 100 : 50,
                         status: valid ? 'high' : 'review',
@@ -10293,7 +10325,7 @@
                     };
                 });
             };
-            lockManualDraft('name', ui.ocrName, value => this.clean(value), value => value.length >= 4);
+            lockManualDraft('name', ui.ocrName, value => EH.PassengerIdentity.formatPersonName(value), value => value.length >= 4);
             lockManualDraft('cpf', ui.ocrCpf, value => this.cpfDigits(value), value => this.validCpf(value));
             lockManualDraft('birthDate', ui.ocrBirth, value => EH.PassengerIdentity.parseDate(value).value, value => {
                 const parsed = EH.PassengerIdentity.parseDate(value); return parsed.valid && parsed.plausible;
@@ -10520,7 +10552,7 @@
         normalizePassenger(item = {}) {
             return {
                 cpf: this.normalizeCpf(item.cpf),
-                nome: EH.Utils.clean(item.nome || item.name || ''),
+                nome: EH.PassengerIdentity?.formatPersonName?.(item.nome || item.name || '') || EH.Utils.clean(item.nome || item.name || ''),
                 dataNascimento: this.normalizeBirthDate(item.dataNascimento || item.birthDate || ''),
                 legs: (Array.isArray(item.legs) ? item.legs : Array.isArray(item.mercados) ? item.mercados : [])
                     .map(leg => this.normalizeLeg(leg))
@@ -10731,7 +10763,7 @@
             const birthMatch = text.match(/DATA DE NASCIMENTO\s*:\s*(\d{2}[\/.-]\d{2}[\/.-]\d{4}|\d{4}-\d{2}-\d{2})/i);
             const parsedMarket = this.parseMarket(mercadoCompleto);
             return {
-                nome: EH.Utils.clean(nameMatch?.[1] || ''),
+                nome: EH.PassengerIdentity?.formatPersonName?.(nameMatch?.[1] || '') || EH.Utils.clean(nameMatch?.[1] || ''),
                 dataNascimento: this.normalizeBirthDate(birthMatch?.[1] || ''),
                 ...parsedMarket
             };
@@ -13772,7 +13804,7 @@
 
     // Sanitização compatível com lembretes antigos.
     EH.SyncLegacyReminder = {
-        sanitize(item={}){const createdAt=Number(item.createdAt||Date.now()),updatedAt=Number(item.updatedAt||item.completedAt||createdAt),{syncState:_syncState,...rest}=item;return{...rest,id:String(item.id||''),name:EH.Utils.clean(item.name||''),cpf:String(item.cpf||'').replace(/\D/g,'').slice(0,11),origin:EH.Utils.clean(item.origin||''),destination:EH.Utils.clean(item.destination||''),service:String(item.service||'').replace(/\D/g,''),seat:EH.Utils.clean(item.seat||''),ticketNumber:EH.Utils.clean(item.ticketNumber||''),status:['pending','printed','checked','completed'].includes(String(item.status||'').toLowerCase())?String(item.status).toLowerCase():'pending',createdAt,updatedAt,completedAt:Number(item.completedAt||0),deviceId:String(item.deviceId||EH.Device.id())};}
+        sanitize(item={}){const createdAt=Number(item.createdAt||Date.now()),updatedAt=Number(item.updatedAt||item.completedAt||createdAt),{syncState:_syncState,...rest}=item;return{...rest,id:String(item.id||''),name:EH.PassengerIdentity?.formatPersonName?.(item.name||'')||EH.Utils.clean(item.name||''),cpf:String(item.cpf||'').replace(/\D/g,'').slice(0,11),origin:EH.Utils.clean(item.origin||''),destination:EH.Utils.clean(item.destination||''),service:String(item.service||'').replace(/\D/g,''),seat:EH.Utils.clean(item.seat||''),ticketNumber:EH.Utils.clean(item.ticketNumber||''),status:['pending','printed','checked','completed'].includes(String(item.status||'').toLowerCase())?String(item.status).toLowerCase():'pending',createdAt,updatedAt,completedAt:Number(item.completedAt||0),deviceId:String(item.deviceId||EH.Device.id())};}
     };
 
     EH.Reminders = {
@@ -14092,7 +14124,7 @@
             return {
                 id: String(item.id || fallbackId),
                 saleId, salePassengerId, cpf,
-                name: EH.Utils.clean(item.name || ''),
+                name: EH.PassengerIdentity?.formatPersonName?.(item.name || '') || EH.Utils.clean(item.name || ''),
                 birthDate: EH.Utils.clean(item.birthDate || ''),
                 origin, destination, travelDate,
                 travelDateBr: EH.Utils.clean(item.travelDateBr || ''),
@@ -14399,7 +14431,7 @@
                     const status=this.statusRank(oldStatus)>=this.statusRank(reminderStatus)?oldStatus:reminderStatus;
                     passengers.push({
                         id,
-                        name:EH.Utils.clean(item.name||old?.name||''),
+                        name:EH.PassengerIdentity?.formatPersonName?.(item.name||old?.name||'')||EH.Utils.clean(item.name||old?.name||''),
                         cpf:String(item.cpf||old?.cpf||'').replace(/\D/g,'').slice(0,11),
                         seat:EH.Utils.clean(item.seat||old?.seat||''),
                         ticket:EH.Utils.clean(item.ticket||old?.ticket||''),
