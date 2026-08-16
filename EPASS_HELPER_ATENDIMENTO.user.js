@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.67.0
+// @version      5.68.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.67.0',
+        VERSION: '5.68.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 9,
+        STORAGE_SCHEMA_VERSION: 10,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -486,6 +486,7 @@
                     ...item,
                     createdAt,
                     updatedAt,
+                    deletedAt: Math.max(0, Number(item.deletedAt || 0)),
                     deviceId: item.deviceId || deviceId,
                     syncState: item.syncState || 'local'
                 };
@@ -493,6 +494,18 @@
                 return merged;
             });
             if (changed) EH.Storage.set(key, next);
+        },
+
+        migrateUiSections() {
+            const key = 'ui.sections.v1';
+            const raw = EH.Storage.get(key, null);
+            if (raw && typeof raw === 'object' && !Array.isArray(raw)) return;
+            EH.Storage.set(key, {
+                workflow: false,
+                prefeitura: false,
+                reminders: true,
+                moreTools: false
+            });
         },
 
         migrateOperationRoutines() {
@@ -568,6 +581,7 @@
             // Migrações incrementais: somente acrescentam/normalizam campos.
             this.migratePanels();
             this.migrateReminders();
+            this.migrateUiSections();
             this.migrateOperationRoutines();
             this.migrateSettingsTypes();
             EH.BoardingFeeManager?.migrateLegacy?.();
@@ -918,6 +932,43 @@
         snapshot() {
             this.load();
             return { ...this.panels };
+        }
+    };
+
+    // ============================================================
+    // ESTADO DAS SEÇÕES RECOLHÍVEIS
+    // Recolher preserva o DOM e os dados; somente a visibilidade muda.
+    // ============================================================
+    EH.Sections = {
+        KEY: 'ui.sections.v1',
+        defaults: { workflow: false, prefeitura: false, reminders: true, moreTools: false },
+
+        load() {
+            const raw = EH.Storage.get(this.KEY, null);
+            return raw && typeof raw === 'object' && !Array.isArray(raw)
+                ? { ...this.defaults, ...raw }
+                : { ...this.defaults };
+        },
+
+        isOpen(key, fallback = false) {
+            const value = this.load()[key];
+            return value === undefined ? Boolean(fallback) : EH.Utils.parseBoolean(value, fallback);
+        },
+
+        setOpen(key, open) {
+            const next = this.load();
+            next[key] = Boolean(open);
+            EH.Storage.set(this.KEY, next);
+            return next[key];
+        },
+
+        bind(details, key, fallback = false) {
+            if (!(details instanceof HTMLDetailsElement) || !key) return details;
+            details.open = this.isOpen(key, fallback);
+            if (details.dataset.ehSectionBound === key) return details;
+            details.dataset.ehSectionBound = key;
+            details.addEventListener('toggle', () => this.setOpen(key, details.open));
+            return details;
         }
     };
 
@@ -2999,6 +3050,23 @@
         bound: new WeakSet(),
         handleBound: new WeakSet(),
         resizeBound: new WeakSet(),
+        dragFrame: 0,
+        resizeFrame: 0,
+        handleFrame: 0,
+
+        scheduleFrame(slot, callback) {
+            if (this[slot]) return;
+            this[slot] = requestAnimationFrame(() => {
+                this[slot] = 0;
+                callback();
+            });
+        },
+
+        flushFrame(slot, callback) {
+            if (this[slot]) cancelAnimationFrame(this[slot]);
+            this[slot] = 0;
+            callback();
+        },
 
         defaults() {
             return {
@@ -3352,6 +3420,70 @@
             ['main', 'whatsapp', 'operation'].forEach(key => this.apply(key));
         },
 
+        renderDrag() {
+            const drag = this.drag;
+            if (!drag?.started) return;
+            const el = this.element(drag.key);
+            if (!el) return;
+            const rect = drag.startRect;
+            const edge = 6;
+            const maxX = Math.max(edge, window.innerWidth - rect.width - edge);
+            const maxY = Math.max(edge, window.innerHeight - rect.height - edge);
+            const mode = String(drag.cfg.mode || 'automatic');
+            let x = Math.min(maxX, Math.max(edge, drag.currentX - drag.dx));
+            let y = Math.min(maxY, Math.max(edge, drag.currentY - drag.dy));
+            if (mode === 'left' || mode === 'right') x = rect.left;
+            if (mode === 'top' || mode === 'bottom') y = rect.top;
+            drag.renderX = x;
+            drag.renderY = y;
+            const tx = Math.round(x - rect.left);
+            const ty = Math.round(y - rect.top);
+            el.style.setProperty('transform', `translate3d(${tx}px, ${ty}px, 0)`, 'important');
+        },
+
+        renderHandleDrag() {
+            const drag = this.handleDrag;
+            if (!drag?.moved) return;
+            const handle = this.handleElement(drag.key);
+            if (!handle) return;
+            const pct = Math.min(90, Math.max(10, (drag.currentY / Math.max(1, window.innerHeight)) * 100));
+            drag.renderPct = pct;
+            handle.style.setProperty('top', `${pct}%`, 'important');
+            handle.style.setProperty('bottom', 'auto', 'important');
+            handle.style.setProperty('transform', 'translateY(-50%)', 'important');
+        },
+
+        renderResize() {
+            const resize = this.resize;
+            if (!resize?.started) return;
+            const el = this.element(resize.key);
+            if (!el) return;
+            const dx = resize.currentX - resize.startX;
+            const dy = resize.currentY - resize.startY;
+            const limits = this.limits(resize.key);
+            const mode = String(resize.cfg.mode || 'automatic');
+            const anchorRight = mode === 'right' || mode === 'top-right' || mode === 'bottom-right';
+            const anchorBottom = mode === 'bottom' || mode === 'bottom-left' || mode === 'bottom-right';
+            const widthDelta = anchorRight ? -dx : dx;
+            const heightDelta = anchorBottom ? -dy : dy;
+            const horizontalRoom = anchorRight
+                ? resize.startLeft + resize.startW - 6
+                : window.innerWidth - resize.startLeft - 6;
+            const verticalRoom = anchorBottom
+                ? resize.startTop + resize.startH - 6
+                : window.innerHeight - resize.startTop - 6;
+            const maxW = Math.max(limits.minW, Math.min(limits.maxW, horizontalRoom));
+            const maxH = Math.max(limits.minH, Math.min(limits.maxH, verticalRoom));
+            const width = Math.min(maxW, Math.max(limits.minW, resize.startW + widthDelta));
+            const height = Math.min(maxH, Math.max(limits.minH, resize.startH + heightDelta));
+            resize.renderWidth = width;
+            resize.renderHeight = height;
+            this.setImportant(el, 'width', `${Math.round(width)}px`);
+            this.setImportant(el, 'height', `${Math.round(height)}px`);
+            if (anchorRight) this.setImportant(el, 'left', `${Math.round(resize.startLeft + resize.startW - width)}px`);
+            if (anchorBottom) this.setImportant(el, 'top', `${Math.round(resize.startTop + resize.startH - height)}px`);
+        },
+
         bind(key) {
             const header = this.header(key);
             if (!header || this.bound.has(header)) return;
@@ -3364,6 +3496,7 @@
                 if (event.button !== 0) return;
                 const cfg = this.get(key);
                 if (!cfg.allowDrag) return;
+                if (/^(?:top|bottom)-(?:left|right)$/.test(String(cfg.mode || ''))) return;
                 if (event.target?.closest?.(blockedSelector)) return;
                 const el = this.element(key);
                 if (!el) return;
@@ -3379,7 +3512,9 @@
                     dy: event.clientY - rect.top,
                     startRect: { left: rect.left, top: rect.top, width: rect.width, height: rect.height },
                     cfg: { ...cfg },
-                    started: false
+                    started: false,
+                    renderX: rect.left,
+                    renderY: rect.top
                 };
                 try { header.setPointerCapture?.(event.pointerId); }
                 catch (error) { EH.Logger.debug('Painel: pointer capture indisponível no início do arraste:', error); }
@@ -3396,61 +3531,45 @@
                     if (Math.hypot(deltaX, deltaY) < threshold) return;
                     drag.started = true;
                     document.documentElement.classList.add('eh-panel-dragging');
+                    const el = this.element(key);
+                    el?.classList?.add('eh-panel-active-drag');
+                    el?.style?.setProperty('transition', 'none', 'important');
+                    el?.style?.setProperty('will-change', 'transform', 'important');
                 }
-
-                const el = this.element(key);
-                if (!el) return;
-                const rect = drag.startRect;
-                const edge = 6;
-                const maxX = Math.max(edge, window.innerWidth - rect.width - edge);
-                const maxY = Math.max(edge, window.innerHeight - rect.height - edge);
-                const mode = String(drag.cfg.mode || 'automatic');
-                let x = Math.min(maxX, Math.max(edge, event.clientX - drag.dx));
-                let y = Math.min(maxY, Math.max(edge, event.clientY - drag.dy));
-
-                // MOVE altera somente posição. Tamanho, zoom, modo dinâmico e lado fixado permanecem intactos.
-                if (mode === 'left' || mode === 'right') {
-                    x = rect.left;
-                } else if (mode === 'top' || mode === 'bottom') {
-                    y = rect.top;
-                } else if (mode === 'top-left' || mode === 'top-right' || mode === 'bottom-left' || mode === 'bottom-right') {
-                    // Cantos fixos não são convertidos silenciosamente em modo livre.
-                    return;
-                }
-
-                this.setImportant(el, 'left', `${Math.round(x)}px`);
-                this.setImportant(el, 'top', `${Math.round(y)}px`);
-                this.setImportant(el, 'right', 'auto');
-                this.setImportant(el, 'bottom', 'auto');
+                this.scheduleFrame('dragFrame', () => this.renderDrag());
                 event.preventDefault();
             });
 
             const finish = event => {
                 const drag = this.drag;
                 if (!drag || drag.key !== key) return;
-                this.drag = null;
+                if (drag.started) this.flushFrame('dragFrame', () => this.renderDrag());
                 document.documentElement.classList.remove('eh-panel-dragging');
                 try { header.releasePointerCapture?.(event.pointerId); }
                 catch (error) { EH.Logger.debug('Painel: pointer capture já estava liberado:', error); }
-                if (!drag.started) return; // clique normal: ZERO alterações.
+                if (!drag.started) { this.drag = null; return; } // clique normal: ZERO alterações.
 
                 const el = this.element(key);
-                const rect = el?.getBoundingClientRect?.();
-                if (!rect) return;
+                el?.classList?.remove('eh-panel-active-drag');
+                el?.style?.removeProperty('transform');
+                el?.style?.removeProperty('transition');
+                el?.style?.removeProperty('will-change');
+                if (!el) { this.drag = null; return; }
                 const mode = String(drag.cfg.mode || 'automatic');
                 const patch = {};
                 if (mode === 'left' || mode === 'right') {
-                    patch.y = Math.round(rect.top);
+                    patch.y = Math.round(drag.renderY);
                 } else if (mode === 'top' || mode === 'bottom') {
-                    patch.x = Math.round(rect.left);
+                    patch.x = Math.round(drag.renderX);
                 } else if (mode === 'automatic') {
                     // O modo automático pode receber uma posição manual sem alterar tamanho/zoom/dinâmico.
-                    patch.x = Math.round(rect.left);
-                    patch.y = Math.round(rect.top);
+                    patch.x = Math.round(drag.renderX);
+                    patch.y = Math.round(drag.renderY);
                 } else if (mode === 'free') {
-                    patch.x = Math.round(rect.left);
-                    patch.y = Math.round(rect.top);
+                    patch.x = Math.round(drag.renderX);
+                    patch.y = Math.round(drag.renderY);
                 }
+                this.drag = null;
                 if (Object.keys(patch).length) this.update(key, patch);
             };
             header.addEventListener('pointerup', finish);
@@ -3461,28 +3580,25 @@
             const handle = this.handleElement(key);
             if (!handle || this.handleBound.has(handle)) return;
             this.handleBound.add(handle);
-            let moved = false;
             handle.addEventListener('pointerdown', event => {
                 if (event.button !== 0) return;
-                moved = false;
-                this.handleDrag = { key, pointerId: event.pointerId, startY: event.clientY, currentY: event.clientY };
+                this.handleDrag = { key, pointerId: event.pointerId, startY: event.clientY, currentY: event.clientY, moved: false, renderPct: this.get(key).handleY };
                 handle.setPointerCapture?.(event.pointerId);
             });
             handle.addEventListener('pointermove', event => {
                 if (!this.handleDrag || this.handleDrag.key !== key || this.handleDrag.pointerId !== event.pointerId) return;
                 this.handleDrag.currentY = event.clientY;
-                if (Math.abs(event.clientY - this.handleDrag.startY) < 4 && !moved) return;
-                moved = true;
-                const pct = Math.min(90, Math.max(10, (event.clientY / Math.max(1, window.innerHeight)) * 100));
-                handle.style.setProperty('top', `${pct}%`, 'important');
-                handle.style.setProperty('bottom', 'auto', 'important');
-                handle.style.setProperty('transform', 'translateY(-50%)', 'important');
+                if (Math.abs(event.clientY - this.handleDrag.startY) < 4 && !this.handleDrag.moved) return;
+                this.handleDrag.moved = true;
+                this.scheduleFrame('handleFrame', () => this.renderHandleDrag());
                 event.preventDefault();
             });
             const finish = event => {
-                if (!this.handleDrag || this.handleDrag.key !== key) return;
-                if (moved) {
-                    const pct = Math.min(90, Math.max(10, (this.handleDrag.currentY / Math.max(1, window.innerHeight)) * 100));
+                const drag = this.handleDrag;
+                if (!drag || drag.key !== key) return;
+                if (drag.moved) {
+                    this.flushFrame('handleFrame', () => this.renderHandleDrag());
+                    const pct = drag.renderPct;
                     this.update(key, { handleY: Math.round(pct * 10) / 10 });
                     handle.dataset.ehHandleDraggedAt = String(Date.now());
                 }
@@ -3524,7 +3640,11 @@
                     startLeft: rect.left,
                     startTop: rect.top,
                     cfg: { ...cfg },
-                    started: false
+                    started: false,
+                    currentX: event.clientX,
+                    currentY: event.clientY,
+                    renderWidth: rect.width,
+                    renderHeight: rect.height
                 };
                 try { grip.setPointerCapture?.(event.pointerId); }
                 catch (error) { EH.Logger.debug('Resize: pointer capture indisponível:', error); }
@@ -3534,35 +3654,19 @@
             grip.addEventListener('pointermove', event => {
                 const resize = this.resize;
                 if (!resize || resize.key !== key || resize.pointerId !== event.pointerId) return;
+                resize.currentX = event.clientX;
+                resize.currentY = event.clientY;
                 const dx = event.clientX - resize.startX;
                 const dy = event.clientY - resize.startY;
                 if (!resize.started) {
                     if (Math.hypot(dx, dy) < threshold) return;
                     resize.started = true;
                     document.documentElement.classList.add('eh-panel-resizing');
+                    const el = this.element(key);
+                    el?.style?.setProperty('transition', 'none', 'important');
+                    el?.style?.setProperty('will-change', 'width, height', 'important');
                 }
-                const el = this.element(key);
-                if (!el) return;
-                const limits = this.limits(key);
-                const mode = String(resize.cfg.mode || 'automatic');
-                const anchorRight = mode === 'right' || mode === 'top-right' || mode === 'bottom-right';
-                const anchorBottom = mode === 'bottom' || mode === 'bottom-left' || mode === 'bottom-right';
-                const widthDelta = anchorRight ? -dx : dx;
-                const heightDelta = anchorBottom ? -dy : dy;
-                const horizontalRoom = anchorRight
-                    ? resize.startLeft + resize.startW - 6
-                    : window.innerWidth - resize.startLeft - 6;
-                const verticalRoom = anchorBottom
-                    ? resize.startTop + resize.startH - 6
-                    : window.innerHeight - resize.startTop - 6;
-                const maxW = Math.max(limits.minW, Math.min(limits.maxW, horizontalRoom));
-                const maxH = Math.max(limits.minH, Math.min(limits.maxH, verticalRoom));
-                const width = Math.min(maxW, Math.max(limits.minW, resize.startW + widthDelta));
-                const height = Math.min(maxH, Math.max(limits.minH, resize.startH + heightDelta));
-                this.setImportant(el, 'width', `${Math.round(width)}px`);
-                this.setImportant(el, 'height', `${Math.round(height)}px`);
-                if (anchorRight) this.setImportant(el, 'left', `${Math.round(resize.startLeft + resize.startW - width)}px`);
-                if (anchorBottom) this.setImportant(el, 'top', `${Math.round(resize.startTop + resize.startH - height)}px`);
+                this.scheduleFrame('resizeFrame', () => this.renderResize());
                 event.preventDefault();
                 event.stopPropagation();
             });
@@ -3570,22 +3674,24 @@
             const finish = event => {
                 const resize = this.resize;
                 if (!resize || resize.key !== key) return;
-                this.resize = null;
+                if (resize.started) this.flushFrame('resizeFrame', () => this.renderResize());
                 document.documentElement.classList.remove('eh-panel-resizing');
                 try { grip.releasePointerCapture?.(event.pointerId); }
                 catch (error) { EH.Logger.debug('Resize: pointer capture já estava liberado:', error); }
-                if (!resize.started) return;
+                if (!resize.started) { this.resize = null; return; }
 
                 const el = this.element(key);
-                const rect = el?.getBoundingClientRect?.();
-                if (!rect) return;
+                el?.style?.removeProperty('transition');
+                el?.style?.removeProperty('will-change');
+                if (!el) { this.resize = null; return; }
                 // RESIZE altera dimensão; nunca muda dock/lado/zoom.
                 // Ajuste manual desliga somente o tamanho dinâmico para respeitar o usuário.
                 this.update(key, {
-                    width: Math.round(rect.width),
-                    height: Math.round(rect.height),
+                    width: Math.round(resize.renderWidth),
+                    height: Math.round(resize.renderHeight),
                     dynamic: false
                 });
+                this.resize = null;
             };
             grip.addEventListener('pointerup', finish);
             grip.addEventListener('pointercancel', finish);
@@ -3640,6 +3746,9 @@
                 .eh-panel-resize-grip:hover { opacity:.9; }
                 html.eh-panel-dragging, html.eh-panel-resizing { user-select:none !important; }
                 html.eh-panel-dragging, html.eh-panel-dragging * { cursor: grabbing !important; user-select: none !important; }
+                html.eh-panel-dragging :is(#eh-root,#eh-wa-dock,#eh-operation-dock),
+                html.eh-panel-resizing :is(#eh-root,#eh-wa-dock,#eh-operation-dock) { transition:none !important; }
+                :is(#eh-root,#eh-wa-dock,#eh-operation-dock).eh-panel-active-drag { contain:layout style; }
                 .eh-wa-scale-body { min-height:0; flex:1 1 auto; display:flex; flex-direction:column; overflow:hidden; transform-origin:top left; }
 
                 /* Componentes do painel esquerdo. Posicionamento e dimensões ficam
@@ -5352,6 +5461,7 @@
             safe('Requisições', () => EH.RequisitionManager?.scanDom?.());
             safe('Requisição Prefeitura', () => EH.PrefeituraRequisition?.onPageUpdate?.(page));
             safe('Atendimento', () => EH.UI?.updateState?.(page));
+            safe('Atalhos contextuais', () => EH.ContextualShortcuts?.render?.(page));
             safe('Mapa dos carros', () => EH.OperationCars?.onPageUpdate?.(page));
             safe('Lembretes', () => EH.Reminders?.onPageUpdate?.(page));
             safe('Memória de emissões', () => EH.EmissionMemory?.onPageUpdate?.(page));
@@ -9929,6 +10039,12 @@
                 name: this.clean(file.name || `documento-${this.state.photos.length + 1}.jpg`),
                 type: file.type || 'image/jpeg',
                 dataUrl,
+                // Variante apenas de sessão para conferência visual. O original acima
+                // continua sendo o único arquivo oficial e nunca é substituído.
+                correctedDataUrl: (() => {
+                    try { return prepared.getVariant(selectedRotation, 'color').toDataURL('image/jpeg', 0.92); }
+                    catch (_error) { return ''; }
+                })(),
                 quality,
                 rotation: selectedRotation,
                 score: best.score,
@@ -10172,6 +10288,9 @@
         preview: null,
         generated: null,
         ocrBusy: false,
+        documentPreviewPhoto: null,
+        documentViewMode: 'corrected',
+        documentView: { zoom: 1, x: 0, y: 0 },
 
         init() {
             if (this.started) return;
@@ -10187,7 +10306,12 @@
         injectStyles() {
             GM_addStyle(`
                 .eh-pref-tool { display:flex; flex-direction:column; gap:7px; padding:9px; border:1px solid rgba(99,102,241,.18); border-radius:12px; background:linear-gradient(145deg,rgba(255,255,255,.95),rgba(238,242,255,.82)); }
-                .eh-pref-tool-title { display:flex; align-items:center; justify-content:space-between; gap:8px; font-size:10px; font-weight:900; letter-spacing:.08em; color:#475569; text-transform:uppercase; }
+                .eh-pref-tool-title { display:flex; align-items:center; justify-content:space-between; gap:8px; list-style:none; cursor:pointer; font-size:10px; font-weight:900; letter-spacing:.04em; color:#475569; }
+                .eh-pref-tool-title::-webkit-details-marker { display:none; }
+                .eh-pref-tool-title::after { content:'＋'; color:#6366f1; }
+                .eh-pref-tool[open]>.eh-pref-tool-title::after { content:'−'; }
+                .eh-pref-tool-body { display:grid; gap:7px; }
+                .eh-pref-tool:not([open])>.eh-pref-tool-body { display:none!important; }
                 .eh-pref-tool-open { width:100%; border:0; border-radius:10px; padding:10px 11px; background:#312e81; color:#fff; font:800 11px/1.2 Arial,sans-serif; cursor:pointer; text-align:left; box-shadow:0 7px 16px rgba(49,46,129,.18); }
                 .eh-pref-tool-open:hover { background:#3730a3; }
                 .eh-pref-status { display:grid; gap:4px; font:700 9px/1.35 Arial,sans-serif; color:#475569; }
@@ -10237,6 +10361,15 @@
                 .eh-pref-candidates.show { display:block; }
                 .eh-pref-photo-summary { display:grid; gap:5px; padding:8px; border-radius:9px; background:#fff7ed; color:#9a3412; font-size:10px; }
                 .eh-pref-progress { color:#4338ca; font-weight:800; }
+                .eh-pref-document-card { min-height:0; }
+                .eh-pref-document-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
+                .eh-pref-document-toolbar .eh-pref-btn[aria-pressed="true"] { border-color:#4f46e5; background:#eef2ff; color:#3730a3; }
+                .eh-pref-document-stage { position:relative; display:flex; align-items:center; justify-content:center; min-height:310px; max-height:56vh; overflow:hidden; border:1px solid #cbd5e1; border-radius:12px; background:#1e293b; touch-action:none; }
+                .eh-pref-document-stage.can-pan { cursor:grab; }
+                .eh-pref-document-stage.is-panning { cursor:grabbing; }
+                .eh-pref-document-image { display:block; max-width:100%; max-height:54vh; width:auto; height:auto; transform-origin:center center; user-select:none; -webkit-user-drag:none; will-change:transform; }
+                .eh-pref-document-empty { max-width:390px; padding:24px; color:#e2e8f0; text-align:center; }
+                .eh-pref-document-meta { color:#64748b; font-size:10px; }
                 .eh-pref-preview-frame { display:flex; align-items:flex-start; justify-content:center; min-height:420px; padding:10px; border:1px solid #cbd5e1; border-radius:12px; background:#334155; overflow:auto; }
                 .eh-pref-preview-frame img { display:block; width:min(100%,660px); height:auto; background:#fff; box-shadow:0 8px 24px rgba(0,0,0,.28); }
                 .eh-pref-empty-preview { align-self:center; max-width:420px; color:#e2e8f0; text-align:center; }
@@ -10253,7 +10386,7 @@
                 .eh-pref-ready code { white-space:normal; overflow-wrap:anywhere; color:#064e3b; }
                 .eh-pref-invalid-override { display:none; align-items:flex-start; gap:7px; color:#92400e; }
                 .eh-pref-invalid-override.show { display:flex; }
-                @media (max-width:820px) { .eh-pref-content { grid-template-columns:1fr; } .eh-pref-preview-frame { min-height:300px; } }
+                @media (max-width:820px) { .eh-pref-content { grid-template-columns:1fr; } .eh-pref-document-stage { min-height:260px; max-height:48vh; } .eh-pref-preview-frame { min-height:300px; } }
                 @media (max-width:520px) { .eh-pref-grid, .eh-pref-route-list, .eh-pref-confirm-grid { grid-template-columns:1fr; } }
             `);
         },
@@ -10493,10 +10626,90 @@
             ui.ocrReview.classList.add('show');
         },
 
+        currentDocumentPhoto() {
+            return this.documentPreviewPhoto || EH.PassengerIdentity.state?.photos?.slice?.(-1)?.[0] || null;
+        },
+
+        renderDocumentPreview(ui, { reset = false } = {}) {
+            if (!ui?.documentImage || !ui?.documentStage) return;
+            const photo = this.currentDocumentPhoto();
+            if (reset) this.documentView = { zoom: 1, x: 0, y: 0 };
+            const corrected = String(photo?.correctedDataUrl || '');
+            const original = String(photo?.dataUrl || this.documentDataUrl || '');
+            const requestedMode = this.documentViewMode === 'original' ? 'original' : 'corrected';
+            const effectiveMode = requestedMode === 'corrected' && corrected ? 'corrected' : 'original';
+            const source = effectiveMode === 'corrected' ? corrected : original;
+            const view = this.documentView || { zoom: 1, x: 0, y: 0 };
+            view.zoom = Math.min(4, Math.max(0.5, Number(view.zoom) || 1));
+            view.x = Number(view.x) || 0;
+            view.y = Number(view.y) || 0;
+            this.documentView = view;
+
+            ui.documentEmpty.hidden = Boolean(source);
+            ui.documentImage.hidden = !source;
+            if (source && ui.documentImage.src !== source) ui.documentImage.src = source;
+            ui.documentImage.style.transform = `translate3d(${Math.round(view.x)}px, ${Math.round(view.y)}px, 0) scale(${view.zoom})`;
+            ui.documentStage.classList.toggle('can-pan', view.zoom > 1);
+            ui.documentCorrected.disabled = !corrected;
+            ui.documentCorrected.setAttribute('aria-pressed', String(effectiveMode === 'corrected'));
+            ui.documentOriginal.setAttribute('aria-pressed', String(effectiveMode === 'original'));
+            ui.documentZoomLabel.textContent = `${Math.round(view.zoom * 100)}%`;
+            ui.documentMeta.textContent = source
+                ? `${effectiveMode === 'corrected' ? 'Imagem corrigida para conferência' : 'Imagem original preservada'}${photo?.name ? ` • ${photo.name}` : ''}`
+                : 'Após o upload, a imagem permanecerá aqui mesmo se o reconhecimento falhar.';
+        },
+
+        bindDocumentPreview(ui) {
+            if (!ui?.documentStage || ui.documentStage.dataset.ehPreviewBound) return;
+            ui.documentStage.dataset.ehPreviewBound = '1';
+            const render = options => this.renderDocumentPreview(ui, options);
+            ui.documentCorrected.addEventListener('click', () => { this.documentViewMode = 'corrected'; render(); });
+            ui.documentOriginal.addEventListener('click', () => { this.documentViewMode = 'original'; render(); });
+            ui.documentZoomIn.addEventListener('click', () => { this.documentView.zoom = Math.min(4, this.documentView.zoom + 0.25); render(); });
+            ui.documentZoomOut.addEventListener('click', () => { this.documentView.zoom = Math.max(0.5, this.documentView.zoom - 0.25); if (this.documentView.zoom <= 1) { this.documentView.x = 0; this.documentView.y = 0; } render(); });
+            ui.documentFit.addEventListener('click', () => { this.documentView = { zoom: 1, x: 0, y: 0 }; render(); });
+
+            let pan = null;
+            let frame = 0;
+            const paint = () => { frame = 0; render(); };
+            ui.documentStage.addEventListener('pointerdown', event => {
+                if (event.button !== 0 || this.documentView.zoom <= 1 || event.target !== ui.documentImage) return;
+                pan = { pointerId: event.pointerId, startX: event.clientX, startY: event.clientY, x: this.documentView.x, y: this.documentView.y };
+                ui.documentStage.classList.add('is-panning');
+                ui.documentStage.setPointerCapture?.(event.pointerId);
+                event.preventDefault();
+            });
+            ui.documentStage.addEventListener('pointermove', event => {
+                if (!pan || pan.pointerId !== event.pointerId) return;
+                this.documentView.x = pan.x + event.clientX - pan.startX;
+                this.documentView.y = pan.y + event.clientY - pan.startY;
+                if (!frame) frame = requestAnimationFrame(paint);
+                event.preventDefault();
+            });
+            const finish = event => {
+                if (!pan || pan.pointerId !== event.pointerId) return;
+                pan = null;
+                ui.documentStage.classList.remove('is-panning');
+                try { ui.documentStage.releasePointerCapture?.(event.pointerId); } catch (_error) {}
+            };
+            ui.documentStage.addEventListener('pointerup', finish);
+            ui.documentStage.addEventListener('pointercancel', finish);
+        },
+
         async processDocuments(files, ui) {
             if (this.ocrBusy) return;
             this.ocrBusy = true; this.setBusy(ui, true); ui.progress.hidden = false; ui.ocrReview.classList.remove('show');
             try {
+                // A prévia original é disponibilizada antes do OCR. Assim, uma falha do
+                // motor nunca bloqueia a digitação manual nem obriga o usuário a trocar de tela.
+                try {
+                    const originalDataUrl = await EH.PassengerIdentity.readFile(files[0]);
+                    this.documentDataUrl = originalDataUrl;
+                    this.documentName = files[0]?.name || 'documento.jpg';
+                    this.documentPreviewPhoto = { name: this.documentName, dataUrl: originalDataUrl, correctedDataUrl: '' };
+                    this.documentViewMode = 'original';
+                    this.renderDocumentPreview(ui, { reset: true });
+                } catch (_previewError) {}
                 await EH.PassengerIdentity.analyzePassengerDocument(files, {
                     onProgress: event => { ui.progress.textContent = event.message || 'Processando documentação…'; },
                     onEngineProgress: message => {
@@ -10505,6 +10718,9 @@
                     onPhoto: photo => {
                         this.documentDataUrl = photo.dataUrl;
                         this.documentName = photo.name;
+                        this.documentPreviewPhoto = photo;
+                        this.documentViewMode = photo.correctedDataUrl ? 'corrected' : 'original';
+                        this.renderDocumentPreview(ui, { reset: true });
                     }
                 });
                 this.renderIdentityReview(ui); this.renderStatus(); this.showAlert(ui, '');
@@ -10538,11 +10754,13 @@
         newDocument(ui) {
             EH.PassengerIdentity.startNew();
             this.documentDataUrl = ''; this.documentName = ''; this.preview = null; this.generated = null;
+            this.documentPreviewPhoto = null; this.documentViewMode = 'corrected'; this.documentView = { zoom: 1, x: 0, y: 0 };
             EH.Storage.remove(this.STORAGE_KEY);
             this.fillForm(ui, { ...this.defaults(), origem: ui.origem.value, destino: ui.destino.value });
             ui.ocrReview.classList.remove('show'); ui.photoSummary.innerHTML = ''; ui.identityConfirmed.textContent = '○ Dados ainda não confirmados'; ui.identityConfirmed.className = 'eh-pref-confidence-review';
             ui.ready.classList.remove('show'); ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false;
             const viewButton = ui.modal.querySelector('.eh-pref-view-doc'); if (viewButton) viewButton.hidden = true;
+            this.renderDocumentPreview(ui, { reset: true });
             this.showAlert(ui, 'Novo passageiro iniciado. Os dados e fotos anteriores foram retirados deste atendimento.');
             this.renderStatus();
         },
@@ -10825,6 +11043,22 @@
                         </section>
                     </div>
                     <div class="eh-pref-preview">
+                        <section class="eh-pref-card eh-pref-document-card">
+                            <h3>Documento para conferência</h3>
+                            <div class="eh-pref-document-toolbar">
+                                <button type="button" class="eh-pref-btn eh-pref-doc-corrected" aria-pressed="false">Imagem corrigida</button>
+                                <button type="button" class="eh-pref-btn eh-pref-doc-original" aria-pressed="false">Original</button>
+                                <button type="button" class="eh-pref-btn eh-pref-doc-zoom-out" aria-label="Reduzir imagem">−</button>
+                                <span class="eh-pref-document-zoom">100%</span>
+                                <button type="button" class="eh-pref-btn eh-pref-doc-zoom-in" aria-label="Ampliar imagem">＋</button>
+                                <button type="button" class="eh-pref-btn eh-pref-doc-fit">Ajustar</button>
+                            </div>
+                            <div class="eh-pref-document-stage">
+                                <div class="eh-pref-document-empty">Adicione uma foto. A imagem ficará visível ao lado dos campos durante toda a conferência manual.</div>
+                                <img class="eh-pref-document-image" alt="Documento do passageiro para conferência" hidden draggable="false">
+                            </div>
+                            <div class="eh-pref-document-meta"></div>
+                        </section>
                         <div class="eh-pref-preview-frame"><div class="eh-pref-empty-preview">A página oficial aparecerá aqui depois da renderização. Confira logos, assinatura, rodapé, nome, CPF, rota, TOTAL e data.</div><img class="eh-pref-preview-image" alt="Prévia da requisição oficial" hidden></div>
                         <section class="eh-pref-card eh-pref-confirm">
                             <h3>Confirme</h3>
@@ -10855,9 +11089,13 @@
                 nameStatus: q('.eh-pref-name-status'), cpfStatus: q('.eh-pref-cpf-status'), birthStatus: q('.eh-pref-birth-status'),
                 nameCandidates: q('.eh-pref-name-candidates'), cpfCandidates: q('.eh-pref-cpf-candidates'), birthCandidates: q('.eh-pref-birth-candidates'),
                 photoSummary: q('.eh-pref-photo-summary'), identityConfirmed: q('.eh-pref-identity-confirmed'),
+                documentStage: q('.eh-pref-document-stage'), documentImage: q('.eh-pref-document-image'), documentEmpty: q('.eh-pref-document-empty'),
+                documentMeta: q('.eh-pref-document-meta'), documentCorrected: q('.eh-pref-doc-corrected'), documentOriginal: q('.eh-pref-doc-original'),
+                documentZoomIn: q('.eh-pref-doc-zoom-in'), documentZoomOut: q('.eh-pref-doc-zoom-out'), documentZoomLabel: q('.eh-pref-document-zoom'), documentFit: q('.eh-pref-doc-fit'),
                 previewImage: q('.eh-pref-preview-image'), emptyPreview: q('.eh-pref-empty-preview'), confirm: q('.eh-pref-confirm'),
                 confirmGrid: q('.eh-pref-confirm-grid'), checks: q('.eh-pref-checks'), ready: q('.eh-pref-ready'), readyName: q('.eh-pref-ready-name')
             };
+            this.bindDocumentPreview(ui);
             this.fillForm(ui, initial);
             ui.cpf.addEventListener('input', () => { ui.cpf.value = this.formatCpf(ui.cpf.value); });
             ui.ocrCpf.addEventListener('input', () => { ui.ocrCpf.value = this.formatCpf(ui.ocrCpf.value); });
@@ -10866,7 +11104,12 @@
                     const value = normalizeValue(input.value);
                     if (!EH.PassengerIdentity.state) EH.PassengerIdentity.state = EH.PassengerIdentity.freshState();
                     if (!value) {
-                        EH.PassengerIdentity.state.fields[fieldName] = EH.PassengerIdentity.emptyField();
+                        EH.PassengerIdentity.state.fields[fieldName] = {
+                            ...EH.PassengerIdentity.emptyField(),
+                            source: 'manual',
+                            locked: true,
+                            reason: 'Campo limpo manualmente; aguarda preenchimento ou confirmação do usuário.'
+                        };
                         return;
                     }
                     const valid = validateValue(value);
@@ -10888,6 +11131,13 @@
             lockManualDraft('name', ui.ocrName, value => EH.PassengerIdentity.formatPersonName(value), value => EH.PassengerIdentity.validatePersonNameValue(value).valid);
             lockManualDraft('cpf', ui.ocrCpf, value => this.cpfDigits(value), value => this.validCpf(value));
             lockManualDraft('birthDate', ui.ocrBirth, value => EH.PassengerIdentity.parseDate(value).value, value => {
+                const parsed = EH.PassengerIdentity.parseDate(value); return parsed.valid && parsed.plausible;
+            });
+            // Os campos principais também são a mesma fonte de verdade. Uma edição
+            // manual neles bloqueia substituições automáticas posteriores.
+            lockManualDraft('name', ui.nome, value => EH.PassengerIdentity.formatPersonName(value), value => EH.PassengerIdentity.validatePersonNameValue(value).valid);
+            lockManualDraft('cpf', ui.cpf, value => this.cpfDigits(value), value => this.validCpf(value));
+            lockManualDraft('birthDate', ui.nascimento, value => EH.PassengerIdentity.parseDate(value).value, value => {
                 const parsed = EH.PassengerIdentity.parseDate(value); return parsed.valid && parsed.plausible;
             });
             const identityNow = EH.PassengerIdentity.confirmedData();
@@ -10932,7 +11182,11 @@
             const docInput = q('.eh-pref-doc-input');
             const viewDoc = q('.eh-pref-view-doc');
             const latestPhoto = EH.PassengerIdentity.state?.photos?.slice?.(-1)?.[0] || null;
-            if (latestPhoto) { this.documentDataUrl = latestPhoto.dataUrl; this.documentName = latestPhoto.name; }
+            if (latestPhoto) {
+                this.documentDataUrl = latestPhoto.dataUrl; this.documentName = latestPhoto.name; this.documentPreviewPhoto = latestPhoto;
+                this.documentViewMode = latestPhoto.correctedDataUrl ? 'corrected' : 'original';
+            }
+            this.renderDocumentPreview(ui, { reset: true });
             viewDoc.hidden = !this.documentDataUrl;
             q('.eh-pref-read-doc').addEventListener('click', () => docInput.click());
             viewDoc.addEventListener('click', () => {
@@ -14153,11 +14407,14 @@
         mergeReminderData(localData={},remoteData={},localTs=0,remoteTs=0) {
             const remoteNewer=Number(remoteTs||0)>=Number(localTs||0);
             const merged=remoteNewer?this.smartMerge(localData,remoteData):this.smartMerge(remoteData,localData);
+            // Exclusão é um registro sincronizável, não ausência de registro. O maior
+            // deletedAt sempre vence para impedir ressurreição após merge entre PCs.
+            merged.deletedAt=Math.max(Number(localData?.deletedAt||0),Number(remoteData?.deletedAt||0));
             const localStatus=String(localData?.status||'pending').toLowerCase(), remoteStatus=String(remoteData?.status||'pending').toLowerCase();
             merged.status=this.statusRank(remoteStatus)>this.statusRank(localStatus)?remoteStatus:localStatus;
             merged.completedAt=Math.max(Number(localData?.completedAt||0),Number(remoteData?.completedAt||0));
             merged.createdAt=Math.min(Number(localData?.createdAt||Date.now()),Number(remoteData?.createdAt||Date.now()));
-            merged.updatedAt=Math.max(Number(localTs||localData?.updatedAt||0),Number(remoteTs||remoteData?.updatedAt||0));
+            merged.updatedAt=Math.max(Number(localTs||localData?.updatedAt||0),Number(remoteTs||remoteData?.updatedAt||0),merged.deletedAt);
             return merged;
         },
         legKey(leg={}) {
@@ -14230,7 +14487,7 @@
         normalizeRemote(row={}){const p=row?.payload||{};if(p?.recordType&&p?.recordId)return this.envelope(p.recordType,p.recordId,p.data||{},p.updatedAt||Date.parse(row.updated_at)||0);const legacyId=String(p.id||row.id||'');return this.envelope('reminder',legacyId,p,Number(p.updatedAt||Date.parse(row.updated_at)||0));},
         collectLocalRecords(){
             const cfg=this.config(),rows=[];
-            if(cfg.reminders)(EH.Reminders?.load?.()||[]).forEach(item=>rows.push(this.envelope('reminder',item.id,EH.SyncLegacyReminder?.sanitize?.(item)||item,item.updatedAt||item.createdAt)));
+            if(cfg.reminders)(EH.Reminders?.loadAll?.()||[]).forEach(item=>rows.push(this.envelope('reminder',item.id,EH.SyncLegacyReminder?.sanitize?.(item)||item,item.updatedAt||item.createdAt)));
             if(cfg.requisitions)(EH.RequisitionManager?.loadStore?.()||[]).forEach(item=>rows.push(this.envelope('requisition',item.id,item,item.updatedAt||item.createdAt)));
             if(cfg.emission){
                 (EH.PassengerMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('passenger',item.id||`cpf:${item.cpf}`,item,item.updatedAt||item.createdAt)));
@@ -14244,11 +14501,11 @@
             this.applyingRemote=true;
             try{
                 if(env.recordType==='reminder'){
-                    const local=EH.Reminders?.load?.()||[],idx=local.findIndex(x=>String(x.id)===env.recordId),current=idx>=0?local[idx]:{};
+                    const local=EH.Reminders?.loadAll?.()||[],idx=local.findIndex(x=>String(x.id)===env.recordId),current=idx>=0?local[idx]:{};
                     const merged=this.mergeReminderData(current,env.data||{},Number(current.updatedAt||0),Number(env.updatedAt||0));
                     merged.id=env.recordId;merged.syncState='synced';
                     if(idx>=0)local[idx]=merged;else local.push(merged);
-                    EH.Storage.set(EH.Reminders.KEY,local.slice(-1000));
+                    EH.Reminders?.save?.(local,{changedIds:[]});
                 } else if(env.recordType==='requisition'){
                     const rows=EH.RequisitionManager?.loadStore?.()||[],idx=rows.findIndex(x=>String(x.id)===env.recordId),current=idx>=0?rows[idx]:{};
                     const merged=this.mergeRequisitionData(current,env.data||{},Number(current.updatedAt||0),Number(env.updatedAt||0));
@@ -14364,29 +14621,51 @@
 
     // Sanitização compatível com lembretes antigos.
     EH.SyncLegacyReminder = {
-        sanitize(item={}){const createdAt=Number(item.createdAt||Date.now()),updatedAt=Number(item.updatedAt||item.completedAt||createdAt),{syncState:_syncState,...rest}=item;return{...rest,id:String(item.id||''),name:EH.PassengerIdentity?.formatPersonName?.(item.name||'')||EH.Utils.clean(item.name||''),cpf:String(item.cpf||'').replace(/\D/g,'').slice(0,11),origin:EH.Utils.clean(item.origin||''),destination:EH.Utils.clean(item.destination||''),service:String(item.service||'').replace(/\D/g,''),seat:EH.Utils.clean(item.seat||''),ticketNumber:EH.Utils.clean(item.ticketNumber||''),status:['pending','printed','checked','completed'].includes(String(item.status||'').toLowerCase())?String(item.status).toLowerCase():'pending',createdAt,updatedAt,completedAt:Number(item.completedAt||0),deviceId:String(item.deviceId||EH.Device.id())};}
+        sanitize(item={}){const createdAt=Number(item.createdAt||Date.now()),deletedAt=Math.max(0,Number(item.deletedAt||0)),updatedAt=Math.max(Number(item.updatedAt||item.completedAt||createdAt),deletedAt),{syncState:_syncState,...rest}=item;return{...rest,id:String(item.id||''),name:EH.PassengerIdentity?.formatPersonName?.(item.name||'')||EH.Utils.clean(item.name||''),cpf:String(item.cpf||'').replace(/\D/g,'').slice(0,11),origin:EH.Utils.clean(item.origin||''),destination:EH.Utils.clean(item.destination||''),service:String(item.service||'').replace(/\D/g,''),seat:EH.Utils.clean(item.seat||''),ticketNumber:EH.Utils.clean(item.ticketNumber||''),status:['pending','printed','checked','completed'].includes(String(item.status||'').toLowerCase())?String(item.status).toLowerCase():'pending',createdAt,updatedAt,deletedAt,completedAt:Number(item.completedAt||0),deviceId:String(item.deviceId||EH.Device.id())};}
     };
 
     EH.Reminders = {
         KEY: 'ticketReminders.v1',
+        TOMBSTONE_KEY: 'ticketReminders.tombstones.v1',
         PENDING_SEARCH_KEY: 'ticketReminders.pendingSearch.v1',
         searchBusy: false,
+        deletionBusy: false,
         stylesInjected: false,
 
         normalizeCpf(value) { return String(value || '').replace(/\D/g, '').slice(0, 11); },
-        load() {
-            const items = EH.Storage.get(this.KEY, []);
-            return Array.isArray(items) ? items : [];
+        loadAll() {
+            const active = EH.Storage.get(this.KEY, []);
+            const tombstones = EH.Storage.get(this.TOMBSTONE_KEY, []);
+            const merged = new Map();
+            [...(Array.isArray(active) ? active : []), ...(Array.isArray(tombstones) ? tombstones : [])].forEach(item => {
+                if (!item?.id) return;
+                const current = merged.get(String(item.id));
+                if (!current || Number(item.updatedAt || item.deletedAt || 0) >= Number(current.updatedAt || current.deletedAt || 0)) merged.set(String(item.id), item);
+            });
+            return Array.from(merged.values());
         },
-        save(items) {
-            const safe = (Array.isArray(items) ? items : []).slice(-1000);
-            EH.Storage.set(this.KEY, safe);
-            safe.forEach(item => {
-                if (item?.cpf) EH.PassengerMemory?.upsert?.({ cpf:item.cpf, name:item.name, updatedAt:item.updatedAt || item.createdAt || Date.now() });
-                if (!EH.Sync?.applyingRemote && item?.id) EH.Sync?.markPendingRecord?.('reminder', item.id);
+        load() {
+            return this.loadAll().filter(item => !Number(item?.deletedAt || 0));
+        },
+        save(items, { changedIds = null } = {}) {
+            const unique = new Map();
+            (Array.isArray(items) ? items : []).forEach(item => {
+                if (!item?.id) return;
+                const current = unique.get(String(item.id));
+                if (!current || Number(item.updatedAt || item.deletedAt || 0) >= Number(current.updatedAt || current.deletedAt || 0)) unique.set(String(item.id), item);
+            });
+            const all = Array.from(unique.values());
+            const active = all.filter(item => !Number(item.deletedAt || 0)).slice(-1000);
+            const tombstones = all.filter(item => Number(item.deletedAt || 0)).sort((a,b)=>Number(a.deletedAt||0)-Number(b.deletedAt||0)).slice(-5000);
+            EH.Storage.set(this.KEY, active);
+            EH.Storage.set(this.TOMBSTONE_KEY, tombstones);
+            const changed = changedIds ? new Set(Array.from(changedIds, value => String(value))) : null;
+            all.forEach(item => {
+                if (!item?.deletedAt && item?.cpf) EH.PassengerMemory?.upsert?.({ cpf:item.cpf, name:item.name, updatedAt:item.updatedAt || item.createdAt || Date.now() });
+                if (!EH.Sync?.applyingRemote && item?.id && (!changed || changed.has(String(item.id)))) EH.Sync?.markPendingRecord?.('reminder', item.id);
             });
             this.render();
-            return safe;
+            return all;
         },
         parseTravel(raw) {
             const text = EH.Utils.clean(raw || '');
@@ -14439,8 +14718,9 @@
             if (!EH.Config.REMINDER_CREATE_AFTER_TICKET) return 0;
             const candidates=this.candidateItems(items);
             if (!candidates.length) return 0;
-            const existing=this.load();
+            const existing=this.loadAll();
             const ids=new Set(existing.map(x=>String(x.id||'')));
+            // Tombstones também bloqueiam recriação automática do mesmo bilhete.
             const fresh=candidates.filter(x=>!ids.has(x.id));
             if (!fresh.length) return 0;
             if (EH.Config.REMINDER_ASK_AFTER_TICKET) {
@@ -14466,12 +14746,72 @@
             return value==='pending'?0:value==='checked'?1:value==='printed'?2:(value==='completed'||value==='concluded')?3:0;
         },
         markStatus(id, status) {
-            const items=this.load(); const item=items.find(x=>x.id===id); if(!item)return null;
+            const items=this.loadAll(); const item=items.find(x=>x.id===id&&!Number(x.deletedAt||0)); if(!item)return null;
             const allowed=['pending','printed','checked','completed'];
             const requested=allowed.includes(String(status||'').toLowerCase())?String(status).toLowerCase():'pending';
             item.status=requested==='pending'?'pending':(this.statusRank(requested)>=this.statusRank(item.status)?requested:String(item.status||'pending').toLowerCase());
             item.completedAt=this.isDoneStatus(item.status)?Date.now():0; item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local';
-            this.save(items); EH.Sync?.syncAll?.({quiet:true}); return item;
+            this.save(items,{changedIds:[id]}); EH.Sync?.syncAll?.({quiet:true}); return item;
+        },
+
+        tombstone(ids = []) {
+            const wanted = new Set((Array.isArray(ids) ? ids : [ids]).map(value => String(value || '')).filter(Boolean));
+            if (!wanted.size) return 0;
+            const items = this.loadAll();
+            const now = Date.now();
+            const changed = [];
+            items.forEach(item => {
+                if (!wanted.has(String(item?.id || '')) || Number(item.deletedAt || 0)) return;
+                item.deletedAt = now;
+                item.updatedAt = now;
+                item.deviceId = EH.Device.id();
+                item.syncState = EH.Sync?.configured?.() ? 'pending' : 'local';
+                changed.push(String(item.id));
+            });
+            if (!changed.length) return 0;
+            this.save(items, { changedIds: changed });
+            EH.Sync?.syncAll?.({ quiet: true });
+            return changed.length;
+        },
+
+        deleteOne(id, { ask = true } = {}) {
+            if (this.deletionBusy) return false;
+            const item = this.load().find(row => String(row.id) === String(id));
+            if (!item) return false;
+            if (ask && !window.confirm(`Excluir o lembrete de ${item.name || 'Passageiro'}?\n\nEsta ação será sincronizada entre os computadores.`)) return false;
+            this.deletionBusy = true;
+            try {
+                const removed = this.tombstone([item.id]);
+                if (!removed) throw new Error('O lembrete não foi encontrado.');
+                EH.Toast?.success?.('Lembrete excluído.');
+                return true;
+            } catch (error) {
+                EH.Toast?.error?.(error.message || 'Não foi possível excluir o lembrete.');
+                return false;
+            } finally { this.deletionBusy = false; }
+        },
+
+        deleteLatest() {
+            const latest = this.load().slice().sort((a, b) => Number(b.createdAt || b.updatedAt || 0) - Number(a.createdAt || a.updatedAt || 0))[0];
+            if (!latest) { EH.Toast?.info?.('Nenhum lembrete para excluir.'); return false; }
+            return this.deleteOne(latest.id, { ask: true });
+        },
+
+        deleteAll() {
+            if (this.deletionBusy) return false;
+            const items = this.load();
+            if (!items.length) { EH.Toast?.info?.('Nenhum lembrete para excluir.'); return false; }
+            if (!window.confirm(`Excluir todos os ${items.length} lembrete(s)?\n\nPassageiros, vendas, requisições, configurações e dados financeiros serão preservados.`)) return false;
+            this.deletionBusy = true;
+            try {
+                const removed = this.tombstone(items.map(item => item.id));
+                if (removed !== items.length) throw new Error('Nem todos os lembretes puderam ser excluídos.');
+                EH.Toast?.success?.(`${removed} lembrete(s) excluído(s).`);
+                return true;
+            } catch (error) {
+                EH.Toast?.error?.(error.message || 'Não foi possível excluir os lembretes.');
+                return false;
+            } finally { this.deletionBusy = false; }
         },
         async copyCpf(item) {
             const cpf=this.normalizeCpf(item?.cpf); if(cpf.length!==11) return EH.Toast.warning('CPF não disponível neste lembrete.');
@@ -14538,12 +14878,14 @@
             if (!record?.service || !record?.agency?.exists || record?.agency?.multiple) return 0;
             const passengers=[...(record.agency.boarders||[]),...(record.agency.alighters||[])];
             if(!passengers.length)return 0;
-            const items=this.load();
+            const items=this.loadAll();
             let changed=0;
+            const changedIds=[];
             passengers.forEach(passenger=>{
                 const cpf=this.normalizeCpf(passenger?.cpf||'');
                 const ticket=EH.Utils.clean(passenger?.ticket||'');
                 const candidates=items.filter(item=>{
+                    if(Number(item.deletedAt||0))return false;
                     if(ticket && item.ticketNumber && EH.Utils.clean(item.ticketNumber)===ticket)return true;
                     if(cpf && this.normalizeCpf(item.cpf)===cpf){
                         if(item.travelDate && record.date && item.travelDate!==record.date)return false;
@@ -14562,11 +14904,12 @@
                     item.updatedAt=Date.now();
                     item.deviceId=EH.Device.id();
                     item.syncState=EH.Sync?.configured?.()?'pending':'local';
+                    changedIds.push(String(item.id));
                     changed++;
                 }
             });
             if(changed){
-                this.save(items);
+                this.save(items,{changedIds});
                 EH.Sync?.syncReminders?.({quiet:true});
             }
             return changed;
@@ -14601,10 +14944,14 @@
                     const copy=document.createElement('button'); copy.type='button'; copy.className='eh-modal-btn'; copy.textContent='Copiar CPF'; copy.addEventListener('click',()=>this.copyCpf(item));
                     const search=document.createElement('button'); search.type='button'; search.className='eh-modal-btn primary'; search.textContent='Buscar passagem'; search.addEventListener('click',()=>this.searchTicket(item));
                     const done=document.createElement('button'); done.type='button'; done.className='eh-modal-btn'; done.textContent=this.isDoneStatus(item.status)?'Reabrir':'✓ Impresso'; done.addEventListener('click',()=>{ this.isDoneStatus(item.status)?this.reopen(item.id):this.complete(item.id); renderList(); });
-                    actions.append(copy,search,done); card.append(top,name,cpf,route,id,mapInfo,requestInfo,actions); content.appendChild(card);
+                    const remove=document.createElement('button'); remove.type='button'; remove.className='eh-modal-btn danger'; remove.textContent='Excluir'; remove.addEventListener('click',()=>{ this.deleteOne(item.id); renderList(); });
+                    actions.append(copy,search,done,remove); card.append(top,name,cpf,route,id,mapInfo,requestInfo,actions); content.appendChild(card);
                 });
             }; renderList();
-            const foot=document.createElement('div'); foot.className='eh-modal-actions'; const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar'; foot.appendChild(close2);
+            const foot=document.createElement('div'); foot.className='eh-modal-actions';
+            const deleteLatest=document.createElement('button'); deleteLatest.type='button'; deleteLatest.className='eh-modal-btn danger'; deleteLatest.textContent='Excluir último'; deleteLatest.addEventListener('click',()=>{this.deleteLatest();renderList();});
+            const deleteAll=document.createElement('button'); deleteAll.type='button'; deleteAll.className='eh-modal-btn danger'; deleteAll.textContent='Excluir todos'; deleteAll.addEventListener('click',()=>{this.deleteAll();renderList();});
+            const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar'; foot.append(deleteLatest,deleteAll,close2);
             modal.append(head,content,foot); overlay.appendChild(modal); document.body.appendChild(overlay);
             const dismiss=()=>overlay.remove(); close.onclick=dismiss; close2.onclick=dismiss; overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
@@ -14613,6 +14960,9 @@
             const pending=this.pending();
             if(!pending.length){ host.hidden=true; host.innerHTML=''; return; }
             host.hidden=false; host.innerHTML='';
+            const sectionSummary=document.createElement('summary'); sectionSummary.className='eh-reminder-section-summary'; sectionSummary.textContent=`Lembretes • ${pending.length}`;
+            const sectionBody=document.createElement('div'); sectionBody.className='eh-reminder-section-body';
+            EH.Sections?.bind?.(host,'reminders',true);
             const today=pending.filter(x=>x.travelDate===this.todayKey(0)); const tomorrow=pending.filter(x=>x.travelDate===this.todayKey(1));
             const title=document.createElement('div'); title.className='eh-reminder-host-title'; title.innerHTML='<span>PENDÊNCIAS</span><strong>Embarques e requisições</strong>';
             const syncStatus=EH.Sync?.status?.() || {state:'local',pending:0};
@@ -14633,13 +14983,14 @@
             const next=pending[0]; const nextLine=document.createElement('div'); nextLine.className='eh-reminder-next';
             const main=document.createElement('strong'); main.textContent=`${next.travelTime||'—'} • ${next.name||'Passageiro'}`;
             const sub=document.createElement('small'); sub.textContent=`${this.maskCpf(next.cpf)} • ${[next.origin,next.destination].filter(Boolean).join(' → ')}`; nextLine.append(main,sub);
-            host.append(title,syncLine,summary,nextLine);
+            sectionBody.append(title,syncLine,summary,nextLine); host.append(sectionSummary,sectionBody);
         },
         injectStyles() {
             if(this.stylesInjected)return; this.stylesInjected=true;
             GM_addStyle(`
-                #eh-root .eh-reminder-host{display:grid;gap:6px;margin:7px 0;padding:8px;border:1px solid #e1d7bd;border-radius:9px;background:#fffaf0;color:#303946}
+                #eh-root .eh-reminder-host{display:block;margin:7px 0;padding:0;border:1px solid #e1d7bd;border-radius:9px;background:#fffaf0;color:#303946;overflow:hidden}
                 #eh-root .eh-reminder-host[hidden]{display:none!important}.eh-reminder-host-title{display:grid;gap:1px}.eh-reminder-host-title span{font-size:7px;font-weight:950;letter-spacing:.5px;color:#92703a}.eh-reminder-host-title strong{font-size:10px;color:#334155}
+                #eh-root .eh-reminder-section-summary{list-style:none;cursor:pointer;padding:8px;color:#6b5734;font-size:9px;font-weight:900}.eh-reminder-section-summary::-webkit-details-marker{display:none}.eh-reminder-section-summary::after{content:'＋';float:right}.eh-reminder-host[open]>.eh-reminder-section-summary::after{content:'−'}.eh-reminder-section-body{display:grid;gap:6px;padding:0 8px 8px}.eh-reminder-host:not([open])>.eh-reminder-section-body{display:none!important}
                 .eh-reminder-sync{font-size:7.4px;color:#7a6c54}.eh-reminder-sync.synced{color:#2f7a5f}.eh-reminder-sync.offline,.eh-reminder-sync.error{color:#a36535}.eh-reminder-host-summary{display:grid;grid-template-columns:repeat(2,1fr);gap:4px}.eh-reminder-host-summary button{min-height:27px;border:1px solid #e4d7ba;border-radius:7px;background:#fff;color:#6b5734;font-size:8px;font-weight:850;cursor:pointer}.eh-reminder-next{display:grid;gap:2px;padding-top:5px;border-top:1px solid #eee2c9}.eh-reminder-next strong{font-size:9px}.eh-reminder-next small{font-size:7.8px;color:#746956;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
                 .eh-reminder-list{display:grid;gap:8px}.eh-reminder-card{display:grid;gap:5px;padding:11px;border:1px solid #dfe5eb;border-radius:10px;background:#fff}.eh-reminder-card.completed{opacity:.68;background:#f7f9fa}.eh-reminder-card-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.eh-reminder-card-top strong{font-size:12px;color:#253348}.eh-reminder-card-top span{font-size:8px;font-weight:900;color:#697687}.eh-reminder-card>b{font-size:12px}.eh-reminder-cpf{font-size:11px;font-weight:800;color:#334155}.eh-reminder-card small{font-size:10px;color:#6d7888}.eh-reminder-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px}.eh-reminder-empty{padding:25px;text-align:center;color:#718092}
             `);
@@ -16381,7 +16732,8 @@
 
             const firstOverlayUse = !EH.Storage.get('overlay546Initialized', false);
             if (firstOverlayUse) {
-                EH.Storage.set('collapsed', false);
+                // Em novas instalações, começam visíveis apenas os atalhos contextuais.
+                EH.Storage.set('collapsed', true);
                 EH.Storage.set('waDockCollapsed', false);
                 EH.Storage.set('overlay546Initialized', true);
             }
@@ -16451,24 +16803,29 @@
             saleBox.className = 'eh-sale-host';
             saleBox.hidden = true;
 
-            const prefeituraTool = document.createElement('section');
+            const prefeituraTool = document.createElement('details');
             prefeituraTool.className = 'eh-pref-tool';
-            const prefeituraToolTitle = document.createElement('div');
+            const prefeituraToolTitle = document.createElement('summary');
             prefeituraToolTitle.className = 'eh-pref-tool-title';
-            prefeituraToolTitle.textContent = 'Ferramentas';
+            prefeituraToolTitle.textContent = 'Requisição da Prefeitura';
+            const prefeituraToolBody = document.createElement('div');
+            prefeituraToolBody.className = 'eh-pref-tool-body';
             const prefeituraButton = document.createElement('button');
             prefeituraButton.type = 'button';
             prefeituraButton.className = 'eh-pref-tool-open';
-            prefeituraButton.textContent = '📄 Requisição Prefeitura';
+            prefeituraButton.textContent = '📄 Abrir ferramenta completa';
             const prefeituraStatus = document.createElement('div');
-            prefeituraTool.append(prefeituraToolTitle, prefeituraButton, prefeituraStatus);
+            prefeituraToolBody.append(prefeituraButton, prefeituraStatus);
+            prefeituraTool.append(prefeituraToolTitle, prefeituraToolBody);
+            EH.Sections?.bind?.(prefeituraTool, 'prefeitura', false);
 
             const context = document.createElement('div');
             context.className = 'eh-context-card';
 
-            const reminderBox = document.createElement('div');
+            const reminderBox = document.createElement('details');
             reminderBox.className = 'eh-reminder-host';
             reminderBox.hidden = true;
+            EH.Sections?.bind?.(reminderBox, 'reminders', true);
 
             const operationBox = document.createElement('div');
             operationBox.className = 'eh-operation-host';
@@ -16529,6 +16886,8 @@
             const flowSummary = document.createElement('summary');
             flowSummary.textContent = 'Fluxo do atendimento';
             flowSection.append(flowSummary, steps);
+            EH.Sections?.bind?.(flowSection, 'workflow', false);
+            EH.Sections?.bind?.(more, 'moreTools', false);
 
             body.append(flowSection, context, reminderBox, operationBox, saleBox, prefeituraTool, quickTitle, quickRoutes, divider, toolsTitle, actions, more);
             panel.append(header, body, footer);
@@ -19133,6 +19492,87 @@
     };
 
     // ============================================================
+    // ATALHOS CONTEXTUAIS — CAMADA COMPACTA
+    // Apenas delega para as funções centrais; não duplica regras de negócio.
+    // ============================================================
+    EH.ContextualShortcuts = {
+        root: null,
+        currentPage: '',
+
+        init() {
+            if (this.root || !document.body) return;
+            const root = document.createElement('nav');
+            root.id = 'eh-context-shortcuts';
+            root.setAttribute('aria-label', 'Atalhos contextuais do E-Pass Helper');
+            document.body.appendChild(root);
+            this.root = root;
+            GM_addStyle(`
+                #eh-context-shortcuts{position:fixed;right:8px;top:150px;z-index:2147482950;display:flex;flex-direction:column;gap:6px;pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}
+                #eh-context-shortcuts[hidden]{display:none!important}#eh-context-shortcuts button{pointer-events:auto;min-width:38px;max-width:150px;min-height:36px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:10px;background:rgba(255,255,255,.96);color:#28415e;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:800 10px/1.15 Inter,"Segoe UI",Arial,sans-serif;text-align:left}
+                #eh-context-shortcuts button:hover,#eh-context-shortcuts button:focus-visible{border-color:#6b9ed8;background:#fff;outline:2px solid rgba(59,130,246,.18)}
+                html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:auto}html.eh-overlay-main-open #eh-context-shortcuts{opacity:.38}html.eh-overlay-main-open #eh-context-shortcuts:hover,html.eh-overlay-main-open #eh-context-shortcuts:focus-within{opacity:1}
+                @media(max-width:760px){#eh-context-shortcuts{top:auto;right:8px;bottom:10px;flex-direction:row;max-width:calc(100vw - 16px);overflow-x:auto}html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:8px}}
+            `);
+            this.render(EH.Pages?.detect?.() || 'desconhecida');
+        },
+
+        openMain(selector = '.eh-context-card') {
+            EH.UI?.setPanelOpen?.(true);
+            EH.Runtime?.timeout?.('context-shortcut-focus', () => EH.UI?.root?.querySelector?.(selector)?.scrollIntoView?.({ block: 'nearest' }), 80);
+        },
+
+        button(label, title, action) {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.textContent = label;
+            button.title = title;
+            button.setAttribute('aria-label', title);
+            button.addEventListener('click', event => { event.stopPropagation(); action(); });
+            return button;
+        },
+
+        definitions(page) {
+            const open = () => this.openMain();
+            if (page === 'pesquisa') return [
+                ['🧭 Rotas', 'Abrir horários e rotas rápidas', () => this.openMain('.eh-quick-routes')],
+                ['🗓️ Horários', 'Gerar horários usando a função central', () => EH.UI?.captureAction?.('pesquisa')]
+            ];
+            if (page === 'reserva') return [
+                ['💺 Poltronas', 'Gerar imagem das poltronas', () => EH.UI?.captureAction?.('reserva')],
+                ['👤 Dados', 'Abrir dados do passageiro', () => EH.PrefeituraRequisition?.open?.()]
+            ];
+            if (page === 'confirmacao') return [['✅ Conferir', 'Abrir conferência da compra', open]];
+            if (page === 'pagamento') {
+                const pix = EH.Payment?.parsePix?.();
+                const actions = [['💳 Pagamento', 'Abrir ferramentas do pagamento', open]];
+                if (pix?.validation?.valid) actions.push(['📋 PIX', 'Copiar o PIX identificado', () => EH.Payment.copyPixCode(pix)]);
+                return actions;
+            }
+            if (page === 'passagens') return [
+                ['🎫 Bilhete', 'Capturar o bilhete selecionado', () => EH.Tickets?.activateSelection?.()],
+                ['👤 Passageiro', 'Abrir os dados confirmados do passageiro', () => EH.PrefeituraRequisition?.open?.()]
+            ];
+            if (page === 'caixa' || page === 'comissoes') return [['📊 Financeiro', 'Abrir resumo financeiro do Helper', () => EH.UI?.showFinanceModal?.('resumo')]];
+            if (page === 'requisicao') return [
+                ['📄 Requisição', 'Abrir a Requisição da Prefeitura', () => EH.PrefeituraRequisition?.open?.()],
+                ['👤 Preencher', 'Preencher os dados confirmados na solicitação', async () => {
+                    try { await EH.PassengerIdentity?.fillSolicitation?.(); EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.'); }
+                    catch (error) { EH.Toast?.warning?.(error.message || 'A tela atual não possui campos compatíveis para preenchimento.'); }
+                }]
+            ];
+            return [];
+        },
+
+        render(page = EH.Pages?.detect?.() || 'desconhecida') {
+            if (!this.root) return;
+            this.currentPage = page;
+            const definitions = this.definitions(page);
+            this.root.replaceChildren(...definitions.map(([label, title, action]) => this.button(label, title, action)));
+            this.root.hidden = !definitions.length;
+        }
+    };
+
+    // ============================================================
     // OBSERVADOR COM DEBOUNCE
     // ============================================================
     EH.Observer = {
@@ -19146,7 +19586,7 @@
 
             const isOwnMutation = mutation => {
                 const target = mutation?.target instanceof Element ? mutation.target : mutation?.target?.parentElement;
-                return Boolean(target?.closest?.('#eh-root, #eh-wa-dock, #eh-operation-dock, #eh-operation-launcher, #eh-toast-area, .eh-overlay, .eh-capture-overlay, .eh-pref-overlay'));
+                return Boolean(target?.closest?.('#eh-root, #eh-context-shortcuts, #eh-wa-dock, #eh-operation-dock, #eh-operation-launcher, #eh-toast-area, .eh-overlay, .eh-capture-overlay, .eh-pref-overlay'));
             };
 
             this.observer = new MutationObserver(mutations => {
@@ -19196,6 +19636,7 @@
             safeInit('Estilo', () => EH.Style.inject());
             safeInit('Avisos', () => EH.Toast.init());
             safeInit('Atendimento', () => EH.UI.init());
+            safeInit('Atalhos contextuais', () => EH.ContextualShortcuts.init());
             safeInit('Lembretes', () => EH.Reminders.init());
             safeInit('Memória persistente de emissões', () => EH.EmissionMemory?.init?.());
             safeInit('Conferência de bilhetes', () => EH.TicketVerificationQueue?.init?.());
