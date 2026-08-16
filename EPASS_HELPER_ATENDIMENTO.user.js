@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.62.0
+// @version      5.63.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.62.0',
+        VERSION: '5.63.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 8,
+        STORAGE_SCHEMA_VERSION: 9,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -677,6 +677,7 @@
     // ============================================================
     EH.PassengerMemory = {
         KEY: 'passengerMemory.v1',
+        SOURCE_RANK: { page: 0, imported: 0, ocr: 1, document: 2, manual: 3 },
         normalizeCpf(value) { return String(value || '').replace(/\D/g, '').slice(0, 11); },
         load() {
             const rows = EH.Storage.get(this.KEY, []);
@@ -691,26 +692,66 @@
         },
         normalize(item = {}) {
             const cpf = this.normalizeCpf(item.cpf);
+            const updatedAt = Number(item.updatedAt || Date.now());
+            const confirmed = Boolean(item.confirmed || item.confirmedAt);
+            const source = String(item.source || (confirmed ? 'document' : 'page'));
+            const rawMeta = item.fieldMeta && typeof item.fieldMeta === 'object' ? item.fieldMeta : {};
+            const fieldMeta = {};
+            ['name', 'cpf', 'birthDate'].forEach(field => {
+                const meta = rawMeta[field] && typeof rawMeta[field] === 'object' ? rawMeta[field] : {};
+                fieldMeta[field] = {
+                    source: String(meta.source || source),
+                    confirmed: Boolean(meta.confirmed ?? confirmed),
+                    updatedAt: Number(meta.updatedAt || updatedAt)
+                };
+            });
             return {
                 id: item.id || (cpf ? `cpf:${cpf}` : ''),
                 cpf,
                 name: EH.Utils.clean(item.name || item.nome || ''),
                 birthDate: EH.Utils.clean(item.birthDate || item.dataNascimento || ''),
+                confirmed,
+                confirmedAt: Number(item.confirmedAt || 0),
+                source,
+                fieldMeta,
                 createdAt: Number(item.createdAt || Date.now()),
-                updatedAt: Number(item.updatedAt || Date.now()),
+                updatedAt,
                 deviceId: String(item.deviceId || EH.Device.id())
             };
+        },
+        chooseField(field, oldItem, nextItem) {
+            const oldValue = EH.Utils.clean(oldItem?.[field] || '');
+            const nextValue = EH.Utils.clean(nextItem?.[field] || '');
+            if (!nextValue) return { value: oldValue, meta: oldItem?.fieldMeta?.[field] || {} };
+            if (!oldValue) return { value: nextValue, meta: nextItem?.fieldMeta?.[field] || {} };
+            const oldMeta = oldItem?.fieldMeta?.[field] || {};
+            const nextMeta = nextItem?.fieldMeta?.[field] || {};
+            const oldRank = Number(this.SOURCE_RANK[oldMeta.source] ?? 0) + (oldMeta.confirmed ? 10 : 0);
+            const nextRank = Number(this.SOURCE_RANK[nextMeta.source] ?? 0) + (nextMeta.confirmed ? 10 : 0);
+            if (nextRank > oldRank) return { value: nextValue, meta: nextMeta };
+            if (nextRank < oldRank) return { value: oldValue, meta: oldMeta };
+            return Number(nextMeta.updatedAt || 0) >= Number(oldMeta.updatedAt || 0)
+                ? { value: nextValue, meta: nextMeta }
+                : { value: oldValue, meta: oldMeta };
         },
         merge(oldItem = {}, incoming = {}) {
             const old = this.normalize(oldItem);
             const next = this.normalize(incoming);
+            const name = this.chooseField('name', old, next);
+            const birthDate = this.chooseField('birthDate', old, next);
+            const cpf = this.chooseField('cpf', old, next);
+            const confirmedAt = Math.max(Number(old.confirmedAt || 0), Number(next.confirmedAt || 0));
             return {
                 ...old,
                 ...next,
                 id: next.id || old.id,
-                cpf: next.cpf || old.cpf,
-                name: this.usefulText(next.name, old.name),
-                birthDate: this.usefulText(next.birthDate, old.birthDate),
+                cpf: cpf.value || next.cpf || old.cpf,
+                name: name.value,
+                birthDate: birthDate.value,
+                confirmed: Boolean(confirmedAt || old.confirmed || next.confirmed),
+                confirmedAt,
+                source: Number(this.SOURCE_RANK[next.source] ?? 0) >= Number(this.SOURCE_RANK[old.source] ?? 0) ? next.source : old.source,
+                fieldMeta: { name: name.meta, cpf: cpf.meta, birthDate: birthDate.meta },
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
                 updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
                 deviceId: next.deviceId || old.deviceId || EH.Device.id()
@@ -723,7 +764,12 @@
             const index = rows.findIndex(row => this.normalizeCpf(row.cpf) === next.cpf);
             const current = index >= 0 ? this.normalize(rows[index]) : null;
             const merged = current ? this.merge(current, next) : { ...next, createdAt: Date.now(), updatedAt: Number(next.updatedAt || Date.now()) };
-            const changed = !current || current.name !== merged.name || current.birthDate !== merged.birthDate;
+            const changed = !current
+                || current.name !== merged.name
+                || current.birthDate !== merged.birthDate
+                || current.confirmed !== merged.confirmed
+                || current.confirmedAt !== merged.confirmedAt
+                || JSON.stringify(current.fieldMeta || {}) !== JSON.stringify(merged.fieldMeta || {});
             if (changed && !fromSync) merged.updatedAt = Date.now();
             if (!changed && current) return rows[index];
             if (index >= 0) rows[index] = merged; else rows.push(merged);
@@ -8054,6 +8100,10 @@
                 cpf,
                 name: EH.Utils.clean(item.name || ''),
                 birthDate: EH.Utils.clean(item.birthDate || ''),
+                confirmed: Boolean(item.confirmed || item.confirmedAt),
+                confirmedAt: Number(item.confirmedAt || 0),
+                source: String(item.source || (item.confirmed || item.confirmedAt ? 'document' : 'page')),
+                fieldMeta: item.fieldMeta && typeof item.fieldMeta === 'object' ? item.fieldMeta : {},
                 requestCode: EH.Utils.clean(item.requestCode || ''),
                 requestStatus: EH.Utils.clean(item.requestStatus || ''),
                 ticketStatus: item.ticketStatus || 'pending',
@@ -8158,8 +8208,9 @@
                 sale.passengers.push(passenger);
                 changed = true;
             } else {
-                const nextName = data.name ? EH.Utils.clean(data.name) : passenger.name;
-                const nextBirthDate = data.birthDate ? EH.Utils.clean(data.birthDate) : passenger.birthDate;
+                const identityMayChange = Boolean(data.confirmed) || !passenger.confirmed;
+                const nextName = identityMayChange && data.name ? EH.Utils.clean(data.name) : passenger.name;
+                const nextBirthDate = identityMayChange && data.birthDate ? EH.Utils.clean(data.birthDate) : passenger.birthDate;
                 if (nextName !== passenger.name) {
                     passenger.name = nextName;
                     changed = true;
@@ -8168,10 +8219,26 @@
                     passenger.birthDate = nextBirthDate;
                     changed = true;
                 }
+                if (data.confirmed && (!passenger.confirmed || Number(data.confirmedAt || 0) >= Number(passenger.confirmedAt || 0))) {
+                    passenger.confirmed = true;
+                    passenger.confirmedAt = Number(data.confirmedAt || Date.now());
+                    passenger.source = String(data.source || 'document');
+                    passenger.fieldMeta = data.fieldMeta && typeof data.fieldMeta === 'object' ? data.fieldMeta : passenger.fieldMeta;
+                    changed = true;
+                }
                 if (changed) passenger.updatedAt = Date.now();
             }
             if (changed) this.saveSale(sale);
-            EH.PassengerMemory?.upsert?.({ cpf: passenger.cpf, name: passenger.name, birthDate: passenger.birthDate, updatedAt: passenger.updatedAt || Date.now() });
+            EH.PassengerMemory?.upsert?.({
+                cpf: passenger.cpf,
+                name: passenger.name,
+                birthDate: passenger.birthDate,
+                confirmed: passenger.confirmed,
+                confirmedAt: passenger.confirmedAt,
+                source: passenger.source,
+                fieldMeta: passenger.fieldMeta,
+                updatedAt: passenger.updatedAt || Date.now()
+            });
             return passenger;
         },
 
@@ -8457,6 +8524,702 @@
     EH.SaleCpfs = EH.SaleContext;
 
     // ============================================================
+    // IDENTIDADE CONFIRMADA DO PASSAGEIRO — DOCUMENTO → OCR → REVISÃO
+    // A saída bruta do OCR nunca alimenta outros módulos. Somente o registro
+    // confirmado abaixo é reutilizado pela venda, solicitação e requisição.
+    // ============================================================
+    EH.PassengerIdentity = {
+        CURRENT_KEY: 'confirmedPassenger.current.v1',
+        SESSION_KEY: 'documentIdentity.session.v2',
+        MAX_PHOTOS: 4,
+        started: false,
+        state: null,
+
+        emptyField() {
+            return { value: '', display: '', confidence: 0, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false };
+        },
+
+        freshState() {
+            return {
+                id: `doc-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                createdAt: Date.now(),
+                photos: [],
+                fields: { name: this.emptyField(), cpf: this.emptyField(), birthDate: this.emptyField() },
+                confirmed: null,
+                allowMemoryFallback: true,
+                diagnostics: []
+            };
+        },
+
+        init() {
+            if (this.started) return;
+            this.started = true;
+            this.state = this.freshState();
+            const existing = this.currentConfirmed();
+            if (existing) this.useConfirmed(existing);
+        },
+
+        clean(value) {
+            return String(value || '').replace(/\u00a0/g, ' ').replace(/[\t\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
+        },
+
+        normalized(value) {
+            return EH.Utils.normalize(this.clean(value));
+        },
+
+        cpfDigits(value) {
+            return String(value || '').replace(/\D/g, '').slice(0, 11);
+        },
+
+        formatCpf(value) {
+            const digits = this.cpfDigits(value);
+            if (digits.length !== 11) return digits;
+            return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}-${digits.slice(9)}`;
+        },
+
+        validCpf(value) {
+            const digits = this.cpfDigits(value);
+            if (digits.length !== 11 || /^(\d)\1{10}$/.test(digits)) return false;
+            for (const size of [9, 10]) {
+                let total = 0;
+                for (let index = 0; index < size; index += 1) total += Number(digits[index]) * (size + 1 - index);
+                let check = (total * 10) % 11;
+                if (check === 10) check = 0;
+                if (check !== Number(digits[size])) return false;
+            }
+            return true;
+        },
+
+        parseDate(value) {
+            const raw = this.clean(value);
+            let day; let month; let year;
+            let match = raw.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/);
+            if (match) [, day, month, year] = match;
+            else {
+                match = raw.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+                if (match) [, year, month, day] = match;
+            }
+            if (!match) return { valid: false, plausible: false, value: raw, reason: 'Use dd/mm/aaaa.' };
+            const numeric = { day: Number(day), month: Number(month), year: Number(year) };
+            const date = new Date(numeric.year, numeric.month - 1, numeric.day);
+            const valid = date.getFullYear() === numeric.year && date.getMonth() === numeric.month - 1 && date.getDate() === numeric.day;
+            if (!valid) return { valid: false, plausible: false, value: raw, reason: 'A data não existe.' };
+            const today = new Date();
+            const future = date > new Date(today.getFullYear(), today.getMonth(), today.getDate());
+            const implausiblyOld = numeric.year < 1900;
+            return {
+                valid: true,
+                plausible: !future && !implausiblyOld,
+                value: `${String(numeric.day).padStart(2, '0')}/${String(numeric.month).padStart(2, '0')}/${numeric.year}`,
+                reason: future ? 'Data futura não é plausível como nascimento.' : (implausiblyOld ? 'Ano incomum; confira manualmente.' : '')
+            };
+        },
+
+        currentConfirmed(cpf = '') {
+            const active = EH.SaleContext?.getActivePassenger?.() || null;
+            const wanted = this.cpfDigits(cpf || active?.cpf || EH.Storage.get(this.CURRENT_KEY, null)?.cpf || '');
+            if (!wanted) return null;
+            const memory = EH.PassengerMemory?.findByCpf?.(wanted) || null;
+            if (memory?.confirmed && memory.name && memory.birthDate && this.validCpf(memory.cpf)) return memory;
+            if (active?.confirmed && active.name && active.birthDate && this.validCpf(active.cpf)) return active;
+            return null;
+        },
+
+        confirmedData(record = null) {
+            const resolved = record || this.state?.confirmed || (this.state?.allowMemoryFallback !== false ? this.currentConfirmed() : null);
+            if (!resolved) return null;
+            const data = {
+                nome: this.clean(resolved.name || resolved.nome),
+                cpf: this.formatCpf(resolved.cpf),
+                cpfDigits: this.cpfDigits(resolved.cpf),
+                nascimento: this.parseDate(resolved.birthDate || resolved.nascimento || resolved.dataNascimento).value,
+                confirmed: Boolean(resolved.confirmed),
+                confirmedAt: Number(resolved.confirmedAt || 0),
+                fieldMeta: resolved.fieldMeta || {}
+            };
+            return data.nome && data.cpfDigits.length === 11 && data.nascimento && data.confirmed ? data : null;
+        },
+
+        useConfirmed(record) {
+            if (!this.state) this.state = this.freshState();
+            const data = this.confirmedData(record);
+            if (!data) return null;
+            this.state.confirmed = {
+                cpf: data.cpfDigits,
+                name: data.nome,
+                birthDate: data.nascimento,
+                confirmed: true,
+                confirmedAt: data.confirmedAt,
+                fieldMeta: data.fieldMeta,
+                source: record.source || 'document'
+            };
+            this.state.allowMemoryFallback = true;
+            this.state.fields = {
+                name: { ...this.emptyField(), value: data.nome, display: data.nome, confidence: 100, status: 'high', valid: true, reason: 'Dados confirmados.', source: 'confirmed', locked: true },
+                cpf: { ...this.emptyField(), value: data.cpfDigits, display: data.cpf, confidence: 100, status: 'high', valid: true, reason: 'CPF confirmado e válido.', source: 'confirmed', locked: true },
+                birthDate: { ...this.emptyField(), value: data.nascimento, display: data.nascimento, confidence: 100, status: 'high', valid: true, reason: 'Nascimento confirmado.', source: 'confirmed', locked: true }
+            };
+            return data;
+        },
+
+        startNew() {
+            this.state = this.freshState();
+            this.state.allowMemoryFallback = false;
+            EH.Storage.remove(this.CURRENT_KEY);
+            try { sessionStorage.removeItem(this.SESSION_KEY); } catch (_error) {}
+            this.logDiagnostic('novo documento iniciado');
+            return this.state;
+        },
+
+        logDiagnostic(message) {
+            if (!this.state) this.state = this.freshState();
+            const safe = this.clean(message).replace(/\b\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2}\b/g, '[CPF oculto]');
+            this.state.diagnostics.push({ at: Date.now(), message: safe });
+            this.state.diagnostics = this.state.diagnostics.slice(-30);
+            EH.Logger.debug(`[Documento] ${safe}`);
+        },
+
+        lineObjects(data = {}) {
+            const rawLines = Array.isArray(data.lines) ? data.lines : [];
+            if (rawLines.length) {
+                return rawLines.map((line, index) => ({
+                    index,
+                    text: this.clean(line.text),
+                    norm: this.normalized(line.text),
+                    confidence: Number(line.confidence ?? data.confidence ?? 0),
+                    bbox: line.bbox || null
+                })).filter(line => line.text);
+            }
+            const words = Array.isArray(data.words) ? data.words.filter(word => this.clean(word.text)) : [];
+            if (words.length) {
+                const rows = [];
+                words.sort((a, b) => Number(a.bbox?.y0 || 0) - Number(b.bbox?.y0 || 0) || Number(a.bbox?.x0 || 0) - Number(b.bbox?.x0 || 0));
+                words.forEach(word => {
+                    const y = Number(word.bbox?.y0 || 0);
+                    let row = rows.find(item => Math.abs(item.y - y) <= Math.max(8, Number(word.bbox?.y1 || y) - y) * 0.65);
+                    if (!row) { row = { y, words: [] }; rows.push(row); }
+                    row.words.push(word);
+                });
+                return rows.sort((a, b) => a.y - b.y).map((row, index) => {
+                    row.words.sort((a, b) => Number(a.bbox?.x0 || 0) - Number(b.bbox?.x0 || 0));
+                    const text = this.clean(row.words.map(word => word.text).join(' '));
+                    return {
+                        index,
+                        text,
+                        norm: this.normalized(text),
+                        confidence: row.words.reduce((sum, word) => sum + Number(word.confidence || 0), 0) / Math.max(1, row.words.length),
+                        bbox: {
+                            x0: Math.min(...row.words.map(word => Number(word.bbox?.x0 || 0))),
+                            y0: Math.min(...row.words.map(word => Number(word.bbox?.y0 || 0))),
+                            x1: Math.max(...row.words.map(word => Number(word.bbox?.x1 || 0))),
+                            y1: Math.max(...row.words.map(word => Number(word.bbox?.y1 || 0)))
+                        }
+                    };
+                });
+            }
+            return String(data.text || '').split(/\r?\n/).map((text, index) => ({
+                index, text: this.clean(text), norm: this.normalized(text), confidence: Number(data.confidence || 0), bbox: null
+            })).filter(line => line.text);
+        },
+
+        nameCandidate(value) {
+            let name = this.clean(value)
+                .replace(/^(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|NAME|TITULAR)\s*[:\-]?\s*/i, '')
+                .replace(/[|_[\]{}]+/g, ' ')
+                .replace(/\s+/g, ' ').trim();
+            name = name.replace(/[.,;:]+$/g, '').trim();
+            if (name.length < 4 || name.length > 160 || /\d/.test(name)) return '';
+            const tokens = name.split(' ').filter(Boolean);
+            if (tokens.length < 2) return '';
+            const letters = (name.match(/[A-Za-zÀ-ÿ]/g) || []).length;
+            if (letters / Math.max(1, name.length) < 0.72) return '';
+            const forbidden = /\b(FILIACAO|MAE|PAI|GENITOR|GENITORA|AUTORIDADE|ORGAO|EMISSOR|ASSINATURA|REPUBLICA|BRASIL|SECRETARIA|IDENTIDADE|CARTEIRA|REGISTRO|VALIDADE|NASCIMENTO|CPF|RG)\b/;
+            if (forbidden.test(this.normalized(name))) return '';
+            return name;
+        },
+
+        extractName(lines) {
+            const label = /\b(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|NAME|TITULAR)\b/;
+            const negative = /\b(?:FILIACAO|MAE|PAI|GENITOR|GENITORA|RESPONSAVEL|AUTORIDADE|ORGAO\s+EMISSOR)\b/;
+            const candidates = [];
+            lines.forEach((line, index) => {
+                if (!label.test(line.norm) || /NOME\s+(?:DA\s+)?(?:MAE|DO\s+PAI)/.test(line.norm)) return;
+                const inline = this.nameCandidate(line.text);
+                if (inline && this.normalized(inline) !== line.norm) {
+                    candidates.push({ value: inline, display: inline, score: 91 + Math.min(7, line.confidence / 20), valid: true, line: index, reason: 'Próximo ao rótulo Nome.' });
+                }
+                for (let offset = 1; offset <= 2; offset += 1) {
+                    const target = lines[index + offset];
+                    if (!target || negative.test(target.norm)) break;
+                    const previousContext = lines.slice(Math.max(0, index), index + offset).map(item => item.norm).join(' ');
+                    if (negative.test(previousContext) && offset > 1) break;
+                    const value = this.nameCandidate(target.text);
+                    if (!value) continue;
+                    candidates.push({ value, display: value, score: 88 - ((offset - 1) * 11) + Math.min(6, target.confidence / 20), valid: true, line: index + offset, reason: 'Linha associada ao rótulo Nome.' });
+                    break;
+                }
+            });
+            return this.fieldFromCandidates(candidates, 'name');
+        },
+
+        numberCandidates(text) {
+            const matches = [];
+            const patterns = [/(?:^|\D)(\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2})(?!\d)/g, /(?:^|\D)(\d{11})(?!\d)/g];
+            patterns.forEach(pattern => {
+                let match;
+                while ((match = pattern.exec(String(text || '')))) {
+                    const digits = this.cpfDigits(match[1]);
+                    if (digits.length === 11) matches.push(digits);
+                }
+            });
+            return [...new Set(matches)];
+        },
+
+        extractCpf(lines) {
+            const label = /\bCPF\b/;
+            const misleading = /\b(?:RG|REGISTRO|CNH|IDENTIDADE|SEGURANCA|DOCUMENTO)\b/;
+            const candidates = [];
+            lines.forEach((line, index) => {
+                const values = this.numberCandidates(line.text);
+                values.forEach(value => {
+                    const valid = this.validCpf(value);
+                    const sameLabel = label.test(line.norm);
+                    const previous = lines.slice(Math.max(0, index - 2), index).map(item => item.norm).join(' ');
+                    const nearLabel = sameLabel || label.test(previous);
+                    const wrongContext = !sameLabel && misleading.test(line.norm);
+                    let score = 38 + (valid ? 24 : 0) + (sameLabel ? 34 : (nearLabel ? 20 : 0)) + Math.min(5, line.confidence / 20) - (wrongContext ? 24 : 0);
+                    if (!valid) score = Math.min(score, 69);
+                    candidates.push({
+                        value,
+                        display: this.formatCpf(value),
+                        score,
+                        valid,
+                        line: index,
+                        reason: valid ? (nearLabel ? 'CPF válido próximo ao rótulo.' : 'CPF matematicamente válido; confira o contexto.') : 'O número não passou na validação matemática.'
+                    });
+                });
+            });
+            return this.fieldFromCandidates(candidates, 'cpf');
+        },
+
+        dateCandidates(text) {
+            const found = [];
+            const pattern = /\b(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4}|\d{4}-\d{1,2}-\d{1,2})\b/g;
+            let match;
+            while ((match = pattern.exec(String(text || '')))) found.push(match[1]);
+            return [...new Set(found)];
+        },
+
+        extractBirthDate(lines) {
+            const positive = /\b(?:DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC\.?|DT\.?\s*NASC\.?|DATA\s*NASC\.?)\b/;
+            const negative = /\b(?:EMISSAO|EXPEDICAO|VALIDADE|VALIDO\s+ATE|PRIMEIRA\s+HABILITACAO|1A\s+HABILITACAO|EMITIDO)\b/;
+            const candidates = [];
+            lines.forEach((line, index) => {
+                this.dateCandidates(line.text).forEach(raw => {
+                    const parsed = this.parseDate(raw);
+                    const previous = lines.slice(Math.max(0, index - 2), index).map(item => item.norm).join(' ');
+                    const samePositive = positive.test(line.norm);
+                    const nearPositive = samePositive || positive.test(previous);
+                    const sameNegative = negative.test(line.norm);
+                    const nearNegative = sameNegative || negative.test(previous);
+                    let score = 30 + (parsed.valid ? 18 : 0) + (parsed.plausible ? 10 : 0) + (samePositive ? 38 : (nearPositive ? 25 : 0)) - (sameNegative ? 45 : (nearNegative ? 28 : 0)) + Math.min(5, line.confidence / 20);
+                    if (!parsed.valid) score = Math.min(score, 45);
+                    if (!parsed.plausible) score = Math.min(score, 64);
+                    candidates.push({
+                        value: parsed.value,
+                        display: parsed.value,
+                        score,
+                        valid: parsed.valid,
+                        plausible: parsed.plausible,
+                        line: index,
+                        reason: nearNegative
+                            ? 'A data está próxima de emissão/validade; não foi aceita como nascimento.'
+                            : (nearPositive && parsed.plausible ? 'Data válida próxima ao rótulo Nascimento.' : (parsed.reason || 'Data encontrada sem vínculo seguro com Nascimento.'))
+                    });
+                });
+            });
+            return this.fieldFromCandidates(candidates, 'birthDate');
+        },
+
+        fieldFromCandidates(list, field) {
+            const unique = new Map();
+            list.forEach(candidate => {
+                const key = String(candidate.value || '');
+                if (!key) return;
+                if (!unique.has(key) || Number(candidate.score || 0) > Number(unique.get(key).score || 0)) unique.set(key, candidate);
+            });
+            const candidates = [...unique.values()].sort((a, b) => Number(b.score || 0) - Number(a.score || 0));
+            if (!candidates.length) return this.emptyField();
+            const best = candidates[0];
+            const second = candidates.find(candidate => candidate.value !== best.value);
+            const ambiguous = Boolean(second && Math.abs(Number(best.score || 0) - Number(second.score || 0)) < 9);
+            const baseValid = field === 'birthDate' ? Boolean(best.valid && best.plausible) : Boolean(best.valid);
+            const high = baseValid && Number(best.score || 0) >= 82 && !ambiguous;
+            return {
+                value: best.value,
+                display: best.display || best.value,
+                confidence: Math.max(0, Math.min(99, Math.round(Number(best.score || 0)))),
+                status: high ? 'high' : 'review',
+                valid: baseValid,
+                reason: ambiguous ? 'Mais de um candidato semelhante foi encontrado. Escolha e confirme.' : best.reason,
+                candidates: candidates.map(candidate => ({
+                    value: candidate.value,
+                    display: candidate.display || candidate.value,
+                    confidence: Math.max(0, Math.min(99, Math.round(Number(candidate.score || 0)))),
+                    valid: Boolean(candidate.valid),
+                    plausible: candidate.plausible !== false,
+                    reason: candidate.reason || ''
+                })),
+                source: 'ocr',
+                sourcePhotoId: '',
+                locked: false
+            };
+        },
+
+        extractFromOcrData(data = {}, quality = null) {
+            const lines = this.lineObjects(data);
+            const fields = {
+                name: this.extractName(lines),
+                cpf: this.extractCpf(lines),
+                birthDate: this.extractBirthDate(lines)
+            };
+            const qualityCap = quality?.score < 45 ? 69 : (quality?.score < 65 ? 82 : 99);
+            Object.values(fields).forEach(field => {
+                field.confidence = Math.min(field.confidence, qualityCap);
+                if (qualityCap < 80 && field.status === 'high') {
+                    field.status = 'review';
+                    field.reason = `${field.reason} A qualidade da foto exige conferência.`;
+                }
+            });
+            return { lines, fields, textConfidence: Number(data.confidence || 0) };
+        },
+
+        ocrScore(result) {
+            const data = result?.data || result || {};
+            const extracted = this.extractFromOcrData(data);
+            const found = Object.values(extracted.fields).filter(field => field.value).length;
+            const high = Object.values(extracted.fields).filter(field => field.status === 'high').length;
+            const normalizedText = this.normalized(data.text || '');
+            const labels = ['NOME', 'CPF', 'NASC'].filter(label => normalizedText.includes(label)).length;
+            return Number(data.confidence || 0) * 0.55 + found * 9 + high * 7 + labels * 5;
+        },
+
+        async readFile(file) {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(String(reader.result || ''));
+                reader.onerror = () => reject(new Error('Não foi possível ler a imagem selecionada.'));
+                reader.readAsDataURL(file);
+            });
+        },
+
+        async loadImage(dataUrl) {
+            return new Promise((resolve, reject) => {
+                const image = new Image();
+                image.onload = () => resolve(image);
+                image.onerror = () => reject(new Error('A imagem não pôde ser aberta.'));
+                image.src = dataUrl;
+            });
+        },
+
+        analyzeImage(image) {
+            const maxSide = 900;
+            const scale = Math.min(1, maxSide / Math.max(image.naturalWidth || image.width, image.naturalHeight || image.height));
+            const width = Math.max(1, Math.round((image.naturalWidth || image.width) * scale));
+            const height = Math.max(1, Math.round((image.naturalHeight || image.height) * scale));
+            const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+            const context = canvas.getContext('2d', { willReadFrequently: true });
+            context.drawImage(image, 0, 0, width, height);
+            const pixels = context.getImageData(0, 0, width, height).data;
+            const gray = new Uint8Array(width * height);
+            let sum = 0; let sumSquares = 0; let dark = 0; let bright = 0;
+            for (let index = 0, pixel = 0; index < pixels.length; index += 4, pixel += 1) {
+                const value = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
+                gray[pixel] = value; sum += value; sumSquares += value * value; if (value < 45) dark += 1; if (value > 250) bright += 1;
+            }
+            const count = gray.length; const mean = sum / Math.max(1, count);
+            const deviation = Math.sqrt(Math.max(0, (sumSquares / Math.max(1, count)) - mean * mean));
+            let lapSum = 0; let lapSquares = 0; let lapCount = 0;
+            for (let y = 1; y < height - 1; y += 3) {
+                for (let x = 1; x < width - 1; x += 3) {
+                    const center = gray[y * width + x];
+                    const lap = (4 * center) - gray[y * width + x - 1] - gray[y * width + x + 1] - gray[(y - 1) * width + x] - gray[(y + 1) * width + x];
+                    lapSum += lap; lapSquares += lap * lap; lapCount += 1;
+                }
+            }
+            const lapMean = lapSum / Math.max(1, lapCount);
+            const sharpness = (lapSquares / Math.max(1, lapCount)) - lapMean * lapMean;
+            const border = Math.max(3, Math.round(Math.min(width, height) * 0.025));
+            let borderInk = 0; let borderCount = 0;
+            for (let y = 0; y < height; y += 3) for (let x = 0; x < width; x += 3) {
+                if (x > border && x < width - border && y > border && y < height - border) continue;
+                borderCount += 1; if (gray[y * width + x] < 190) borderInk += 1;
+            }
+            const issues = []; let score = 100;
+            const originalWidth = image.naturalWidth || image.width; const originalHeight = image.naturalHeight || image.height;
+            if (Math.min(originalWidth, originalHeight) < 650) { issues.push('resolução baixa; aproxime o documento'); score -= 28; }
+            if (mean < 70) { issues.push('imagem muito escura'); score -= 24; }
+            if (mean > 246 && (bright / Math.max(1, count)) > 0.86 && deviation < 38) { issues.push('imagem clara demais ou com reflexo'); score -= 20; }
+            if (deviation < 28) { issues.push('contraste insuficiente'); score -= 22; }
+            if (sharpness < 85) { issues.push('imagem possivelmente desfocada'); score -= 26; }
+            if ((dark / Math.max(1, count)) > 0.34) { issues.push('grandes áreas escuras'); score -= 14; }
+            if ((borderInk / Math.max(1, borderCount)) > 0.22) { issues.push('o documento pode estar cortado ou encostado na borda'); score -= 18; }
+            return { width: originalWidth, height: originalHeight, mean, contrast: deviation, sharpness, borderInkRatio: borderInk / Math.max(1, borderCount), score: Math.max(0, score), issues, blocked: score < 25 };
+        },
+
+        prepareCanvas(image, rotation = 0) {
+            const sourceWidth = image.naturalWidth || image.width; const sourceHeight = image.naturalHeight || image.height;
+            let scale = Math.min(1, 2600 / Math.max(sourceWidth, sourceHeight));
+            if (Math.max(sourceWidth, sourceHeight) < 1600) scale = Math.min(2, 1600 / Math.max(sourceWidth, sourceHeight));
+            const baseWidth = Math.max(1, Math.round(sourceWidth * scale)); const baseHeight = Math.max(1, Math.round(sourceHeight * scale));
+            const sideways = Math.abs(rotation) % 180 === 90;
+            const canvas = document.createElement('canvas'); canvas.width = sideways ? baseHeight : baseWidth; canvas.height = sideways ? baseWidth : baseHeight;
+            const context = canvas.getContext('2d', { willReadFrequently: true });
+            context.save(); context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height);
+            context.translate(canvas.width / 2, canvas.height / 2); context.rotate(rotation * Math.PI / 180);
+            context.drawImage(image, -baseWidth / 2, -baseHeight / 2, baseWidth, baseHeight); context.restore();
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height); const data = imageData.data;
+            let sum = 0; let sumSquares = 0; let count = 0;
+            for (let index = 0; index < data.length; index += 16) {
+                const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+                sum += gray; sumSquares += gray * gray; count += 1;
+            }
+            const mean = sum / Math.max(1, count); const deviation = Math.sqrt(Math.max(0, sumSquares / Math.max(1, count) - mean * mean));
+            const factor = deviation < 40 ? 1.55 : (deviation < 65 ? 1.3 : 1.15);
+            for (let index = 0; index < data.length; index += 4) {
+                const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+                const value = Math.max(0, Math.min(255, (gray - mean) * factor + 150));
+                data[index] = value; data[index + 1] = value; data[index + 2] = value;
+            }
+            context.putImageData(imageData, 0, 0);
+            return canvas;
+        },
+
+        async processPhoto(file, worker, callbacks = {}) {
+            const id = `photo-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+            const dataUrl = await this.readFile(file);
+            const image = await this.loadImage(dataUrl);
+            const quality = this.analyzeImage(image);
+            callbacks.onProgress?.({ status: 'validating', photoId: id, progress: 0.05, message: 'Validando qualidade e orientação…' });
+            const rotations = [0]; const results = [];
+            const recognize = async rotation => {
+                const canvas = this.prepareCanvas(image, rotation);
+                const result = await worker.recognize(canvas, {}, { text: true, blocks: true, hocr: false, tsv: false });
+                const score = this.ocrScore(result);
+                results.push({ rotation, result, score });
+                return { rotation, result, score };
+            };
+            const first = await recognize(0);
+            const firstExtracted = this.extractFromOcrData(first.result?.data || {}, quality);
+            const found = Object.values(firstExtracted.fields).filter(field => field.value).length;
+            if (first.score < 82 || found < 2) {
+                for (const rotation of [90, 270, 180]) {
+                    callbacks.onProgress?.({ status: 'orientation', photoId: id, progress: 0.22 + results.length * 0.18, message: `Tentando orientação ${rotation}°…` });
+                    await recognize(rotation);
+                }
+            }
+            results.sort((a, b) => b.score - a.score);
+            const best = results[0];
+            const extracted = this.extractFromOcrData(best.result?.data || {}, quality);
+            Object.values(extracted.fields).forEach(field => { field.sourcePhotoId = id; });
+            if (quality.blocked) {
+                Object.values(extracted.fields).forEach(field => {
+                    if (field.value) { field.status = 'review'; field.confidence = Math.min(field.confidence, 55); field.reason = `${field.reason} A foto não tem qualidade suficiente para confirmação automática.`; }
+                });
+            }
+            const photo = {
+                id,
+                name: this.clean(file.name || `documento-${this.state.photos.length + 1}.jpg`),
+                type: file.type || 'image/jpeg',
+                dataUrl,
+                quality,
+                rotation: best.rotation,
+                score: best.score,
+                fields: extracted.fields,
+                addedAt: Date.now()
+            };
+            this.logDiagnostic(`leitura concluída; orientação ${best.rotation}°; qualidade ${Math.round(quality.score)} de 100`);
+            ['name', 'cpf', 'birthDate'].forEach(field => {
+                const result = extracted.fields[field];
+                const label = field === 'name' ? 'nome' : (field === 'cpf' ? 'CPF' : 'nascimento');
+                this.logDiagnostic(`${label}: ${result.status === 'high' ? 'alta confiança' : (result.value ? 'requer conferência' : 'não identificado')}`);
+            });
+            return photo;
+        },
+
+        mergeField(current, incoming) {
+            if (!incoming?.value) return current || this.emptyField();
+            if (!current?.value) return { ...incoming };
+            if (current.locked || current.source === 'manual' || current.source === 'confirmed') return current;
+            if (String(current.value) === String(incoming.value)) {
+                const better = Number(incoming.confidence || 0) > Number(current.confidence || 0) ? incoming : current;
+                return { ...better, candidates: [...new Map([...(current.candidates || []), ...(incoming.candidates || [])].map(item => [String(item.value), item])).values()] };
+            }
+            if (Number(incoming.confidence || 0) >= Number(current.confidence || 0) + 6) return { ...incoming };
+            const candidates = [...new Map([...(current.candidates || []), ...(incoming.candidates || []), current, incoming].map(item => [String(item.value), item])).values()]
+                .filter(item => item.value).sort((a, b) => Number(b.confidence || b.score || 0) - Number(a.confidence || a.score || 0));
+            return { ...current, status: 'review', confidence: Math.min(Number(current.confidence || 0), 78), reason: 'Fotos diferentes produziram candidatos distintos. Escolha e confirme.', candidates };
+        },
+
+        mergePhoto(photo) {
+            if (!this.state) this.state = this.freshState();
+            this.state.photos.push(photo);
+            ['name', 'cpf', 'birthDate'].forEach(field => { this.state.fields[field] = this.mergeField(this.state.fields[field], photo.fields[field]); });
+            this.state.confirmed = null;
+            try {
+                sessionStorage.setItem(this.SESSION_KEY, JSON.stringify({
+                    id: this.state.id,
+                    photoCount: this.state.photos.length,
+                    fields: this.state.fields,
+                    updatedAt: Date.now()
+                }));
+            } catch (_error) {}
+            return this.state;
+        },
+
+        async processFiles(files, callbacks = {}) {
+            const images = Array.from(files || []).filter(file => String(file.type || '').startsWith('image/'));
+            if (!images.length) throw new Error('Selecione uma ou mais fotos do documento.');
+            if (!this.state) this.state = this.freshState();
+            const remaining = Math.max(0, this.MAX_PHOTOS - this.state.photos.length);
+            if (!remaining) throw new Error(`O limite é de ${this.MAX_PHOTOS} fotos por passageiro.`);
+            if (typeof Tesseract !== 'object' || typeof Tesseract.createWorker !== 'function') throw new Error('Leitor OCR não carregado.');
+            const selected = images.slice(0, remaining);
+            const worker = await Tesseract.createWorker('por', 1, {
+                workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
+                corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
+                langPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/por@1.0.0/4.0.0_best_int',
+                logger: message => callbacks.onEngineProgress?.(message)
+            });
+            try {
+                for (let index = 0; index < selected.length; index += 1) {
+                    callbacks.onProgress?.({ status: 'photo', progress: index / selected.length, message: `Processando foto ${index + 1} de ${selected.length}…` });
+                    const photo = await this.processPhoto(selected[index], worker, callbacks);
+                    this.mergePhoto(photo); callbacks.onPhoto?.(photo, this.state);
+                }
+            } finally { await worker.terminate(); }
+            callbacks.onProgress?.({ status: 'done', progress: 1, message: 'Leitura concluída. Confira cada campo.' });
+            return this.state;
+        },
+
+        validateForConfirmation(input = {}) {
+            const nome = this.clean(input.nome || input.name);
+            const cpf = this.cpfDigits(input.cpf);
+            const birth = this.parseDate(input.nascimento || input.birthDate || input.dataNascimento);
+            const errors = [];
+            if (nome.length < 4 || (nome.match(/[A-Za-zÀ-ÿ]/g) || []).length < 4) errors.push('Nome completo');
+            if (cpf.length !== 11) errors.push('CPF com 11 dígitos');
+            else if (!this.validCpf(cpf)) errors.push('CPF válido');
+            if (!birth.valid) errors.push('Data de nascimento válida');
+            else if (!birth.plausible) errors.push('Data de nascimento plausível');
+            return { ok: !errors.length, errors, data: { nome, cpf, nascimento: birth.value } };
+        },
+
+        confirm(input = {}) {
+            const validation = this.validateForConfirmation(input);
+            if (!validation.ok) throw new Error(`Confira antes de confirmar: ${validation.errors.join(', ')}.`);
+            if (!this.state) this.state = this.freshState();
+            const now = Date.now(); const proposed = this.state.fields;
+            const sourceFor = (field, value) => {
+                if (proposed[field]?.source === 'manual') return 'manual';
+                const sourceValue = field === 'cpf' ? this.cpfDigits(proposed[field]?.value) : this.clean(proposed[field]?.value);
+                const wanted = field === 'cpf' ? this.cpfDigits(value) : this.clean(value);
+                return sourceValue && sourceValue === wanted ? 'document' : 'manual';
+            };
+            const fieldMeta = {
+                name: { source: sourceFor('name', validation.data.nome), confirmed: true, updatedAt: now },
+                cpf: { source: sourceFor('cpf', validation.data.cpf), confirmed: true, updatedAt: now },
+                birthDate: { source: sourceFor('birthDate', validation.data.nascimento), confirmed: true, updatedAt: now }
+            };
+            const source = Object.values(fieldMeta).some(meta => meta.source === 'manual') ? 'manual' : 'document';
+            const record = {
+                id: `cpf:${validation.data.cpf}`,
+                cpf: validation.data.cpf,
+                name: validation.data.nome,
+                birthDate: validation.data.nascimento,
+                confirmed: true,
+                confirmedAt: now,
+                source,
+                fieldMeta,
+                updatedAt: now,
+                deviceId: EH.Device.id()
+            };
+            const passenger = EH.SaleContext?.upsertPassenger?.(record);
+            if (passenger?.id) EH.SaleContext?.setActivePassenger?.(passenger.id);
+            const saved = EH.PassengerMemory?.upsert?.(record, { quiet: true }) || record;
+            EH.Storage.set(this.CURRENT_KEY, { cpf: record.cpf, confirmedAt: now });
+            this.useConfirmed(saved);
+            this.logDiagnostic('dados confirmados pelo usuário e disponíveis para reutilização');
+            if (EH.Sync?.configured?.()) Promise.resolve(EH.Sync.syncAll({ quiet: true })).catch(error => EH.Logger.debug('Sincronização do passageiro ficará para o próximo ciclo:', error));
+            return this.confirmedData(saved);
+        },
+
+        matchesConfirmed(input = {}) {
+            const confirmed = this.confirmedData();
+            if (!confirmed) return false;
+            const birth = this.parseDate(input.nascimento || input.birthDate || input.dataNascimento || '').value;
+            return this.normalized(input.nome || input.name) === this.normalized(confirmed.nome)
+                && this.cpfDigits(input.cpf) === confirmed.cpfDigits
+                && birth === confirmed.nascimento;
+        },
+
+        findSolicitationRows(root = document) {
+            const form = root.querySelector?.('app-solicitacao-requisicoes-prefeitura [formarrayname="info"]')
+                || root.querySelector?.('[formarrayname="info"]');
+            if (!form) return [];
+            const cpfInputs = Array.from(form.querySelectorAll('input[formcontrolname="cpf"]'));
+            return cpfInputs.map((cpfInput, position) => {
+                const index = String(cpfInput.id || '').match(/^cpf_(\d+)$/)?.[1] ?? '';
+                let nameInput = index ? form.querySelector(`#nome_${index}[formcontrolname="nome"]`) : null;
+                let birthInput = index ? form.querySelector(`#data_nascimento_${index}[formcontrolname="data_nascimento"]`) : null;
+                if (!index && cpfInputs.length === 1) {
+                    const names = form.querySelectorAll('input[formcontrolname="nome"]');
+                    const births = form.querySelectorAll('input[formcontrolname="data_nascimento"]');
+                    if (names.length === 1) nameInput = names[0];
+                    if (births.length === 1) birthInput = births[0];
+                }
+                const exact = cpfInput.getAttribute('formcontrolname') === 'cpf'
+                    && nameInput?.getAttribute('formcontrolname') === 'nome'
+                    && birthInput?.getAttribute('formcontrolname') === 'data_nascimento';
+                return { position, index, cpfInput, nameInput, birthInput, exact };
+            }).filter(row => row.exact);
+        },
+
+        selectSolicitationRow(rows, cpf) {
+            const digits = this.cpfDigits(cpf);
+            const matching = rows.filter(row => this.cpfDigits(row.cpfInput.value) === digits);
+            if (matching.length === 1) return matching[0];
+            if (matching.length > 1) return null;
+            const empty = rows.filter(row => !this.cpfDigits(row.cpfInput.value) && !this.clean(row.nameInput.value) && !this.clean(row.birthInput.value));
+            if (empty.length === 1) return empty[0];
+            return rows.length === 1 ? rows[0] : null;
+        },
+
+        async fillSolicitation() {
+            const data = this.confirmedData();
+            if (!data) throw new Error('Confirme Nome, CPF e Data de nascimento antes de preencher.');
+            if (EH.Pages?.detect?.() !== 'requisicao') throw new Error('Abra a tela de Solicitação/Requisição do E-Pass.');
+            let rows = this.findSolicitationRows(document); let row = this.selectSolicitationRow(rows, data.cpfDigits);
+            if (!row) throw new Error('Não identifiquei uma única linha segura para o passageiro. Preencha manualmente.');
+            EH.SaleContext.setNativeValue(row.cpfInput, data.cpf);
+            await EH.Utils.sleep(120);
+            rows = this.findSolicitationRows(document); row = rows.find(item => item.index === row.index) || this.selectSolicitationRow(rows, data.cpfDigits);
+            if (!row) throw new Error('O Angular recriou o formulário e a linha do passageiro não pôde ser confirmada.');
+            EH.SaleContext.setNativeValue(row.nameInput, data.nome);
+            EH.SaleContext.setNativeValue(row.birthInput, data.nascimento);
+            await EH.Utils.sleep(320);
+            const finalRows = this.findSolicitationRows(document); const finalRow = finalRows.find(item => item.index === row.index) || this.selectSolicitationRow(finalRows, data.cpfDigits);
+            const ok = finalRow
+                && this.cpfDigits(finalRow.cpfInput.value) === data.cpfDigits
+                && this.normalized(finalRow.nameInput.value) === this.normalized(data.nome)
+                && this.parseDate(finalRow.birthInput.value).value === data.nascimento;
+            if (!ok) throw new Error('O E-Pass não manteve os três valores. Nenhum envio foi realizado; confira o formulário manualmente.');
+            this.logDiagnostic('solicitação preenchida e valores conferidos no Angular');
+            return { ok: true, row: finalRow.index || String(finalRow.position + 1), data };
+        }
+    };
+
+    // ============================================================
     // REQUISIÇÃO PREFEITURA — MODELO DOCX OFICIAL + GERADOR LOCAL
     // O UserScript coleta e confere dados. A cópia/edição/renderização do DOCX
     // acontece no serviço local, sempre a partir do modelo oficial permanente.
@@ -8465,6 +9228,7 @@
         SERVICE_URL: 'http://127.0.0.1:8716',
         CLIENT_HEADER: 'requisicao-prefeitura-v1',
         STORAGE_KEY: 'prefeituraRequisition.current.v1',
+        CUSTOM_ROUTES_KEY: 'prefeituraRequisition.customRoutes.v1',
         DOCUMENT_SESSION_KEY: 'epassHelper.prefeituraDocument.v1',
         started: false,
         serviceHealth: null,
@@ -8479,16 +9243,11 @@
         init() {
             if (this.started) return;
             this.started = true;
+            EH.PassengerIdentity?.init?.();
             this.injectStyles();
             const saved = EH.Storage.get(this.STORAGE_KEY, null);
             if (saved?.filename && saved?.finalUrl) this.generated = saved;
-            try {
-                const documentState = JSON.parse(sessionStorage.getItem(this.DOCUMENT_SESSION_KEY) || 'null');
-                if (documentState?.dataUrl?.startsWith('data:image/')) {
-                    this.documentDataUrl = documentState.dataUrl;
-                    this.documentName = String(documentState.name || 'documentacao.jpg');
-                }
-            } catch (_error) {}
+            try { sessionStorage.removeItem(this.DOCUMENT_SESSION_KEY); } catch (_error) {}
             this.checkService({ quiet: true }).finally(() => this.renderStatus());
         },
 
@@ -8535,6 +9294,15 @@
                 .eh-pref-ocr-review { display:none; gap:8px; padding:10px; border:1px solid #a7f3d0; border-radius:10px; background:#ecfdf5; }
                 .eh-pref-ocr-review.show { display:grid; }
                 .eh-pref-ocr-review strong { color:#065f46; }
+                .eh-pref-identity-status { display:grid; gap:5px; padding:9px; border-radius:9px; background:#f8fafc; border:1px solid #e2e8f0; }
+                .eh-pref-identity-row { display:grid; grid-template-columns:1fr auto; gap:8px; align-items:center; }
+                .eh-pref-identity-row small { color:#64748b; }
+                .eh-pref-confidence-high { color:#047857; font-weight:900; }
+                .eh-pref-confidence-review { color:#b45309; font-weight:900; }
+                .eh-pref-confidence-missing { color:#b91c1c; font-weight:900; }
+                .eh-pref-candidates { display:none; width:100%; border:1px solid #cbd5e1; border-radius:8px; padding:7px; background:#fff; }
+                .eh-pref-candidates.show { display:block; }
+                .eh-pref-photo-summary { display:grid; gap:5px; padding:8px; border-radius:9px; background:#fff7ed; color:#9a3412; font-size:10px; }
                 .eh-pref-progress { color:#4338ca; font-weight:800; }
                 .eh-pref-preview-frame { display:flex; align-items:flex-start; justify-content:center; min-height:420px; padding:10px; border:1px solid #cbd5e1; border-radius:12px; background:#334155; overflow:auto; }
                 .eh-pref-preview-frame img { display:block; width:min(100%,660px); height:auto; background:#fff; box-shadow:0 8px 24px rgba(0,0,0,.28); }
@@ -8567,32 +9335,21 @@
         },
 
         clean(value) {
-            return String(value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+            return EH.PassengerIdentity.clean(value);
         },
 
         cpfDigits(value) {
-            return String(value || '').replace(/\D/g, '').slice(0, 11);
+            return EH.PassengerIdentity.cpfDigits(value);
         },
 
         formatCpf(value) {
             const digits = this.cpfDigits(value);
-            if (digits.length <= 3) return digits;
-            if (digits.length <= 6) return `${digits.slice(0, 3)}.${digits.slice(3)}`;
-            if (digits.length <= 9) return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6)}`;
-            return `${digits.slice(0, 3)}.${digits.slice(3, 6)}.${digits.slice(6, 9)}-${digits.slice(9)}`;
+            if (digits.length < 11) return digits;
+            return EH.PassengerIdentity.formatCpf(digits);
         },
 
         validCpf(value) {
-            const digits = this.cpfDigits(value);
-            if (digits.length !== 11 || /^(\d)\1{10}$/.test(digits)) return false;
-            for (const size of [9, 10]) {
-                let total = 0;
-                for (let index = 0; index < size; index += 1) total += Number(digits[index]) * (size + 1 - index);
-                let check = (total * 10) % 11;
-                if (check === 10) check = 0;
-                if (check !== Number(digits[size])) return false;
-            }
-            return true;
+            return EH.PassengerIdentity.validCpf(value);
         },
 
         cityDisplay(value) {
@@ -8616,7 +9373,7 @@
             const two = value => String(value).padStart(2, '0');
             const months = ['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
             return {
-                nome: '', cpf: '', origem: '', destino: '',
+                nome: '', cpf: '', nascimento: '', origem: '', destino: '',
                 data: `${two(now.getDate())}/${two(now.getMonth() + 1)}/${now.getFullYear()}`,
                 mesAno: `${months[now.getMonth()]}/${now.getFullYear()}`,
                 acceptInvalidCpf: false
@@ -8625,15 +9382,21 @@
 
         currentContext() {
             const sale = EH.SaleContext?.loadSale?.();
-            const passenger = sale?.passengers?.find(item => item.id === sale.activePassengerId)
+            const passenger = EH.PassengerIdentity?.state?.allowMemoryFallback === false ? null : (
+                sale?.passengers?.find(item => item.id === sale.activePassengerId)
                 || sale?.passengers?.slice?.(-1)?.[0]
-                || null;
+                || null
+            );
+            const remembered = EH.PassengerIdentity?.state?.allowMemoryFallback === false ? null : EH.PassengerIdentity.currentConfirmed(passenger?.cpf || '');
+            const confirmed = EH.PassengerIdentity?.confirmedData?.(remembered) || EH.PassengerIdentity?.confirmedData?.();
             const workflowRoute = EH.Workflow?.route || EH.Storage.get('workflowRoute', null) || {};
             const originDom = EH.Utils.first(EH.Selectors.ORIGEM)?.textContent || '';
             const destinationDom = EH.Utils.first(EH.Selectors.DESTINO)?.textContent || '';
             return {
-                nome: this.clean(passenger?.name || ''),
-                cpf: this.formatCpf(passenger?.cpf || ''),
+                nome: this.clean(confirmed?.nome || passenger?.name || ''),
+                cpf: this.formatCpf(confirmed?.cpf || passenger?.cpf || ''),
+                nascimento: confirmed?.nascimento || EH.PassengerIdentity.parseDate(passenger?.birthDate || '').value || '',
+                confirmed: Boolean(confirmed),
                 origem: this.cityDisplay(workflowRoute.origem || originDom),
                 destino: this.cityDisplay(workflowRoute.destino || destinationDom)
             };
@@ -8704,6 +9467,22 @@
             service.className = `eh-pref-status-line ${this.serviceHealth?.ok ? 'eh-pref-status-ready' : 'eh-pref-status-warn'}`;
             service.textContent = this.serviceHealth?.ok ? '● Gerador local pronto' : '○ Gerador local não confirmado';
             wrap.appendChild(service);
+            const identity = EH.PassengerIdentity?.confirmedData?.();
+            const identityLine = document.createElement('div');
+            identityLine.className = `eh-pref-status-line ${identity ? 'eh-pref-status-ready' : 'eh-pref-status-warn'}`;
+            identityLine.textContent = identity
+                ? `✓ Dados confirmados • ${identity.nome} • ${identity.nascimento}`
+                : '○ Nome, CPF e nascimento ainda não confirmados';
+            wrap.appendChild(identityLine);
+            if (identity && EH.Pages?.detect?.() === 'requisicao') {
+                const fill = document.createElement('button');
+                fill.type = 'button'; fill.className = 'eh-pref-btn'; fill.textContent = 'Preencher solicitação';
+                fill.addEventListener('click', async () => {
+                    try { await EH.PassengerIdentity.fillSolicitation(); EH.Toast.success('✓ Solicitação preenchida e conferida. Envio continua manual.'); }
+                    catch (error) { EH.Toast.warning(error.message); }
+                });
+                wrap.appendChild(fill);
+            }
             const record = this.generated || EH.Storage.get(this.STORAGE_KEY, null);
             if (record?.filename) {
                 const name = document.createElement('strong');
@@ -8724,108 +9503,119 @@
             this.statusHost.appendChild(wrap);
         },
 
-        persistDocument() {
-            try {
-                if (this.documentDataUrl.length <= 8 * 1024 * 1024) {
-                    sessionStorage.setItem(this.DOCUMENT_SESSION_KEY, JSON.stringify({
-                        dataUrl: this.documentDataUrl,
-                        name: this.documentName,
-                        savedAt: Date.now()
-                    }));
-                }
-            } catch (_error) {
-                EH.Toast.warning('A documentação ficará disponível apenas enquanto este painel estiver aberto.');
-            }
-            this.renderStatus();
+        fieldStatus(field) {
+            if (!field?.value) return { label: '✕ Não identificado', className: 'eh-pref-confidence-missing' };
+            if (field.status === 'high' && field.valid) return { label: '✓ Alta confiança', className: 'eh-pref-confidence-high' };
+            return { label: '⚠ Conferir', className: 'eh-pref-confidence-review' };
         },
 
-        readFile(file) {
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(String(reader.result || ''));
-                reader.onerror = () => reject(new Error('Não foi possível ler a imagem selecionada.'));
-                reader.readAsDataURL(file);
+        populateCandidateSelect(select, field, input, formatter = value => value) {
+            select.innerHTML = '';
+            const candidates = Array.isArray(field?.candidates) ? field.candidates : [];
+            const unique = [...new Map(candidates.filter(item => item.value).map(item => [String(item.value), item])).values()];
+            select.classList.toggle('show', unique.length > 1);
+            if (unique.length <= 1) return;
+            const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = 'Escolha entre os candidatos encontrados';
+            select.appendChild(placeholder);
+            unique.forEach(candidate => {
+                const option = document.createElement('option'); option.value = String(candidate.value); option.textContent = `${formatter(candidate.value)}${candidate.valid === false ? ' — inválido' : ''}`;
+                select.appendChild(option);
             });
+            select.onchange = () => {
+                if (!select.value) return;
+                input.value = formatter(select.value);
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+            };
         },
 
-        extractOcr(text, data = {}) {
-            const raw = String(text || '').replace(/\r/g, '');
-            const lines = raw.split('\n').map(line => this.clean(line)).filter(Boolean);
-            const compact = raw.replace(/[^0-9]/g, ' ');
-            const formattedMatches = raw.match(/\b\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2}\b/g) || [];
-            const cpfCandidates = [...formattedMatches, ...compact.split(/\s+/).filter(value => value.length === 11)]
-                .map(value => this.cpfDigits(value)).filter(value => value.length === 11);
-            const cpfDigits = cpfCandidates.find(value => this.validCpf(value)) || '';
-
-            const excluded = /\b(CPF|RG|IDENTIDADE|NASCIMENTO|FILIAÇÃO|FILIACAO|BRASIL|REPÚBLICA|REPUBLICA|CARTEIRA|DOCUMENTO|VALIDADE|ASSINATURA|REGISTRO|NACIONAL|ESTADO|SECRETARIA)\b/i;
-            let name = '';
-            const labelIndex = lines.findIndex(line => /\bNOME\b/i.test(line));
-            if (labelIndex >= 0) {
-                const inline = this.clean(lines[labelIndex].replace(/^.*?\bNOME\b\s*[:\-]?\s*/i, ''));
-                if (inline.split(' ').length >= 2 && !excluded.test(inline)) name = inline;
-                else if (lines[labelIndex + 1] && lines[labelIndex + 1].split(' ').length >= 2 && !excluded.test(lines[labelIndex + 1])) name = lines[labelIndex + 1];
+        renderIdentityReview(ui) {
+            const state = EH.PassengerIdentity.state;
+            const fields = state?.fields || {};
+            ui.ocrName.value = fields.name?.display || fields.name?.value || '';
+            ui.ocrCpf.value = fields.cpf?.display || (fields.cpf?.value ? this.formatCpf(fields.cpf.value) : '');
+            ui.ocrBirth.value = fields.birthDate?.display || fields.birthDate?.value || '';
+            const rows = [
+                [ui.nameStatus, fields.name], [ui.cpfStatus, fields.cpf], [ui.birthStatus, fields.birthDate]
+            ];
+            rows.forEach(([host, field]) => {
+                const status = this.fieldStatus(field); host.className = status.className; host.textContent = status.label;
+                host.title = field?.reason || '';
+            });
+            this.populateCandidateSelect(ui.nameCandidates, fields.name, ui.ocrName);
+            this.populateCandidateSelect(ui.cpfCandidates, fields.cpf, ui.ocrCpf, value => this.formatCpf(value));
+            this.populateCandidateSelect(ui.birthCandidates, fields.birthDate, ui.ocrBirth, value => value);
+            const issues = (state?.photos || []).flatMap((photo, index) => (photo.quality?.issues || []).map(issue => `Foto ${index + 1}: ${issue}`));
+            ui.photoSummary.innerHTML = '';
+            const count = document.createElement('strong'); count.textContent = `${state?.photos?.length || 0} foto(s) adicionada(s)`; ui.photoSummary.appendChild(count);
+            if (issues.length) {
+                const warning = document.createElement('span'); warning.textContent = `⚠ ${[...new Set(issues)].join(' • ')}`; ui.photoSummary.appendChild(warning);
             }
-            if (!name) {
-                name = lines.filter(line => {
-                    const letters = line.replace(/[^A-Za-zÀ-ÿ]/g, '');
-                    return line.split(/\s+/).length >= 2 && letters.length >= 8 && !excluded.test(line) && !/\d/.test(line);
-                }).sort((a, b) => b.length - a.length)[0] || '';
-            }
-            const confidence = Number(data?.confidence || 0);
-            const safeName = confidence >= 55 && name ? name.toLocaleUpperCase('pt-BR') : '';
-            return { nome: safeName, cpf: cpfDigits ? this.formatCpf(cpfDigits) : '', confidence };
+            const complete = fields.name?.value && fields.cpf?.value && fields.birthDate?.value;
+            ui.ocrMessage.textContent = complete
+                ? 'DADOS IDENTIFICADOS — confira os três campos. Nenhum dado será reutilizado antes da confirmação.'
+                : '⚠ Não consegui ler todos os dados com segurança. Adicione outra foto ou preencha manualmente.';
+            ui.ocrReview.classList.add('show');
         },
 
-        async runOcr(dataUrl, ui) {
+        async processDocuments(files, ui) {
             if (this.ocrBusy) return;
-            this.ocrBusy = true;
-            ui.progress.textContent = 'Lendo a documentação localmente… 0%';
-            ui.progress.hidden = false;
-            ui.ocrReview.classList.remove('show');
+            this.ocrBusy = true; this.setBusy(ui, true); ui.progress.hidden = false; ui.ocrReview.classList.remove('show');
             try {
-                if (typeof Tesseract !== 'object' || typeof Tesseract.createWorker !== 'function') {
-                    throw new Error('Leitor OCR não carregado.');
-                }
-                const worker = await Tesseract.createWorker('por', 1, {
-                    workerPath: 'https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/worker.min.js',
-                    corePath: 'https://cdn.jsdelivr.net/npm/tesseract.js-core@5.1.1',
-                    langPath: 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/por@1.0.0/4.0.0_best_int',
-                    logger: message => {
-                        if (message?.status === 'recognizing text') {
-                            ui.progress.textContent = `Lendo a documentação localmente… ${Math.round(Number(message.progress || 0) * 100)}%`;
-                        }
+                await EH.PassengerIdentity.processFiles(files, {
+                    onProgress: event => { ui.progress.textContent = event.message || 'Processando documentação…'; },
+                    onEngineProgress: message => {
+                        if (message?.status === 'recognizing text') ui.progress.textContent = `Lendo a documentação… ${Math.round(Number(message.progress || 0) * 100)}%`;
+                    },
+                    onPhoto: photo => {
+                        this.documentDataUrl = photo.dataUrl;
+                        this.documentName = photo.name;
                     }
                 });
-                let result;
-                try { result = await worker.recognize(dataUrl); }
-                finally { await worker.terminate(); }
-                const identified = this.extractOcr(result?.data?.text, result?.data || {});
-                if (!identified.nome || !identified.cpf) {
-                    ui.ocrMessage.textContent = 'Não foi possível identificar nome e CPF com segurança. Preencha manualmente ou envie outra foto.';
-                    ui.ocrName.value = identified.nome || '';
-                    ui.ocrCpf.value = identified.cpf || '';
-                } else {
-                    ui.ocrMessage.textContent = 'DADOS IDENTIFICADOS — confira obrigatoriamente antes de usar.';
-                    ui.ocrName.value = identified.nome;
-                    ui.ocrCpf.value = identified.cpf;
-                }
-                ui.ocrReview.classList.add('show');
+                this.renderIdentityReview(ui); this.renderStatus(); this.showAlert(ui, '');
             } catch (error) {
-                ui.ocrMessage.textContent = 'Não foi possível identificar os dados com segurança. Preencha manualmente ou envie outra foto.';
-                ui.ocrName.value = '';
-                ui.ocrCpf.value = '';
-                ui.ocrReview.classList.add('show');
-                EH.Logger.warn('OCR da documentação indisponível:', error);
+                this.showAlert(ui, `⚠ Não consegui ler este documento com segurança.\n\n${error.message}\n\nEnvie outra foto ou preencha manualmente.`);
+                this.renderIdentityReview(ui);
             } finally {
-                ui.progress.hidden = true;
-                this.ocrBusy = false;
+                ui.progress.hidden = true; this.ocrBusy = false; this.setBusy(ui, false);
             }
+        },
+
+        confirmIdentity(ui, source = 'review') {
+            const input = source === 'form'
+                ? { nome: ui.nome.value, cpf: ui.cpf.value, nascimento: ui.nascimento.value }
+                : { nome: ui.ocrName.value, cpf: ui.ocrCpf.value, nascimento: ui.ocrBirth.value };
+            try {
+                const confirmed = EH.PassengerIdentity.confirm(input);
+                this.fillForm(ui, confirmed);
+                ui.ocrReview.classList.remove('show');
+                ui.identityConfirmed.textContent = `✓ Dados confirmados • CPF válido • ${confirmed.nascimento}`;
+                ui.identityConfirmed.className = 'eh-pref-confidence-high';
+                this.showAlert(ui, ''); this.renderStatus();
+                EH.Toast.success('✓ Nome, CPF e nascimento confirmados');
+                return confirmed;
+            } catch (error) {
+                this.showAlert(ui, error.message);
+                return null;
+            }
+        },
+
+        newDocument(ui) {
+            EH.PassengerIdentity.startNew();
+            this.documentDataUrl = ''; this.documentName = ''; this.preview = null; this.generated = null;
+            EH.Storage.remove(this.STORAGE_KEY);
+            this.fillForm(ui, { ...this.defaults(), origem: ui.origem.value, destino: ui.destino.value });
+            ui.ocrReview.classList.remove('show'); ui.photoSummary.innerHTML = ''; ui.identityConfirmed.textContent = '○ Dados ainda não confirmados'; ui.identityConfirmed.className = 'eh-pref-confidence-review';
+            ui.ready.classList.remove('show'); ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false;
+            const viewButton = ui.modal.querySelector('.eh-pref-view-doc'); if (viewButton) viewButton.hidden = true;
+            this.showAlert(ui, 'Novo passageiro iniciado. Os dados e fotos anteriores foram retirados deste atendimento.');
+            this.renderStatus();
         },
 
         collect(ui) {
             return {
                 nome: this.clean(ui.nome.value),
                 cpf: this.formatCpf(ui.cpf.value),
+                nascimento: EH.PassengerIdentity.parseDate(ui.nascimento.value).value,
                 origem: this.cityDisplay(ui.origem.value),
                 destino: this.cityDisplay(ui.destino.value),
                 data: this.clean(ui.data.value),
@@ -8836,10 +9626,12 @@
 
         validate(data) {
             const missing = [];
-            [['Nome',data.nome],['CPF',this.cpfDigits(data.cpf)],['Origem',data.origem],['Destino',data.destino],['Data',data.data],['Mês/Ano',data.mesAno]]
+            [['Nome',data.nome],['CPF',this.cpfDigits(data.cpf)],['Data de nascimento',data.nascimento],['Origem',data.origem],['Destino',data.destino],['Data',data.data],['Mês/Ano',data.mesAno]]
                 .forEach(([label, value]) => { if (!value) missing.push(label); });
             if (missing.length) return `Não foi possível gerar.\n\nFalta:\n${missing.map(item => `• ${item}`).join('\n')}`;
             if (this.cpfDigits(data.cpf).length !== 11) return 'Confira o CPF antes de gerar. Ele precisa ter 11 dígitos.';
+            const birth = EH.PassengerIdentity.parseDate(data.nascimento);
+            if (!birth.valid || !birth.plausible) return `Confira a Data de nascimento. ${birth.reason || 'Use dd/mm/aaaa.'}`;
             if (!/^\d{2}\/\d{2}\/\d{4}$/.test(data.data)) return 'Confira a data. Use dd/mm/aaaa.';
             if (!/^[^/]+\/\d{4}$/.test(data.mesAno)) return 'Confira Mês/Ano. Use Mês/aaaa.';
             return '';
@@ -8858,6 +9650,7 @@
         fillForm(ui, data) {
             ui.nome.value = data.nome || '';
             ui.cpf.value = this.formatCpf(data.cpf || '');
+            ui.nascimento.value = data.nascimento || data.birthDate || '';
             ui.origem.value = data.origem || '';
             ui.destino.value = data.destino || '';
             ui.data.value = data.data || ui.data.value;
@@ -8874,6 +9667,7 @@
             const data = result.data;
             const entries = [
                 ['Nome', data.nome], ['CPF', data.cpf], ['Origem', data.origem],
+                ['Nascimento (não impresso)', EH.PassengerIdentity.confirmedData()?.nascimento || 'Confirmado'],
                 ['Destino', data.destino], ['Data', data.data], ['Mês/Ano', data.mesAno]
             ];
             ui.confirmGrid.innerHTML = '';
@@ -8894,6 +9688,9 @@
             const data = this.collect(ui);
             const validation = this.validate(data);
             if (validation) return this.showAlert(ui, validation);
+            if (!EH.PassengerIdentity.matchesConfirmed(data)) {
+                return this.showAlert(ui, 'Confirme Nome, CPF e Data de nascimento antes de gerar. O OCR bruto nunca é enviado para a requisição.');
+            }
             if (!this.validCpf(data.cpf) && !data.acceptInvalidCpf) {
                 ui.cpfOverrideWrap.classList.add('show');
                 return this.showAlert(ui, '⚠ O CPF não passou na validação matemática. Confira o número. Se for uma exceção legítima, marque a confirmação manual abaixo.');
@@ -8923,6 +9720,7 @@
                     generatedAt: Date.now(),
                     documentLoaded: Boolean(this.documentDataUrl),
                     documentName: this.documentName || '',
+                    documentCount: EH.PassengerIdentity.state?.photos?.length || 0,
                     syncBinary: false
                 };
                 this.saveGenerated(record);
@@ -9020,7 +9818,14 @@
             const defaults = this.defaults();
             const current = this.currentContext();
             const saved = this.generated?.data || EH.Storage.get(this.STORAGE_KEY, null)?.data || {};
-            const initial = { ...defaults, ...saved };
+            const confirmed = EH.PassengerIdentity.confirmedData();
+            const initial = {
+                ...defaults,
+                origem: saved.origem || defaults.origem,
+                destino: saved.destino || defaults.destino,
+                ...(current.origem || current.destino ? { origem: current.origem || saved.origem || '', destino: current.destino || saved.destino || '' } : {}),
+                ...(confirmed ? { nome: confirmed.nome, cpf: confirmed.cpf, nascimento: confirmed.nascimento } : {})
+            };
 
             const overlay = document.createElement('div');
             overlay.className = 'eh-pref-overlay';
@@ -9038,23 +9843,29 @@
                             <div class="eh-pref-current"></div>
                             <div class="eh-pref-actions">
                                 <button type="button" class="eh-pref-btn eh-pref-use-current">Usar passageiro atual</button>
-                                <button type="button" class="eh-pref-btn eh-pref-read-doc">📷 Enviar documentação</button>
+                                <button type="button" class="eh-pref-btn eh-pref-read-doc">📷 Adicionar foto</button>
                                 <button type="button" class="eh-pref-btn eh-pref-view-doc" hidden>Ver documento</button>
-                                <input type="file" class="eh-pref-doc-input" accept="image/*" hidden>
+                                <button type="button" class="eh-pref-btn eh-pref-new-doc">Novo passageiro</button>
+                                <input type="file" class="eh-pref-doc-input" accept="image/*" multiple hidden>
                             </div>
                             <div class="eh-pref-progress" hidden></div>
+                            <div class="eh-pref-photo-summary"></div>
                             <div class="eh-pref-ocr-review">
                                 <strong class="eh-pref-ocr-message">DADOS IDENTIFICADOS</strong>
-                                <div class="eh-pref-grid">
-                                    <div class="eh-pref-field full"><label>Nome identificado</label><input class="eh-pref-ocr-name" autocomplete="off"></div>
-                                    <div class="eh-pref-field full"><label>CPF identificado</label><input class="eh-pref-ocr-cpf" inputmode="numeric" autocomplete="off"></div>
+                                <div class="eh-pref-identity-status">
+                                    <div class="eh-pref-field full"><label>Nome completo <span class="eh-pref-name-status"></span></label><input class="eh-pref-ocr-name" autocomplete="off"><select class="eh-pref-candidates eh-pref-name-candidates"></select></div>
+                                    <div class="eh-pref-field full"><label>CPF <span class="eh-pref-cpf-status"></span></label><input class="eh-pref-ocr-cpf" inputmode="numeric" autocomplete="off"><select class="eh-pref-candidates eh-pref-cpf-candidates"></select></div>
+                                    <div class="eh-pref-field full"><label>Data de nascimento <span class="eh-pref-birth-status"></span></label><input class="eh-pref-ocr-birth" inputmode="numeric" autocomplete="off"><select class="eh-pref-candidates eh-pref-birth-candidates"></select></div>
                                 </div>
-                                <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-ocr-confirm">Confirmar dados</button><button type="button" class="eh-pref-btn eh-pref-ocr-manual">Corrigir manualmente</button></div>
+                                <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-ocr-confirm">Confirmar os três dados</button><button type="button" class="eh-pref-btn eh-pref-ocr-manual">Editar no formulário</button></div>
                             </div>
                             <div class="eh-pref-grid">
                                 <div class="eh-pref-field full"><label>Nome</label><input class="eh-pref-name" maxlength="180" autocomplete="off"></div>
-                                <div class="eh-pref-field full"><label>CPF</label><input class="eh-pref-cpf" maxlength="14" inputmode="numeric" autocomplete="off"></div>
+                                <div class="eh-pref-field"><label>CPF</label><input class="eh-pref-cpf" maxlength="14" inputmode="numeric" autocomplete="off"></div>
+                                <div class="eh-pref-field"><label>Data de nascimento</label><input class="eh-pref-birth" maxlength="10" inputmode="numeric" autocomplete="off"></div>
                             </div>
+                            <div class="eh-pref-confidence-review eh-pref-identity-confirmed">○ Dados ainda não confirmados</div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-confirm-form">Confirmar dados digitados</button><button type="button" class="eh-pref-btn eh-pref-fill-request">Preencher solicitação</button></div>
                         </section>
                         <section class="eh-pref-card">
                             <h3>Rota</h3>
@@ -9063,6 +9874,7 @@
                                 <div class="eh-pref-field"><label>Origem</label><input class="eh-pref-origin" maxlength="80"></div>
                                 <div class="eh-pref-field"><label>Destino</label><input class="eh-pref-destination" maxlength="80"></div>
                             </div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-save-route">+ Salvar mercado informado</button></div>
                         </section>
                         <section class="eh-pref-card">
                             <h3>Documento</h3>
@@ -9087,7 +9899,7 @@
                         <section class="eh-pref-ready">
                             <strong>✓ REQUISIÇÃO PRONTA</strong>
                             <code class="eh-pref-ready-name"></code>
-                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-download">Baixar PNG</button><button type="button" class="eh-pref-btn eh-pref-attach">Usar na solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach-doc">Usar documentação</button><button type="button" class="eh-pref-btn eh-pref-again">Gerar novamente</button></div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-download">Baixar PNG</button><button type="button" class="eh-pref-btn eh-pref-fill-request">Preencher solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach">Usar na solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach-doc">Usar documentação</button><button type="button" class="eh-pref-btn eh-pref-again">Gerar novamente</button></div>
                             <small>O Helper não clica em “Enviar solicitação”. Confira os anexos e envie manualmente.</small>
                         </section>
                     </div>
@@ -9099,38 +9911,90 @@
             const q = selector => modal.querySelector(selector);
             const ui = {
                 modal, form: q('.eh-pref-form'), nome: q('.eh-pref-name'), cpf: q('.eh-pref-cpf'),
+                nascimento: q('.eh-pref-birth'),
                 origem: q('.eh-pref-origin'), destino: q('.eh-pref-destination'), data: q('.eh-pref-date'),
                 mesAno: q('.eh-pref-month'), cpfOverride: q('.eh-pref-cpf-override'), cpfOverrideWrap: q('.eh-pref-invalid-override'),
                 alert: q('.eh-pref-alert'), progress: q('.eh-pref-progress'), ocrReview: q('.eh-pref-ocr-review'),
-                ocrMessage: q('.eh-pref-ocr-message'), ocrName: q('.eh-pref-ocr-name'), ocrCpf: q('.eh-pref-ocr-cpf'),
+                ocrMessage: q('.eh-pref-ocr-message'), ocrName: q('.eh-pref-ocr-name'), ocrCpf: q('.eh-pref-ocr-cpf'), ocrBirth: q('.eh-pref-ocr-birth'),
+                nameStatus: q('.eh-pref-name-status'), cpfStatus: q('.eh-pref-cpf-status'), birthStatus: q('.eh-pref-birth-status'),
+                nameCandidates: q('.eh-pref-name-candidates'), cpfCandidates: q('.eh-pref-cpf-candidates'), birthCandidates: q('.eh-pref-birth-candidates'),
+                photoSummary: q('.eh-pref-photo-summary'), identityConfirmed: q('.eh-pref-identity-confirmed'),
                 previewImage: q('.eh-pref-preview-image'), emptyPreview: q('.eh-pref-empty-preview'), confirm: q('.eh-pref-confirm'),
                 confirmGrid: q('.eh-pref-confirm-grid'), checks: q('.eh-pref-checks'), ready: q('.eh-pref-ready'), readyName: q('.eh-pref-ready-name')
             };
             this.fillForm(ui, initial);
             ui.cpf.addEventListener('input', () => { ui.cpf.value = this.formatCpf(ui.cpf.value); });
             ui.ocrCpf.addEventListener('input', () => { ui.ocrCpf.value = this.formatCpf(ui.ocrCpf.value); });
+            const lockManualDraft = (fieldName, input, normalizeValue, validateValue) => {
+                input.addEventListener('input', () => {
+                    const value = normalizeValue(input.value);
+                    if (!EH.PassengerIdentity.state) EH.PassengerIdentity.state = EH.PassengerIdentity.freshState();
+                    if (!value) {
+                        EH.PassengerIdentity.state.fields[fieldName] = EH.PassengerIdentity.emptyField();
+                        return;
+                    }
+                    const valid = validateValue(value);
+                    EH.PassengerIdentity.state.fields[fieldName] = {
+                        ...EH.PassengerIdentity.state.fields[fieldName],
+                        value,
+                        display: input.value,
+                        confidence: valid ? 100 : 50,
+                        status: valid ? 'high' : 'review',
+                        valid,
+                        reason: valid ? 'Valor escolhido/corrigido manualmente; aguarda confirmação.' : 'Correção manual ainda inválida.',
+                        source: 'manual',
+                        locked: true
+                    };
+                });
+            };
+            lockManualDraft('name', ui.ocrName, value => this.clean(value), value => value.length >= 4);
+            lockManualDraft('cpf', ui.ocrCpf, value => this.cpfDigits(value), value => this.validCpf(value));
+            lockManualDraft('birthDate', ui.ocrBirth, value => EH.PassengerIdentity.parseDate(value).value, value => {
+                const parsed = EH.PassengerIdentity.parseDate(value); return parsed.valid && parsed.plausible;
+            });
+            const identityNow = EH.PassengerIdentity.confirmedData();
+            if (identityNow) {
+                ui.identityConfirmed.textContent = `✓ Dados confirmados • CPF válido • ${identityNow.nascimento}`;
+                ui.identityConfirmed.className = 'eh-pref-confidence-high eh-pref-identity-confirmed';
+            }
 
             const currentBox = q('.eh-pref-current');
             if (current.nome || current.cpf) {
-                const title = document.createElement('strong'); title.textContent = 'Passageiro atual encontrado';
+                const title = document.createElement('strong'); title.textContent = current.confirmed ? 'Passageiro confirmado encontrado' : 'Passageiro atual encontrado';
                 const name = document.createElement('span'); name.textContent = current.nome || 'Nome ainda não identificado';
                 const cpf = document.createElement('span'); cpf.textContent = current.cpf ? `CPF ***.***.***-${this.cpfDigits(current.cpf).slice(-2)}` : 'CPF ainda não identificado';
-                currentBox.append(title, name, cpf);
+                const birth = document.createElement('span'); birth.textContent = current.nascimento ? `Nascimento ${current.nascimento}` : 'Nascimento ainda não identificado';
+                currentBox.append(title, name, cpf, birth);
             } else currentBox.textContent = 'Nenhum passageiro atual foi identificado. Envie a documentação ou preencha manualmente.';
 
             const routeHost = q('.eh-pref-route-list');
-            [
+            const baseRoutes = [
                 ['Arenópolis','Goiânia'], ['Arenópolis','Barra do Garças'],
                 ['Arenópolis','Iporá'], ['Goiânia','Arenópolis']
-            ].forEach(([origin, destination]) => {
+            ];
+            const storedRoutes = (EH.Storage.get(this.CUSTOM_ROUTES_KEY, []) || []).filter(route => route?.origem && route?.destino);
+            const renderRoute = ([origin, destination]) => {
                 const button = document.createElement('button');
                 button.type = 'button'; button.className = 'eh-pref-route'; button.textContent = `${origin.toLocaleUpperCase('pt-BR')} → ${destination.toLocaleUpperCase('pt-BR')}`;
                 button.addEventListener('click', () => { ui.origem.value = origin; ui.destino.value = destination; });
                 routeHost.appendChild(button);
+            };
+            [...baseRoutes, ...storedRoutes.map(route => [route.origem, route.destino])].forEach(renderRoute);
+            q('.eh-pref-save-route').addEventListener('click', () => {
+                const origem = this.cityDisplay(ui.origem.value); const destino = this.cityDisplay(ui.destino.value);
+                if (!origem || !destino) return this.showAlert(ui, 'Informe Origem e Destino antes de salvar o mercado.');
+                const routes = (EH.Storage.get(this.CUSTOM_ROUTES_KEY, []) || []).filter(route => route?.origem && route?.destino);
+                const key = `${EH.Utils.normalize(origem)}>${EH.Utils.normalize(destino)}`;
+                if (!routes.some(route => `${EH.Utils.normalize(route.origem)}>${EH.Utils.normalize(route.destino)}` === key)) {
+                    routes.push({ origem, destino, updatedAt: Date.now() }); EH.Storage.set(this.CUSTOM_ROUTES_KEY, routes.slice(-20)); renderRoute([origem, destino]);
+                }
+                this.showAlert(ui, '✓ Mercado salvo nas opções rápidas.');
             });
 
             const docInput = q('.eh-pref-doc-input');
             const viewDoc = q('.eh-pref-view-doc');
+            const latestPhoto = EH.PassengerIdentity.state?.photos?.slice?.(-1)?.[0] || null;
+            if (latestPhoto) { this.documentDataUrl = latestPhoto.dataUrl; this.documentName = latestPhoto.name; }
             viewDoc.hidden = !this.documentDataUrl;
             q('.eh-pref-read-doc').addEventListener('click', () => docInput.click());
             viewDoc.addEventListener('click', () => {
@@ -9140,27 +10004,45 @@
                 viewer.appendChild(image); viewer.addEventListener('click', () => viewer.remove()); document.body.appendChild(viewer);
             });
             docInput.addEventListener('change', async () => {
-                const file = docInput.files?.[0];
-                if (!file) return;
-                if (!file.type.startsWith('image/')) return this.showAlert(ui, 'Envie uma foto ou imagem da documentação.');
-                try {
-                    this.documentDataUrl = await this.readFile(file);
-                    this.documentName = file.name || 'documentacao.jpg';
-                    this.persistDocument(); viewDoc.hidden = false;
-                    await this.runOcr(this.documentDataUrl, ui);
-                } catch (error) { this.showAlert(ui, error.message); }
+                const files = Array.from(docInput.files || []);
+                if (!files.length) return;
+                await this.processDocuments(files, ui);
+                viewDoc.hidden = !this.documentDataUrl;
+                docInput.value = '';
             });
+            q('.eh-pref-new-doc').addEventListener('click', () => this.newDocument(ui));
 
             q('.eh-pref-use-current').addEventListener('click', () => {
                 this.fillForm(ui, { ...initial, ...current });
-                this.showAlert(ui, current.nome || current.cpf ? '' : 'Nenhum passageiro atual foi encontrado.');
+                const memory = EH.PassengerIdentity.currentConfirmed(current.cpf);
+                if (memory) {
+                    EH.PassengerIdentity.useConfirmed(memory);
+                    const data = EH.PassengerIdentity.confirmedData(memory);
+                    ui.identityConfirmed.textContent = `✓ Dados confirmados • CPF válido • ${data.nascimento}`;
+                    ui.identityConfirmed.className = 'eh-pref-confidence-high';
+                    this.showAlert(ui, '');
+                } else this.showAlert(ui, current.nome || current.cpf ? 'Os dados atuais foram copiados, mas ainda precisam ser confirmados com o nascimento.' : 'Nenhum passageiro atual foi encontrado.');
             });
-            q('.eh-pref-ocr-confirm').addEventListener('click', () => {
-                const name = this.clean(ui.ocrName.value); const cpf = this.formatCpf(ui.ocrCpf.value);
-                if (!name || this.cpfDigits(cpf).length !== 11) return this.showAlert(ui, 'Confira nome e CPF identificados antes de confirmar.');
-                ui.nome.value = name; ui.cpf.value = cpf; ui.ocrReview.classList.remove('show'); this.showAlert(ui, '');
+            q('.eh-pref-ocr-confirm').addEventListener('click', () => this.confirmIdentity(ui, 'review'));
+            q('.eh-pref-ocr-manual').addEventListener('click', () => {
+                this.fillForm(ui, { nome: ui.ocrName.value, cpf: ui.ocrCpf.value, nascimento: ui.ocrBirth.value });
+                ui.ocrReview.classList.remove('show'); ui.nome.focus();
+                this.showAlert(ui, 'Edite os campos e clique em “Confirmar dados digitados”.');
             });
-            q('.eh-pref-ocr-manual').addEventListener('click', () => { ui.ocrReview.classList.remove('show'); ui.nome.focus(); });
+            q('.eh-pref-confirm-form').addEventListener('click', () => this.confirmIdentity(ui, 'form'));
+            const markUnconfirmed = () => {
+                if (!EH.PassengerIdentity.matchesConfirmed(this.collect(ui))) {
+                    ui.identityConfirmed.textContent = '⚠ Alteração pendente de confirmação'; ui.identityConfirmed.className = 'eh-pref-confidence-review';
+                }
+            };
+            [ui.nome, ui.cpf, ui.nascimento].forEach(input => input.addEventListener('input', markUnconfirmed));
+            modal.querySelectorAll('.eh-pref-fill-request').forEach(button => {
+                button.hidden = EH.Pages?.detect?.() !== 'requisicao';
+                button.addEventListener('click', async () => {
+                    try { await EH.PassengerIdentity.fillSolicitation(); EH.Toast.success('✓ Solicitação preenchida e conferida. Envio continua manual.'); }
+                    catch (error) { this.showAlert(ui, error.message); }
+                });
+            });
             q('.eh-pref-health').addEventListener('click', async () => {
                 const health = await this.checkService();
                 this.showAlert(ui, health?.ok ? '✓ Gerador local, modelo oficial e LibreOffice prontos.' : (health?.error || 'Gerador local incompleto.'));
@@ -9451,8 +10333,11 @@
                 const index = indexMatch ? indexMatch[1] : String(position);
                 const cpf = this.normalizeCpf(cpfInput.value);
                 if (cpf.length !== 11) return;
-                const nome = EH.Utils.clean(root.querySelector(`#nome_${index}[formcontrolname="nome"]`)?.value || '');
-                const dataNascimento = this.normalizeBirthDate(root.querySelector(`#data_nascimento_${index}[formcontrolname="data_nascimento"]`)?.value || '');
+                const memory = EH.PassengerMemory?.findByCpf?.(cpf) || null;
+                const nome = memory?.confirmed ? EH.Utils.clean(memory.name) : EH.Utils.clean(root.querySelector(`#nome_${index}[formcontrolname="nome"]`)?.value || '');
+                const dataNascimento = memory?.confirmed
+                    ? this.normalizeBirthDate(memory.birthDate)
+                    : this.normalizeBirthDate(root.querySelector(`#data_nascimento_${index}[formcontrolname="data_nascimento"]`)?.value || '');
                 const idaEl = root.querySelector(`#id_mercado_ida_${index}[formcontrolname="id_mercado_ida"]`);
                 const voltaEl = root.querySelector(`#id_mercado_volta_${index}[formcontrolname="id_mercado_volta"]`);
                 const switchEl = root.querySelector(`#tem_volta${index}[formcontrolname="tem_volta"]`);
@@ -9468,7 +10353,16 @@
             if (!passengers.length) return null;
             const saved = this.upsertRequest({ prefeitura, secretaria, contrato, status: 'pending', passengers });
             passengers.forEach(passenger => {
-                EH.SaleContext?.upsertPassenger?.({ cpf: passenger.cpf, name: passenger.nome, birthDate: passenger.dataNascimento });
+                const memory = EH.PassengerMemory?.findByCpf?.(passenger.cpf) || null;
+                EH.SaleContext?.upsertPassenger?.({
+                    cpf: passenger.cpf,
+                    name: memory?.confirmed ? memory.name : passenger.nome,
+                    birthDate: memory?.confirmed ? memory.birthDate : passenger.dataNascimento,
+                    confirmed: Boolean(memory?.confirmed),
+                    confirmedAt: memory?.confirmedAt,
+                    source: memory?.source,
+                    fieldMeta: memory?.fieldMeta
+                });
             });
             if (saved) EH.Toast.success(`Requisição salva: ${passengers.length} passageiro${passengers.length === 1 ? '' : 's'}.`);
             return saved;
@@ -17363,6 +18257,7 @@
             safeInit('Operação', () => EH.OperationDock.init());
             safeInit('Mapa dos carros', () => EH.OperationCars.init());
             safeInit('Contexto de vendas', () => EH.SaleCpfs.init());
+            safeInit('Identidade do passageiro', () => EH.PassengerIdentity.init());
             safeInit('Requisições', () => EH.RequisitionManager.init());
             safeInit('Requisição Prefeitura', () => EH.PrefeituraRequisition.init());
             safeInit('WhatsApp', () => EH.WhatsAppDock.init());
