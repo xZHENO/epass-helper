@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.63.0
+// @version      5.64.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,7 +37,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.63.0',
+        VERSION: '5.64.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
         STORAGE_SCHEMA_VERSION: 9,
@@ -8536,7 +8536,7 @@
         state: null,
 
         emptyField() {
-            return { value: '', display: '', confidence: 0, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false };
+            return { value: '', display: '', confidence: 0, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false, evidence: null };
         },
 
         freshState() {
@@ -8679,47 +8679,221 @@
             EH.Logger.debug(`[Documento] ${safe}`);
         },
 
-        lineObjects(data = {}) {
-            const rawLines = Array.isArray(data.lines) ? data.lines : [];
-            if (rawLines.length) {
-                return rawLines.map((line, index) => ({
-                    index,
-                    text: this.clean(line.text),
-                    norm: this.normalized(line.text),
-                    confidence: Number(line.confidence ?? data.confidence ?? 0),
-                    bbox: line.bbox || null
+        bbox(value = null) {
+            if (!value || ![value.x0, value.y0, value.x1, value.y1].every(item => Number.isFinite(Number(item)))) return null;
+            const box = { x0: Number(value.x0), y0: Number(value.y0), x1: Number(value.x1), y1: Number(value.y1) };
+            return box.x1 >= box.x0 && box.y1 >= box.y0 ? box : null;
+        },
+
+        unionBbox(items = []) {
+            const boxes = items.map(item => this.bbox(item?.bbox || item)).filter(Boolean);
+            if (!boxes.length) return null;
+            return {
+                x0: Math.min(...boxes.map(box => box.x0)), y0: Math.min(...boxes.map(box => box.y0)),
+                x1: Math.max(...boxes.map(box => box.x1)), y1: Math.max(...boxes.map(box => box.y1))
+            };
+        },
+
+        bboxHeight(value) {
+            const box = this.bbox(value?.bbox || value); return box ? Math.max(1, box.y1 - box.y0) : 1;
+        },
+
+        labelSequences(kind = 'all') {
+            const groups = {
+                name: [['NOME', 'COMPLETO'], ['NOME', 'CIVIL'], ['NOME', 'DO', 'TITULAR'], ['NOME'], ['NAME']],
+                cpf: [['CPF']],
+                birthDate: [['DATA', 'DE', 'NASCIMENTO'], ['DATA', 'NASCIMENTO'], ['DT', 'NASC'], ['DATA', 'NASC'], ['NASCIMENTO'], ['NASC']],
+                negativeName: [['FILIACAO'], ['MAE'], ['PAI'], ['GENITOR'], ['GENITORA'], ['RESPONSAVEL'], ['AUTORIDADE'], ['ORGAO', 'EMISSOR'], ['ASSINATURA']],
+                negativeDate: [['DATA', 'DE', 'EXPEDICAO'], ['DATA', 'EXPEDICAO'], ['EXPEDICAO'], ['EMISSAO'], ['VALIDADE'], ['VALIDO', 'ATE'], ['PRIMEIRA', 'HABILITACAO'], ['REGISTRO'], ['CASAMENTO']]
+            };
+            if (kind !== 'all') return groups[kind] || [];
+            return Object.values(groups).flat().sort((a, b) => b.length - a.length);
+        },
+
+        spatialWord(word = {}, meta = {}) {
+            const text = this.clean(word.text);
+            if (!text) return null;
+            return {
+                text,
+                norm: this.normalized(text).replace(/[^A-Z0-9]+/g, ''),
+                confidence: Number(word.confidence ?? meta.confidence ?? 0),
+                bbox: this.bbox(word.bbox),
+                blockIndex: Number(meta.blockIndex ?? -1), paragraphIndex: Number(meta.paragraphIndex ?? -1), lineIndex: Number(meta.lineIndex ?? -1)
+            };
+        },
+
+        lineSegments(words = [], lineBox = null) {
+            const sorted = words.filter(word => word?.text).slice().sort((a, b) => Number(a.bbox?.x0 || 0) - Number(b.bbox?.x0 || 0));
+            if (!sorted.length) return [];
+            const heights = sorted.map(word => this.bboxHeight(word)).sort((a, b) => a - b);
+            const medianHeight = heights[Math.floor(heights.length / 2)] || this.bboxHeight(lineBox);
+            const gaps = sorted.slice(1).map((word, index) => word.bbox && sorted[index].bbox ? Math.max(0, word.bbox.x0 - sorted[index].bbox.x1) : 0)
+                .filter(value => value > 0).sort((a, b) => a - b);
+            const typicalGap = gaps.length ? gaps[Math.floor((gaps.length - 1) / 2)] : 0;
+            const threshold = Math.min(medianHeight * 2.25, Math.max(22, medianHeight * 1.35, typicalGap * 2.6));
+            const groups = [];
+            sorted.forEach(word => {
+                const current = groups[groups.length - 1];
+                const previous = current?.words?.[current.words.length - 1];
+                const gap = previous?.bbox && word.bbox ? word.bbox.x0 - previous.bbox.x1 : 0;
+                if (!current || gap > threshold) groups.push({ words: [word], gapBefore: Math.max(0, gap) });
+                else current.words.push(word);
+            });
+            return groups.map((group, index) => {
+                const text = this.clean(group.words.map(word => word.text).join(' '));
+                return {
+                    index, text, norm: this.normalized(text), words: group.words, bbox: this.unionBbox(group.words), gapBefore: group.gapBefore,
+                    confidence: group.words.reduce((sum, word) => sum + Number(word.confidence || 0), 0) / Math.max(1, group.words.length)
+                };
+            });
+        },
+
+        buildSpatialModel(data = {}) {
+            const sourceLines = [];
+            const blocks = [];
+            const rawBlocks = Array.isArray(data.blocks) ? data.blocks : [];
+            rawBlocks.forEach((block, blockIndex) => {
+                const blockEntry = { index: blockIndex, text: this.clean(block.text), bbox: this.bbox(block.bbox), lines: [] };
+                const nestedText = [];
+                (block.paragraphs || []).forEach((paragraph, paragraphIndex) => {
+                    (paragraph.lines || []).forEach(line => {
+                        sourceLines.push({ line, blockIndex, paragraphIndex });
+                        blockEntry.lines.push(sourceLines.length - 1);
+                        if (this.clean(line.text)) nestedText.push(this.clean(line.text));
+                    });
+                });
+                const reconstructed = this.clean(nestedText.join(' '));
+                if (reconstructed.length > blockEntry.text.length) blockEntry.text = reconstructed;
+                blocks.push(blockEntry);
+            });
+            if (!sourceLines.length && Array.isArray(data.lines)) {
+                data.lines.forEach(line => sourceLines.push({ line, blockIndex: -1, paragraphIndex: -1 }));
+            }
+            if (!sourceLines.length && Array.isArray(data.words) && data.words.length) {
+                const rows = [];
+                data.words.filter(word => this.clean(word.text) && this.bbox(word.bbox)).sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0).forEach(word => {
+                    const height = this.bboxHeight(word); const center = (word.bbox.y0 + word.bbox.y1) / 2;
+                    let row = rows.find(item => Math.abs(item.center - center) <= Math.max(8, Math.max(item.height, height) * 0.58));
+                    if (!row) { row = { center, height, words: [] }; rows.push(row); }
+                    row.words.push(word); row.center = (row.center * (row.words.length - 1) + center) / row.words.length; row.height = Math.max(row.height, height);
+                });
+                rows.sort((a, b) => a.center - b.center).forEach(row => sourceLines.push({ line: { words: row.words }, blockIndex: -1, paragraphIndex: -1 }));
+            }
+            let lines = sourceLines.map((entry, index) => {
+                const rawWords = Array.isArray(entry.line.words) ? entry.line.words : [];
+                const words = rawWords.map(word => this.spatialWord(word, { blockIndex: entry.blockIndex, paragraphIndex: entry.paragraphIndex, lineIndex: index })).filter(Boolean);
+                const text = words.length ? this.clean(words.map(word => word.text).join(' ')) : this.clean(entry.line.text);
+                const bbox = this.unionBbox(words) || this.bbox(entry.line.bbox);
+                return {
+                    index, text, rawText: this.clean(entry.line.text || text), norm: this.normalized(text),
+                    confidence: Number(entry.line.confidence ?? data.confidence ?? 0), bbox, words,
+                    blockIndex: entry.blockIndex, paragraphIndex: entry.paragraphIndex,
+                    segments: this.lineSegments(words, bbox)
+                };
+            }).filter(line => line.text);
+            if (!lines.length) {
+                lines = String(data.text || '').split(/\r?\n/).map((text, index) => ({
+                    index, text: this.clean(text), rawText: this.clean(text), norm: this.normalized(text), confidence: Number(data.confidence || 0),
+                    bbox: null, words: [], segments: [], blockIndex: -1, paragraphIndex: -1
                 })).filter(line => line.text);
             }
-            const words = Array.isArray(data.words) ? data.words.filter(word => this.clean(word.text)) : [];
-            if (words.length) {
-                const rows = [];
-                words.sort((a, b) => Number(a.bbox?.y0 || 0) - Number(b.bbox?.y0 || 0) || Number(a.bbox?.x0 || 0) - Number(b.bbox?.x0 || 0));
-                words.forEach(word => {
-                    const y = Number(word.bbox?.y0 || 0);
-                    let row = rows.find(item => Math.abs(item.y - y) <= Math.max(8, Number(word.bbox?.y1 || y) - y) * 0.65);
-                    if (!row) { row = { y, words: [] }; rows.push(row); }
-                    row.words.push(word);
-                });
-                return rows.sort((a, b) => a.y - b.y).map((row, index) => {
-                    row.words.sort((a, b) => Number(a.bbox?.x0 || 0) - Number(b.bbox?.x0 || 0));
-                    const text = this.clean(row.words.map(word => word.text).join(' '));
-                    return {
-                        index,
-                        text,
-                        norm: this.normalized(text),
-                        confidence: row.words.reduce((sum, word) => sum + Number(word.confidence || 0), 0) / Math.max(1, row.words.length),
-                        bbox: {
-                            x0: Math.min(...row.words.map(word => Number(word.bbox?.x0 || 0))),
-                            y0: Math.min(...row.words.map(word => Number(word.bbox?.y0 || 0))),
-                            x1: Math.max(...row.words.map(word => Number(word.bbox?.x1 || 0))),
-                            y1: Math.max(...row.words.map(word => Number(word.bbox?.y1 || 0)))
-                        }
-                    };
-                });
+            const words = lines.flatMap(line => line.words);
+            const pageBox = this.unionBbox(words) || this.unionBbox(lines) || null;
+            return {
+                rawText: String(data.text || lines.map(line => line.rawText || line.text).join('\n')),
+                confidence: Number(data.confidence || 0), blocks, lines, words, bbox: pageBox,
+                hasGeometry: words.some(word => Boolean(word.bbox)), source: rawBlocks.length ? 'blocks' : (words.length ? 'words' : 'text')
+            };
+        },
+
+        lineObjects(data = {}) {
+            return this.buildSpatialModel(data).lines;
+        },
+
+        tokenMatches(words, index, sequence) {
+            return sequence.every((token, offset) => words[index + offset]?.norm === token);
+        },
+
+        findAnchors(model, kind) {
+            const sequences = this.labelSequences(kind).slice().sort((a, b) => b.length - a.length);
+            const anchors = [];
+            model.lines.forEach(line => {
+                if (!line.words.length) return;
+                for (let index = 0; index < line.words.length; index += 1) {
+                    const sequence = sequences.find(item => this.tokenMatches(line.words, index, item));
+                    if (!sequence) continue;
+                    const before = line.words.slice(Math.max(0, index - 2), index).map(word => word.norm).join(' ');
+                    const after = line.words.slice(index + sequence.length, index + sequence.length + 3).map(word => word.norm).join(' ');
+                    if (kind === 'name' && (/ASSINATURA/.test(before) || /^(?:DA )?(?:MAE|PAI)/.test(after))) continue;
+                    anchors.push({ kind, line, start: index, end: index + sequence.length - 1, words: line.words.slice(index, index + sequence.length), bbox: this.unionBbox(line.words.slice(index, index + sequence.length)), label: sequence.join(' ') });
+                    index += sequence.length - 1;
+                }
+            });
+            return anchors;
+        },
+
+        isAnyLabelAt(words, index) {
+            return this.labelSequences('all').some(sequence => this.tokenMatches(words, index, sequence));
+        },
+
+        fragmentFromWords(words, relation, anchor) {
+            const cleanWords = words.filter(word => word?.text);
+            if (!cleanWords.length) return null;
+            const text = this.clean(cleanWords.map(word => word.text).join(' '));
+            return {
+                text, norm: this.normalized(text), words: cleanWords, bbox: this.unionBbox(cleanWords), relation,
+                line: cleanWords[0].lineIndex, confidence: cleanWords.reduce((sum, word) => sum + Number(word.confidence || 0), 0) / cleanWords.length,
+                anchor: anchor?.label || '', anchorBbox: anchor?.bbox || null
+            };
+        },
+
+        anchorFragments(model, anchor, { belowLines = 3 } = {}) {
+            const fragments = [];
+            const tail = [];
+            const words = anchor.line.words;
+            const candidateWords = words.slice(anchor.end + 1);
+            const candidateHeights = candidateWords.map(word => this.bboxHeight(word)).sort((a, b) => a - b);
+            const candidateHeight = candidateHeights[Math.floor(candidateHeights.length / 2)] || this.bboxHeight(anchor);
+            const candidateGaps = candidateWords.slice(1).map((word, index) => word.bbox && candidateWords[index].bbox ? Math.max(0, word.bbox.x0 - candidateWords[index].bbox.x1) : 0)
+                .filter(value => value > 0).sort((a, b) => a - b);
+            const typicalGap = candidateGaps.length ? candidateGaps[Math.floor((candidateGaps.length - 1) / 2)] : 0;
+            const fieldGapLimit = Math.min(candidateHeight * 2.25, Math.max(22, candidateHeight * 1.35, typicalGap * 2.6));
+            for (let index = anchor.end + 1; index < words.length; index += 1) {
+                if (this.isAnyLabelAt(words, index)) break;
+                const previous = tail[tail.length - 1];
+                if (previous?.bbox && words[index].bbox) {
+                    const gap = words[index].bbox.x0 - previous.bbox.x1;
+                    if (gap > fieldGapLimit) break;
+                }
+                tail.push(words[index]);
             }
-            return String(data.text || '').split(/\r?\n/).map((text, index) => ({
-                index, text: this.clean(text), norm: this.normalized(text), confidence: Number(data.confidence || 0), bbox: null
-            })).filter(line => line.text);
+            const inline = this.fragmentFromWords(tail, 'same-line', anchor);
+            if (inline) fragments.push(inline);
+
+            const pageWidth = Math.max(1, Number(model.bbox?.x1 || 0) - Number(model.bbox?.x0 || 0));
+            const pageHeight = Math.max(1, Number(model.bbox?.y1 || 0) - Number(model.bbox?.y0 || 0));
+            const anchorHeight = this.bboxHeight(anchor);
+            const following = model.lines.filter(line => line.index > anchor.line.index && line.bbox && anchor.bbox)
+                .filter(line => line.bbox.y0 >= anchor.bbox.y0 - anchorHeight * 0.25)
+                .sort((a, b) => a.bbox.y0 - b.bbox.y0 || a.bbox.x0 - b.bbox.x0)
+                .slice(0, Math.max(5, belowLines * 3));
+            let acceptedLines = 0;
+            for (const line of following) {
+                const dy = line.bbox.y0 - anchor.bbox.y1;
+                if (dy > Math.max(anchorHeight * 5.2, pageHeight * 0.105)) break;
+                if (this.findAnchors({ lines: [line] }, 'negativeName').length || this.findAnchors({ lines: [line] }, 'negativeDate').length) break;
+                const segments = line.segments.length ? line.segments : [{ words: line.words, bbox: line.bbox }];
+                for (const segment of segments) {
+                    if (!segment.words?.length || this.isAnyLabelAt(segment.words, 0)) continue;
+                    const horizontalDistance = Math.min(Math.abs(segment.bbox.x0 - anchor.bbox.x0), Math.abs(segment.bbox.x0 - anchor.bbox.x1));
+                    if (horizontalDistance > pageWidth * 0.46) continue;
+                    const fragment = this.fragmentFromWords(segment.words, 'below', anchor);
+                    if (fragment) fragments.push(fragment);
+                }
+                acceptedLines += 1;
+                if (acceptedLines >= belowLines) break;
+            }
+            return fragments;
         },
 
         nameCandidate(value) {
@@ -8738,7 +8912,7 @@
             return name;
         },
 
-        extractName(lines) {
+        extractNameFallback(lines) {
             const label = /\b(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|NAME|TITULAR)\b/;
             const negative = /\b(?:FILIACAO|MAE|PAI|GENITOR|GENITORA|RESPONSAVEL|AUTORIDADE|ORGAO\s+EMISSOR)\b/;
             const candidates = [];
@@ -8762,6 +8936,32 @@
             return this.fieldFromCandidates(candidates, 'name');
         },
 
+        extractName(model) {
+            const lines = Array.isArray(model) ? model : (model?.lines || []);
+            if (!model?.hasGeometry) return this.extractNameFallback(lines);
+            const anchors = this.findAnchors(model, 'name');
+            if (!anchors.length) return this.extractNameFallback(lines);
+            const candidates = [];
+            anchors.forEach(anchor => {
+                this.anchorFragments(model, anchor, { belowLines: 2 }).forEach(fragment => {
+                    const value = this.nameCandidate(fragment.text);
+                    if (!value) return;
+                    const heading = /\b(REPUBLICA|ESTADO|SECRETARIA|POLICIA|INSTITUTO|CARTEIRA|IDENTIDADE|FILIACAO|AUTORIDADE|ASSINATURA)\b/.test(this.normalized(value));
+                    if (heading) return;
+                    const compactness = fragment.words.length >= 2 ? 5 : 0;
+                    const score = 71 + (fragment.relation === 'same-line' ? 20 : 14) + compactness + Math.min(5, fragment.confidence / 20);
+                    candidates.push({
+                        value, display: value, score, valid: true, line: fragment.line,
+                        reason: fragment.relation === 'same-line'
+                            ? 'Valor delimitado pelas palavras à direita do rótulo Nome.'
+                            : 'Valor delimitado na linha imediatamente associada ao rótulo Nome.',
+                        evidence: { anchor: anchor.label, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox, reconstructedFromWords: true }
+                    });
+                });
+            });
+            return this.fieldFromCandidates(candidates, 'name');
+        },
+
         numberCandidates(text) {
             const matches = [];
             const patterns = [/(?:^|\D)(\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2})(?!\d)/g, /(?:^|\D)(\d{11})(?!\d)/g];
@@ -8775,7 +8975,7 @@
             return [...new Set(matches)];
         },
 
-        extractCpf(lines) {
+        extractCpfFallback(lines) {
             const label = /\bCPF\b/;
             const misleading = /\b(?:RG|REGISTRO|CNH|IDENTIDADE|SEGURANCA|DOCUMENTO)\b/;
             const candidates = [];
@@ -8802,6 +9002,41 @@
             return this.fieldFromCandidates(candidates, 'cpf');
         },
 
+        extractCpf(model) {
+            const lines = Array.isArray(model) ? model : (model?.lines || []);
+            if (!model?.hasGeometry) return this.extractCpfFallback(lines);
+            const candidates = [];
+            const anchors = this.findAnchors(model, 'cpf');
+            anchors.forEach(anchor => {
+                this.anchorFragments(model, anchor, { belowLines: 2 }).forEach(fragment => {
+                    this.numberCandidates(fragment.text).forEach(value => {
+                        const valid = this.validCpf(value);
+                        let score = 44 + (valid ? 26 : 0) + (fragment.relation === 'same-line' ? 30 : 22) + Math.min(5, fragment.confidence / 20);
+                        if (!valid) score = Math.min(score, 69);
+                        candidates.push({
+                            value, display: this.formatCpf(value), score, valid, line: fragment.line,
+                            reason: valid ? 'CPF válido delimitado pela âncora CPF.' : 'Número ligado ao rótulo CPF, mas reprovado nos dígitos verificadores.',
+                            evidence: { anchor: anchor.label, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox }
+                        });
+                    });
+                });
+            });
+            model.lines.forEach(line => {
+                const fragments = line.segments.length ? line.segments : [line];
+                fragments.forEach(fragment => this.numberCandidates(fragment.text).forEach(value => {
+                    const valid = this.validCpf(value);
+                    const context = fragment.norm || this.normalized(fragment.text);
+                    const wrongContext = /\b(?:RG|REGISTRO|CNH|IDENTIDADE|SEGURANCA|DOCUMENTO)\b/.test(context) && !/\bCPF\b/.test(context);
+                    candidates.push({
+                        value, display: this.formatCpf(value), score: 36 + (valid ? 25 : 0) - (wrongContext ? 28 : 0), valid, line: line.index,
+                        reason: wrongContext ? 'Número encontrado em região de RG/registro; mantido apenas como candidato secundário.' : (valid ? 'CPF matematicamente válido sem vínculo espacial forte; confira.' : 'Número de 11 dígitos inválido.'),
+                        evidence: { anchor: '', relation: 'unanchored', valueBbox: fragment.bbox || line.bbox }
+                    });
+                }));
+            });
+            return this.fieldFromCandidates(candidates, 'cpf');
+        },
+
         dateCandidates(text) {
             const found = [];
             const pattern = /\b(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{4}|\d{4}-\d{1,2}-\d{1,2})\b/g;
@@ -8810,7 +9045,7 @@
             return [...new Set(found)];
         },
 
-        extractBirthDate(lines) {
+        extractBirthDateFallback(lines) {
             const positive = /\b(?:DATA\s+DE\s+NASCIMENTO|NASCIMENTO|NASC\.?|DT\.?\s*NASC\.?|DATA\s*NASC\.?)\b/;
             const negative = /\b(?:EMISSAO|EXPEDICAO|VALIDADE|VALIDO\s+ATE|PRIMEIRA\s+HABILITACAO|1A\s+HABILITACAO|EMITIDO)\b/;
             const candidates = [];
@@ -8837,6 +9072,45 @@
                             : (nearPositive && parsed.plausible ? 'Data válida próxima ao rótulo Nascimento.' : (parsed.reason || 'Data encontrada sem vínculo seguro com Nascimento.'))
                     });
                 });
+            });
+            return this.fieldFromCandidates(candidates, 'birthDate');
+        },
+
+        extractBirthDate(model) {
+            const lines = Array.isArray(model) ? model : (model?.lines || []);
+            if (!model?.hasGeometry) return this.extractBirthDateFallback(lines);
+            const candidates = [];
+            const positiveAnchors = this.findAnchors(model, 'birthDate');
+            positiveAnchors.forEach(anchor => {
+                this.anchorFragments(model, anchor, { belowLines: 2 }).forEach(fragment => {
+                    this.dateCandidates(fragment.text).forEach(raw => {
+                        const parsed = this.parseDate(raw);
+                        let score = 43 + (parsed.valid ? 20 : 0) + (parsed.plausible ? 10 : 0) + (fragment.relation === 'same-line' ? 28 : 21) + Math.min(5, fragment.confidence / 20);
+                        if (!parsed.valid) score = Math.min(score, 45);
+                        if (!parsed.plausible) score = Math.min(score, 64);
+                        candidates.push({
+                            value: parsed.value, display: parsed.value, score, valid: parsed.valid, plausible: parsed.plausible, line: fragment.line,
+                            reason: parsed.valid && parsed.plausible ? 'Data válida delimitada pela âncora Nascimento.' : (parsed.reason || 'Data ligada a Nascimento requer conferência.'),
+                            evidence: { anchor: anchor.label, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox }
+                        });
+                    });
+                });
+            });
+            const negativeAnchors = this.findAnchors(model, 'negativeDate');
+            const negativeLines = new Set(negativeAnchors.map(anchor => anchor.line.index));
+            model.lines.forEach(line => {
+                const fragments = line.segments.length ? line.segments : [line];
+                fragments.forEach(fragment => this.dateCandidates(fragment.text).forEach(raw => {
+                    const parsed = this.parseDate(raw);
+                    const negative = negativeLines.has(line.index) || /\b(?:EMISSAO|EXPEDICAO|VALIDADE|VALIDO\s+ATE|HABILITACAO|REGISTRO|CASAMENTO)\b/.test(fragment.norm || this.normalized(fragment.text));
+                    let score = 28 + (parsed.valid ? 18 : 0) + (parsed.plausible ? 8 : 0) - (negative ? 46 : 0);
+                    if (!parsed.valid) score = Math.min(score, 40);
+                    candidates.push({
+                        value: parsed.value, display: parsed.value, score, valid: parsed.valid, plausible: parsed.plausible, line: line.index,
+                        reason: negative ? 'Data associada a emissão/expedição/validade; descartada como nascimento.' : 'Data sem vínculo espacial seguro com Nascimento; confira.',
+                        evidence: { anchor: negative ? 'DATA NÃO RELACIONADA AO NASCIMENTO' : '', relation: negative ? 'excluded-context' : 'unanchored', valueBbox: fragment.bbox || line.bbox }
+                    });
+                }));
             });
             return this.fieldFromCandidates(candidates, 'birthDate');
         },
@@ -8868,20 +9142,23 @@
                     confidence: Math.max(0, Math.min(99, Math.round(Number(candidate.score || 0)))),
                     valid: Boolean(candidate.valid),
                     plausible: candidate.plausible !== false,
-                    reason: candidate.reason || ''
+                    reason: candidate.reason || '',
+                    evidence: candidate.evidence || null
                 })),
                 source: 'ocr',
                 sourcePhotoId: '',
-                locked: false
+                locked: false,
+                evidence: best.evidence || null
             };
         },
 
         extractFromOcrData(data = {}, quality = null) {
-            const lines = this.lineObjects(data);
+            const spatial = this.buildSpatialModel(data);
+            const lines = spatial.lines;
             const fields = {
-                name: this.extractName(lines),
-                cpf: this.extractCpf(lines),
-                birthDate: this.extractBirthDate(lines)
+                name: this.extractName(spatial),
+                cpf: this.extractCpf(spatial),
+                birthDate: this.extractBirthDate(spatial)
             };
             const qualityCap = quality?.score < 45 ? 69 : (quality?.score < 65 ? 82 : 99);
             Object.values(fields).forEach(field => {
@@ -8891,7 +9168,7 @@
                     field.reason = `${field.reason} A qualidade da foto exige conferência.`;
                 }
             });
-            return { lines, fields, textConfidence: Number(data.confidence || 0) };
+            return { lines, spatial, fields, textConfidence: Number(data.confidence || 0) };
         },
 
         ocrScore(result) {
@@ -8902,6 +9179,49 @@
             const normalizedText = this.normalized(data.text || '');
             const labels = ['NOME', 'CPF', 'NASC'].filter(label => normalizedText.includes(label)).length;
             return Number(data.confidence || 0) * 0.55 + found * 9 + high * 7 + labels * 5;
+        },
+
+        regionRectangles(spatial) {
+            const blocks = (spatial?.blocks || []).filter(block => block.bbox && this.clean(block.text).length >= 8);
+            if (blocks.length < 2) return [];
+            const page = spatial.bbox;
+            if (!page) return [];
+            const dimensions = { x: Math.max(1, page.x1 - page.x0), y: Math.max(1, page.y1 - page.y0) };
+            let best = null;
+            ['x', 'y'].forEach(axis => {
+                const start = axis === 'x' ? 'x0' : 'y0'; const end = axis === 'x' ? 'x1' : 'y1';
+                const ordered = blocks.slice().sort((a, b) => a.bbox[start] - b.bbox[start]);
+                for (let split = 1; split < ordered.length; split += 1) {
+                    const first = ordered.slice(0, split); const second = ordered.slice(split);
+                    const firstBox = this.unionBbox(first); const secondBox = this.unionBbox(second);
+                    const firstText = first.reduce((sum, block) => sum + this.clean(block.text).length, 0);
+                    const secondText = second.reduce((sum, block) => sum + this.clean(block.text).length, 0);
+                    if (firstText < 12 || secondText < 12) continue;
+                    const gap = secondBox[start] - firstBox[end]; const ratio = gap / dimensions[axis];
+                    if (ratio < 0.045) continue;
+                    const balance = Math.min(firstText, secondText) / Math.max(firstText, secondText);
+                    const score = ratio + balance * 0.08;
+                    if (!best || score > best.score) best = { axis, score, groups: [first, second] };
+                }
+            });
+            if (!best) return [];
+            return best.groups.map(group => {
+                const box = this.unionBbox(group); const pad = 8;
+                const left = Math.max(0, Math.floor(box.x0 - pad)); const top = Math.max(0, Math.floor(box.y0 - pad));
+                return { left, top, width: Math.max(1, Math.ceil(box.x1 + pad - left)), height: Math.max(1, Math.ceil(box.y1 + pad - top)) };
+            });
+        },
+
+        diagnosticReport(photoId = '', { maskSensitive = true } = {}) {
+            const photos = this.state?.photos || [];
+            const photo = photoId ? photos.find(item => item.id === photoId) : photos[photos.length - 1];
+            if (!photo?.diagnostic) return null;
+            const copy = JSON.parse(JSON.stringify(photo.diagnostic));
+            if (!maskSensitive) return copy;
+            const mask = value => String(value || '').replace(/\b\d{3}[.\s]?\d{3}[.\s]?\d{3}[-\s]?\d{2}\b/g, match => `***.***.***-${match.replace(/\D/g, '').slice(-2)}`);
+            copy.rawOcr = mask(copy.rawOcr);
+            Object.values(copy.interpreted || {}).forEach(field => { field.value = mask(field.value); });
+            return copy;
         },
 
         async readFile(file) {
@@ -9006,8 +9326,8 @@
                 const canvas = this.prepareCanvas(image, rotation);
                 const result = await worker.recognize(canvas, {}, { text: true, blocks: true, hocr: false, tsv: false });
                 const score = this.ocrScore(result);
-                results.push({ rotation, result, score });
-                return { rotation, result, score };
+                results.push({ rotation, result, score, canvas });
+                return { rotation, result, score, canvas };
             };
             const first = await recognize(0);
             const firstExtracted = this.extractFromOcrData(first.result?.data || {}, quality);
@@ -9020,7 +9340,17 @@
             }
             results.sort((a, b) => b.score - a.score);
             const best = results[0];
-            const extracted = this.extractFromOcrData(best.result?.data || {}, quality);
+            let extracted = this.extractFromOcrData(best.result?.data || {}, quality);
+            const regions = this.regionRectangles(extracted.spatial);
+            const needsRegionalPass = Object.values(extracted.fields).some(field => !field.value || field.status !== 'high');
+            if (needsRegionalPass && regions.length === 2) {
+                callbacks.onProgress?.({ status: 'regions', photoId: id, progress: 0.9, message: 'Separando as regiões do documento para evitar cruzamento de campos…' });
+                for (const rectangle of regions) {
+                    const regionResult = await worker.recognize(best.canvas, { rectangle }, { text: true, blocks: true, hocr: false, tsv: false });
+                    const regional = this.extractFromOcrData(regionResult?.data || {}, quality);
+                    ['name', 'cpf', 'birthDate'].forEach(field => { extracted.fields[field] = this.mergeField(extracted.fields[field], regional.fields[field]); });
+                }
+            }
             Object.values(extracted.fields).forEach(field => { field.sourcePhotoId = id; });
             if (quality.blocked) {
                 Object.values(extracted.fields).forEach(field => {
@@ -9036,6 +9366,17 @@
                 rotation: best.rotation,
                 score: best.score,
                 fields: extracted.fields,
+                diagnostic: {
+                    rawOcr: this.clean(extracted.spatial?.rawText || best.result?.data?.text || ''),
+                    spatialSource: extracted.spatial?.source || 'text',
+                    regionsAnalyzed: needsRegionalPass ? regions.length : 0,
+                    interpreted: Object.fromEntries(['name', 'cpf', 'birthDate'].map(field => [field, {
+                        value: extracted.fields[field]?.display || extracted.fields[field]?.value || '',
+                        confidence: extracted.fields[field]?.confidence || 0,
+                        reason: extracted.fields[field]?.reason || '',
+                        evidence: extracted.fields[field]?.evidence || null
+                    }]))
+                },
                 addedAt: Date.now()
             };
             this.logDiagnostic(`leitura concluída; orientação ${best.rotation}°; qualidade ${Math.round(quality.score)} de 100`);
@@ -9077,7 +9418,7 @@
             return this.state;
         },
 
-        async processFiles(files, callbacks = {}) {
+        async analyzePassengerDocument(files, callbacks = {}) {
             const images = Array.from(files || []).filter(file => String(file.type || '').startsWith('image/'));
             if (!images.length) throw new Error('Selecione uma ou mais fotos do documento.');
             if (!this.state) this.state = this.freshState();
@@ -9100,6 +9441,10 @@
             } finally { await worker.terminate(); }
             callbacks.onProgress?.({ status: 'done', progress: 1, message: 'Leitura concluída. Confira cada campo.' });
             return this.state;
+        },
+
+        async processFiles(files, callbacks = {}) {
+            return this.analyzePassengerDocument(files, callbacks);
         },
 
         validateForConfirmation(input = {}) {
@@ -9561,7 +9906,7 @@
             if (this.ocrBusy) return;
             this.ocrBusy = true; this.setBusy(ui, true); ui.progress.hidden = false; ui.ocrReview.classList.remove('show');
             try {
-                await EH.PassengerIdentity.processFiles(files, {
+                await EH.PassengerIdentity.analyzePassengerDocument(files, {
                     onProgress: event => { ui.progress.textContent = event.message || 'Processando documentação…'; },
                     onEngineProgress: message => {
                         if (message?.status === 'recognizing text') ui.progress.textContent = `Lendo a documentação… ${Math.round(Number(message.progress || 0) * 100)}%`;
@@ -9857,7 +10202,7 @@
                                     <div class="eh-pref-field full"><label>CPF <span class="eh-pref-cpf-status"></span></label><input class="eh-pref-ocr-cpf" inputmode="numeric" autocomplete="off"><select class="eh-pref-candidates eh-pref-cpf-candidates"></select></div>
                                     <div class="eh-pref-field full"><label>Data de nascimento <span class="eh-pref-birth-status"></span></label><input class="eh-pref-ocr-birth" inputmode="numeric" autocomplete="off"><select class="eh-pref-candidates eh-pref-birth-candidates"></select></div>
                                 </div>
-                                <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-ocr-confirm">Confirmar os três dados</button><button type="button" class="eh-pref-btn eh-pref-ocr-manual">Editar no formulário</button></div>
+                                <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-ocr-confirm">Confirmar os três dados</button><button type="button" class="eh-pref-btn eh-pref-ocr-manual">Editar no formulário</button><button type="button" class="eh-pref-btn eh-pref-ocr-diagnostic" hidden>Copiar diagnóstico OCR</button></div>
                             </div>
                             <div class="eh-pref-grid">
                                 <div class="eh-pref-field full"><label>Nome</label><input class="eh-pref-name" maxlength="180" autocomplete="off"></div>
@@ -9943,7 +10288,8 @@
                         valid,
                         reason: valid ? 'Valor escolhido/corrigido manualmente; aguarda confirmação.' : 'Correção manual ainda inválida.',
                         source: 'manual',
-                        locked: true
+                        locked: true,
+                        evidence: null
                     };
                 });
             };
@@ -10028,6 +10374,14 @@
                 this.fillForm(ui, { nome: ui.ocrName.value, cpf: ui.ocrCpf.value, nascimento: ui.ocrBirth.value });
                 ui.ocrReview.classList.remove('show'); ui.nome.focus();
                 this.showAlert(ui, 'Edite os campos e clique em “Confirmar dados digitados”.');
+            });
+            const ocrDiagnostic = q('.eh-pref-ocr-diagnostic');
+            ocrDiagnostic.hidden = !EH.Config.DEBUG;
+            ocrDiagnostic.addEventListener('click', async () => {
+                const report = EH.PassengerIdentity.diagnosticReport();
+                if (!report) return this.showAlert(ui, 'Nenhum diagnóstico OCR está disponível nesta sessão.');
+                await EH.Clipboard.copyText(JSON.stringify(report, null, 2));
+                this.showAlert(ui, 'Diagnóstico OCR copiado com o CPF mascarado. A foto não foi incluída.');
             });
             q('.eh-pref-confirm-form').addEventListener('click', () => this.confirmIdentity(ui, 'form'));
             const markUnconfirmed = () => {
