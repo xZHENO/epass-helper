@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.65.0
+// @version      5.66.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,7 +37,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.65.0',
+        VERSION: '5.66.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
         STORAGE_SCHEMA_VERSION: 9,
@@ -8536,7 +8536,7 @@
         state: null,
 
         emptyField() {
-            return { value: '', rawValue: '', display: '', confidence: 0, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false, evidence: null };
+            return { value: '', rawValue: '', display: '', sourceLabel: '', confidence: 0, confidenceParts: { text: 0, field: 0, validation: 0 }, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false, evidence: null };
         },
 
         freshState() {
@@ -8719,16 +8719,132 @@
             const box = this.bbox(value?.bbox || value); return box ? Math.max(1, box.y1 - box.y0) : 1;
         },
 
+        fieldLabelDefinitions() {
+            return [
+                {
+                    type: 'SOCIAL_NAME', kind: 'socialName', priority: 130,
+                    sequences: [
+                        ['NOME', 'SOCIAL', 'SOCIAL', 'NAME'], ['NOME', 'SOCIAL'], ['SOCIAL', 'NAME'],
+                        // Fragmento bilíngue observado quando o OCR perde NOME/NAME.
+                        ['SOCIAL', 'SOCIAL']
+                    ]
+                },
+                {
+                    type: 'PERSON_NAME', kind: 'name', priority: 120,
+                    sequences: [
+                        ['NOME', 'DO', 'TITULAR'], ['NOME', 'COMPLETO'], ['NOME', 'CIVIL'],
+                        ['NOME', 'NAME'], ['FULL', 'NAME'], ['NOME'], ['NAME']
+                    ]
+                },
+                {
+                    type: 'CPF', kind: 'cpf', priority: 120,
+                    sequences: [
+                        ['REGISTRO', 'GERAL', 'CPF', 'PERSONAL', 'NUMBER'], ['REGISTRO', 'GERAL', 'CPF'],
+                        ['CPF', 'PERSONAL', 'NUMBER'], ['PERSONAL', 'NUMBER'], ['CPF']
+                    ]
+                },
+                {
+                    type: 'BIRTH_DATE', kind: 'birthDate', priority: 120,
+                    sequences: [
+                        ['DATA', 'DE', 'NASCIMENTO', 'DATE', 'OF', 'BIRTH'], ['DATA', 'NASCIMENTO', 'DATE', 'OF', 'BIRTH'],
+                        ['DATA', 'DE', 'NASCIMENTO'], ['DATA', 'NASCIMENTO'], ['DATE', 'OF', 'BIRTH'],
+                        ['BIRTH', 'DATE'], ['DT', 'NASC'], ['DATA', 'NASC'], ['NASCIMENTO'], ['NASC']
+                    ]
+                },
+                {
+                    type: 'FILIATION', kind: 'negativeName', priority: 110,
+                    sequences: [
+                        ['NOME', 'DA', 'MAE'], ['NOME', 'DO', 'PAI'], ['NAME', 'OF', 'MOTHER'], ['NAME', 'OF', 'FATHER'],
+                        ['MOTHER', 'NAME'], ['FATHER', 'NAME'], ['PARENT', 'NAME'], ['ORGAO', 'EMISSOR'],
+                        ['FILIACAO'], ['FILIATION'], ['MAE'], ['PAI'], ['MOTHER'], ['FATHER'], ['PARENTS'],
+                        ['GENITOR'], ['GENITORA'], ['RESPONSAVEL'], ['AUTORIDADE'], ['ASSINATURA'], ['SIGNATURE']
+                    ]
+                },
+                {
+                    type: 'NON_BIRTH_DATE', kind: 'negativeDate', priority: 110,
+                    sequences: [
+                        ['DATA', 'DE', 'EXPEDICAO'], ['DATA', 'EXPEDICAO'], ['DATE', 'OF', 'ISSUE'], ['ISSUE', 'DATE'],
+                        ['VALIDO', 'ATE'], ['EXPIRY', 'DATE'], ['PRIMEIRA', 'HABILITACAO'], ['EXPEDICAO'],
+                        ['EMISSAO'], ['VALIDADE'], ['EXPIRY'], ['EXPIRATION'], ['CASAMENTO']
+                    ]
+                },
+                {
+                    type: 'OTHER_LABEL', kind: 'other', priority: 90,
+                    sequences: [
+                        ['REGISTRO', 'GERAL'], ['NATURALIDADE'], ['NACIONALIDADE'], ['NATIONALITY'],
+                        ['SEXO'], ['SEX'], ['RG'], ['DOCUMENTO'], ['IDENTIDADE']
+                    ]
+                }
+            ];
+        },
+
         labelSequences(kind = 'all') {
-            const groups = {
-                name: [['NOME', 'COMPLETO'], ['NOME', 'CIVIL'], ['NOME', 'DO', 'TITULAR'], ['FULL', 'NAME'], ['NOME'], ['NAME']],
-                cpf: [['REGISTRO', 'GERAL', 'CPF'], ['CPF', 'PERSONAL', 'NUMBER'], ['PERSONAL', 'NUMBER'], ['CPF']],
-                birthDate: [['DATA', 'DE', 'NASCIMENTO'], ['DATA', 'NASCIMENTO'], ['DATE', 'OF', 'BIRTH'], ['DT', 'NASC'], ['DATA', 'NASC'], ['NASCIMENTO'], ['BIRTH', 'DATE'], ['NASC']],
-                negativeName: [['FILIACAO'], ['MAE'], ['PAI'], ['GENITOR'], ['GENITORA'], ['RESPONSAVEL'], ['FILIATION'], ['MOTHER'], ['FATHER'], ['PARENTS'], ['AUTORIDADE'], ['ORGAO', 'EMISSOR'], ['ASSINATURA'], ['SIGNATURE']],
-                negativeDate: [['DATA', 'DE', 'EXPEDICAO'], ['DATA', 'EXPEDICAO'], ['DATE', 'OF', 'ISSUE'], ['ISSUE', 'DATE'], ['EXPEDICAO'], ['EMISSAO'], ['VALIDADE'], ['VALIDO', 'ATE'], ['EXPIRY', 'DATE'], ['EXPIRY'], ['EXPIRATION'], ['PRIMEIRA', 'HABILITACAO'], ['REGISTRO'], ['CASAMENTO']]
-            };
-            if (kind !== 'all') return groups[kind] || [];
-            return Object.values(groups).flat().sort((a, b) => b.length - a.length);
+            const definitions = this.fieldLabelDefinitions().filter(definition => kind === 'all' || definition.kind === kind);
+            return definitions.flatMap(definition => definition.sequences).sort((a, b) => b.length - a.length);
+        },
+
+        labelWordsFromText(value) {
+            return this.normalized(value).replace(/[^A-Z0-9]+/g, ' ').split(/\s+/).filter(Boolean)
+                .map((norm, index) => ({ text: norm, norm, bbox: null, lineIndex: -1, syntheticIndex: index }));
+        },
+
+        detectLabelsInLine(line = {}) {
+            const originalWords = Array.isArray(line.words) && line.words.length ? line.words : this.labelWordsFromText(line.text || line.rawText || '');
+            const significant = originalWords.map((word, originalIndex) => ({ word, originalIndex, norm: word.norm || this.normalized(word.text).replace(/[^A-Z0-9]+/g, '') }))
+                .filter(item => item.norm);
+            const aliases = this.fieldLabelDefinitions().flatMap(definition => definition.sequences.map(sequence => ({ definition, sequence })))
+                .sort((a, b) => b.sequence.length - a.sequence.length || b.definition.priority - a.definition.priority);
+            const labels = [];
+            for (let cursor = 0; cursor < significant.length;) {
+                const matches = aliases.filter(alias => alias.sequence.every((token, offset) => significant[cursor + offset]?.norm === token));
+                const match = matches[0];
+                if (!match) { cursor += 1; continue; }
+                const selected = significant.slice(cursor, cursor + match.sequence.length);
+                const words = selected.map(item => item.word);
+                labels.push({
+                    type: match.definition.type,
+                    kind: match.definition.kind,
+                    priority: match.definition.priority,
+                    line,
+                    start: selected[0].originalIndex,
+                    end: selected[selected.length - 1].originalIndex,
+                    words,
+                    bbox: this.unionBbox(words),
+                    label: match.sequence.join(' '),
+                    sourceLabel: this.clean(words.map(word => word.text).join(' '))
+                });
+                cursor += match.sequence.length;
+            }
+            return labels;
+        },
+
+        labelsInText(value) {
+            const words = this.labelWordsFromText(value);
+            return this.detectLabelsInLine({ text: this.clean(value), words, index: -1 });
+        },
+
+        isFieldLabel(value) {
+            const words = this.labelWordsFromText(value);
+            if (!words.length) return null;
+            const labels = this.detectLabelsInLine({ text: this.clean(value), words, index: -1 });
+            return labels.find(label => label.start === 0 && label.end === words.length - 1) || null;
+        },
+
+        detectDocumentType(model = {}) {
+            const text = this.normalized(model.rawText || model.lines?.map(line => line.text).join(' ') || '');
+            if (/CARTEIRA NACIONAL DE HABILITACAO|\bCNH\b/.test(text)) return 'CNH_BR';
+            if (/CARTEIRA DE IDENTIDADE NACIONAL|PERSONAL NUMBER|DATE OF BIRTH/.test(text)) return 'CIN_BR';
+            if (/ESTADO DE GOIAS/.test(text) && /INSTITUTO DE IDENTIFICACAO/.test(text)) return 'RG_GO_ANTIGO';
+            if (/CARTEIRA DE IDENTIDADE|\bREGISTRO GERAL\b|\bRG\b/.test(text)) return 'RG_BR';
+            return 'DOCUMENTO_BR_DESCONHECIDO';
+        },
+
+        detectDocumentLayout(data = {}) {
+            const model = this.buildSpatialModel(data);
+            model.labels = model.lines.flatMap(line => this.detectLabelsInLine(line));
+            model.documentType = this.detectDocumentType(model);
+            model.fieldDiagnostics = { name: { rejected: [] }, cpf: { rejected: [] }, birthDate: { rejected: [] } };
+            return model;
         },
 
         spatialWord(word = {}, meta = {}) {
@@ -8836,25 +8952,15 @@
         },
 
         findAnchors(model, kind) {
-            const sequences = this.labelSequences(kind).slice().sort((a, b) => b.length - a.length);
-            const anchors = [];
-            model.lines.forEach(line => {
-                if (!line.words.length) return;
-                for (let index = 0; index < line.words.length; index += 1) {
-                    const sequence = sequences.find(item => this.tokenMatches(line.words, index, item));
-                    if (!sequence) continue;
-                    const before = line.words.slice(Math.max(0, index - 2), index).map(word => word.norm).join(' ');
-                    const after = line.words.slice(index + sequence.length, index + sequence.length + 3).map(word => word.norm).join(' ');
-                    if (kind === 'name' && (/ASSINATURA/.test(before) || /^(?:DA )?(?:MAE|PAI)/.test(after))) continue;
-                    anchors.push({ kind, line, start: index, end: index + sequence.length - 1, words: line.words.slice(index, index + sequence.length), bbox: this.unionBbox(line.words.slice(index, index + sequence.length)), label: sequence.join(' ') });
-                    index += sequence.length - 1;
-                }
-            });
-            return anchors;
+            const labels = Array.isArray(model?.labels)
+                ? model.labels
+                : (model?.lines || []).flatMap(line => this.detectLabelsInLine(line));
+            return labels.filter(label => label.kind === kind);
         },
 
         isAnyLabelAt(words, index) {
-            return this.labelSequences('all').some(sequence => this.tokenMatches(words, index, sequence));
+            return this.detectLabelsInLine({ words, text: words.map(word => word.text).join(' '), index: words[0]?.lineIndex ?? -1 })
+                .some(label => label.start === index);
         },
 
         fragmentFromWords(words, relation, anchor) {
@@ -8900,12 +9006,19 @@
                 .slice(0, Math.max(5, belowLines * 3));
             let acceptedLines = 0;
             for (const line of following) {
+                const lineHorizontalDistance = Math.min(Math.abs(line.bbox.x0 - anchor.bbox.x0), Math.abs(line.bbox.x0 - anchor.bbox.x1));
+                const sameBlock = anchor.line.blockIndex >= 0 && line.blockIndex === anchor.line.blockIndex;
+                const overlapsColumn = line.bbox.x0 <= anchor.bbox.x1 + pageWidth * 0.2 && line.bbox.x1 >= anchor.bbox.x0 - pageWidth * 0.08;
+                if (!sameBlock && !overlapsColumn && lineHorizontalDistance > pageWidth * 0.46) continue;
                 const dy = line.bbox.y0 - anchor.bbox.y1;
                 if (dy > Math.max(anchorHeight * 5.2, pageHeight * 0.105)) break;
-                if (this.findAnchors({ lines: [line] }, 'negativeName').length || this.findAnchors({ lines: [line] }, 'negativeDate').length) break;
+                // O próximo rótulo sempre encerra o campo anterior, mesmo quando
+                // for Nome Social, CPF, Sexo ou outro campo — desde que esteja
+                // no mesmo bloco/coluna, sem cruzar frente e verso lado a lado.
+                if (this.detectLabelsInLine(line).length) break;
                 const segments = line.segments.length ? line.segments : [{ words: line.words, bbox: line.bbox }];
                 for (const segment of segments) {
-                    if (!segment.words?.length || this.isAnyLabelAt(segment.words, 0)) continue;
+                    if (!segment.words?.length || this.detectLabelsInLine({ words: segment.words, text: segment.text || segment.words.map(word => word.text).join(' '), index: line.index }).length) continue;
                     const horizontalDistance = Math.min(Math.abs(segment.bbox.x0 - anchor.bbox.x0), Math.abs(segment.bbox.x0 - anchor.bbox.x1));
                     if (horizontalDistance > pageWidth * 0.46) continue;
                     const fragment = this.fragmentFromWords(segment.words, 'below', anchor);
@@ -8917,42 +9030,65 @@
             return fragments;
         },
 
+        validatePersonNameValue(value) {
+            const name = this.clean(value);
+            if (!name) return { valid: false, reason: 'Nome vazio.' };
+            const exactLabel = this.isFieldLabel(name);
+            if (exactLabel) return { valid: false, reason: `FIELD_LABEL:${exactLabel.type}` };
+            const embeddedLabels = this.labelsInText(name);
+            const unsafeLabel = embeddedLabels.find(label => {
+                // Nascimento também é sobrenome legítimo. Fora do início do
+                // valor, a palavra isolada não basta para classificar um LABEL.
+                if (label.type === 'BIRTH_DATE' && ['NASCIMENTO', 'NASC'].includes(label.label) && label.start > 0) return false;
+                return true;
+            });
+            if (unsafeLabel) return { valid: false, reason: `CONTAINS_FIELD_LABEL:${unsafeLabel.type}` };
+            if (name.length < 4 || name.length > 160 || /\d/.test(name)) return { valid: false, reason: 'Formato incompatível com nome.' };
+            const tokens = name.split(' ').filter(Boolean);
+            if (tokens.length < 2) return { valid: false, reason: 'Nome completo precisa de pelo menos duas partes.' };
+            const letters = (name.match(/[A-Za-zÀ-ÿ]/g) || []).length;
+            if (letters / Math.max(1, name.length) < 0.72) return { valid: false, reason: 'Texto contém símbolos demais para ser nome.' };
+            const forbidden = /\b(FILIACAO|FILIATION|MAE|PAI|MOTHER|FATHER|PARENTS|GENITOR|GENITORA|AUTORIDADE|ORGAO|EMISSOR|ASSINATURA|SIGNATURE|REPUBLICA|BRASIL|SECRETARIA|IDENTIDADE|CARTEIRA|REGISTRO|VALIDADE|EXPIRY|PERSONAL|NUMBER|NACIONALIDADE|NATIONALITY|SEXO|SEX|CPF|RG)\b/;
+            if (forbidden.test(this.normalized(name))) return { valid: false, reason: 'Texto institucional ou de outro campo.' };
+            return { valid: true, reason: '' };
+        },
+
+        calculateFieldConfidence({ text = 0, field = 0, validation = 0 } = {}) {
+            const clamp = value => Math.max(0, Math.min(100, Number(value || 0)));
+            return Math.round(clamp(text) * 0.24 + clamp(field) * 0.46 + clamp(validation) * 0.30);
+        },
+
         nameCandidate(value) {
-            let name = this.clean(value)
-                .replace(/^(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|FULL\s+NAME|NAME|TITULAR)\s*[:\-]?\s*/i, '')
+            const original = this.clean(value);
+            if (this.isFieldLabel(original)) return '';
+            let name = original
+                .replace(/^(?:NOME\s*\/?\s*NAME|NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|FULL\s+NAME|NAME|TITULAR)\s*[:\-]?\s*/i, '')
                 .replace(/[|_[\]{}]+/g, ' ')
                 .replace(/\s+/g, ' ').trim();
             name = name.replace(/[.,;:]+$/g, '').trim();
-            if (name.length < 4 || name.length > 160 || /\d/.test(name)) return '';
-            const tokens = name.split(' ').filter(Boolean);
-            if (tokens.length < 2) return '';
-            const letters = (name.match(/[A-Za-zÀ-ÿ]/g) || []).length;
-            if (letters / Math.max(1, name.length) < 0.72) return '';
-            const forbidden = /\b(FILIACAO|FILIATION|MAE|PAI|MOTHER|FATHER|PARENTS|GENITOR|GENITORA|AUTORIDADE|ORGAO|EMISSOR|ASSINATURA|SIGNATURE|REPUBLICA|BRASIL|SECRETARIA|IDENTIDADE|CARTEIRA|REGISTRO|VALIDADE|EXPIRY|NASCIMENTO|BIRTH|PERSONAL|NUMBER|NACIONALIDADE|NATIONALITY|SEXO|SEX|CPF|RG)\b/;
-            if (forbidden.test(this.normalized(name))) return '';
-            return name;
+            return this.validatePersonNameValue(name).valid ? name : '';
         },
 
         extractNameFallback(lines) {
-            const label = /\b(?:NOME(?:\s+COMPLETO|\s+CIVIL|\s+DO\s+TITULAR)?|FULL\s+NAME|NAME|TITULAR)\b/;
-            const negative = /\b(?:FILIACAO|FILIATION|MAE|PAI|MOTHER|FATHER|PARENTS|GENITOR|GENITORA|RESPONSAVEL|AUTORIDADE|ORGAO\s+EMISSOR|ASSINATURA|SIGNATURE)\b/;
             const candidates = [];
             lines.forEach((line, index) => {
-                if (!label.test(line.norm) || /NOME\s+(?:DA\s+)?(?:MAE|DO\s+PAI)/.test(line.norm)) return;
+                const labels = this.detectLabelsInLine(line);
+                const personLabel = labels.find(item => item.type === 'PERSON_NAME');
+                if (!personLabel || labels.some(item => item.type === 'SOCIAL_NAME')) return;
                 const inline = this.nameCandidate(line.text);
                 if (inline && this.normalized(inline) !== line.norm) {
                     const formatted = this.formatPersonName(inline);
-                    candidates.push({ value: formatted, rawValue: inline, display: formatted, score: 91 + Math.min(7, line.confidence / 20), valid: true, line: index, reason: 'Próximo ao rótulo Nome.' });
+                    const confidenceParts = { text: line.confidence, field: 91, validation: 100 };
+                    candidates.push({ value: formatted, rawValue: inline, display: formatted, score: this.calculateFieldConfidence(confidenceParts), confidenceParts, valid: true, line: index, reason: 'Valor associado ao rótulo semântico Nome.' });
                 }
                 for (let offset = 1; offset <= 2; offset += 1) {
                     const target = lines[index + offset];
-                    if (!target || negative.test(target.norm)) break;
-                    const previousContext = lines.slice(Math.max(0, index), index + offset).map(item => item.norm).join(' ');
-                    if (negative.test(previousContext) && offset > 1) break;
+                    if (!target || this.detectLabelsInLine(target).length) break;
                     const value = this.nameCandidate(target.text);
                     if (!value) continue;
                     const formatted = this.formatPersonName(value);
-                    candidates.push({ value: formatted, rawValue: value, display: formatted, score: 88 - ((offset - 1) * 11) + Math.min(6, target.confidence / 20), valid: true, line: index + offset, reason: 'Linha associada ao rótulo Nome.' });
+                    const confidenceParts = { text: target.confidence, field: 92 - ((offset - 1) * 16), validation: 100 };
+                    candidates.push({ value: formatted, rawValue: value, display: formatted, score: this.calculateFieldConfidence(confidenceParts), confidenceParts, valid: true, line: index + offset, reason: 'Linha delimitada entre o rótulo Nome e o próximo rótulo.' });
                     break;
                 }
             });
@@ -8965,21 +9101,34 @@
             const anchors = this.findAnchors(model, 'name');
             if (!anchors.length) return this.extractNameFallback(lines);
             const candidates = [];
+            const rejected = (model.labels || []).filter(label => label.type === 'SOCIAL_NAME').map(label => ({
+                value: label.sourceLabel || label.label,
+                rejectedReason: 'FIELD_LABEL:SOCIAL_NAME',
+                line: label.line?.index ?? -1
+            }));
+            if (model.fieldDiagnostics?.name) model.fieldDiagnostics.name.rejected.push(...rejected);
             anchors.forEach(anchor => {
                 this.anchorFragments(model, anchor, { belowLines: 2 }).forEach(fragment => {
                     const rawValue = this.nameCandidate(fragment.text);
-                    if (!rawValue) return;
+                    if (!rawValue) {
+                        if (fragment.text && model.fieldDiagnostics?.name) model.fieldDiagnostics.name.rejected.push({ value: fragment.text, rejectedReason: this.validatePersonNameValue(fragment.text).reason || 'INVALID_NAME_VALUE', line: fragment.line });
+                        return;
+                    }
                     const heading = /\b(REPUBLICA|ESTADO|SECRETARIA|POLICIA|INSTITUTO|CARTEIRA|IDENTIDADE|FILIACAO|FILIATION|AUTORIDADE|ASSINATURA|SIGNATURE)\b/.test(this.normalized(rawValue));
                     if (heading) return;
                     const value = this.formatPersonName(rawValue);
-                    const compactness = fragment.words.length >= 2 ? 5 : 0;
-                    const score = 71 + (fragment.relation === 'same-line' ? 20 : 14) + compactness + Math.min(5, fragment.confidence / 20);
+                    const confidenceParts = {
+                        text: fragment.confidence,
+                        field: fragment.relation === 'same-line' ? 97 : 94,
+                        validation: 100
+                    };
+                    const score = this.calculateFieldConfidence(confidenceParts);
                     candidates.push({
-                        value, rawValue, display: value, score, valid: true, line: fragment.line,
+                        value, rawValue, display: value, score, confidenceParts, valid: true, line: fragment.line,
                         reason: fragment.relation === 'same-line'
                             ? 'Valor delimitado pelas palavras à direita do rótulo Nome.'
                             : 'Valor delimitado na linha imediatamente associada ao rótulo Nome.',
-                        evidence: { anchor: anchor.label, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox, reconstructedFromWords: true }
+                        evidence: { anchor: anchor.label, sourceLabel: anchor.sourceLabel || anchor.label, fieldType: anchor.type, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox, reconstructedFromWords: true }
                     });
                 });
             });
@@ -9040,7 +9189,7 @@
                         candidates.push({
                             value, display: this.formatCpf(value), score, valid, line: fragment.line,
                             reason: valid ? 'CPF válido delimitado pela âncora CPF.' : 'Número ligado ao rótulo CPF, mas reprovado nos dígitos verificadores.',
-                            evidence: { anchor: anchor.label, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox }
+                            evidence: { anchor: anchor.label, sourceLabel: anchor.sourceLabel || anchor.label, fieldType: anchor.type, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox }
                         });
                     });
                 });
@@ -9115,7 +9264,7 @@
                         candidates.push({
                             value: parsed.value, display: parsed.value, score, valid: parsed.valid, plausible: parsed.plausible, line: fragment.line,
                             reason: parsed.valid && parsed.plausible ? 'Data válida delimitada pela âncora Nascimento.' : (parsed.reason || 'Data ligada a Nascimento requer conferência.'),
-                            evidence: { anchor: anchor.label, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox }
+                            evidence: { anchor: anchor.label, sourceLabel: anchor.sourceLabel || anchor.label, fieldType: anchor.type, relation: fragment.relation, anchorBbox: anchor.bbox, valueBbox: fragment.bbox }
                         });
                     });
                 });
@@ -9157,12 +9306,20 @@
             const second = candidates.find(candidate => candidate.value !== best.value);
             const ambiguous = Boolean(second && Math.abs(Number(best.score || 0) - Number(second.score || 0)) < 9);
             const baseValid = field === 'birthDate' ? Boolean(best.valid && best.plausible) : Boolean(best.valid);
-            const high = baseValid && Number(best.score || 0) >= 82 && !ambiguous;
+            const confidenceParts = best.confidenceParts || {
+                text: Number(best.textConfidence || 0),
+                field: Number(best.fieldConfidence || best.score || 0),
+                validation: baseValid ? 100 : 0
+            };
+            const semanticNameValid = field !== 'name' || (Number(confidenceParts.field || 0) >= 80 && Number(confidenceParts.validation || 0) >= 90);
+            const high = baseValid && semanticNameValid && Number(best.score || 0) >= 82 && !ambiguous;
             return {
                 value: best.value,
                 rawValue: best.rawValue || best.value,
                 display: best.display || best.value,
+                sourceLabel: best.evidence?.sourceLabel || best.evidence?.anchor || '',
                 confidence: Math.max(0, Math.min(99, Math.round(Number(best.score || 0)))),
+                confidenceParts,
                 status: high ? 'high' : 'review',
                 valid: baseValid,
                 reason: ambiguous ? 'Mais de um candidato semelhante foi encontrado. Escolha e confirme.' : best.reason,
@@ -9171,6 +9328,7 @@
                     rawValue: candidate.rawValue || candidate.value,
                     display: candidate.display || candidate.value,
                     confidence: Math.max(0, Math.min(99, Math.round(Number(candidate.score || 0)))),
+                    confidenceParts: candidate.confidenceParts || null,
                     valid: Boolean(candidate.valid),
                     plausible: candidate.plausible !== false,
                     reason: candidate.reason || '',
@@ -9184,7 +9342,7 @@
         },
 
         extractFromOcrData(data = {}, quality = null) {
-            const spatial = this.buildSpatialModel(data);
+            const spatial = this.detectDocumentLayout(data);
             const lines = spatial.lines;
             const fields = {
                 name: this.extractName(spatial),
@@ -9199,7 +9357,7 @@
                     field.reason = `${field.reason} A qualidade da foto exige conferência.`;
                 }
             });
-            return { lines, spatial, fields, textConfidence: Number(data.confidence || 0) };
+            return { lines, spatial, fields, documentType: spatial.documentType, textConfidence: Number(data.confidence || 0) };
         },
 
         ocrScore(result) {
@@ -9241,6 +9399,45 @@
                 const left = Math.max(0, Math.floor(box.x0 - pad)); const top = Math.max(0, Math.floor(box.y0 - pad));
                 return { left, top, width: Math.max(1, Math.ceil(box.x1 + pad - left)), height: Math.max(1, Math.ceil(box.y1 + pad - top)) };
             });
+        },
+
+        fieldCropRectangle(spatial, field, canvas) {
+            const kind = { name: 'name', cpf: 'cpf', birthDate: 'birthDate' }[field];
+            if (!kind || !spatial?.bbox) return null;
+            const anchors = this.findAnchors(spatial, kind).filter(anchor => anchor.bbox)
+                .sort((a, b) => a.bbox.y0 - b.bbox.y0 || b.priority - a.priority);
+            const anchor = anchors[0];
+            if (!anchor) return null;
+            const page = spatial.bbox;
+            const pageWidth = Math.max(1, page.x1 - page.x0);
+            const pageHeight = Math.max(1, page.y1 - page.y0);
+            const anchorHeight = this.bboxHeight(anchor);
+            const nextLabel = (spatial.labels || []).filter(label => label.bbox && label.bbox.y0 > anchor.bbox.y1 + anchorHeight * 0.35)
+                .sort((a, b) => a.bbox.y0 - b.bbox.y0)[0];
+            const pad = Math.max(8, Math.round(anchorHeight * 0.55));
+            const left = Math.max(0, Math.floor(page.x0 - pad));
+            const top = Math.max(0, Math.floor(anchor.bbox.y0 - pad));
+            const naturalBottom = anchor.bbox.y1 + Math.max(anchorHeight * 6, pageHeight * 0.13);
+            const labelBottom = nextLabel ? nextLabel.bbox.y0 - Math.max(2, pad * 0.35) : naturalBottom;
+            const bottom = Math.min(Number(canvas?.height || page.y1 + pad), Math.max(anchor.bbox.y1 + anchorHeight * 1.6, Math.min(naturalBottom, labelBottom)));
+            const right = Math.min(Number(canvas?.width || page.x1 + pad), Math.max(page.x1 + pad, anchor.bbox.x1 + pageWidth * 0.6));
+            return {
+                left,
+                top,
+                width: Math.max(1, Math.ceil(right - left)),
+                height: Math.max(1, Math.ceil(bottom - top)),
+                sourceLabel: anchor.sourceLabel || anchor.label,
+                fieldType: anchor.type
+            };
+        },
+
+        async retryFieldWithCrop(worker, canvas, extracted, field, quality = null) {
+            const crop = this.fieldCropRectangle(extracted?.spatial, field, canvas);
+            if (!crop) return null;
+            const rectangle = { left: crop.left, top: crop.top, width: crop.width, height: crop.height };
+            const result = await worker.recognize(canvas, { rectangle }, { text: true, blocks: true, hocr: false, tsv: false });
+            const focused = this.extractFromOcrData(result?.data || {}, quality);
+            return { field: focused.fields[field], rectangle, sourceLabel: crop.sourceLabel, fieldType: crop.fieldType };
         },
 
         diagnosticReport(photoId = '', { maskSensitive = true } = {}) {
@@ -9382,6 +9579,15 @@
                     ['name', 'cpf', 'birthDate'].forEach(field => { extracted.fields[field] = this.mergeField(extracted.fields[field], regional.fields[field]); });
                 }
             }
+            const fieldRetries = [];
+            for (const field of ['name', 'cpf', 'birthDate']) {
+                if (extracted.fields[field]?.value && extracted.fields[field]?.status === 'high') continue;
+                callbacks.onProgress?.({ status: 'field-retry', photoId: id, progress: 0.94, message: `Refazendo leitura direcionada do campo ${field === 'name' ? 'Nome' : (field === 'cpf' ? 'CPF' : 'Nascimento')}…` });
+                const retry = await this.retryFieldWithCrop(worker, best.canvas, extracted, field, quality);
+                if (!retry) continue;
+                extracted.fields[field] = this.mergeField(extracted.fields[field], retry.field);
+                fieldRetries.push({ field, sourceLabel: retry.sourceLabel, fieldType: retry.fieldType, rectangle: retry.rectangle, improved: Boolean(retry.field?.value) });
+            }
             Object.values(extracted.fields).forEach(field => { field.sourcePhotoId = id; });
             if (quality.blocked) {
                 Object.values(extracted.fields).forEach(field => {
@@ -9400,16 +9606,25 @@
                 diagnostic: {
                     rawOcr: this.clean(extracted.spatial?.rawText || best.result?.data?.text || ''),
                     spatialSource: extracted.spatial?.source || 'text',
+                    documentType: extracted.documentType || extracted.spatial?.documentType || 'DOCUMENTO_BR_DESCONHECIDO',
+                    labels: (extracted.spatial?.labels || []).map(label => ({ type: label.type, kind: label.kind, sourceLabel: label.sourceLabel || label.label, line: label.line?.index ?? -1 })),
+                    rejectedCandidates: extracted.spatial?.fieldDiagnostics || {},
                     regionsAnalyzed: needsRegionalPass ? regions.length : 0,
+                    fieldRetries,
                     interpreted: Object.fromEntries(['name', 'cpf', 'birthDate'].map(field => [field, {
                         value: extracted.fields[field]?.display || extracted.fields[field]?.value || '',
                         confidence: extracted.fields[field]?.confidence || 0,
+                        confidenceParts: extracted.fields[field]?.confidenceParts || null,
                         reason: extracted.fields[field]?.reason || '',
                         evidence: extracted.fields[field]?.evidence || null
                     }]))
                 },
                 addedAt: Date.now()
             };
+            this.logDiagnostic(`tipo do documento: ${photo.diagnostic.documentType}`);
+            const nameLabel = photo.diagnostic.labels.find(label => label.type === 'PERSON_NAME');
+            if (nameLabel) this.logDiagnostic(`campo NOME localizado por ${nameLabel.sourceLabel || 'rótulo semântico'}`);
+            if (photo.diagnostic.labels.some(label => label.type === 'SOCIAL_NAME')) this.logDiagnostic('rótulo NOME SOCIAL classificado separadamente e rejeitado como nome completo');
             this.logDiagnostic(`leitura concluída; orientação ${best.rotation}°; qualidade ${Math.round(quality.score)} de 100`);
             ['name', 'cpf', 'birthDate'].forEach(field => {
                 const result = extracted.fields[field];
@@ -9483,7 +9698,7 @@
             const cpf = this.cpfDigits(input.cpf);
             const birth = this.parseDate(input.nascimento || input.birthDate || input.dataNascimento);
             const errors = [];
-            if (nome.length < 4 || (nome.match(/[A-Za-zÀ-ÿ]/g) || []).length < 4) errors.push('Nome completo');
+            if (!this.validatePersonNameValue(nome).valid) errors.push('Nome completo que não seja um rótulo do documento');
             if (cpf.length !== 11) errors.push('CPF com 11 dígitos');
             else if (!this.validCpf(cpf)) errors.push('CPF válido');
             if (!birth.valid) errors.push('Data de nascimento válida');
@@ -10325,7 +10540,7 @@
                     };
                 });
             };
-            lockManualDraft('name', ui.ocrName, value => EH.PassengerIdentity.formatPersonName(value), value => value.length >= 4);
+            lockManualDraft('name', ui.ocrName, value => EH.PassengerIdentity.formatPersonName(value), value => EH.PassengerIdentity.validatePersonNameValue(value).valid);
             lockManualDraft('cpf', ui.ocrCpf, value => this.cpfDigits(value), value => this.validCpf(value));
             lockManualDraft('birthDate', ui.ocrBirth, value => EH.PassengerIdentity.parseDate(value).value, value => {
                 const parsed = EH.PassengerIdentity.parseDate(value); return parsed.valid && parsed.plausible;
