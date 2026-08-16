@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.66.0
+// @version      5.67.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,7 +37,7 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.66.0',
+        VERSION: '5.67.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
         STORAGE_SCHEMA_VERSION: 9,
@@ -8536,7 +8536,7 @@
         state: null,
 
         emptyField() {
-            return { value: '', rawValue: '', display: '', sourceLabel: '', confidence: 0, confidenceParts: { text: 0, field: 0, validation: 0 }, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false, evidence: null };
+            return { value: '', rawValue: '', display: '', sourceLabel: '', confidence: 0, confidenceParts: { text: 0, field: 0, validation: 0, consensus: 0 }, status: 'missing', valid: false, reason: 'Não identificado.', candidates: [], source: '', sourcePhotoId: '', locked: false, evidence: null };
         },
 
         freshState() {
@@ -9370,6 +9370,72 @@
             return Number(data.confidence || 0) * 0.55 + found * 9 + high * 7 + labels * 5;
         },
 
+        fieldConsensusKey(field, value) {
+            if (field === 'cpf') return this.cpfDigits(value);
+            if (field === 'birthDate') return this.parseDate(value).value;
+            return this.normalized(value);
+        },
+
+        buildFieldConsensus(field, analyses = []) {
+            const observations = analyses.map(analysis => ({ variant: analysis.variant, field: analysis.extracted?.fields?.[field] }))
+                .filter(item => item.field?.value);
+            if (!observations.length) return this.emptyField();
+            const groups = new Map();
+            observations.forEach(item => {
+                const key = this.fieldConsensusKey(field, item.field.value); if (!key) return;
+                if (!groups.has(key)) groups.set(key, []); groups.get(key).push(item);
+            });
+            const ranked = [...groups.entries()].map(([key, items]) => ({
+                key,
+                items,
+                votes: items.length,
+                average: items.reduce((sum, item) => sum + Number(item.field.confidence || 0), 0) / items.length,
+                validVotes: items.filter(item => item.field.valid).length
+            })).sort((a, b) => b.votes - a.votes || b.validVotes - a.validVotes || b.average - a.average);
+            if (!ranked.length) return this.emptyField();
+            const winner = ranked[0]; const second = ranked[1];
+            const ambiguous = Boolean(second && second.votes === winner.votes && Math.abs(second.average - winner.average) < 12);
+            const selected = winner.items.slice().sort((a, b) => Number(b.field.confidence || 0) - Number(a.field.confidence || 0))[0].field;
+            const consensus = Math.round((winner.votes / Math.max(1, analyses.length)) * 100);
+            const confidenceParts = { ...(selected.confidenceParts || {}), consensus };
+            const confidence = Math.max(0, Math.min(99, Math.round(Number(selected.confidence || 0) * 0.72 + consensus * 0.28)));
+            const candidates = [...new Map(observations.flatMap(item => [item.field, ...(item.field.candidates || [])])
+                .filter(item => item?.value).map(item => [this.fieldConsensusKey(field, item.value), item])).values()];
+            const deterministicValid = field === 'birthDate'
+                ? Boolean(selected.valid && this.parseDate(selected.value).plausible)
+                : (field === 'cpf' ? this.validCpf(selected.value) : this.validatePersonNameValue(selected.value).valid);
+            const high = deterministicValid && selected.status === 'high' && !ambiguous && winner.votes >= 2 && consensus >= 60
+                && Number(confidenceParts.field || selected.confidence || 0) >= 80;
+            return {
+                ...selected,
+                confidence,
+                confidenceParts,
+                status: high ? 'high' : 'review',
+                valid: deterministicValid,
+                reason: ambiguous
+                    ? 'As variantes produziram resultados divergentes; confira ou envie outra foto.'
+                    : `${selected.reason || 'Campo identificado.'} Consenso ${winner.votes}/${analyses.length}.`,
+                candidates,
+                consensus: { votes: winner.votes, total: analyses.length, variants: winner.items.map(item => item.variant), ambiguous }
+            };
+        },
+
+        buildConsensus(analyses = [], quality = null) {
+            const usable = analyses.filter(item => item?.extracted);
+            if (!usable.length) return null;
+            const best = usable.slice().sort((a, b) => Number(b.score || 0) - Number(a.score || 0))[0];
+            const fields = Object.fromEntries(['name', 'cpf', 'birthDate'].map(field => [field, this.buildFieldConsensus(field, usable)]));
+            if (quality?.blocked) Object.values(fields).forEach(field => {
+                if (!field.value) return; field.status = 'review'; field.confidence = Math.min(field.confidence, 55);
+                field.reason = `${field.reason} A foto original não tem qualidade suficiente para confirmação automática.`;
+            });
+            return { ...best.extracted, fields, variantAnalyses: usable, bestVariant: best.variant, score: best.score };
+        },
+
+        consensusStable(extracted) {
+            return ['name', 'cpf', 'birthDate'].every(field => extracted?.fields?.[field]?.value && extracted.fields[field].status === 'high');
+        },
+
         regionRectangles(spatial) {
             const blocks = (spatial?.blocks || []).filter(block => block.bbox && this.clean(block.text).length >= 8);
             if (blocks.length < 2) return [];
@@ -9431,13 +9497,31 @@
             };
         },
 
-        async retryFieldWithCrop(worker, canvas, extracted, field, quality = null) {
-            const crop = this.fieldCropRectangle(extracted?.spatial, field, canvas);
+        async retryFieldWithCrop(worker, canvases, extracted, field, quality = null) {
+            const sources = (Array.isArray(canvases) ? canvases : [{ id: 'corrected', canvas: canvases }]).filter(item => item?.canvas);
+            const primary = sources[0]?.canvas;
+            const crop = this.fieldCropRectangle(extracted?.spatial, field, primary);
             if (!crop) return null;
             const rectangle = { left: crop.left, top: crop.top, width: crop.width, height: crop.height };
-            const result = await worker.recognize(canvas, { rectangle }, { text: true, blocks: true, hocr: false, tsv: false });
-            const focused = this.extractFromOcrData(result?.data || {}, quality);
-            return { field: focused.fields[field], rectangle, sourceLabel: crop.sourceLabel, fieldType: crop.fieldType };
+            const attempts = [];
+            for (const source of sources.slice(0, 3)) {
+                const result = await worker.recognize(source.canvas, { rectangle }, { text: true, blocks: true, hocr: false, tsv: false });
+                const focused = this.extractFromOcrData(result?.data || {}, quality);
+                attempts.push({ variant: `crop:${source.id}`, extracted: focused, score: this.ocrScore(result) });
+                if (attempts.length >= 2) {
+                    const current = this.buildFieldConsensus(field, attempts);
+                    if (current.value && current.status === 'high') break;
+                }
+            }
+            const consensusField = this.buildFieldConsensus(field, attempts);
+            return {
+                field: consensusField,
+                rectangle,
+                sourceLabel: crop.sourceLabel,
+                fieldType: crop.fieldType,
+                attempts: attempts.map(item => item.variant),
+                consensus: consensusField.consensus || null
+            };
         },
 
         diagnosticReport(photoId = '', { maskSensitive = true } = {}) {
@@ -9501,7 +9585,9 @@
             let borderInk = 0; let borderCount = 0;
             for (let y = 0; y < height; y += 3) for (let x = 0; x < width; x += 3) {
                 if (x > border && x < width - border && y > border && y < height - border) continue;
-                borderCount += 1; if (gray[y * width + x] < 190) borderInk += 1;
+                const left = gray[y * width + Math.max(0, x - 2)]; const right = gray[y * width + Math.min(width - 1, x + 2)];
+                const top = gray[Math.max(0, y - 2) * width + x]; const bottom = gray[Math.min(height - 1, y + 2) * width + x];
+                borderCount += 1; if (Math.abs(right - left) + Math.abs(bottom - top) > 58) borderInk += 1;
             }
             const issues = []; let score = 100;
             const originalWidth = image.naturalWidth || image.width; const originalHeight = image.naturalHeight || image.height;
@@ -9511,36 +9597,263 @@
             if (deviation < 28) { issues.push('contraste insuficiente'); score -= 22; }
             if (sharpness < 85) { issues.push('imagem possivelmente desfocada'); score -= 26; }
             if ((dark / Math.max(1, count)) > 0.34) { issues.push('grandes áreas escuras'); score -= 14; }
-            if ((borderInk / Math.max(1, borderCount)) > 0.22) { issues.push('o documento pode estar cortado ou encostado na borda'); score -= 18; }
-            return { width: originalWidth, height: originalHeight, mean, contrast: deviation, sharpness, borderInkRatio: borderInk / Math.max(1, borderCount), score: Math.max(0, score), issues, blocked: score < 25 };
+            if ((borderInk / Math.max(1, borderCount)) > 0.12) { issues.push('o documento pode estar cortado ou encostado na borda'); score -= 18; }
+            const reflectionRatio = bright / Math.max(1, count);
+            const borderInkRatio = borderInk / Math.max(1, borderCount);
+            return {
+                width: originalWidth,
+                height: originalHeight,
+                mean,
+                contrast: deviation,
+                sharpness,
+                reflectionRatio,
+                borderInkRatio,
+                focus: sharpness < 85 ? 'low' : (sharpness < 180 ? 'moderate' : 'good'),
+                exposure: mean < 70 ? 'underexposed' : (mean > 246 ? 'overexposed' : 'balanced'),
+                cutRisk: borderInkRatio > 0.12 ? 'high' : (borderInkRatio > 0.06 ? 'moderate' : 'low'),
+                score: Math.max(0, score),
+                issues,
+                blocked: score < 25
+            };
+        },
+
+        createCanvas(width, height) {
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(width));
+            canvas.height = Math.max(1, Math.round(height));
+            return canvas;
+        },
+
+        cloneCanvas(source) {
+            const canvas = this.createCanvas(source.width, source.height);
+            const context = canvas.getContext('2d', { willReadFrequently: true });
+            context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height);
+            context.drawImage(source, 0, 0);
+            return canvas;
+        },
+
+        sourceCanvas(image) {
+            const sourceWidth = image.naturalWidth || image.width; const sourceHeight = image.naturalHeight || image.height;
+            let scale = Math.min(1, 2600 / Math.max(sourceWidth, sourceHeight));
+            if (Math.max(sourceWidth, sourceHeight) < 1600) scale = Math.min(2.5, 1600 / Math.max(sourceWidth, sourceHeight));
+            const width = Math.max(1, Math.round(sourceWidth * scale)); const height = Math.max(1, Math.round(sourceHeight * scale));
+            const canvas = this.createCanvas(width, height);
+            const context = canvas.getContext('2d', { willReadFrequently: true });
+            context.fillStyle = '#fff'; context.fillRect(0, 0, width, height);
+            context.imageSmoothingEnabled = true; context.imageSmoothingQuality = 'high';
+            context.drawImage(image, 0, 0, width, height);
+            return canvas;
+        },
+
+        rotateCanvas(source, rotation = 0) {
+            const normalized = ((Number(rotation || 0) % 360) + 360) % 360;
+            if (normalized === 0) return this.cloneCanvas(source);
+            const radians = normalized * Math.PI / 180;
+            const quarterTurn = normalized === 90 || normalized === 270;
+            const rightAngle = quarterTurn || normalized === 180;
+            let width; let height;
+            if (rightAngle) {
+                width = quarterTurn ? source.height : source.width;
+                height = quarterTurn ? source.width : source.height;
+            } else {
+                width = Math.ceil(Math.abs(source.width * Math.cos(radians)) + Math.abs(source.height * Math.sin(radians)));
+                height = Math.ceil(Math.abs(source.width * Math.sin(radians)) + Math.abs(source.height * Math.cos(radians)));
+            }
+            const canvas = this.createCanvas(width, height);
+            const context = canvas.getContext('2d', { willReadFrequently: true });
+            context.fillStyle = '#fff'; context.fillRect(0, 0, width, height);
+            context.translate(width / 2, height / 2); context.rotate(radians);
+            context.imageSmoothingEnabled = true; context.imageSmoothingQuality = 'high';
+            context.drawImage(source, -source.width / 2, -source.height / 2);
+            return canvas;
+        },
+
+        quadMetrics(corners = [], width = 1, height = 1) {
+            if (corners.length !== 4) return { valid: false, confidence: 0, areaRatio: 0, perspective: 0 };
+            const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+            const [tl, tr, br, bl] = corners;
+            const area = Math.abs(corners.reduce((sum, point, index) => {
+                const next = corners[(index + 1) % corners.length]; return sum + point.x * next.y - next.x * point.y;
+            }, 0) / 2);
+            const areaRatio = area / Math.max(1, width * height);
+            const horizontal = [distance(tl, tr), distance(bl, br)];
+            const vertical = [distance(tl, bl), distance(tr, br)];
+            const minSide = Math.min(...horizontal, ...vertical);
+            const perspective = Math.max(
+                Math.abs(horizontal[0] - horizontal[1]) / Math.max(...horizontal, 1),
+                Math.abs(vertical[0] - vertical[1]) / Math.max(...vertical, 1)
+            );
+            const valid = areaRatio > 0.24 && areaRatio < 0.99 && minSide > Math.min(width, height) * 0.22;
+            const confidence = valid ? Math.max(0, Math.min(1, 0.92 - perspective * 0.85 - Math.abs(0.68 - areaRatio) * 0.18)) : 0;
+            return { valid, confidence, areaRatio, perspective, horizontal, vertical };
+        },
+
+        detectDocument(canvas) {
+            const maxSide = 720; const scale = Math.min(1, maxSide / Math.max(canvas.width, canvas.height));
+            const width = Math.max(1, Math.round(canvas.width * scale)); const height = Math.max(1, Math.round(canvas.height * scale));
+            const sample = this.createCanvas(width, height); const context = sample.getContext('2d', { willReadFrequently: true });
+            context.drawImage(canvas, 0, 0, width, height);
+            const pixels = context.getImageData(0, 0, width, height).data;
+            const gray = new Uint8Array(width * height);
+            for (let index = 0, pixel = 0; index < pixels.length; index += 4, pixel += 1) gray[pixel] = Math.round(pixels[index] * 0.299 + pixels[index + 1] * 0.587 + pixels[index + 2] * 0.114);
+            const edges = [];
+            for (let y = 2; y < height - 2; y += 1) for (let x = 2; x < width - 2; x += 1) {
+                const gx = Math.abs(gray[y * width + x + 1] - gray[y * width + x - 1]);
+                const gy = Math.abs(gray[(y + 1) * width + x] - gray[(y - 1) * width + x]);
+                const magnitude = gx + gy;
+                if (magnitude > 58) edges.push({ x, y, magnitude });
+            }
+            if (edges.length < 120) return { detected: false, confidence: 0, corners: null, reason: 'insufficient-edges', perspectiveApplied: false };
+            const meanMagnitude = edges.reduce((sum, edge) => sum + edge.magnitude, 0) / edges.length;
+            const strong = edges.filter(edge => edge.magnitude >= Math.max(72, meanMagnitude * 1.08));
+            if (strong.length < 80) return { detected: false, confidence: 0, corners: null, reason: 'insufficient-strong-edges', perspectiveApplied: false };
+
+            // A borda do documento costuma ser a estrutura fechada mais externa. Usar o
+            // extremo geométrico e depois centralizar um pequeno agrupamento evita que o
+            // texto interno desloque os cantos, sem confiar em um único pixel ruidoso.
+            const clusteredExtreme = (score, direction = 1) => {
+                let seed = strong[0]; let extreme = score(seed);
+                for (let index = 1; index < strong.length; index += 1) {
+                    const value = score(strong[index]);
+                    if ((direction === 1 && value < extreme) || (direction === -1 && value > extreme)) { seed = strong[index]; extreme = value; }
+                }
+                const radius = Math.max(7, Math.round(Math.min(width, height) * 0.022));
+                const cluster = [];
+                for (const edge of strong) {
+                    if (Math.abs(edge.x - seed.x) <= radius && Math.abs(edge.y - seed.y) <= radius
+                        && Math.hypot(edge.x - seed.x, edge.y - seed.y) <= radius) cluster.push(edge);
+                    if (cluster.length >= 80) break;
+                }
+                const weight = cluster.reduce((sum, edge) => sum + edge.magnitude, 0) || 1;
+                return {
+                    x: cluster.reduce((sum, edge) => sum + edge.x * edge.magnitude, 0) / weight,
+                    y: cluster.reduce((sum, edge) => sum + edge.y * edge.magnitude, 0) / weight
+                };
+            };
+            const localCorners = [
+                clusteredExtreme(edge => edge.x + edge.y, 1),
+                clusteredExtreme(edge => edge.x - edge.y, -1),
+                clusteredExtreme(edge => edge.x + edge.y, -1),
+                clusteredExtreme(edge => edge.x - edge.y, 1)
+            ];
+            const metrics = this.quadMetrics(localCorners, width, height);
+            if (!metrics.valid || metrics.confidence < 0.72) return { detected: false, confidence: metrics.confidence, corners: null, metrics, reason: 'uncertain-quad', perspectiveApplied: false };
+            const corners = localCorners.map(point => ({ x: point.x / scale, y: point.y / scale }));
+            const fullMetrics = this.quadMetrics(corners, canvas.width, canvas.height);
+            return { detected: true, confidence: fullMetrics.confidence, corners, metrics: fullMetrics, reason: '', perspectiveApplied: false };
+        },
+
+        warpDocument(canvas, detection) {
+            if (!detection?.detected || !Array.isArray(detection.corners)) return this.cloneCanvas(canvas);
+            const [tl, tr, br, bl] = detection.corners;
+            const targetWidth = Math.max(Math.hypot(tr.x - tl.x, tr.y - tl.y), Math.hypot(br.x - bl.x, br.y - bl.y));
+            const targetHeight = Math.max(Math.hypot(bl.x - tl.x, bl.y - tl.y), Math.hypot(br.x - tr.x, br.y - tr.y));
+            const limitScale = Math.min(1, 2400 / Math.max(targetWidth, targetHeight));
+            const width = Math.max(320, Math.round(targetWidth * limitScale)); const height = Math.max(200, Math.round(targetHeight * limitScale));
+            const sourceContext = canvas.getContext('2d', { willReadFrequently: true });
+            const source = sourceContext.getImageData(0, 0, canvas.width, canvas.height);
+            const output = this.createCanvas(width, height); const outputContext = output.getContext('2d', { willReadFrequently: true });
+            const imageData = outputContext.createImageData(width, height);
+            for (let y = 0; y < height; y += 1) {
+                const v = height === 1 ? 0 : y / (height - 1);
+                for (let x = 0; x < width; x += 1) {
+                    const u = width === 1 ? 0 : x / (width - 1);
+                    const topX = tl.x + (tr.x - tl.x) * u; const topY = tl.y + (tr.y - tl.y) * u;
+                    const bottomX = bl.x + (br.x - bl.x) * u; const bottomY = bl.y + (br.y - bl.y) * u;
+                    const sx = Math.max(0, Math.min(canvas.width - 1, topX + (bottomX - topX) * v));
+                    const sy = Math.max(0, Math.min(canvas.height - 1, topY + (bottomY - topY) * v));
+                    const x0 = Math.floor(sx); const y0 = Math.floor(sy); const x1 = Math.min(canvas.width - 1, x0 + 1); const y1 = Math.min(canvas.height - 1, y0 + 1);
+                    const fx = sx - x0; const fy = sy - y0;
+                    const source00 = (y0 * canvas.width + x0) * 4; const source10 = (y0 * canvas.width + x1) * 4;
+                    const source01 = (y1 * canvas.width + x0) * 4; const source11 = (y1 * canvas.width + x1) * 4;
+                    const targetIndex = (y * width + x) * 4;
+                    for (let channel = 0; channel < 3; channel += 1) {
+                        const top = source.data[source00 + channel] * (1 - fx) + source.data[source10 + channel] * fx;
+                        const bottom = source.data[source01 + channel] * (1 - fx) + source.data[source11 + channel] * fx;
+                        imageData.data[targetIndex + channel] = Math.round(top * (1 - fy) + bottom * fy);
+                    }
+                    imageData.data[targetIndex + 3] = 255;
+                }
+            }
+            outputContext.putImageData(imageData, 0, 0);
+            detection.perspectiveApplied = Number(detection.metrics?.perspective || 0) > 0.025;
+            return output;
+        },
+
+        estimateDeskew(canvas) {
+            const maxSide = 640; const scale = Math.min(1, maxSide / Math.max(canvas.width, canvas.height));
+            const width = Math.max(1, Math.round(canvas.width * scale)); const height = Math.max(1, Math.round(canvas.height * scale));
+            const sample = this.createCanvas(width, height); const context = sample.getContext('2d', { willReadFrequently: true });
+            context.drawImage(canvas, 0, 0, width, height);
+            const data = context.getImageData(0, 0, width, height).data; const points = []; let sum = 0; let count = 0;
+            for (let index = 0; index < data.length; index += 16) { sum += data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114; count += 1; }
+            const mean = sum / Math.max(1, count);
+            for (let y = 2; y < height - 2; y += 3) for (let x = 2; x < width - 2; x += 3) {
+                const index = (y * width + x) * 4; const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
+                if (gray < mean - 28) points.push({ x, y });
+            }
+            if (points.length < 150) return { angle: 0, confidence: 0 };
+            const score = angle => {
+                const radians = angle * Math.PI / 180; const sin = Math.sin(radians); const cos = Math.cos(radians); const rows = new Uint32Array(height + width + 20);
+                points.forEach(point => { const row = Math.round(point.y * cos - point.x * sin) + width; if (row >= 0 && row < rows.length) rows[row] += 1; });
+                let total = 0; rows.forEach(value => { total += value * value; }); return total;
+            };
+            const baseline = score(0); let best = { angle: 0, score: baseline };
+            for (let angle = -7; angle <= 7; angle += 1) { const current = score(angle); if (current > best.score) best = { angle, score: current }; }
+            const improvement = baseline ? (best.score - baseline) / baseline : 0;
+            return Math.abs(best.angle) >= 1 && improvement > 0.035 ? { angle: -best.angle, confidence: Math.min(1, improvement * 5) } : { angle: 0, confidence: Math.max(0, improvement) };
+        },
+
+        variantCanvas(source, mode = 'color') {
+            if (mode === 'color') return this.cloneCanvas(source);
+            const canvas = this.cloneCanvas(source); const context = canvas.getContext('2d', { willReadFrequently: true });
+            const imageData = context.getImageData(0, 0, canvas.width, canvas.height); const data = imageData.data;
+            const gray = new Uint8Array(canvas.width * canvas.height); let sum = 0; let count = 0;
+            for (let index = 0, pixel = 0; index < data.length; index += 4, pixel += 1) { const value = Math.round(data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114); gray[pixel] = value; sum += value; count += 1; }
+            const mean = sum / Math.max(1, count);
+            const integral = (mode === 'contrast' || mode === 'binary') ? new Uint32Array((canvas.width + 1) * (canvas.height + 1)) : null;
+            if (integral) for (let y = 1; y <= canvas.height; y += 1) { let row = 0; for (let x = 1; x <= canvas.width; x += 1) { row += gray[(y - 1) * canvas.width + x - 1]; integral[y * (canvas.width + 1) + x] = integral[(y - 1) * (canvas.width + 1) + x] + row; } }
+            const localMean = (x, y, radius = 18) => {
+                if (!integral) return mean;
+                const x0 = Math.max(0, x - radius); const y0 = Math.max(0, y - radius); const x1 = Math.min(canvas.width - 1, x + radius); const y1 = Math.min(canvas.height - 1, y + radius);
+                const stride = canvas.width + 1; const total = integral[(y1 + 1) * stride + x1 + 1] - integral[y0 * stride + x1 + 1] - integral[(y1 + 1) * stride + x0] + integral[y0 * stride + x0];
+                return total / Math.max(1, (x1 - x0 + 1) * (y1 - y0 + 1));
+            };
+            for (let y = 0; y < canvas.height; y += 1) for (let x = 0; x < canvas.width; x += 1) {
+                const pixel = y * canvas.width + x; const index = pixel * 4; let value = gray[pixel];
+                if (mode === 'contrast') value = Math.max(0, Math.min(255, (value - localMean(x, y)) * 1.38 + 178));
+                else if (mode === 'binary') value = value < localMean(x, y) - 9 ? 0 : 255;
+                else if (mode === 'sharp') {
+                    const left = gray[y * canvas.width + Math.max(0, x - 1)]; const right = gray[y * canvas.width + Math.min(canvas.width - 1, x + 1)];
+                    const top = gray[Math.max(0, y - 1) * canvas.width + x]; const bottom = gray[Math.min(canvas.height - 1, y + 1) * canvas.width + x];
+                    value = Math.max(0, Math.min(255, gray[pixel] * 5 - left - right - top - bottom));
+                }
+                data[index] = value; data[index + 1] = value; data[index + 2] = value; data[index + 3] = 255;
+            }
+            context.putImageData(imageData, 0, 0); return canvas;
+        },
+
+        prepareDocumentImage(image, callbacks = {}) {
+            callbacks.onProgress?.({ status: 'preparing', progress: 0.07, message: 'Preparando documento…' });
+            const source = this.sourceCanvas(image);
+            callbacks.onProgress?.({ status: 'detecting-document', progress: 0.1, message: 'Detectando os limites do documento…' });
+            const detection = this.detectDocument(source);
+            const rectified = detection.detected ? this.warpDocument(source, detection) : this.cloneCanvas(source);
+            callbacks.onProgress?.({ status: 'geometry', progress: 0.13, message: detection.detected ? 'Corrigindo perspectiva…' : 'Documento mantido sem recorte inseguro…' });
+            const deskew = this.estimateDeskew(rectified);
+            const corrected = deskew.angle ? this.rotateCanvas(rectified, deskew.angle) : rectified;
+            const cache = new Map();
+            const getVariant = (rotation = 0, mode = 'color') => {
+                const key = `${rotation}:${mode}`; if (cache.has(key)) return cache.get(key);
+                const oriented = rotation ? this.rotateCanvas(corrected, rotation) : this.cloneCanvas(corrected);
+                const variant = this.variantCanvas(oriented, mode); cache.set(key, variant); return variant;
+            };
+            return { source, corrected, detection, deskew, cache, getVariant };
         },
 
         prepareCanvas(image, rotation = 0) {
-            const sourceWidth = image.naturalWidth || image.width; const sourceHeight = image.naturalHeight || image.height;
-            let scale = Math.min(1, 2600 / Math.max(sourceWidth, sourceHeight));
-            if (Math.max(sourceWidth, sourceHeight) < 1600) scale = Math.min(2, 1600 / Math.max(sourceWidth, sourceHeight));
-            const baseWidth = Math.max(1, Math.round(sourceWidth * scale)); const baseHeight = Math.max(1, Math.round(sourceHeight * scale));
-            const sideways = Math.abs(rotation) % 180 === 90;
-            const canvas = document.createElement('canvas'); canvas.width = sideways ? baseHeight : baseWidth; canvas.height = sideways ? baseWidth : baseHeight;
-            const context = canvas.getContext('2d', { willReadFrequently: true });
-            context.save(); context.fillStyle = '#fff'; context.fillRect(0, 0, canvas.width, canvas.height);
-            context.translate(canvas.width / 2, canvas.height / 2); context.rotate(rotation * Math.PI / 180);
-            context.drawImage(image, -baseWidth / 2, -baseHeight / 2, baseWidth, baseHeight); context.restore();
-            const imageData = context.getImageData(0, 0, canvas.width, canvas.height); const data = imageData.data;
-            let sum = 0; let sumSquares = 0; let count = 0;
-            for (let index = 0; index < data.length; index += 16) {
-                const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
-                sum += gray; sumSquares += gray * gray; count += 1;
-            }
-            const mean = sum / Math.max(1, count); const deviation = Math.sqrt(Math.max(0, sumSquares / Math.max(1, count) - mean * mean));
-            const factor = deviation < 40 ? 1.55 : (deviation < 65 ? 1.3 : 1.15);
-            for (let index = 0; index < data.length; index += 4) {
-                const gray = data[index] * 0.299 + data[index + 1] * 0.587 + data[index + 2] * 0.114;
-                const value = Math.max(0, Math.min(255, (gray - mean) * factor + 150));
-                data[index] = value; data[index + 1] = value; data[index + 2] = value;
-            }
-            context.putImageData(imageData, 0, 0);
-            return canvas;
+            const prepared = this.prepareDocumentImage(image);
+            return prepared.getVariant(rotation, 'contrast');
         },
 
         async processPhoto(file, worker, callbacks = {}) {
@@ -9549,30 +9862,45 @@
             const image = await this.loadImage(dataUrl);
             const quality = this.analyzeImage(image);
             callbacks.onProgress?.({ status: 'validating', photoId: id, progress: 0.05, message: 'Validando qualidade e orientação…' });
-            const rotations = [0]; const results = [];
-            const recognize = async rotation => {
-                const canvas = this.prepareCanvas(image, rotation);
+            const prepared = this.prepareDocumentImage(image, callbacks);
+            const recognize = async (rotation, mode) => {
+                const canvas = prepared.getVariant(rotation, mode);
                 const result = await worker.recognize(canvas, {}, { text: true, blocks: true, hocr: false, tsv: false });
                 const score = this.ocrScore(result);
-                results.push({ rotation, result, score, canvas });
-                return { rotation, result, score, canvas };
+                const extracted = this.extractFromOcrData(result?.data || {}, quality);
+                return { rotation, variant: mode, result, extracted, score, canvas };
             };
-            const first = await recognize(0);
-            const firstExtracted = this.extractFromOcrData(first.result?.data || {}, quality);
-            const found = Object.values(firstExtracted.fields).filter(field => field.value).length;
-            if (first.score < 82 || found < 2) {
+
+            callbacks.onProgress?.({ status: 'layout', photoId: id, progress: 0.18, message: 'Identificando campos na imagem corrigida…' });
+            const first = await recognize(0, 'color');
+            const firstFound = Object.values(first.extracted.fields).filter(field => field.value).length;
+            let selectedRotation = 0; let selectedAnalyses = [first]; const orientationProbes = [];
+            if (first.score < 82 || firstFound < 2) {
                 for (const rotation of [90, 270, 180]) {
-                    callbacks.onProgress?.({ status: 'orientation', photoId: id, progress: 0.22 + results.length * 0.18, message: `Tentando orientação ${rotation}°…` });
-                    await recognize(rotation);
+                    callbacks.onProgress?.({ status: 'orientation', photoId: id, progress: 0.22 + orientationProbes.length * 0.12, message: `Conferindo orientação ${rotation}°…` });
+                    orientationProbes.push(await recognize(rotation, 'contrast'));
                 }
+                const orientationBest = [first, ...orientationProbes].sort((a, b) => b.score - a.score)[0];
+                selectedRotation = orientationBest.rotation;
+                selectedAnalyses = [orientationBest];
             }
-            results.sort((a, b) => b.score - a.score);
-            const best = results[0];
-            let extracted = this.extractFromOcrData(best.result?.data || {}, quality);
+
+            if (!selectedAnalyses.some(item => item.variant === 'color')) selectedAnalyses.push(await recognize(selectedRotation, 'color'));
+            if (!selectedAnalyses.some(item => item.variant === 'contrast')) {
+                callbacks.onProgress?.({ status: 'variants', photoId: id, progress: 0.62, message: 'Comparando variante com iluminação normalizada…' });
+                selectedAnalyses.push(await recognize(selectedRotation, 'contrast'));
+            }
+            let extracted = this.buildConsensus(selectedAnalyses, quality);
+            if (!this.consensusStable(extracted)) {
+                callbacks.onProgress?.({ status: 'variants', photoId: id, progress: 0.73, message: 'Comparando variante em escala de cinza…' });
+                selectedAnalyses.push(await recognize(selectedRotation, 'gray'));
+                extracted = this.buildConsensus(selectedAnalyses, quality);
+            }
+            const best = selectedAnalyses.slice().sort((a, b) => b.score - a.score)[0];
             const regions = this.regionRectangles(extracted.spatial);
             const needsRegionalPass = Object.values(extracted.fields).some(field => !field.value || field.status !== 'high');
             if (needsRegionalPass && regions.length === 2) {
-                callbacks.onProgress?.({ status: 'regions', photoId: id, progress: 0.9, message: 'Separando as regiões do documento para evitar cruzamento de campos…' });
+                callbacks.onProgress?.({ status: 'regions', photoId: id, progress: 0.82, message: 'Separando as regiões do documento para evitar cruzamento de campos…' });
                 for (const rectangle of regions) {
                     const regionResult = await worker.recognize(best.canvas, { rectangle }, { text: true, blocks: true, hocr: false, tsv: false });
                     const regional = this.extractFromOcrData(regionResult?.data || {}, quality);
@@ -9580,13 +9908,15 @@
                 }
             }
             const fieldRetries = [];
+            const thirdCropMode = quality.contrast < 40 ? 'binary' : (quality.sharpness < 180 ? 'sharp' : 'binary');
+            const cropSources = ['color', 'contrast', thirdCropMode].map(mode => ({ id: mode, canvas: prepared.getVariant(selectedRotation, mode) }));
             for (const field of ['name', 'cpf', 'birthDate']) {
                 if (extracted.fields[field]?.value && extracted.fields[field]?.status === 'high') continue;
                 callbacks.onProgress?.({ status: 'field-retry', photoId: id, progress: 0.94, message: `Refazendo leitura direcionada do campo ${field === 'name' ? 'Nome' : (field === 'cpf' ? 'CPF' : 'Nascimento')}…` });
-                const retry = await this.retryFieldWithCrop(worker, best.canvas, extracted, field, quality);
+                const retry = await this.retryFieldWithCrop(worker, cropSources, extracted, field, quality);
                 if (!retry) continue;
                 extracted.fields[field] = this.mergeField(extracted.fields[field], retry.field);
-                fieldRetries.push({ field, sourceLabel: retry.sourceLabel, fieldType: retry.fieldType, rectangle: retry.rectangle, improved: Boolean(retry.field?.value) });
+                fieldRetries.push({ field, sourceLabel: retry.sourceLabel, fieldType: retry.fieldType, rectangle: retry.rectangle, attempts: retry.attempts, consensus: retry.consensus, improved: Boolean(retry.field?.value) });
             }
             Object.values(extracted.fields).forEach(field => { field.sourcePhotoId = id; });
             if (quality.blocked) {
@@ -9600,13 +9930,23 @@
                 type: file.type || 'image/jpeg',
                 dataUrl,
                 quality,
-                rotation: best.rotation,
+                rotation: selectedRotation,
                 score: best.score,
                 fields: extracted.fields,
                 diagnostic: {
                     rawOcr: this.clean(extracted.spatial?.rawText || best.result?.data?.text || ''),
                     spatialSource: extracted.spatial?.source || 'text',
                     documentType: extracted.documentType || extracted.spatial?.documentType || 'DOCUMENTO_BR_DESCONHECIDO',
+                    preparation: {
+                        originalPreserved: true,
+                        documentCrop: prepared.detection.detected ? 'applied' : 'not-applied-low-confidence',
+                        documentConfidence: Math.round(Number(prepared.detection.confidence || 0) * 100),
+                        perspectiveCorrection: prepared.detection.perspectiveApplied ? 'applied' : 'not-needed-or-unsafe',
+                        deskewAngle: prepared.deskew.angle || 0,
+                        deskewConfidence: Math.round(Number(prepared.deskew.confidence || 0) * 100),
+                        variants: selectedAnalyses.map(item => item.variant),
+                        cachedVariants: prepared.cache.size
+                    },
                     labels: (extracted.spatial?.labels || []).map(label => ({ type: label.type, kind: label.kind, sourceLabel: label.sourceLabel || label.label, line: label.line?.index ?? -1 })),
                     rejectedCandidates: extracted.spatial?.fieldDiagnostics || {},
                     regionsAnalyzed: needsRegionalPass ? regions.length : 0,
@@ -9621,11 +9961,13 @@
                 },
                 addedAt: Date.now()
             };
+            this.logDiagnostic(`preparo: recorte ${photo.diagnostic.preparation.documentCrop}; perspectiva ${photo.diagnostic.preparation.perspectiveCorrection}; deskew ${photo.diagnostic.preparation.deskewAngle}°`);
+            this.logDiagnostic(`variantes comparadas: ${photo.diagnostic.preparation.variants.join(', ')}`);
             this.logDiagnostic(`tipo do documento: ${photo.diagnostic.documentType}`);
             const nameLabel = photo.diagnostic.labels.find(label => label.type === 'PERSON_NAME');
             if (nameLabel) this.logDiagnostic(`campo NOME localizado por ${nameLabel.sourceLabel || 'rótulo semântico'}`);
             if (photo.diagnostic.labels.some(label => label.type === 'SOCIAL_NAME')) this.logDiagnostic('rótulo NOME SOCIAL classificado separadamente e rejeitado como nome completo');
-            this.logDiagnostic(`leitura concluída; orientação ${best.rotation}°; qualidade ${Math.round(quality.score)} de 100`);
+            this.logDiagnostic(`leitura concluída; orientação ${selectedRotation}°; qualidade ${Math.round(quality.score)} de 100`);
             ['name', 'cpf', 'birthDate'].forEach(field => {
                 const result = extracted.fields[field];
                 const label = field === 'name' ? 'nome' : (field === 'cpf' ? 'CPF' : 'nascimento');
@@ -10142,9 +10484,12 @@
                 const warning = document.createElement('span'); warning.textContent = `⚠ ${[...new Set(issues)].join(' • ')}`; ui.photoSummary.appendChild(warning);
             }
             const complete = fields.name?.value && fields.cpf?.value && fields.birthDate?.value;
-            ui.ocrMessage.textContent = complete
+            const uncertain = [fields.name, fields.cpf, fields.birthDate].some(field => !field?.value || field.status !== 'high');
+            ui.ocrMessage.textContent = complete && !uncertain
                 ? 'DADOS IDENTIFICADOS — confira os três campos. Nenhum dado será reutilizado antes da confirmação.'
-                : '⚠ Não consegui ler todos os dados com segurança. Adicione outra foto ou preencha manualmente.';
+                : (complete
+                    ? '⚠ As variantes divergiram em pelo menos um campo. Priorize adicionar outra foto; use a edição manual somente se necessário.'
+                    : '⚠ Não consegui ler todos os dados com segurança. Priorize adicionar outra foto mais próxima e sem reflexo; depois, se necessário, preencha manualmente.');
             ui.ocrReview.classList.add('show');
         },
 
