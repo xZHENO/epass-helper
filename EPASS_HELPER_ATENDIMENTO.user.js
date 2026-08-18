@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.68.0
+// @version      5.69.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.68.0',
+        VERSION: '5.69.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 10,
+        STORAGE_SCHEMA_VERSION: 11,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -90,6 +90,18 @@
         SYNC_REQUISITIONS: true,
         SYNC_EMISSION_DATA: true,
         SYNC_SETTINGS: false,
+        CONTEXT_BUTTON_SIZE: 'normal',
+        CONTEXT_BUTTON_FONT_SIZE: 10,
+        CONTEXT_BUTTON_ICON_SIZE: 15,
+        CONTEXT_BUTTON_GAP: 6,
+        CONTEXT_BUTTON_OPACITY: 0.96,
+        CONTEXT_BUTTON_SHOW_TEXT: true,
+        QUICK_ROUTE_GREETING: '',
+        QUICK_ROUTE_FOOTER: 'Consulte disponibilidade.',
+        QUICK_ROUTE_SUMMARY_TEMPLATE: '',
+        QUICK_ROUTE_FULL_TEMPLATE: '',
+        QUICK_ROUTE_EMOJI_LEVEL: 'normal',
+        QUICK_ROUTE_COPY_BEFORE_WHATSAPP: true,
         // Rotina operacional: horário/nome são configuração; SERVIÇO é sempre dado detectado do dia.
         OPERATION_TIME_TOLERANCE_MINUTES: 20,
         OPERATION_ROUTINES: [
@@ -372,6 +384,20 @@
             EH.Config.SYNC_REQUISITIONS = EH.Utils.parseBoolean(this.get('syncRequisitions', EH.Config.SYNC_REQUISITIONS), EH.Config.SYNC_REQUISITIONS);
             EH.Config.SYNC_EMISSION_DATA = EH.Utils.parseBoolean(this.get('syncEmissionData', EH.Config.SYNC_EMISSION_DATA), EH.Config.SYNC_EMISSION_DATA);
             EH.Config.SYNC_SETTINGS = EH.Utils.parseBoolean(this.get('syncSettings', EH.Config.SYNC_SETTINGS), EH.Config.SYNC_SETTINGS);
+            EH.Config.CONTEXT_BUTTON_SIZE = ['small','normal','large','xlarge'].includes(String(this.get('contextButtonSize', EH.Config.CONTEXT_BUTTON_SIZE)))
+                ? String(this.get('contextButtonSize', EH.Config.CONTEXT_BUTTON_SIZE)) : 'normal';
+            EH.Config.CONTEXT_BUTTON_FONT_SIZE = Math.min(18, Math.max(8, Number(this.get('contextButtonFontSize', EH.Config.CONTEXT_BUTTON_FONT_SIZE)) || 10));
+            EH.Config.CONTEXT_BUTTON_ICON_SIZE = Math.min(26, Math.max(12, Number(this.get('contextButtonIconSize', EH.Config.CONTEXT_BUTTON_ICON_SIZE)) || 15));
+            EH.Config.CONTEXT_BUTTON_GAP = Math.min(18, Math.max(2, Number(this.get('contextButtonGap', EH.Config.CONTEXT_BUTTON_GAP)) || 6));
+            EH.Config.CONTEXT_BUTTON_OPACITY = Math.min(1, Math.max(0.65, Number(this.get('contextButtonOpacity', EH.Config.CONTEXT_BUTTON_OPACITY)) || 0.96));
+            EH.Config.CONTEXT_BUTTON_SHOW_TEXT = EH.Utils.parseBoolean(this.get('contextButtonShowText', EH.Config.CONTEXT_BUTTON_SHOW_TEXT), EH.Config.CONTEXT_BUTTON_SHOW_TEXT);
+            EH.Config.QUICK_ROUTE_GREETING = String(this.get('quickRouteGreeting', EH.Config.QUICK_ROUTE_GREETING) || '').trim();
+            EH.Config.QUICK_ROUTE_FOOTER = String(this.get('quickRouteFooter', EH.Config.QUICK_ROUTE_FOOTER) || '').trim();
+            EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE = String(this.get('quickRouteSummaryTemplate', EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE) || '');
+            EH.Config.QUICK_ROUTE_FULL_TEMPLATE = String(this.get('quickRouteFullTemplate', EH.Config.QUICK_ROUTE_FULL_TEMPLATE) || '');
+            EH.Config.QUICK_ROUTE_EMOJI_LEVEL = ['none','low','normal','high'].includes(String(this.get('quickRouteEmojiLevel', EH.Config.QUICK_ROUTE_EMOJI_LEVEL)))
+                ? String(this.get('quickRouteEmojiLevel', EH.Config.QUICK_ROUTE_EMOJI_LEVEL)) : 'normal';
+            EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP = EH.Utils.parseBoolean(this.get('quickRouteCopyBeforeWhatsApp', EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP), EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP);
 
             const savedRoutines = this.get('operationRoutines', null);
             if (Array.isArray(savedRoutines) && savedRoutines.length) {
@@ -572,6 +598,30 @@
             }
         },
 
+        migrateContextualWorkspace() {
+            const quickKey = 'quickRoutes.v1';
+            const existing = EH.Storage.get(quickKey, null);
+            if (!Array.isArray(existing) || !existing.length) {
+                const routines = EH.Storage.get('operationRoutines', EH.ConfigDefaults?.OPERATION_ROUTINES || []);
+                const routes = (Array.isArray(routines) ? routines : []).map((item, index) => ({
+                    id: String(item?.id || `rota-${Date.now()}-${index}`),
+                    time: EH.Utils.clean(item?.operationalTime || ''),
+                    origin: EH.Utils.clean(item?.originHint || String(item?.name || '').split(/\s*[→>-]\s*/)[0] || ''),
+                    destination: EH.Utils.clean(item?.destinationHint || String(item?.name || '').split(/\s*[→>-]\s*/)[1] || ''),
+                    alias: EH.Utils.clean(item?.name || ''),
+                    active: item?.active !== false,
+                    visible: item?.active !== false,
+                    order: index,
+                    createdAt: Date.now(),
+                    updatedAt: Date.now()
+                })).filter(item => item.time && item.origin && item.destination);
+                EH.Storage.set(quickKey, routes);
+            }
+            const panelKey = 'contextualPanels.v1';
+            const panels = EH.Storage.get(panelKey, null);
+            if (!panels || typeof panels !== 'object' || Array.isArray(panels)) EH.Storage.set(panelKey, {});
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -584,6 +634,7 @@
             this.migrateUiSections();
             this.migrateOperationRoutines();
             this.migrateSettingsTypes();
+            this.migrateContextualWorkspace();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -613,7 +664,10 @@
                 'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
                 'reminderHighlightToday','panelManager.v1',
                 'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail',
-                'syncReminders','syncRequisitions','syncEmissionData','syncSettings'
+                'syncReminders','syncRequisitions','syncEmissionData','syncSettings',
+                'contextButtonSize','contextButtonFontSize','contextButtonIconSize','contextButtonGap',
+                'contextButtonOpacity','contextButtonShowText','quickRouteGreeting','quickRouteFooter','quickRouteSummaryTemplate','quickRouteFullTemplate',
+                'quickRouteEmojiLevel','quickRouteCopyBeforeWhatsApp','quickRoutes.v1','contextualPanels.v1'
             ];
             const values = {};
             keys.forEach(key => {
@@ -658,7 +712,10 @@
                 'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
                 'reminderHighlightToday','panelManager.v1',
                 'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail',
-                'syncReminders','syncRequisitions','syncEmissionData','syncSettings'
+                'syncReminders','syncRequisitions','syncEmissionData','syncSettings',
+                'contextButtonSize','contextButtonFontSize','contextButtonIconSize','contextButtonGap',
+                'contextButtonOpacity','contextButtonShowText','quickRouteGreeting','quickRouteFooter','quickRouteSummaryTemplate','quickRouteFullTemplate',
+                'quickRouteEmojiLevel','quickRouteCopyBeforeWhatsApp','quickRoutes.v1','contextualPanels.v1'
             ]));
             Object.entries(payload.values).forEach(([key, value]) => {
                 if (allowed.has(key)) EH.Storage.set(key, value);
@@ -10108,6 +10165,7 @@
 
         mergePhoto(photo) {
             if (!this.state) this.state = this.freshState();
+            if (!photo.side) photo.side = this.state.photos.length === 0 ? 'front' : (this.state.photos.length === 1 ? 'back' : `page-${this.state.photos.length + 1}`);
             this.state.photos.push(photo);
             ['name', 'cpf', 'birthDate'].forEach(field => { this.state.fields[field] = this.mergeField(this.state.fields[field], photo.fields[field]); });
             this.state.confirmed = null;
@@ -10120,6 +10178,32 @@
                 }));
             } catch (_error) {}
             return this.state;
+        },
+
+        rebuildFieldsFromPhotos() {
+            if(!this.state)return null;const protectedFields={};
+            ['name','cpf','birthDate'].forEach(field=>{const current=this.state.fields?.[field];if(current?.locked||current?.source==='manual'||current?.source==='confirmed')protectedFields[field]=current;});
+            const fields={name:this.emptyField(),cpf:this.emptyField(),birthDate:this.emptyField()};
+            (this.state.photos||[]).forEach(photo=>['name','cpf','birthDate'].forEach(field=>{fields[field]=this.mergeField(fields[field],photo.fields?.[field]);}));
+            Object.assign(fields,protectedFields);this.state.fields=fields;return fields;
+        },
+
+        async combineDocumentPhotos(photos = this.state?.photos || [], { useCorrected = true, layout = 'horizontal', margin = 24 } = {}) {
+            const selected=(Array.isArray(photos)?photos:[]).filter(Boolean);
+            if(!selected.length)throw new Error('Adicione ao menos uma imagem do documento.');
+            const images=[];
+            for(const photo of selected){const src=useCorrected&&photo.correctedDataUrl?photo.correctedDataUrl:photo.dataUrl;if(!src)continue;images.push(await this.loadImage(src));}
+            if(!images.length)throw new Error('As imagens do documento não estão disponíveis.');
+            const gap=Math.min(120,Math.max(0,Number(margin)||0));const maxSide=2800;
+            let width,height,draw=[];
+            if(layout==='vertical'){
+                const targetWidth=Math.min(maxSide,Math.max(...images.map(image=>image.naturalWidth||image.width)));let y=gap;
+                draw=images.map(image=>{const w=image.naturalWidth||image.width,h=image.naturalHeight||image.height,scale=targetWidth/w;const item={image,x:gap,y,width:targetWidth,height:Math.round(h*scale)};y+=item.height+gap;return item;});width=targetWidth+gap*2;height=y;
+            }else{
+                const targetHeight=Math.min(maxSide,Math.max(...images.map(image=>image.naturalHeight||image.height)));let x=gap;
+                draw=images.map(image=>{const w=image.naturalWidth||image.width,h=image.naturalHeight||image.height,scale=targetHeight/h;const item={image,x,y:gap,width:Math.round(w*scale),height:targetHeight};x+=item.width+gap;return item;});width=x;height=targetHeight+gap*2;
+            }
+            const limit=Math.min(1,5000/Math.max(width,height));const canvas=this.createCanvas(Math.round(width*limit),Math.round(height*limit));const context=canvas.getContext('2d',{alpha:false});context.fillStyle='#f3f4f6';context.fillRect(0,0,canvas.width,canvas.height);context.imageSmoothingEnabled=true;context.imageSmoothingQuality='high';draw.forEach(item=>context.drawImage(item.image,Math.round(item.x*limit),Math.round(item.y*limit),Math.round(item.width*limit),Math.round(item.height*limit)));return{canvas,dataUrl:canvas.toDataURL('image/png',1),layout,useCorrected,margin:gap};
         },
 
         async analyzePassengerDocument(files, callbacks = {}) {
@@ -10283,8 +10367,12 @@
         serviceHealth: null,
         statusHost: null,
         modal: null,
+        previews: [],
         documentDataUrl: '',
         documentName: '',
+        documentSelectedPhotoId: '',
+        documentReplacePhotoId: '',
+        combinedDocument: null,
         preview: null,
         generated: null,
         ocrBusy: false,
@@ -10298,7 +10386,7 @@
             EH.PassengerIdentity?.init?.();
             this.injectStyles();
             const saved = EH.Storage.get(this.STORAGE_KEY, null);
-            if (saved?.filename && saved?.finalUrl) this.generated = saved;
+            if (saved?.filename && (saved?.finalUrl || saved?.combinedDataUrl)) this.generated = saved;
             try { sessionStorage.removeItem(this.DOCUMENT_SESSION_KEY); } catch (_error) {}
             this.checkService({ quiet: true }).finally(() => this.renderStatus());
         },
@@ -10336,8 +10424,8 @@
                 .eh-pref-field { display:grid; gap:4px; min-width:0; }
                 .eh-pref-field.full { grid-column:1/-1; }
                 .eh-pref-field label { font-size:10px; font-weight:900; color:#475569; text-transform:uppercase; letter-spacing:.04em; }
-                .eh-pref-field input { min-width:0; width:100%; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:9px; padding:9px 10px; background:#fff; color:#0f172a; font:700 12px Arial,sans-serif; }
-                .eh-pref-field input:focus { outline:2px solid rgba(79,70,229,.22); border-color:#6366f1; }
+                .eh-pref-field input,.eh-pref-field select { min-width:0; width:100%; box-sizing:border-box; border:1px solid #cbd5e1; border-radius:9px; padding:9px 10px; background:#fff; color:#0f172a; font:700 12px Arial,sans-serif; }
+                .eh-pref-field input:focus,.eh-pref-field select:focus { outline:2px solid rgba(79,70,229,.22); border-color:#6366f1; }
                 .eh-pref-route-list { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
                 .eh-pref-route { border:1px solid #c7d2fe; border-radius:8px; padding:7px; background:#eef2ff; color:#3730a3; font:800 9px Arial,sans-serif; cursor:pointer; }
                 .eh-pref-actions { display:flex; flex-wrap:wrap; gap:8px; }
@@ -10360,6 +10448,7 @@
                 .eh-pref-candidates { display:none; width:100%; border:1px solid #cbd5e1; border-radius:8px; padding:7px; background:#fff; }
                 .eh-pref-candidates.show { display:block; }
                 .eh-pref-photo-summary { display:grid; gap:5px; padding:8px; border-radius:9px; background:#fff7ed; color:#9a3412; font-size:10px; }
+                .eh-pref-document-pages{display:flex;flex-wrap:wrap;gap:6px}.eh-pref-document-pages:empty{display:none}.eh-pref-document-combine{padding:9px;border:1px solid #dbe4ed;border-radius:10px;background:#f8fafc}.eh-pref-errors{padding-top:6px;border-top:1px solid #d5e7de}.eh-pref-errors summary{cursor:pointer;font-size:10px;font-weight:850;color:#49655a}.eh-pref-error-details{padding-top:7px;color:#64748b;font-size:10px;overflow-wrap:anywhere}
                 .eh-pref-progress { color:#4338ca; font-weight:800; }
                 .eh-pref-document-card { min-height:0; }
                 .eh-pref-document-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
@@ -10370,7 +10459,7 @@
                 .eh-pref-document-image { display:block; max-width:100%; max-height:54vh; width:auto; height:auto; transform-origin:center center; user-select:none; -webkit-user-drag:none; will-change:transform; }
                 .eh-pref-document-empty { max-width:390px; padding:24px; color:#e2e8f0; text-align:center; }
                 .eh-pref-document-meta { color:#64748b; font-size:10px; }
-                .eh-pref-preview-frame { display:flex; align-items:flex-start; justify-content:center; min-height:420px; padding:10px; border:1px solid #cbd5e1; border-radius:12px; background:#334155; overflow:auto; }
+                .eh-pref-preview-frame { display:flex; flex-wrap:wrap; gap:10px; align-items:flex-start; justify-content:center; min-height:420px; padding:10px; border:1px solid #cbd5e1; border-radius:12px; background:#334155; overflow:auto; }
                 .eh-pref-preview-frame img { display:block; width:min(100%,660px); height:auto; background:#fff; box-shadow:0 8px 24px rgba(0,0,0,.28); }
                 .eh-pref-empty-preview { align-self:center; max-width:420px; color:#e2e8f0; text-align:center; }
                 .eh-pref-confirm { display:none; gap:10px; }
@@ -10570,9 +10659,8 @@
         },
 
         fieldStatus(field) {
-            if (!field?.value) return { label: '✕ Não identificado', className: 'eh-pref-confidence-missing' };
-            if (field.status === 'high' && field.valid) return { label: '✓ Alta confiança', className: 'eh-pref-confidence-high' };
-            return { label: '⚠ Conferir', className: 'eh-pref-confidence-review' };
+            if (field?.value && field.status === 'high' && field.valid) return { label: '✓ Lido', className: 'eh-pref-confidence-high' };
+            return { label: 'Confira este campo', className: 'eh-pref-confidence-review' };
         },
 
         populateCandidateSelect(select, field, input, formatter = value => value) {
@@ -10618,16 +10706,34 @@
             }
             const complete = fields.name?.value && fields.cpf?.value && fields.birthDate?.value;
             const uncertain = [fields.name, fields.cpf, fields.birthDate].some(field => !field?.value || field.status !== 'high');
-            ui.ocrMessage.textContent = complete && !uncertain
-                ? 'DADOS IDENTIFICADOS — confira os três campos. Nenhum dado será reutilizado antes da confirmação.'
-                : (complete
-                    ? '⚠ As variantes divergiram em pelo menos um campo. Priorize adicionar outra foto; use a edição manual somente se necessário.'
-                    : '⚠ Não consegui ler todos os dados com segurança. Priorize adicionar outra foto mais próxima e sem reflexo; depois, se necessário, preencha manualmente.');
+            ui.ocrMessage.textContent = complete && !uncertain ? 'Documento pronto — confira os dados.' : 'Confira os campos destacados.';
+            if(ui.errorDetails){const details=(state?.diagnostics||[]).slice(-8).map(item=>item.message).join(' • ');ui.errorDetails.textContent=details||'Nenhuma falha técnica registrada nesta sessão.';}
             ui.ocrReview.classList.add('show');
         },
 
         currentDocumentPhoto() {
             return this.documentPreviewPhoto || EH.PassengerIdentity.state?.photos?.slice?.(-1)?.[0] || null;
+        },
+
+        renderDocumentPages(ui) {
+            if(!ui?.documentPages)return;
+            const photos=EH.PassengerIdentity.state?.photos||[];ui.documentPages.innerHTML='';
+            if(!photos.length){ui.documentPageActions.hidden=true;ui.documentCombine.hidden=true;return;}
+            if(!photos.some(photo=>photo.id===this.documentSelectedPhotoId))this.documentSelectedPhotoId=photos[0].id;
+            photos.forEach((photo,index)=>{const button=document.createElement('button');button.type='button';button.className='eh-pref-btn';button.classList.toggle('primary',photo.id===this.documentSelectedPhotoId);button.textContent=`${index===0?'Frente':index===1?'Verso':`Página ${index+1}`} • ${photo.name||'imagem'}`;button.addEventListener('click',()=>{this.documentSelectedPhotoId=photo.id;this.documentPreviewPhoto=photo;this.documentDataUrl=photo.dataUrl;this.documentName=photo.name;this.documentViewMode=photo.correctedDataUrl?'corrected':'original';this.renderDocumentPages(ui);this.renderDocumentPreview(ui,{reset:true});});ui.documentPages.appendChild(button);});
+            ui.documentPageActions.hidden=false;ui.documentCombine.hidden=photos.length<1;
+        },
+
+        removeSelectedDocument(ui) {
+            const photos=EH.PassengerIdentity.state?.photos||[],index=photos.findIndex(photo=>photo.id===this.documentSelectedPhotoId);if(index<0)return;
+            const removed=photos.splice(index,1)[0];photos.forEach((photo,position)=>{photo.side=position===0?'front':position===1?'back':`page-${position+1}`;});
+            EH.PassengerIdentity.rebuildFieldsFromPhotos();
+            const next=photos[Math.min(index,photos.length-1)]||null;this.documentSelectedPhotoId=next?.id||'';this.documentPreviewPhoto=next;this.documentDataUrl=next?.dataUrl||'';this.documentName=next?.name||'';this.combinedDocument=null;this.renderDocumentPages(ui);this.renderDocumentPreview(ui,{reset:true});this.showAlert(ui,removed?`Imagem ${removed.name||''} removida desta sessão.`:'');
+        },
+
+        async combineDocuments(ui) {
+            try{const result=await EH.PassengerIdentity.combineDocumentPhotos(EH.PassengerIdentity.state?.photos||[],{useCorrected:ui.documentSource.value!=='original',layout:ui.documentLayout.value,margin:Number(ui.documentMargin.value)||0});this.combinedDocument={...result,filename:'documento-frente-verso.png',createdAt:Date.now()};ui.downloadCombined.href=result.dataUrl;ui.downloadCombined.hidden=false;EH.Clipboard.rememberImage(result.dataUrl,'documento-frente-verso.png');EH.Toast.success('PNG unificado pronto.');}
+            catch(error){this.showAlert(ui,error.message||'Não foi possível unir as imagens.');}
         },
 
         renderDocumentPreview(ui, { reset = false } = {}) {
@@ -10698,7 +10804,7 @@
 
         async processDocuments(files, ui) {
             if (this.ocrBusy) return;
-            this.ocrBusy = true; this.setBusy(ui, true); ui.progress.hidden = false; ui.ocrReview.classList.remove('show');
+            let processed=false;this.ocrBusy = true; this.setBusy(ui, true); ui.progress.hidden = false; ui.ocrReview.classList.remove('show');
             try {
                 // A prévia original é disponibilizada antes do OCR. Assim, uma falha do
                 // motor nunca bloqueia a digitação manual nem obriga o usuário a trocar de tela.
@@ -10711,25 +10817,28 @@
                     this.renderDocumentPreview(ui, { reset: true });
                 } catch (_previewError) {}
                 await EH.PassengerIdentity.analyzePassengerDocument(files, {
-                    onProgress: event => { ui.progress.textContent = event.message || 'Processando documentação…'; },
-                    onEngineProgress: message => {
-                        if (message?.status === 'recognizing text') ui.progress.textContent = `Lendo a documentação… ${Math.round(Number(message.progress || 0) * 100)}%`;
-                    },
+                    onProgress: event => { ui.progress.textContent = event.status==='done'?'Documento pronto':'Preparando documento…'; },
+                    onEngineProgress: message => { if (message?.status === 'recognizing text') ui.progress.textContent = 'Preparando documento…'; },
                     onPhoto: photo => {
                         this.documentDataUrl = photo.dataUrl;
                         this.documentName = photo.name;
                         this.documentPreviewPhoto = photo;
+                        this.documentSelectedPhotoId = photo.id;
                         this.documentViewMode = photo.correctedDataUrl ? 'corrected' : 'original';
+                        this.renderDocumentPages(ui);
                         this.renderDocumentPreview(ui, { reset: true });
                     }
                 });
+                processed=true;
                 this.renderIdentityReview(ui); this.renderStatus(); this.showAlert(ui, '');
             } catch (error) {
                 this.showAlert(ui, `⚠ Não consegui ler este documento com segurança.\n\n${error.message}\n\nEnvie outra foto ou preencha manualmente.`);
+                if(ui.errorDetails)ui.errorDetails.textContent=`Etapa: processamento do documento. ${error.message} Tente novamente ou use uma foto mais nítida; o preenchimento manual permanece disponível.`;
                 this.renderIdentityReview(ui);
             } finally {
                 ui.progress.hidden = true; this.ocrBusy = false; this.setBusy(ui, false);
             }
+            return processed;
         },
 
         confirmIdentity(ui, source = 'review') {
@@ -10753,13 +10862,14 @@
 
         newDocument(ui) {
             EH.PassengerIdentity.startNew();
-            this.documentDataUrl = ''; this.documentName = ''; this.preview = null; this.generated = null;
-            this.documentPreviewPhoto = null; this.documentViewMode = 'corrected'; this.documentView = { zoom: 1, x: 0, y: 0 };
+            this.documentDataUrl = ''; this.documentName = ''; this.preview = null; this.previews=[];this.generated = null;
+            this.documentPreviewPhoto = null; this.documentSelectedPhotoId='';this.documentReplacePhotoId='';this.combinedDocument=null;this.documentViewMode = 'corrected'; this.documentView = { zoom: 1, x: 0, y: 0 };
             EH.Storage.remove(this.STORAGE_KEY);
             this.fillForm(ui, { ...this.defaults(), origem: ui.origem.value, destino: ui.destino.value });
             ui.ocrReview.classList.remove('show'); ui.photoSummary.innerHTML = ''; ui.identityConfirmed.textContent = '○ Dados ainda não confirmados'; ui.identityConfirmed.className = 'eh-pref-confidence-review';
             ui.ready.classList.remove('show'); ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false;
             const viewButton = ui.modal.querySelector('.eh-pref-view-doc'); if (viewButton) viewButton.hidden = true;
+            this.renderDocumentPages(ui);
             this.renderDocumentPreview(ui, { reset: true });
             this.showAlert(ui, 'Novo passageiro iniciado. Os dados e fotos anteriores foram retirados deste atendimento.');
             this.renderStatus();
@@ -10774,6 +10884,7 @@
                 destino: this.cityDisplay(ui.destino.value),
                 data: this.clean(ui.data.value),
                 mesAno: this.clean(ui.mesAno.value),
+                tripKind: ui.tripKind?.value || 'outbound',
                 acceptInvalidCpf: Boolean(ui.cpfOverride.checked)
             };
         },
@@ -10809,10 +10920,12 @@
             ui.destino.value = data.destino || '';
             ui.data.value = data.data || ui.data.value;
             ui.mesAno.value = data.mesAno || ui.mesAno.value;
+            if(ui.tripKind&&['outbound','return','roundtrip'].includes(data.tripKind))ui.tripKind.value=data.tripKind;
         },
 
         showPreview(ui, result) {
             this.preview = result;
+            ui.previewImage.parentElement?.querySelectorAll?.('.eh-pref-preview-image-extra')?.forEach?.(image=>image.remove());
             ui.previewImage.src = `${result.previewUrl}?v=${Date.now()}`;
             ui.emptyPreview.hidden = true;
             ui.previewImage.hidden = false;
@@ -10838,6 +10951,12 @@
             this.showAlert(ui, '');
         },
 
+        requestLegs(data) {
+            const outbound={...data,tripKind:'outbound'};
+            const inbound={...data,origem:data.destino,destino:data.origem,tripKind:'return'};
+            return data.tripKind==='roundtrip'?[outbound,inbound]:data.tripKind==='return'?[inbound]:[outbound];
+        },
+
         async previewRequest(ui) {
             const data = this.collect(ui);
             const validation = this.validate(data);
@@ -10853,8 +10972,10 @@
             this.setBusy(ui, true);
             this.showAlert(ui, 'Gerando a prévia a partir do DOCX oficial…');
             try {
-                const result = await this.request('POST', '/preview', { requisitionData: data });
-                this.showPreview(ui, result);
+                const results=[];
+                for(const leg of this.requestLegs(data))results.push(await this.request('POST','/preview',{requisitionData:leg}));
+                this.previews=results;this.showPreview(ui,results[0]);
+                if(results[1]){const extra=document.createElement('img');extra.className='eh-pref-preview-image eh-pref-preview-image-extra';extra.alt='Prévia da requisição de volta';extra.src=`${results[1].previewUrl}?v=${Date.now()}`;ui.previewImage.parentElement.appendChild(extra);this.showAlert(ui,'Confira as requisições de ida e volta antes de finalizar.');}
             } catch (error) {
                 if (error.details?.requiresCpfOverride) ui.cpfOverrideWrap.classList.add('show');
                 this.showAlert(ui, error.message);
@@ -10864,13 +10985,18 @@
         },
 
         async generateRequest(ui) {
-            if (!this.preview?.previewId) return this.showAlert(ui, 'Gere e confira a prévia antes de finalizar.');
+            const previews=this.previews?.length?this.previews:(this.preview?.previewId?[this.preview]:[]);
+            if (!previews.length) return this.showAlert(ui, 'Gere e confira a prévia antes de finalizar.');
             this.setBusy(ui, true);
             this.showAlert(ui, 'Finalizando exatamente a prévia conferida…');
             try {
-                const result = await this.request('POST', '/generate', { previewId: this.preview.previewId });
+                const results=[];for(const preview of previews)results.push(await this.request('POST','/generate',{previewId:preview.previewId}));
+                let result=results[0];let combinedDataUrl='';
+                if(results.length>1){const photos=[];for(const generated of results){const blob=await this.imageBlob(generated.finalUrl);photos.push({dataUrl:await EH.Clipboard.blobToDataUrl(blob)});}const combined=await EH.PassengerIdentity.combineDocumentPhotos(photos,{useCorrected:false,layout:'horizontal',margin:24});combinedDataUrl=combined.dataUrl;result={...result,filename:'Requisicao_Prefeitura_Ida_e_Volta.png',finalUrl:'',files:results.map(item=>item.filename)};EH.Clipboard.rememberImage(combinedDataUrl,result.filename);}
                 const record = {
                     ...result,
+                    combinedDataUrl,
+                    tripKind: previews.length>1?'roundtrip':(this.collect(ui).tripKind||'outbound'),
                     generatedAt: Date.now(),
                     documentLoaded: Boolean(this.documentDataUrl),
                     documentName: this.documentName || '',
@@ -10897,9 +11023,9 @@
         },
 
         async downloadGenerated(record = this.generated) {
-            if (!record?.finalUrl) return EH.Toast.warning('Nenhuma requisição pronta.');
+            if (!record?.finalUrl&&!record?.combinedDataUrl) return EH.Toast.warning('Nenhuma requisição pronta.');
             try {
-                const blob = await this.imageBlob(record.finalUrl);
+                const blob = record.combinedDataUrl ? await (await fetch(record.combinedDataUrl)).blob() : await this.imageBlob(record.finalUrl);
                 const url = URL.createObjectURL(blob);
                 const anchor = document.createElement('a');
                 anchor.href = url; anchor.download = record.filename || 'Requisicao_Prefeitura.png';
@@ -10945,14 +11071,15 @@
             }
             try {
                 if (kind === 'request') {
-                    if (!this.generated?.finalUrl) throw new Error('Nenhuma requisição pronta.');
-                    const blob = await this.imageBlob(this.generated.finalUrl);
+                    if (!this.generated?.finalUrl&&!this.generated?.combinedDataUrl) throw new Error('Nenhuma requisição pronta.');
+                    const blob = this.generated.combinedDataUrl ? await (await fetch(this.generated.combinedDataUrl)).blob() : await this.imageBlob(this.generated.finalUrl);
                     this.setInputFile(best.input, blob, this.generated.filename);
                     EH.Toast.success('Requisição anexada. Confira o campo antes de enviar manualmente.');
                 } else {
-                    if (!this.documentDataUrl) throw new Error('Nenhuma documentação carregada.');
-                    const blob = await (await fetch(this.documentDataUrl)).blob();
-                    this.setInputFile(best.input, blob, this.documentName || 'documentacao.jpg');
+                    const source=this.combinedDocument?.dataUrl||this.documentDataUrl;
+                    if (!source) throw new Error('Nenhuma documentação carregada.');
+                    const blob = await (await fetch(source)).blob();
+                    this.setInputFile(best.input, blob, this.combinedDocument?.filename||this.documentName || 'documentacao.jpg');
                     EH.Toast.success('Documentação anexada. Confira o campo antes de enviar manualmente.');
                 }
             } catch (error) { EH.Toast.warning(error.message); }
@@ -10997,12 +11124,24 @@
                             <div class="eh-pref-current"></div>
                             <div class="eh-pref-actions">
                                 <button type="button" class="eh-pref-btn eh-pref-use-current">Usar passageiro atual</button>
-                                <button type="button" class="eh-pref-btn eh-pref-read-doc">📷 Adicionar foto</button>
+                                <button type="button" class="eh-pref-btn eh-pref-read-doc">📷 Adicionar frente/verso</button>
                                 <button type="button" class="eh-pref-btn eh-pref-view-doc" hidden>Ver documento</button>
                                 <button type="button" class="eh-pref-btn eh-pref-new-doc">Novo passageiro</button>
                                 <input type="file" class="eh-pref-doc-input" accept="image/*" multiple hidden>
                             </div>
                             <div class="eh-pref-progress" hidden></div>
+                            <div class="eh-pref-document-pages"></div>
+                            <div class="eh-pref-actions eh-pref-document-page-actions" hidden>
+                                <button type="button" class="eh-pref-btn eh-pref-swap-docs">Trocar ordem</button>
+                                <button type="button" class="eh-pref-btn eh-pref-replace-doc">Substituir selecionada</button>
+                                <button type="button" class="eh-pref-btn eh-pref-remove-doc">Remover selecionada</button>
+                            </div>
+                            <div class="eh-pref-grid eh-pref-document-combine" hidden>
+                                <div class="eh-pref-field"><label>Usar imagens</label><select class="eh-pref-doc-source"><option value="corrected">Corrigidas</option><option value="original">Originais</option></select></div>
+                                <div class="eh-pref-field"><label>União</label><select class="eh-pref-doc-layout"><option value="horizontal">Horizontal</option><option value="vertical">Vertical</option></select></div>
+                                <div class="eh-pref-field"><label>Margem (px)</label><input class="eh-pref-doc-margin" type="number" min="0" max="120" value="24"></div>
+                                <div class="eh-pref-actions"><button type="button" class="eh-pref-btn primary eh-pref-combine-docs">Gerar PNG unificado</button><a class="eh-pref-btn eh-pref-download-combined" hidden download="documento-frente-verso.png">Baixar PNG</a></div>
+                            </div>
                             <div class="eh-pref-photo-summary"></div>
                             <div class="eh-pref-ocr-review">
                                 <strong class="eh-pref-ocr-message">DADOS IDENTIFICADOS</strong>
@@ -11012,6 +11151,7 @@
                                     <div class="eh-pref-field full"><label>Data de nascimento <span class="eh-pref-birth-status"></span></label><input class="eh-pref-ocr-birth" inputmode="numeric" autocomplete="off"><select class="eh-pref-candidates eh-pref-birth-candidates"></select></div>
                                 </div>
                                 <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-ocr-confirm">Confirmar os três dados</button><button type="button" class="eh-pref-btn eh-pref-ocr-manual">Editar no formulário</button><button type="button" class="eh-pref-btn eh-pref-ocr-diagnostic" hidden>Copiar diagnóstico OCR</button></div>
+                                <details class="eh-pref-errors"><summary>Erros e detalhes</summary><div class="eh-pref-error-details">As tentativas e recomendações aparecerão aqui sem expor dados pessoais completos.</div></details>
                             </div>
                             <div class="eh-pref-grid">
                                 <div class="eh-pref-field full"><label>Nome</label><input class="eh-pref-name" maxlength="180" autocomplete="off"></div>
@@ -11033,6 +11173,7 @@
                         <section class="eh-pref-card">
                             <h3>Documento</h3>
                             <div class="eh-pref-grid">
+                                <div class="eh-pref-field"><label>Trechos</label><select class="eh-pref-trip-kind"><option value="outbound">Somente ida</option><option value="return">Somente volta</option><option value="roundtrip">Ida e volta</option></select></div>
                                 <div class="eh-pref-field"><label>Data</label><input class="eh-pref-date" maxlength="10" inputmode="numeric"></div>
                                 <div class="eh-pref-field"><label>Mês/Ano</label><input class="eh-pref-month" maxlength="30"></div>
                             </div>
@@ -11089,6 +11230,9 @@
                 nameStatus: q('.eh-pref-name-status'), cpfStatus: q('.eh-pref-cpf-status'), birthStatus: q('.eh-pref-birth-status'),
                 nameCandidates: q('.eh-pref-name-candidates'), cpfCandidates: q('.eh-pref-cpf-candidates'), birthCandidates: q('.eh-pref-birth-candidates'),
                 photoSummary: q('.eh-pref-photo-summary'), identityConfirmed: q('.eh-pref-identity-confirmed'),
+                documentPages: q('.eh-pref-document-pages'), documentPageActions: q('.eh-pref-document-page-actions'), documentCombine: q('.eh-pref-document-combine'),
+                documentSource: q('.eh-pref-doc-source'), documentLayout: q('.eh-pref-doc-layout'), documentMargin: q('.eh-pref-doc-margin'), downloadCombined: q('.eh-pref-download-combined'),
+                errorDetails: q('.eh-pref-error-details'), tripKind: q('.eh-pref-trip-kind'),
                 documentStage: q('.eh-pref-document-stage'), documentImage: q('.eh-pref-document-image'), documentEmpty: q('.eh-pref-document-empty'),
                 documentMeta: q('.eh-pref-document-meta'), documentCorrected: q('.eh-pref-doc-corrected'), documentOriginal: q('.eh-pref-doc-original'),
                 documentZoomIn: q('.eh-pref-doc-zoom-in'), documentZoomOut: q('.eh-pref-doc-zoom-out'), documentZoomLabel: q('.eh-pref-document-zoom'), documentFit: q('.eh-pref-doc-fit'),
@@ -11184,8 +11328,10 @@
             const latestPhoto = EH.PassengerIdentity.state?.photos?.slice?.(-1)?.[0] || null;
             if (latestPhoto) {
                 this.documentDataUrl = latestPhoto.dataUrl; this.documentName = latestPhoto.name; this.documentPreviewPhoto = latestPhoto;
+                this.documentSelectedPhotoId = latestPhoto.id;
                 this.documentViewMode = latestPhoto.correctedDataUrl ? 'corrected' : 'original';
             }
+            this.renderDocumentPages(ui);
             this.renderDocumentPreview(ui, { reset: true });
             viewDoc.hidden = !this.documentDataUrl;
             q('.eh-pref-read-doc').addEventListener('click', () => docInput.click());
@@ -11198,10 +11344,19 @@
             docInput.addEventListener('change', async () => {
                 const files = Array.from(docInput.files || []);
                 if (!files.length) return;
-                await this.processDocuments(files, ui);
+                let replacement=null;
+                if(this.documentReplacePhotoId){
+                    const photos=EH.PassengerIdentity.state?.photos||[];const index=photos.findIndex(photo=>photo.id===this.documentReplacePhotoId);if(index>=0)replacement={index,photo:photos.splice(index,1)[0]};EH.PassengerIdentity.rebuildFieldsFromPhotos();this.documentReplacePhotoId='';
+                }
+                const processed=await this.processDocuments(replacement?files.slice(0,1):files, ui);
+                if(!processed&&replacement){const photos=EH.PassengerIdentity.state?.photos||[];photos.splice(Math.min(replacement.index,photos.length),0,replacement.photo);EH.PassengerIdentity.rebuildFieldsFromPhotos();this.documentSelectedPhotoId=replacement.photo.id;this.documentPreviewPhoto=replacement.photo;this.documentDataUrl=replacement.photo.dataUrl;this.documentName=replacement.photo.name;this.renderDocumentPages(ui);this.renderDocumentPreview(ui,{reset:true});}
                 viewDoc.hidden = !this.documentDataUrl;
                 docInput.value = '';
             });
+            q('.eh-pref-swap-docs').addEventListener('click',()=>{const photos=EH.PassengerIdentity.state?.photos||[];if(photos.length<2)return EH.Toast.info('Adicione frente e verso para trocar a ordem.');[photos[0],photos[1]]=[photos[1],photos[0]];photos.forEach((photo,index)=>{photo.side=index===0?'front':index===1?'back':`page-${index+1}`;});this.combinedDocument=null;this.renderDocumentPages(ui);this.renderDocumentPreview(ui,{reset:true});});
+            q('.eh-pref-remove-doc').addEventListener('click',()=>this.removeSelectedDocument(ui));
+            q('.eh-pref-replace-doc').addEventListener('click',()=>{if(!this.documentSelectedPhotoId)return EH.Toast.info('Selecione a imagem que deseja substituir.');this.documentReplacePhotoId=this.documentSelectedPhotoId;docInput.click();});
+            q('.eh-pref-combine-docs').addEventListener('click',()=>this.combineDocuments(ui));
             q('.eh-pref-new-doc').addEventListener('click', () => this.newDocument(ui));
 
             q('.eh-pref-use-current').addEventListener('click', () => {
@@ -11248,7 +11403,7 @@
                 this.showAlert(ui, health?.ok ? '✓ Gerador local, modelo oficial e LibreOffice prontos.' : (health?.error || 'Gerador local incompleto.'));
             });
             q('.eh-pref-preview-btn').addEventListener('click', () => this.previewRequest(ui));
-            q('.eh-pref-correct').addEventListener('click', () => { ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null; ui.nome.focus(); });
+            q('.eh-pref-correct').addEventListener('click', () => { ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null;this.previews=[];ui.previewImage.parentElement?.querySelectorAll?.('.eh-pref-preview-image-extra')?.forEach?.(image=>image.remove()); ui.nome.focus(); });
             q('.eh-pref-generate').addEventListener('click', () => this.generateRequest(ui));
             q('.eh-pref-download').addEventListener('click', () => this.downloadGenerated());
             q('.eh-pref-attach').addEventListener('click', () => this.attachToRequest('request'));
@@ -14339,6 +14494,7 @@
         lastRemoteReceivedAt: 0,
         lastServerConfirmedAt: 0,
         failCount: 0,
+        nextRetryAt: 0,
 
         config() {
             return {
@@ -14359,7 +14515,7 @@
         setStatus(state,message='',pending=null){const status={state,message,pending:pending===null?this.pendingCount():Number(pending||0),at:Date.now()};this.lastStatus=status;EH.Storage.set(this.STATUS_KEY,status);EH.Reminders?.render?.();return status;},
         status(){return this.lastStatus?.at?this.lastStatus:(EH.Storage.get(this.STATUS_KEY,null)||this.lastStatus);},
         configured(){const cfg=this.config();return cfg.enabled&&cfg.provider==='supabase'&&Boolean(cfg.url&&cfg.key);},
-        pendingIds(){const rows=EH.Storage.get(this.PENDING_KEY,[]);return Array.isArray(rows)?rows:[];},
+        pendingIds(){const rows=EH.Storage.get(this.PENDING_KEY,[]);return Array.from(new Set(Array.isArray(rows)?rows.map(String).filter(Boolean):[]));},
         pendingCount(){return this.pendingIds().length;},
         shouldSyncType(type){
             const cfg=this.config(),kind=String(type||'');
@@ -14377,6 +14533,13 @@
         },
         markPendingRecord(type,id){if(this.applyingRemote||!id||!this.shouldSyncType(type))return;const key=this.recordKey(type,id);const set=new Set(this.pendingIds());set.add(key);EH.Storage.set(this.PENDING_KEY,Array.from(set).slice(-3000));this.lastStatus={...(this.status()||{}),pending:set.size};},
         clearPending(keys=[]){const remove=new Set(keys);EH.Storage.set(this.PENDING_KEY,this.pendingIds().filter(key=>!remove.has(key)));},
+        reconcilePending(localRecords=[],confirmedKeys=[]){
+            const local=new Set((Array.isArray(localRecords)?localRecords:[]).map(item=>String(item?.id||'')).filter(Boolean));
+            const confirmed=new Set((Array.isArray(confirmedKeys)?confirmedKeys:[]).map(String));
+            const next=this.pendingIds().filter(key=>local.has(key)&&!confirmed.has(key));
+            EH.Storage.set(this.PENDING_KEY,next);
+            return next;
+        },
 
         async request(path,options={}, {auth=true}={}){
             const cfg=this.config(),url=this.normalizeUrl(cfg.url),key=this.safeKey(cfg.key);if(!url||!key)throw new Error('Sincronização Supabase ainda não configurada.');
@@ -14493,7 +14656,7 @@
                 (EH.PassengerMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('passenger',item.id||`cpf:${item.cpf}`,item,item.updatedAt||item.createdAt)));
                 (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
             }
-            if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,updatedAt:opUpdated},opUpdated));}
+            if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;const quickUpdated=Number(EH.Storage.get('quickRoutes.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,updatedAt:opUpdated},opUpdated));rows.push(this.envelope('config','quick-routes',{routes:EH.QuickRoutes?.load?.()||[],updatedAt:quickUpdated},quickUpdated));}
             return rows.filter(row=>row.recordId);
         },
         applyEnvelope(env){
@@ -14525,6 +14688,11 @@
                         EH.Storage.set('operationAgencyCode',EH.Config.OPERATION_AGENCY_CODE);
                         EH.Storage.set('operationRoutines',EH.Config.OPERATION_ROUTINES);
                         EH.Storage.set('operationTimeToleranceMinutes',EH.Config.OPERATION_TIME_TOLERANCE_MINUTES);
+                        EH.Storage.set('operationConfig.updatedAt',Number(env.updatedAt||env.data.updatedAt||Date.now()));
+                    }
+                    if(env.recordId==='quick-routes'&&Array.isArray(env.data?.routes)){
+                        EH.QuickRoutes?.save?.(env.data.routes,{markPending:false,preserveUpdatedAt:true});
+                        EH.Storage.set('quickRoutes.updatedAt',Number(env.updatedAt||env.data.updatedAt||Date.now()));
                     }
                 }
             } finally { this.applyingRemote=false; }
@@ -14532,18 +14700,23 @@
         async syncAll({quiet=false}={}){
             if(this.busy)return this.status();
             if(!this.configured())return this.setStatus('local','Sincronização entre computadores não configurada.');
+            if(quiet&&this.nextRetryAt>Date.now())return this.status();
+            this.busy=true;
+            this.setStatus('authenticating','Autenticando…');
             const auth=this.auth();
-            if(!auth?.userId||!(await this.ensureToken()))return this.setStatus('auth-required','Entre na conta Supabase para sincronizar.');
-            this.busy=true;this.setStatus('syncing','Sincronizando…');
+            if(!auth?.userId||!(await this.ensureToken())){this.busy=false;return this.setStatus('auth-required','Entre na conta Supabase para sincronizar.');}
             try{
                 const userId=this.auth()?.userId;
                 // REGRA CRÍTICA: sempre PULL antes de qualquer PUSH. Um PC vazio nunca
                 // envia "vazio" como substituição do remoto; esta sincronização é por registro.
-                const remoteRows=await this.request(`/rest/v1/${this.TABLE}?select=id,payload,updated_at,device_id&order=updated_at.asc`,{method:'GET',headers:{Accept:'application/json'}});
+                this.setStatus('fetching','Buscando dados remotos…');
+                const query=`user_id=eq.${encodeURIComponent(userId)}&select=id,payload,updated_at,device_id&order=updated_at.asc`;
+                const remoteRows=await this.request(`/rest/v1/${this.TABLE}?${query}`,{method:'GET',headers:{Accept:'application/json'}});
                 const remoteMap=new Map((Array.isArray(remoteRows)?remoteRows:[]).map(row=>{const env=this.normalizeRemote(row);return[env.id,env];}));
                 this.lastRemoteReceivedAt=Date.now();
                 EH.Storage.set('sync.lastRemoteReceivedAt',this.lastRemoteReceivedAt);
 
+                this.setStatus('merging','Mesclando registros…');
                 const before=this.collectLocalRecords(),localMap=new Map(before.map(local=>[local.id,local]));
                 let received=0;
                 remoteMap.forEach(remote=>{
@@ -14571,11 +14744,17 @@
                         });
                     }
                 });
-                if(push.length)await this.request(`/rest/v1/${this.TABLE}?on_conflict=user_id,id`,{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(push)});
+                let sent=0;
+                for(let offset=0;offset<push.length;offset+=50){
+                    const batch=push.slice(offset,offset+50);this.setStatus('sending',`${sent} de ${push.length} enviados`,Math.max(this.pendingCount(),push.length-sent));
+                    await this.request(`/rest/v1/${this.TABLE}?on_conflict=user_id,id`,{method:'POST',headers:{Prefer:'resolution=merge-duplicates,return=minimal'},body:JSON.stringify(batch)});sent+=batch.length;
+                    this.setStatus('sending',`${sent} de ${push.length} enviados`,Math.max(this.pendingCount(),push.length-sent));
+                }
 
                 // Não declare "Sincronizado" só porque POST respondeu. Faz uma leitura de
                 // confirmação e só remove da fila aquilo que realmente existe no servidor.
-                const verifyRows=await this.request(`/rest/v1/${this.TABLE}?select=id,payload,updated_at,device_id&order=updated_at.asc`,{method:'GET',headers:{Accept:'application/json'}});
+                this.setStatus('awaiting-confirmation','Aguardando confirmação do servidor…');
+                const verifyRows=await this.request(`/rest/v1/${this.TABLE}?${query}`,{method:'GET',headers:{Accept:'application/json'}});
                 const verifyMap=new Map((Array.isArray(verifyRows)?verifyRows:[]).map(row=>{const env=this.normalizeRemote(row);return[env.id,env];}));
                 const confirmed=[];
                 this.collectLocalRecords().forEach(local=>{
@@ -14585,10 +14764,11 @@
                     const serverHasLocal=Number(remote.updatedAt||0)>=Number(local.updatedAt||0)&&this.sameData(merged,remote.data||{});
                     if(serverHasLocal){confirmed.push(local.id);this.applyEnvelope(remote);}
                 });
-                this.clearPending(confirmed);
+                const finalLocal=this.collectLocalRecords();
+                this.reconcilePending(finalLocal,confirmed);
                 this.lastServerConfirmedAt=Date.now();
                 EH.Storage.set('sync.lastServerConfirmedAt',this.lastServerConfirmedAt);
-                this.failCount=0;
+                this.failCount=0;this.nextRetryAt=0;
 
                 // Dados recebidos precisam reconstruir a interface imediatamente.
                 const page=EH.Pages?.detect?.()||'desconhecida';
@@ -14602,7 +14782,7 @@
                 const message=pending
                     ? `Servidor confirmado • ${pending} alteração(ões) ainda pendente(s)`
                     : `Sincronizado • ${received} recebido(s) • ${push.length} enviado(s)`;
-                const status=this.setStatus(pending?'pending':'synced',message,pending);
+                const status=this.setStatus(pending?'partial':'synced',message,pending);
                 if(!quiet){
                     if(pending)EH.Toast?.warning?.(message);
                     else EH.Toast?.success?.('Dados operacionais confirmados no servidor e reconstruídos neste computador.');
@@ -14610,10 +14790,19 @@
                 return status;
             }catch(error){
                 this.failCount=Math.min(8,Number(this.failCount||0)+1);
+                this.nextRetryAt=Date.now()+Math.min(15*60*1000,5000*(2**Math.max(0,this.failCount-1)));
                 const status=this.setStatus(navigator.onLine===false?'offline':'error',navigator.onLine===false?'Sem conexão • dados preservados localmente.':`Falha na sincronização: ${error.message}`);
                 if(!quiet)EH.Toast?.warning?.(status.message);
                 return status;
             }finally{this.busy=false;}
+        },
+        async testConnection(){
+            if(!this.configured())throw new Error('Configure a sincronização primeiro.');
+            this.setStatus('authenticating','Testando autenticação…');
+            const token=await this.ensureToken();if(!token)throw new Error('Entre na conta de sincronização primeiro.');
+            const userId=this.auth()?.userId;if(!userId)throw new Error('A sessão não possui usuário confirmado.');
+            await this.request(`/rest/v1/${this.TABLE}?user_id=eq.${encodeURIComponent(userId)}&select=id&limit=1`,{method:'GET',headers:{Accept:'application/json'}});
+            return this.setStatus('connected','Conexão e leitura remota confirmadas.');
         },
         syncReminders(options={}){return this.syncAll(options);},
         start(){if(this.timer)clearInterval(this.timer);const cfg=this.config();if(!cfg.enabled||cfg.provider!=='supabase'){this.setStatus('local','Somente local');return;}this.setStatus(this.auth()?.accessToken?'connected':'auth-required',this.auth()?.accessToken?'Conta conectada.':'Entre para sincronizar.');EH.Runtime.timeout('sync-first-run',()=>this.syncAll({quiet:true}),2500);this.timer=setInterval(()=>this.syncAll({quiet:true}),Math.max(30000,Number(EH.Config.SYNC_INTERVAL_MS||60000)));EH.Runtime?.on?.('sync-online',window,'online',()=>this.syncAll({quiet:true}),{passive:true});}
@@ -14968,8 +15157,9 @@
             const syncStatus=EH.Sync?.status?.() || {state:'local',pending:0};
             const syncLine=document.createElement('small'); syncLine.className=`eh-reminder-sync ${syncStatus.state||'local'}`;
             syncLine.textContent = syncStatus.state==='synced' ? '☁ Sincronizado'
-                : syncStatus.state==='syncing' ? '☁ Sincronizando…'
-                    : syncStatus.state==='offline' ? `⚠ Sem conexão${syncStatus.pending?` • ${syncStatus.pending} pendente(s)`:''}`
+                : ['authenticating','fetching','merging','sending','awaiting-confirmation'].includes(syncStatus.state) ? `☁ ${syncStatus.message||'Sincronizando…'}`
+                    : syncStatus.state==='partial' ? `⚠ ${syncStatus.pending||0} registro(s) ainda pendente(s)`
+                : syncStatus.state==='offline' ? `⚠ Sem conexão${syncStatus.pending?` • ${syncStatus.pending} pendente(s)`:''}`
                         : syncStatus.state==='auth-required' ? '☁ Sincronização: entrar na conta'
                             : syncStatus.state==='error' ? `⚠ ${syncStatus.pending||0} alteração(ões) pendente(s)`
                                 : 'Somente neste computador';
@@ -15472,13 +15662,13 @@
             const next=document.createElement('button');next.className='eh-modal-btn';next.textContent='Próximo pendente';next.addEventListener('click',()=>this.next());box.append(next);
         },
         onPageUpdate(page) {
-            if(page==='passagens'){EH.Runtime.timeout('verification-search',()=>this.runPendingSearch(),350);this.render();}
+            if(page==='passagens'){EH.Runtime.timeout('verification-search',()=>this.runPendingSearch(),350);}
             else document.querySelector('#eh-ticket-verification-queue')?.remove();
         },
         injectStyles() {
             GM_addStyle(`#eh-ticket-verification-queue{position:fixed;right:18px;bottom:18px;z-index:2147482900;width:min(430px,calc(100vw - 36px));max-height:58vh;overflow:auto;display:grid;gap:6px;padding:10px;border:1px solid #d8e0e8;border-radius:11px;background:#fff;color:#253348;box-shadow:0 14px 36px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif;font-size:10px}.eh-verification-tabs{display:grid;grid-template-columns:1fr 1fr;gap:5px}.eh-verification-tabs button{min-height:28px;border:1px solid #d4dde6;border-radius:7px;background:#f8fafc;font-size:9px;font-weight:800;cursor:pointer}.eh-verification-tabs button.active{border-color:#8fb1cf;background:#edf5fb;color:#245b86}.eh-verification-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto auto;gap:5px;align-items:center;padding:5px 0;border-top:1px solid #eef1f4}.eh-verification-row button{min-height:27px;border:1px solid #d4dde6;border-radius:6px;background:#f8fafc;font-size:8px;cursor:pointer}`);
         },
-        init(){this.injectStyles();this.render();}
+        init(){this.injectStyles();}
     };
 
     // ============================================================
@@ -18567,7 +18757,7 @@
             head.className = 'eh-modal-head';
             const title = document.createElement('div');
             title.className = 'eh-modal-title';
-            title.textContent = 'Configurações';
+            title.textContent = 'Configurações Gerais';
             const closeTop = document.createElement('button');
             closeTop.type = 'button';
             closeTop.className = 'eh-modal-close';
@@ -18756,6 +18946,8 @@
                 valores: makePane('valores', 'Atendimento', 'Taxas de embarque por origem e qualidade das capturas usadas no atendimento.'),
                 financeiro: makePane('financeiro', 'Financeiro', 'Comissão e comportamento do controle local de Caixa e Comissões.'),
                 carros: makePane('carros', 'Carros / Operação', 'Agência 287 e serviços usados na consulta rápida do Mapa de Viagem.'),
+                atalhos: makePane('atalhos', 'Botões contextuais', 'Tamanho e aparência apenas dos botões que abrem as ferramentas.'),
+                rotas: makePane('rotas', 'Rotas rápidas', 'Horários configuráveis. O serviço continua sendo detectado na pesquisa real do dia.'),
                 lembretes: makePane('lembretes', 'Lembretes', 'Passagens emitidas/capturadas que precisam ser localizadas e impressas posteriormente.'),
                 sincronizacao: makePane('sincronizacao', 'Sincronização', 'Dados operacionais compartilhados entre os computadores autorizados.'),
                 avancado: makePane('avancado', 'Avançado', 'Diagnóstico e opções técnicas que normalmente não precisam ser alteradas.')
@@ -18768,6 +18960,64 @@
                 checkField('autoCopy', 'Tentar copiar automaticamente o PNG quando o navegador permitir', EH.Config.AUTO_COPY_IMAGES)
             );
             sections.geral.pane.appendChild(generalAutomation);
+
+            // BOTÕES CONTEXTUAIS
+            const shortcutCard = card('Abertura dos painéis');
+            const shortcutGrid = grid();
+            shortcutGrid.append(
+                selectField('contextButtonSize', 'Tamanho', EH.Config.CONTEXT_BUTTON_SIZE, [
+                    ['small','Pequeno'],['normal','Normal'],['large','Grande'],['xlarge','Extra grande']
+                ]),
+                numberField('contextButtonFontSize', 'Fonte (px)', EH.Config.CONTEXT_BUTTON_FONT_SIZE, {min:8,max:18,step:1}),
+                numberField('contextButtonIconSize', 'Ícone (px)', EH.Config.CONTEXT_BUTTON_ICON_SIZE, {min:12,max:26,step:1}),
+                numberField('contextButtonGap', 'Distância (px)', EH.Config.CONTEXT_BUTTON_GAP, {min:2,max:18,step:1}),
+                numberField('contextButtonOpacity', 'Opacidade (%)', Math.round(EH.Config.CONTEXT_BUTTON_OPACITY*100), {min:65,max:100,step:1})
+            );
+            shortcutCard.append(shortcutGrid,checkField('contextButtonShowText','Exibir texto ao lado do ícone',EH.Config.CONTEXT_BUTTON_SHOW_TEXT,'Quando desativado, o nome continua disponível no tooltip e no rótulo acessível.'));
+            const resetContextPanels=document.createElement('button');resetContextPanels.type='button';resetContextPanels.className='eh-modal-btn';resetContextPanels.textContent='Restaurar posições dos painéis contextuais';resetContextPanels.addEventListener('click',()=>{EH.Storage.set('contextualPanels.v1',{});for(const [id] of EH.ContextualPanels?.panels||[])EH.ContextualPanels.close(id);EH.Toast.info('Posições contextuais restauradas.');});shortcutCard.appendChild(resetContextPanels);
+            sections.atalhos.pane.appendChild(shortcutCard);
+
+            // ROTAS RÁPIDAS
+            const quickMessageCard=card('Mensagem e WhatsApp');
+            quickMessageCard.append(
+                textField('quickRouteGreeting','Saudação opcional',EH.Config.QUICK_ROUTE_GREETING),
+                textField('quickRouteFooter','Rodapé',EH.Config.QUICK_ROUTE_FOOTER),
+                textareaField('quickRouteSummaryTemplate','Modelo resumido (opcional)',EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE),
+                textareaField('quickRouteFullTemplate','Modelo completo (opcional)',EH.Config.QUICK_ROUTE_FULL_TEMPLATE),
+                selectField('quickRouteEmojiLevel','Emojis',EH.Config.QUICK_ROUTE_EMOJI_LEVEL,[['none','Nenhum'],['low','Poucos'],['normal','Normal'],['high','Mais emojis']]),
+                checkField('quickRouteCopyBeforeWhatsApp','Copiar antes de preparar no WhatsApp',EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP)
+            );
+            quickMessageCard.append(note('Campos disponíveis: {greeting}, {origin}, {destination}, {date}, {time}, {company}, {line}, {vehicle}, {service}, {base}, {fee}, {final}, {notes}, {footer}. Linhas sem dado são omitidas.'));
+            sections.rotas.pane.appendChild(quickMessageCard);
+            const quickRoutesCard=card('Rotas cadastradas');
+            const quickRouteList=document.createElement('div');quickRouteList.className='eh-settings-list';
+            const quickRouteRows=[];
+            const addQuickRouteRow=(item={})=>{
+                const row=document.createElement('div');row.className='eh-settings-card';row.style.margin='7px 0';
+                const rowGrid=grid();
+                const time=document.createElement('input');time.type='time';time.value=String(item.time||'');
+                const origin=document.createElement('input');origin.type='text';origin.value=String(item.origin||'');origin.placeholder='Origem';
+                const destination=document.createElement('input');destination.type='text';destination.value=String(item.destination||'');destination.placeholder='Destino';
+                const alias=document.createElement('input');alias.type='text';alias.value=String(item.alias||'');alias.placeholder='Apelido opcional';
+                const wrap=(labelText,input)=>{const field=document.createElement('div');field.className='eh-field';const label=document.createElement('label');label.textContent=labelText;field.append(label,input);return field;};
+                rowGrid.append(wrap('Horário',time),wrap('Origem',origin),wrap('Destino',destination),wrap('Apelido',alias));
+                const active=document.createElement('input');active.type='checkbox';active.checked=item.active!==false;
+                const visible=document.createElement('input');visible.type='checkbox';visible.checked=item.visible!==false;
+                const flags=document.createElement('div');flags.className='eh-settings-inline-actions';
+                const flag=(input,labelText)=>{const label=document.createElement('label');label.className='eh-check';const span=document.createElement('span');span.textContent=labelText;label.append(input,span);return label;};
+                const up=document.createElement('button');up.type='button';up.className='eh-modal-btn';up.textContent='↑';up.title='Mover para cima';
+                const down=document.createElement('button');down.type='button';down.className='eh-modal-btn';down.textContent='↓';down.title='Mover para baixo';
+                const remove=document.createElement('button');remove.type='button';remove.className='eh-modal-btn danger';remove.textContent='Excluir';
+                flags.append(flag(active,'Ativa'),flag(visible,'Painel rápido'),up,down,remove);row.append(rowGrid,flags);quickRouteList.appendChild(row);
+                const state={id:String(item.id||`rota-${Date.now()}-${Math.random().toString(36).slice(2,7)}`),row,time,origin,destination,alias,active,visible,removed:false};quickRouteRows.push(state);
+                up.addEventListener('click',()=>{const previous=row.previousElementSibling;if(previous)quickRouteList.insertBefore(row,previous);});
+                down.addEventListener('click',()=>{const next=row.nextElementSibling;if(next)quickRouteList.insertBefore(next,row);});
+                remove.addEventListener('click',()=>{state.removed=true;row.remove();});
+            };
+            EH.QuickRoutes.load().forEach(addQuickRouteRow);
+            const addQuickRoute=document.createElement('button');addQuickRoute.type='button';addQuickRoute.className='eh-modal-btn';addQuickRoute.textContent='+ Adicionar rota';addQuickRoute.addEventListener('click',()=>addQuickRouteRow());
+            quickRoutesCard.append(quickRouteList,addQuickRoute,note('Cada rota possui ID próprio. Horário e serviço não são usados como identificador interno.'));
+            sections.rotas.pane.appendChild(quickRoutesCard);
 
             // APARÊNCIA
             const presetCard = card('Presets');
@@ -18820,10 +19070,8 @@
                 ], 'Os dois painéis permanecem agrupados como overlays.'),
                 numberField('topOffset', 'Distância do topo (px)', EH.Config.OVERLAY_TOP_OFFSET, { min: 0, max: 240, step: 2, hint: '0 = automático conforme o tamanho da tela.' })
             );
-            positionCard.append(
-                checkField('mainOpen', 'Manter o painel Atendimento aberto', EH.State.isOpen('left'), 'O estado é salvo localmente e pode ser alterado pelo botão recolher.'),
-                positionGrid
-            );
+            const legacyMainOpen=checkField('mainOpen','Painel legado',false);legacyMainOpen.hidden=true;
+            positionCard.append(legacyMainOpen,positionGrid,note('Os painéis operacionais agora são independentes e aparecem somente no contexto correspondente.'));
             sections.paineis.pane.appendChild(positionCard);
 
             const dimensionsCard = card('Dimensões');
@@ -18840,6 +19088,7 @@
             const managedPanels = EH.PanelManager.load();
             const panelDrafts = JSON.parse(JSON.stringify(managedPanels));
             const controlCard = card('Mover, fixar e dimensionar');
+            controlCard.hidden = true;
             const controlGrid = grid();
             controlGrid.append(
                 selectField('managedPanel', 'Painel', 'main', [
@@ -18877,10 +19126,8 @@
 
             // WHATSAPP
             const waStateCard = card('Painel integrado');
-            waStateCard.append(
-                checkField('waVisible', 'Exibir Conversa atual / WhatsApp integrado', EH.State.isOpen('right')),
-                note('A conexão continua sendo feita pelo WhatsApp Bridge já existente. Estas opções não alteram a Bridge.')
-            );
+            const legacyWaVisible=checkField('waVisible','Painel legado',false);legacyWaVisible.hidden=true;
+            waStateCard.append(legacyWaVisible,note('A conexão continua sendo feita pelo WhatsApp Bridge. A interface é aberta somente quando uma ação de envio for solicitada.'));
             sections.whatsapp.pane.appendChild(waStateCard);
 
             const messagesCard = card('Mensagens automáticas');
@@ -19044,7 +19291,7 @@
             const updateSyncStatus=()=>{const s=EH.Sync?.status?.()||{};syncStatusLine.textContent=`Status: ${s.message||s.state||'somente local'}${s.pending?` • ${s.pending} pendente(s)`:''}`;};
             updateSyncStatus();
             const syncActions=document.createElement('div'); syncActions.className='eh-settings-inline-actions';
-            const syncLogin=document.createElement('button'); syncLogin.type='button'; syncLogin.className='eh-modal-btn primary'; syncLogin.textContent='Entrar / testar';
+            const syncLogin=document.createElement('button'); syncLogin.type='button'; syncLogin.className='eh-modal-btn primary'; syncLogin.textContent='Entrar / testar conexão';
             const syncNow=document.createElement('button'); syncNow.type='button'; syncNow.className='eh-modal-btn'; syncNow.textContent='Sincronizar agora';
             const syncLogout=document.createElement('button'); syncLogout.type='button'; syncLogout.className='eh-modal-btn'; syncLogout.textContent='Sair da sincronização';
             syncActions.append(syncLogin,syncNow,syncLogout);
@@ -19085,7 +19332,8 @@
                 try{
                     applySyncFields();
                     if(!EH.Config.SYNC_ENABLED) { fields.syncEnabled.checked=true; applySyncFields(); }
-                    await EH.Sync.login(fields.syncEmail.value,fields.syncPassword.value);
+                    if(String(fields.syncPassword.value||''))await EH.Sync.login(fields.syncEmail.value,fields.syncPassword.value);
+                    else await EH.Sync.testConnection();
                     fields.syncPassword.value='';
                     EH.Sync.start(); updateSyncStatus();
                     EH.Toast.success('Conta de sincronização conectada.');
@@ -19246,6 +19494,20 @@
                 fields.syncRequisitions.checked = Boolean(d.SYNC_REQUISITIONS);
                 fields.syncEmissionData.checked = Boolean(d.SYNC_EMISSION_DATA);
                 fields.syncSettings.checked = Boolean(d.SYNC_SETTINGS);
+                fields.contextButtonSize.value = d.CONTEXT_BUTTON_SIZE;
+                fields.contextButtonFontSize.value = String(d.CONTEXT_BUTTON_FONT_SIZE);
+                fields.contextButtonIconSize.value = String(d.CONTEXT_BUTTON_ICON_SIZE);
+                fields.contextButtonGap.value = String(d.CONTEXT_BUTTON_GAP);
+                fields.contextButtonOpacity.value = String(Math.round(d.CONTEXT_BUTTON_OPACITY*100));
+                fields.contextButtonShowText.checked = Boolean(d.CONTEXT_BUTTON_SHOW_TEXT);
+                fields.quickRouteGreeting.value = d.QUICK_ROUTE_GREETING;
+                fields.quickRouteFooter.value = d.QUICK_ROUTE_FOOTER;
+                fields.quickRouteSummaryTemplate.value = d.QUICK_ROUTE_SUMMARY_TEMPLATE;
+                fields.quickRouteFullTemplate.value = d.QUICK_ROUTE_FULL_TEMPLATE;
+                fields.quickRouteEmojiLevel.value = d.QUICK_ROUTE_EMOJI_LEVEL;
+                fields.quickRouteCopyBeforeWhatsApp.checked = Boolean(d.QUICK_ROUTE_COPY_BEFORE_WHATSAPP);
+                quickRouteRows.forEach(row=>{row.removed=true;row.row.remove();});
+                (d.OPERATION_ROUTINES||[]).forEach((item,index)=>addQuickRouteRow({id:item.id,time:item.operationalTime,origin:item.originHint,destination:item.destinationHint,alias:item.name,active:item.active!==false,visible:item.active!==false,order:index}));
                 const defaultPanels = EH.PanelManager.defaults();
                 Object.keys(defaultPanels).forEach(key => panelDrafts[key] = { ...defaultPanels[key] });
                 loadPanelDraft(fields.managedPanel.value);
@@ -19354,6 +19616,23 @@
                 EH.Config.SYNC_REQUISITIONS = Boolean(fields.syncRequisitions?.checked);
                 EH.Config.SYNC_EMISSION_DATA = Boolean(fields.syncEmissionData?.checked);
                 EH.Config.SYNC_SETTINGS = Boolean(fields.syncSettings?.checked);
+                EH.Config.CONTEXT_BUTTON_SIZE = fields.contextButtonSize.value;
+                EH.Config.CONTEXT_BUTTON_FONT_SIZE = clamp(fields.contextButtonFontSize.value,8,18,10);
+                EH.Config.CONTEXT_BUTTON_ICON_SIZE = clamp(fields.contextButtonIconSize.value,12,26,15);
+                EH.Config.CONTEXT_BUTTON_GAP = clamp(fields.contextButtonGap.value,2,18,6);
+                EH.Config.CONTEXT_BUTTON_OPACITY = clamp(Number(fields.contextButtonOpacity.value)/100,.65,1,.96);
+                EH.Config.CONTEXT_BUTTON_SHOW_TEXT = Boolean(fields.contextButtonShowText.checked);
+                EH.Config.QUICK_ROUTE_GREETING = String(fields.quickRouteGreeting.value||'').trim();
+                EH.Config.QUICK_ROUTE_FOOTER = String(fields.quickRouteFooter.value||'').trim();
+                EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE = String(fields.quickRouteSummaryTemplate.value||'');
+                EH.Config.QUICK_ROUTE_FULL_TEMPLATE = String(fields.quickRouteFullTemplate.value||'');
+                EH.Config.QUICK_ROUTE_EMOJI_LEVEL = fields.quickRouteEmojiLevel.value;
+                EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP = Boolean(fields.quickRouteCopyBeforeWhatsApp.checked);
+                const quickRouteOrder=Array.from(quickRouteList.children);const quickRoutes = quickRouteRows.filter(row=>!row.removed&&row.row.isConnected).sort((a,b)=>quickRouteOrder.indexOf(a.row)-quickRouteOrder.indexOf(b.row)).map((row,index)=>({
+                    id:row.id,time:EH.Utils.clean(row.time.value||''),origin:EH.Utils.clean(row.origin.value||''),destination:EH.Utils.clean(row.destination.value||''),alias:EH.Utils.clean(row.alias.value||''),active:Boolean(row.active.checked),visible:Boolean(row.visible.checked),order:index
+                }));
+                const invalidQuickRoute=quickRoutes.find(item=>!/^\d{2}:\d{2}$/.test(item.time)||!item.origin||!item.destination);
+                if(invalidQuickRoute){EH.Toast.error('Confira horário, origem e destino das rotas rápidas.');return;}
                 const operationRoutines = operationRoutineFields
                     .filter(row => !row.removed && row.row.isConnected)
                     .map((row,index) => {
@@ -19443,25 +19722,30 @@
                     syncRequisitions: EH.Config.SYNC_REQUISITIONS,
                     syncEmissionData: EH.Config.SYNC_EMISSION_DATA,
                     syncSettings: EH.Config.SYNC_SETTINGS,
+                    contextButtonSize: EH.Config.CONTEXT_BUTTON_SIZE,
+                    contextButtonFontSize: EH.Config.CONTEXT_BUTTON_FONT_SIZE,
+                    contextButtonIconSize: EH.Config.CONTEXT_BUTTON_ICON_SIZE,
+                    contextButtonGap: EH.Config.CONTEXT_BUTTON_GAP,
+                    contextButtonOpacity: EH.Config.CONTEXT_BUTTON_OPACITY,
+                    contextButtonShowText: EH.Config.CONTEXT_BUTTON_SHOW_TEXT,
+                    quickRouteGreeting: EH.Config.QUICK_ROUTE_GREETING,
+                    quickRouteFooter: EH.Config.QUICK_ROUTE_FOOTER,
+                    quickRouteSummaryTemplate: EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE,
+                    quickRouteFullTemplate: EH.Config.QUICK_ROUTE_FULL_TEMPLATE,
+                    quickRouteEmojiLevel: EH.Config.QUICK_ROUTE_EMOJI_LEVEL,
+                    quickRouteCopyBeforeWhatsApp: EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP,
                     debug: fields.debug.checked
                 };
                 Object.entries(settingsToSave).forEach(([key, value]) => EH.Storage.set(key, value));
+                EH.QuickRoutes.save(quickRoutes);
                 EH.PanelManager.save(panelDrafts);
                 EH.Sync?.start?.();
 
-                // Estado dos overlays usa a mesma memória já existente do projeto.
-                EH.State.setPanel('left', fields.mainOpen.checked);
-                EH.State.setPanel('right', fields.waVisible.checked);
-
                 EH.Layout.sync();
-                if (EH.Config.OPERATION_DOCK_ENABLED) EH.OperationDock?.init?.();
-                if (EH.OperationDock?.root) {
-                    EH.OperationDock.root.style.setProperty('display', EH.Config.OPERATION_DOCK_ENABLED && !EH.OperationDock.collapsed ? 'flex' : 'none', 'important');
-                    if (EH.OperationDock.launcher) EH.OperationDock.launcher.hidden = !EH.Config.OPERATION_DOCK_ENABLED || !EH.OperationDock.collapsed;
-                }
                 EH.PanelManager?.bindAll?.();
                 EH.Reminders?.render?.();
                 EH.OperationCars?.render?.();
+                EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');
 
                 const verification = {
                     preset: EH.Storage.get('settingsPreset', ''),
@@ -19492,84 +19776,223 @@
     };
 
     // ============================================================
-    // ATALHOS CONTEXTUAIS — CAMADA COMPACTA
-    // Apenas delega para as funções centrais; não duplica regras de negócio.
+    // ROTAS RÁPIDAS — configuração por registro, sem serviço fixo.
+    // ============================================================
+    EH.QuickRoutes = {
+        KEY: 'quickRoutes.v1',
+        load() {
+            const rows = EH.Storage.get(this.KEY, []);
+            return (Array.isArray(rows) ? rows : []).map((item, index) => ({
+                id: String(item?.id || `rota-${index}`),
+                time: EH.Utils.clean(item?.time || item?.operationalTime || ''),
+                origin: EH.Utils.clean(item?.origin || item?.origem || item?.originHint || ''),
+                destination: EH.Utils.clean(item?.destination || item?.destino || item?.destinationHint || ''),
+                alias: EH.Utils.clean(item?.alias || item?.name || ''),
+                active: item?.active !== false,
+                visible: item?.visible !== false,
+                order: Number.isFinite(Number(item?.order)) ? Number(item.order) : index,
+                createdAt: Number(item?.createdAt || Date.now()),
+                updatedAt: Number(item?.updatedAt || item?.createdAt || Date.now())
+            })).filter(item => item.time && item.origin && item.destination).sort((a,b) => a.order - b.order || a.time.localeCompare(b.time));
+        },
+        save(rows, { markPending = true, preserveUpdatedAt = false } = {}) {
+            const used = new Set();
+            const clean = (Array.isArray(rows) ? rows : []).map((item, index) => {
+                let id = String(item?.id || `rota-${Date.now()}-${index}`);
+                while (used.has(id)) id = `${id}-${index + 1}`;
+                used.add(id);
+                return { ...item, id, order:index, updatedAt:preserveUpdatedAt?Number(item?.updatedAt||Date.now()):Date.now() };
+            }).filter(item => item.time && item.origin && item.destination);
+            EH.Storage.set(this.KEY, clean);
+            EH.Storage.set('quickRoutes.updatedAt', Date.now());
+            if (markPending) EH.Sync?.markPendingRecord?.('config', 'quick-routes');
+            EH.ContextualPanels?.refresh?.('routes');
+            return clean;
+        },
+        active() { return this.load().filter(item => item.active && item.visible); },
+        title(route) { return route.alias || `${route.origin} → ${route.destination}`; },
+        currentResult(route) {
+            if (EH.Pages?.detect?.() !== 'pesquisa') return { data:null, item:null };
+            const data = EH.Parser?.parsePesquisa?.();
+            const sameOrigin = EH.Utils.normalize(data?.origem || '').includes(EH.Utils.normalize(route.origin));
+            const sameDestination = EH.Utils.normalize(data?.destino || '').includes(EH.Utils.normalize(route.destination));
+            const item = sameOrigin && sameDestination
+                ? (data?.horarios || []).find(row => String(row.saida || '') === String(route.time || '')) || null
+                : null;
+            return { data, item };
+        },
+        renderTemplate(template, values={}) {
+            return String(template||'').split(/\r?\n/).filter(line=>{
+                const tokens=Array.from(line.matchAll(/\{([a-zA-Z]+)\}/g),match=>match[1]);
+                return !tokens.length||tokens.some(token=>String(values[token]??'').trim());
+            }).map(line=>line.replace(/\{([a-zA-Z]+)\}/g,(_match,key)=>String(values[key]??''))).join('\n').replace(/[ \t]+\n/g,'\n').replace(/\n{3,}/g,'\n\n').trim();
+        },
+        message(route, mode = 'summary') {
+            const { data, item } = this.currentResult(route);
+            const emojiLevels={
+                none:{bus:'',time:'',date:'',money:'',seat:'',info:''},
+                low:{bus:'🚌 ',time:'🕐 ',date:'',money:'',seat:'',info:''},
+                normal:{bus:'🚌 ',time:'🕐 ',date:'🗓️ ',money:'💰 ',seat:'💺 ',info:'🎫 '},
+                high:{bus:'🚌✨ ',time:'🕐 ',date:'🗓️ ',money:'💰 ',seat:'💺 ',info:'🎫✅ '}
+            };const emoji=emojiLevels[EH.Config.QUICK_ROUTE_EMOJI_LEVEL]||emojiLevels.normal;
+            const values={greeting:EH.Config.QUICK_ROUTE_GREETING,footer:EH.Config.QUICK_ROUTE_FOOTER,origin:route.origin,destination:route.destination,time:route.time,date:data?.data||'',company:item?.empresa||item?.linha||'',line:item?.linhaReal||'',vehicle:item?.tipo||'',service:item?.servicos?.join(', ')||'',availability:'',base:item?.valorBase||'',fee:Number(item?.taxaEmbarqueNum||0)>0?(item?.taxaEmbarque||''):'',final:item?.valorFinal||'',notes:route.alias||''};
+            const custom=mode==='details'?EH.Config.QUICK_ROUTE_FULL_TEMPLATE:EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE;
+            if(String(custom||'').trim())return this.renderTemplate(custom,values);
+            const lines = [];
+            if (EH.Config.QUICK_ROUTE_GREETING) lines.push(EH.Config.QUICK_ROUTE_GREETING, '');
+            lines.push(`${emoji.bus}${route.origin} → ${route.destination}`.trim(), `${emoji.time}${route.time}`.trim());
+            if (mode === 'details') {
+                if (data?.data) lines.push(`${emoji.date}${data.data}`.trim());
+                if (item?.empresa || item?.linha) lines.push(`${emoji.bus}${item.empresa || item.linha}`.trim());
+                if (item?.linhaReal) lines.push(`Linha: ${item.linhaReal}`);
+                if (item?.tipo) lines.push(`${emoji.seat}${item.tipo}`.trim());
+                if (item?.servicos?.length) lines.push(`Serviço do dia: ${item.servicos.join(', ')}`);
+                if (item?.valorBase) lines.push(`Valor base: ${item.valorBase}`);
+                if (Number(item?.taxaEmbarqueNum || 0) > 0 && item?.taxaEmbarque) lines.push(`Taxa de embarque: ${item.taxaEmbarque}`);
+                if (item?.valorFinal) lines.push(`${emoji.money}${item.valorFinal}`.trim());
+            }
+            lines.push('', `${emoji.info}${EH.Config.QUICK_ROUTE_FOOTER || 'Consulte disponibilidade.'}`.trim());
+            return lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+        },
+        async copy(route, mode) {
+            await EH.Clipboard.copyText(this.message(route, mode));
+            EH.Toast.success(mode === 'details' ? 'Horário completo copiado.' : 'Horário resumido copiado.');
+        },
+        async search(route) {
+            await EH.Routes.apply({ id:route.id, origem:route.origin, destino:route.destination, observacao:route.alias || '' }, { search:true, autoCapture:false });
+        },
+        previewWhatsApp(route) {
+            document.querySelector('#eh-quick-wa-preview')?.remove();
+            const overlay=document.createElement('div');overlay.id='eh-quick-wa-preview';overlay.className='eh-overlay';
+            const modal=document.createElement('div');modal.className='eh-modal';modal.style.width='min(620px,96vw)';
+            const head=document.createElement('div');head.className='eh-modal-head';
+            const title=document.createElement('div');title.className='eh-modal-title';title.textContent='Prévia para WhatsApp';
+            const close=document.createElement('button');close.type='button';close.className='eh-modal-close';close.textContent='✕';head.append(title,close);
+            const content=document.createElement('div');content.className='eh-modal-content';
+            const textarea=document.createElement('textarea');textarea.rows=12;textarea.value=this.message(route,'details');textarea.setAttribute('aria-label','Mensagem editável para WhatsApp');content.appendChild(textarea);
+            const actions=document.createElement('div');actions.className='eh-modal-actions';
+            const copy=document.createElement('button');copy.className='eh-modal-btn';copy.textContent='Copiar';
+            const send=document.createElement('button');send.className='eh-modal-btn success';send.textContent='Preparar no WhatsApp';
+            const cancel=document.createElement('button');cancel.className='eh-modal-btn';cancel.textContent='Cancelar';actions.append(copy,send,cancel);
+            const dismiss=()=>overlay.remove();close.onclick=dismiss;cancel.onclick=dismiss;overlay.addEventListener('click',event=>{if(event.target===overlay)dismiss();});
+            copy.onclick=async()=>{await EH.Clipboard.copyText(textarea.value);EH.Toast.success('Mensagem copiada.');};
+            send.onclick=async()=>{
+                if(EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP) await EH.Clipboard.copyText(textarea.value);
+                const result=await EH.UI?.openWhatsApp?.(textarea.value,{allowCurrentChat:true,bridgeOnly:true});
+                if(result?.connected)dismiss();
+            };
+            modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);textarea.focus();
+        }
+    };
+
+    // ============================================================
+    // GERENCIADOR DE PAINÉIS CONTEXTUAIS
+    // O antigo painel geral permanece somente como camada interna de funções.
+    // ============================================================
+    EH.ContextualPanels = {
+        KEY: 'contextualPanels.v1',
+        panels: new Map(),
+        settingsButton: null,
+        contexts: {
+            routes:['pesquisa'], seats:['reserva'], passenger:['reserva','passagens','requisicao'],
+            payment:['pagamento'], confirmation:['confirmacao'], tickets:['passagens'], reminders:['passagens'],
+            finance:['caixa','comissoes'], prefeitura:['requisicao'], operation:['pesquisa','passagens']
+        },
+        titles: { routes:'Rotas e horários', seats:'Poltronas', passenger:'Dados do passageiro', payment:'Pagamento e PIX', confirmation:'Resumo da compra', tickets:'Passagens emitidas', reminders:'Lembretes', finance:'Caixa e financeiro', prefeitura:'Requisição da Prefeitura', operation:'Mapa do carro e fila', menu:'Ferramentas' },
+        init() {
+            if (this.settingsButton || !document.body) return;
+            // A UI antiga continua montada para reutilizar captura/configuração, mas deixa
+            // de ser uma superfície operacional visível.
+            if (EH.UI?.root) EH.UI.root.hidden = true;
+            if (EH.UI?.launcher) EH.UI.launcher.hidden = true;
+            const button=document.createElement('button');button.id='eh-general-settings';button.type='button';button.textContent='⚙';button.title='Configurações Gerais';button.setAttribute('aria-label','Configurações Gerais');
+            button.addEventListener('click',()=>EH.UI?.showSettings?.());document.body.appendChild(button);this.settingsButton=button;
+            GM_addStyle(`
+                #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
+                html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 34px));min-width:270px;min-height:190px;overflow:hidden;resize:both;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
+                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:6px;padding:9px;border:1px solid #dfe5eb;border-radius:10px;background:#fff}.eh-context-route-head{display:flex;justify-content:space-between;gap:8px}.eh-context-route-head strong{font-size:11px}.eh-context-route-head time{font-size:12px;font-weight:900;color:#2f6ea5}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}
+                @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:auto!important;height:min(72vh,560px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
+            `);
+        },
+        saved() { const value=EH.Storage.get(this.KEY,{});return value&&typeof value==='object'?value:{}; },
+        persist(id, panel) {
+            const rect=panel.getBoundingClientRect(),all=this.saved();
+            all[id]={x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height),updatedAt:Date.now()};EH.Storage.set(this.KEY,all);
+        },
+        position(id,panel) {
+            const cfg=this.saved()[id]||{};const width=Math.min(window.innerWidth-24,Math.max(270,Number(cfg.width)||390));const height=Math.min(window.innerHeight-34,Math.max(190,Number(cfg.height)||520));
+            const fallbackX=EH.Config.OVERLAY_SIDE==='left'?12:Math.max(12,window.innerWidth-width-62);const x=Math.min(window.innerWidth-80,Math.max(0,Number.isFinite(Number(cfg.x))?Number(cfg.x):fallbackX));const y=Math.min(window.innerHeight-48,Math.max(0,Number.isFinite(Number(cfg.y))?Number(cfg.y):92));
+            Object.assign(panel.style,{width:`${width}px`,height:`${height}px`,left:`${x}px`,top:`${y}px`});
+        },
+        bindMovement(id,panel,head) {
+            let start=null,frame=0,pending=null;
+            const paint=()=>{frame=0;if(!pending)return;panel.style.transform=`translate3d(${pending.dx}px,${pending.dy}px,0)`;};
+            head.addEventListener('pointerdown',event=>{if(event.button!==0||event.target.closest('button,input,select,textarea,a'))return;start={id:event.pointerId,x:event.clientX,y:event.clientY,dx:0,dy:0,dragging:false};head.setPointerCapture?.(event.pointerId);event.preventDefault();});
+            head.addEventListener('pointermove',event=>{if(!start||start.id!==event.pointerId)return;let dx=event.clientX-start.x,dy=event.clientY-start.y;if(!start.dragging&&Math.hypot(dx,dy)<5)return;start.dragging=true;panel.classList.add('is-dragging');const rect=panel.getBoundingClientRect();dx=Math.max(-rect.left+28,Math.min(window.innerWidth-rect.right+rect.width-28,dx));dy=Math.max(-rect.top+24,Math.min(window.innerHeight-rect.bottom+rect.height-24,dy));start.dx=dx;start.dy=dy;pending={dx,dy};if(!frame)frame=requestAnimationFrame(paint);event.preventDefault();});
+            const finish=event=>{if(!start||start.id!==event.pointerId)return;if(frame){cancelAnimationFrame(frame);frame=0;}if(start.dragging){const baseLeft=parseFloat(panel.style.left)||panel.getBoundingClientRect().left;const baseTop=parseFloat(panel.style.top)||panel.getBoundingClientRect().top;panel.style.transform='';panel.style.left=`${Math.max(0,Math.min(window.innerWidth-60,baseLeft+start.dx))}px`;panel.style.top=`${Math.max(0,Math.min(window.innerHeight-42,baseTop+start.dy))}px`;panel.classList.remove('is-dragging');this.persist(id,panel);}start=null;pending=null;try{head.releasePointerCapture?.(event.pointerId);}catch(_error){}};
+            head.addEventListener('pointerup',finish);head.addEventListener('pointercancel',finish);
+            if(typeof ResizeObserver==='function'){const saveSize=EH.Utils.debounce(()=>{if(panel.isConnected&&!panel.classList.contains('is-dragging'))this.persist(id,panel);},280);new ResizeObserver(saveSize).observe(panel);}
+        },
+        cell(label,value) { const cell=document.createElement('div');const span=document.createElement('span');span.textContent=label;const strong=document.createElement('b');strong.textContent=value||'—';cell.append(span,strong);return cell; },
+        action(label,callback,className='') { const button=document.createElement('button');button.type='button';button.textContent=label;button.className=className;button.addEventListener('click',callback);return button; },
+        renderRoutes(body) {
+            const routes=EH.QuickRoutes.active();if(!routes.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota rápida ativa. Cadastre nas Configurações Gerais.';body.appendChild(empty);return;}
+            routes.forEach(route=>{const card=document.createElement('article');card.className='eh-context-route';const head=document.createElement('div');head.className='eh-context-route-head';const title=document.createElement('strong');title.textContent=EH.QuickRoutes.title(route);const time=document.createElement('time');time.textContent=route.time;head.append(title,time);const path=document.createElement('small');path.textContent=`${route.origin} → ${route.destination}`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Pesquisar',()=>EH.QuickRoutes.search(route),'primary'),this.action('Copiar resumido',()=>EH.QuickRoutes.copy(route,'summary')),this.action('Copiar completo',()=>EH.QuickRoutes.copy(route,'details')),this.action('WhatsApp',()=>EH.QuickRoutes.previewWhatsApp(route),'success'));card.append(head,path,actions);body.appendChild(card);});
+        },
+        renderSeats(body) {
+            const data=EH.Parser?.parseReserva?.()||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',EH.SaleContext?.getActivePassenger?.()?.name||''),this.cell('Rota',data.origemDestino),this.cell('Horário',data.horaSaida),this.cell('Poltrona',data.poltronasSelecionadas?.join(', ')),this.cell('Disponíveis',data.poltronasLivres?.length?String(data.poltronasLivres.length):''),this.cell('Valor',data.valorTotalNum>0?EH.Utils.formatMoney(data.valorTotalNum):''));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Gerar poltronas',()=>EH.UI?.captureAction?.('reserva'),'primary'),this.action('Copiar dados',async()=>{await EH.Clipboard.copyText(EH.Parser.formatReservaResumo(data));EH.Toast.success('Dados das poltronas copiados.');}));body.append(grid,actions);
+        },
+        renderPayment(body) {
+            const sale=EH.SaleContext?.loadSale?.()||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const pix=EH.Payment?.parsePix?.();const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name),this.cell('Rota',[sale.origem,sale.destino].filter(Boolean).join(' → ')),this.cell('Data',sale.data||sale.travelDate),this.cell('Horário',sale.horario||sale.time),this.cell('Poltrona',passenger.seat||passenger.poltrona),this.cell('Status PIX',pix?.validation?.valid?'Código disponível':'Aguardando E-Pass'));const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid)actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));body.append(grid,actions);
+        },
+        renderConfirmation(body) {
+            const sale=EH.SaleContext?.loadSale?.()||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const cpf=EH.SaleContext?.maskCpfPublic?.(passenger.cpf||'')||'';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Nome',passenger.name),this.cell('CPF',cpf),this.cell('Origem',sale.origem),this.cell('Destino',sale.destino),this.cell('Horário',sale.horario||sale.time),this.cell('Poltrona',passenger.seat||passenger.poltrona),this.cell('Pagamento',sale.paymentMethod||sale.formaPagamento),this.cell('Valor final',sale.valorFinal||sale.total));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Copiar resumo',()=>EH.UI?.copyCurrentSummary?.(),'primary'));body.append(grid,actions);
+        },
+        renderMenu(body) {
+            const actions=document.createElement('div');actions.className='eh-context-actions';[['Rotas','routes'],['Poltronas','seats'],['Passageiro / Document AI','passenger'],['Pagamento / PIX','payment'],['Confirmação','confirmation'],['Lembretes','reminders'],['Passagens','tickets'],['Caixa / Financeiro','finance'],['Requisição Prefeitura','prefeitura'],['Mapa / Fila','operation']].forEach(([label,id])=>actions.append(this.action(label,()=>this.open(id))));body.appendChild(actions);
+        },
+        render(id,body) {
+            body.innerHTML='';
+            if(id==='routes')return this.renderRoutes(body);
+            if(id==='seats')return this.renderSeats(body);
+            if(id==='payment')return this.renderPayment(body);
+            if(id==='confirmation')return this.renderConfirmation(body);
+            if(id==='passenger'||id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent=id==='prefeitura'?'Use o documento oficial, confira os dados e prepare o anexo.':'A imagem e os campos permanecerão juntos durante a conferência.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action(id==='prefeitura'?'Abrir Requisição da Prefeitura':'Abrir dados e Document AI',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));body.append(note,actions);return;}
+            if(id==='reminders'){const count=EH.Reminders?.pending?.()?.length||0;const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${count} lembrete(s) pendente(s).`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir lembretes',()=>EH.Reminders?.openModal?.(),'primary'));body.append(note,actions);return;}
+            if(id==='tickets'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Selecionar passagem',()=>EH.Tickets?.activateSelection?.(),'primary'),this.action('Abrir fila',()=>EH.TicketVerificationQueue?.render?.()));body.appendChild(actions);return;}
+            if(id==='finance'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir resumo financeiro',()=>EH.UI?.showFinanceModal?.('resumo'),'primary'));body.appendChild(actions);return;}
+            if(id==='operation'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Carros de hoje',()=>EH.OperationCars?.showCars?.(),'primary'),this.action('Atualizar mapa',()=>EH.OperationCars?.scanCurrentMap?.()));body.appendChild(actions);return;}
+            this.renderMenu(body);
+        },
+        open(id) {
+            this.init();if(this.panels.has(id)){const existing=this.panels.get(id);this.render(id,existing.body);existing.panel.focus();return existing.panel;}
+            const panel=document.createElement('aside');panel.className='eh-context-panel';panel.dataset.panel=id;panel.tabIndex=-1;panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const head=document.createElement('div');head.className='eh-context-panel-head';const title=document.createElement('strong');title.textContent=this.titles[id]||'E-Pass Helper';const close=document.createElement('button');close.type='button';close.textContent='✕';close.title='Fechar painel';head.append(title,close);const body=document.createElement('div');body.className='eh-context-panel-body';panel.append(head,body);document.body.appendChild(panel);this.panels.set(id,{panel,body});this.position(id,panel);this.bindMovement(id,panel,head);close.onclick=()=>this.close(id);this.render(id,body);panel.focus();return panel;
+        },
+        close(id){const entry=this.panels.get(id);if(!entry)return;this.persist(id,entry.panel);entry.panel.remove();this.panels.delete(id);},
+        refresh(id){const entry=this.panels.get(id);if(entry)this.render(id,entry.body);},
+        sync(page){for(const [id,entry] of this.panels){entry.panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const allowed=this.contexts[id];if(allowed&&!allowed.includes(page))this.close(id);}}
+    };
+
+    // ============================================================
+    // ATALHOS CONTEXTUAIS — apenas abrem o painel específico.
     // ============================================================
     EH.ContextualShortcuts = {
         root: null,
         currentPage: '',
-
         init() {
             if (this.root || !document.body) return;
-            const root = document.createElement('nav');
-            root.id = 'eh-context-shortcuts';
-            root.setAttribute('aria-label', 'Atalhos contextuais do E-Pass Helper');
-            document.body.appendChild(root);
-            this.root = root;
+            EH.ContextualPanels.init();
+            const root=document.createElement('nav');root.id='eh-context-shortcuts';root.setAttribute('aria-label','Atalhos contextuais do E-Pass Helper');document.body.appendChild(root);this.root=root;
             GM_addStyle(`
-                #eh-context-shortcuts{position:fixed;right:8px;top:150px;z-index:2147482950;display:flex;flex-direction:column;gap:6px;pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}
-                #eh-context-shortcuts[hidden]{display:none!important}#eh-context-shortcuts button{pointer-events:auto;min-width:38px;max-width:150px;min-height:36px;padding:7px 9px;border:1px solid #cbd5e1;border-radius:10px;background:rgba(255,255,255,.96);color:#28415e;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:800 10px/1.15 Inter,"Segoe UI",Arial,sans-serif;text-align:left}
-                #eh-context-shortcuts button:hover,#eh-context-shortcuts button:focus-visible{border-color:#6b9ed8;background:#fff;outline:2px solid rgba(59,130,246,.18)}
-                html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:auto}html.eh-overlay-main-open #eh-context-shortcuts{opacity:.38}html.eh-overlay-main-open #eh-context-shortcuts:hover,html.eh-overlay-main-open #eh-context-shortcuts:focus-within{opacity:1}
-                @media(max-width:760px){#eh-context-shortcuts{top:auto;right:8px;bottom:10px;flex-direction:row;max-width:calc(100vw - 16px);overflow-x:auto}html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:8px}}
-            `);
-            this.render(EH.Pages?.detect?.() || 'desconhecida');
+                #eh-context-shortcuts{position:fixed;right:8px;top:142px;z-index:2147482950;display:flex;flex-direction:column;gap:var(--eh-context-gap,6px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}
+                #eh-context-shortcuts button{pointer-events:auto;display:flex;align-items:center;gap:6px;min-width:var(--eh-context-min,38px);min-height:var(--eh-context-height,36px);padding:7px 9px;border:1px solid #cbd5e1;border-radius:10px;background:rgba(255,255,255,var(--eh-context-opacity,.96));color:#28415e;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:800 var(--eh-context-font,10px)/1.15 Inter,"Segoe UI",Arial,sans-serif;text-align:left}.eh-context-shortcut-icon{font-size:var(--eh-context-icon,15px)}#eh-context-shortcuts button:hover,#eh-context-shortcuts button:focus-visible{border-color:#6b9ed8;background:#fff;outline:2px solid rgba(59,130,246,.18)}
+                html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:auto}@media(max-width:760px){#eh-context-shortcuts{top:auto;right:8px;bottom:10px;flex-direction:row;max-width:calc(100vw - 16px);overflow-x:auto}html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:8px}}
+            `);this.render(EH.Pages?.detect?.()||'desconhecida');
         },
-
-        openMain(selector = '.eh-context-card') {
-            EH.UI?.setPanelOpen?.(true);
-            EH.Runtime?.timeout?.('context-shortcut-focus', () => EH.UI?.root?.querySelector?.(selector)?.scrollIntoView?.({ block: 'nearest' }), 80);
-        },
-
-        button(label, title, action) {
-            const button = document.createElement('button');
-            button.type = 'button';
-            button.textContent = label;
-            button.title = title;
-            button.setAttribute('aria-label', title);
-            button.addEventListener('click', event => { event.stopPropagation(); action(); });
-            return button;
-        },
-
-        definitions(page) {
-            const open = () => this.openMain();
-            if (page === 'pesquisa') return [
-                ['🧭 Rotas', 'Abrir horários e rotas rápidas', () => this.openMain('.eh-quick-routes')],
-                ['🗓️ Horários', 'Gerar horários usando a função central', () => EH.UI?.captureAction?.('pesquisa')]
-            ];
-            if (page === 'reserva') return [
-                ['💺 Poltronas', 'Gerar imagem das poltronas', () => EH.UI?.captureAction?.('reserva')],
-                ['👤 Dados', 'Abrir dados do passageiro', () => EH.PrefeituraRequisition?.open?.()]
-            ];
-            if (page === 'confirmacao') return [['✅ Conferir', 'Abrir conferência da compra', open]];
-            if (page === 'pagamento') {
-                const pix = EH.Payment?.parsePix?.();
-                const actions = [['💳 Pagamento', 'Abrir ferramentas do pagamento', open]];
-                if (pix?.validation?.valid) actions.push(['📋 PIX', 'Copiar o PIX identificado', () => EH.Payment.copyPixCode(pix)]);
-                return actions;
-            }
-            if (page === 'passagens') return [
-                ['🎫 Bilhete', 'Capturar o bilhete selecionado', () => EH.Tickets?.activateSelection?.()],
-                ['👤 Passageiro', 'Abrir os dados confirmados do passageiro', () => EH.PrefeituraRequisition?.open?.()]
-            ];
-            if (page === 'caixa' || page === 'comissoes') return [['📊 Financeiro', 'Abrir resumo financeiro do Helper', () => EH.UI?.showFinanceModal?.('resumo')]];
-            if (page === 'requisicao') return [
-                ['📄 Requisição', 'Abrir a Requisição da Prefeitura', () => EH.PrefeituraRequisition?.open?.()],
-                ['👤 Preencher', 'Preencher os dados confirmados na solicitação', async () => {
-                    try { await EH.PassengerIdentity?.fillSolicitation?.(); EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.'); }
-                    catch (error) { EH.Toast?.warning?.(error.message || 'A tela atual não possui campos compatíveis para preenchimento.'); }
-                }]
-            ];
-            return [];
-        },
-
-        render(page = EH.Pages?.detect?.() || 'desconhecida') {
-            if (!this.root) return;
-            this.currentPage = page;
-            const definitions = this.definitions(page);
-            this.root.replaceChildren(...definitions.map(([label, title, action]) => this.button(label, title, action)));
-            this.root.hidden = !definitions.length;
-        }
+        button(icon,label,title,action){const button=document.createElement('button');button.type='button';button.title=title;button.setAttribute('aria-label',title);const i=document.createElement('span');i.className='eh-context-shortcut-icon';i.textContent=icon;button.appendChild(i);if(EH.Config.CONTEXT_BUTTON_SHOW_TEXT){const text=document.createElement('span');text.textContent=label;button.appendChild(text);}button.addEventListener('click',event=>{event.stopPropagation();action();});return button;},
+        definitions(page){const open=id=>()=>EH.ContextualPanels.open(id);if(page==='pesquisa')return[['🧭','Rotas','Rotas e horários rápidos',open('routes')],['🗓️','Horários','Capturar horários encontrados',()=>EH.UI?.captureAction?.('pesquisa')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];if(page==='reserva')return[['💺','Poltronas','Poltronas e passageiro atual',open('seats')],['👤','Dados','Dados do passageiro e Document AI',open('passenger')]];if(page==='confirmacao')return[['✅','Conferir','Resumo e confirmação consciente',open('confirmation')]];if(page==='pagamento')return[['💳','Pagamento','Pagamento e PIX',open('payment')]];if(page==='passagens')return[['🎫','Bilhetes','Passagens emitidas',open('tickets')],['🔔','Lembretes','Lembretes de impressão',open('reminders')],['👤','Passageiro','Dados confirmados do passageiro',open('passenger')]];if(page==='caixa'||page==='comissoes')return[['📊','Financeiro','Caixa e financeiro',open('finance')]];if(page==='requisicao')return[['📄','Requisição','Requisição da Prefeitura',open('prefeitura')],['👤','Preencher','Preencher somente campos reais compatíveis',async()=>{try{await EH.PassengerIdentity?.fillSolicitation?.();EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.');}catch(error){EH.Toast?.warning?.(error.message||'A tela atual não possui campos compatíveis para preenchimento.');}}]];return[['☰','Ferramentas','Abrir menu compacto de ferramentas',open('menu')]];},
+        applyPreferences(){if(!this.root)return;const sizes={small:[32,32],normal:[38,36],large:[46,42],xlarge:[56,50]};const [min,height]=sizes[EH.Config.CONTEXT_BUTTON_SIZE]||sizes.normal;this.root.style.setProperty('--eh-context-min',`${min}px`);this.root.style.setProperty('--eh-context-height',`${height}px`);this.root.style.setProperty('--eh-context-font',`${EH.Config.CONTEXT_BUTTON_FONT_SIZE}px`);this.root.style.setProperty('--eh-context-icon',`${EH.Config.CONTEXT_BUTTON_ICON_SIZE}px`);this.root.style.setProperty('--eh-context-gap',`${EH.Config.CONTEXT_BUTTON_GAP}px`);this.root.style.setProperty('--eh-context-opacity',String(EH.Config.CONTEXT_BUTTON_OPACITY));},
+        render(page=EH.Pages?.detect?.()||'desconhecida'){if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);this.root.replaceChildren(...definitions.map(args=>this.button(...args)));this.root.hidden=!definitions.length;EH.ContextualPanels?.sync?.(page);}
     };
 
     // ============================================================
@@ -19586,7 +20009,7 @@
 
             const isOwnMutation = mutation => {
                 const target = mutation?.target instanceof Element ? mutation.target : mutation?.target?.parentElement;
-                return Boolean(target?.closest?.('#eh-root, #eh-context-shortcuts, #eh-wa-dock, #eh-operation-dock, #eh-operation-launcher, #eh-toast-area, .eh-overlay, .eh-capture-overlay, .eh-pref-overlay'));
+                return Boolean(target?.closest?.('#eh-root, #eh-context-shortcuts, #eh-general-settings, .eh-context-panel, #eh-wa-dock, #eh-operation-dock, #eh-operation-launcher, #eh-toast-area, .eh-overlay, .eh-capture-overlay, .eh-pref-overlay'));
             };
 
             this.observer = new MutationObserver(mutations => {
@@ -19641,13 +20064,13 @@
             safeInit('Memória persistente de emissões', () => EH.EmissionMemory?.init?.());
             safeInit('Conferência de bilhetes', () => EH.TicketVerificationQueue?.init?.());
             safeInit('Sincronização', () => EH.Sync?.start?.());
-            safeInit('Operação', () => EH.OperationDock.init());
+            // Docks operacionais permanentes foram substituídos por painéis contextuais.
             safeInit('Mapa dos carros', () => EH.OperationCars.init());
             safeInit('Contexto de vendas', () => EH.SaleCpfs.init());
             safeInit('Identidade do passageiro', () => EH.PassengerIdentity.init());
             safeInit('Requisições', () => EH.RequisitionManager.init());
             safeInit('Requisição Prefeitura', () => EH.PrefeituraRequisition.init());
-            safeInit('WhatsApp', () => EH.WhatsAppDock.init());
+            // O WhatsApp Bridge continua ativo; sua interface só é acionada quando necessária.
             safeInit('Layout', () => EH.Layout.sync());
             safeInit('Painéis', () => EH.PanelManager.bindAll());
             EH.Runtime.on('app-resize', window, 'resize', EH.Utils.debounce(() => { EH.Layout.sync(); EH.PanelManager.applyAll(); }, 140));
@@ -19658,7 +20081,7 @@
             EH.Runtime.on('app-shortcuts', document, 'keydown', event => {
                 if (event.altKey && !event.ctrlKey && !event.shiftKey && String(event.key || '').toLowerCase() === 'a') {
                     event.preventDefault();
-                    EH.UI.togglePanel();
+                    EH.ContextualPanels?.open?.('menu');
                     return;
                 }
                 if (event.key === 'Escape' && EH.Tickets.active) {
