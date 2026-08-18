@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.69.0
+// @version      5.70.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.69.0',
+        VERSION: '5.70.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 11,
+        STORAGE_SCHEMA_VERSION: 12,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -622,6 +622,23 @@
             if (!panels || typeof panels !== 'object' || Array.isArray(panels)) EH.Storage.set(panelKey, {});
         },
 
+        migrateContextualMapWorkflow() {
+            // v12 acrescenta somente estado de fluxo e metadados opcionais. Imagens
+            // continuam fora do armazenamento persistente para não exceder limites.
+            const draftKey = 'prefeituraRequisition.draft.v2';
+            const draft = EH.Storage.get(draftKey, null);
+            if (!draft || typeof draft !== 'object' || Array.isArray(draft)) {
+                EH.Storage.set(draftKey, { version: 2, stage: 1, updatedAt: 0 });
+            }
+            const reminders = EH.Storage.get('ticketReminders.v1', []);
+            if (Array.isArray(reminders)) {
+                const normalized = reminders.map(item => item && typeof item === 'object'
+                    ? { ...item, movement: EH.Utils.clean(item.movement || ''), mapKey: EH.Utils.clean(item.mapKey || '') }
+                    : item);
+                if (JSON.stringify(normalized) !== JSON.stringify(reminders)) EH.Storage.set('ticketReminders.v1', normalized);
+            }
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -635,6 +652,7 @@
             this.migrateOperationRoutines();
             this.migrateSettingsTypes();
             this.migrateContextualWorkspace();
+            this.migrateContextualMapWorkflow();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -783,6 +801,8 @@
                 birthDate: EH.Utils.clean(item.birthDate || item.dataNascimento || ''),
                 confirmed,
                 confirmedAt: Number(item.confirmedAt || 0),
+                cpfValid: item.cpfValid !== undefined ? Boolean(item.cpfValid) : Boolean(cpf && EH.PassengerIdentity?.validCpf?.(cpf)),
+                invalidCpfOverride: Boolean(item.invalidCpfOverride),
                 source,
                 fieldMeta,
                 createdAt: Number(item.createdAt || Date.now()),
@@ -821,6 +841,8 @@
                 birthDate: birthDate.value,
                 confirmed: Boolean(confirmedAt || old.confirmed || next.confirmed),
                 confirmedAt,
+                cpfValid: next.cpfValid !== undefined ? Boolean(next.cpfValid) : Boolean(old.cpfValid),
+                invalidCpfOverride: Boolean(next.invalidCpfOverride || old.invalidCpfOverride),
                 source: Number(this.SOURCE_RANK[next.source] ?? 0) >= Number(this.SOURCE_RANK[old.source] ?? 0) ? next.source : old.source,
                 fieldMeta: { name: name.meta, cpf: cpf.meta, birthDate: birthDate.meta },
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
@@ -840,6 +862,8 @@
                 || current.birthDate !== merged.birthDate
                 || current.confirmed !== merged.confirmed
                 || current.confirmedAt !== merged.confirmedAt
+                || current.cpfValid !== merged.cpfValid
+                || current.invalidCpfOverride !== merged.invalidCpfOverride
                 || JSON.stringify(current.fieldMeta || {}) !== JSON.stringify(merged.fieldMeta || {});
             if (changed && !fromSync) merged.updatedAt = Date.now();
             if (!changed && current) return rows[index];
@@ -5805,6 +5829,7 @@
     EH.FinanceLedger = {
         STORE_KEY: 'financeLedgerV1',
         META_KEY: 'financeMetaV1',
+        lastUiSignature: '',
 
         money(value) {
             const number = Number(value);
@@ -5866,9 +5891,19 @@
             return Array.isArray(data) ? data : [];
         },
 
+        uiSignature(records = []) {
+            return (Array.isArray(records)?records:[]).map(record=>[
+                record.id,record.category,record.status,record.timestamp,record.originalValue,
+                record.caixaAdjustment,record.commissionEpass,record.commissionEstimated,
+                record.deleted,record.mergedInto,record.shadowedByCommission
+            ].join('|')).sort().join('||');
+        },
+
         save(records) {
             const safe = Array.isArray(records) ? records : [];
             EH.Storage.set(this.STORE_KEY, safe);
+            const signature=this.uiSignature(safe);
+            if(signature!==this.lastUiSignature){this.lastUiSignature=signature;EH.ContextualPanels?.refresh?.('finance');}
             return safe;
         },
 
@@ -6335,18 +6370,26 @@
             const elapsedDays = isCurrentMonth ? Math.max(1, now.getDate()) : (isPastMonth ? daysInMonth : 0);
             const divisor = Math.max(1, elapsedDays || 1);
             const merchandiseValue = this.money(summary.merchandiseReceivedValue + summary.merchandiseSentValue);
+            // Preserve a precisão da média para a projeção e arredonde apenas os
+            // valores exibidos. Multiplicar a média já arredondada acumula centavos.
+            const rawAverage = {
+                movement: elapsedDays ? summary.movement / divisor : 0,
+                passage: elapsedDays ? summary.passageValue / divisor : 0,
+                merchandise: elapsedDays ? merchandiseValue / divisor : 0,
+                commission: elapsedDays ? summary.commission / divisor : 0
+            };
             const average = {
-                movement: elapsedDays ? this.money(summary.movement / divisor) : 0,
-                passage: elapsedDays ? this.money(summary.passageValue / divisor) : 0,
-                merchandise: elapsedDays ? this.money(merchandiseValue / divisor) : 0,
-                commission: elapsedDays ? this.money(summary.commission / divisor) : 0
+                movement: this.money(rawAverage.movement),
+                passage: this.money(rawAverage.passage),
+                merchandise: this.money(rawAverage.merchandise),
+                commission: this.money(rawAverage.commission)
             };
             const configuredCommissionPercent = Math.max(0, Number(EH.Config.FINANCE_COMMISSION_PERCENT) || 0);
-            const projectedMovement = this.money(average.movement * daysInMonth);
+            const projectedMovement = this.money(rawAverage.movement * daysInMonth);
             const projection = isCurrentMonth ? {
                 movement: projectedMovement,
-                passage: this.money(average.passage * daysInMonth),
-                merchandise: this.money(average.merchandise * daysInMonth),
+                passage: this.money(rawAverage.passage * daysInMonth),
+                merchandise: this.money(rawAverage.merchandise * daysInMonth),
                 // Projeção estatística: usa o percentual atualmente configurado no Helper.
                 // Não altera comissão realizada nem cria operação financeira.
                 commission: this.money(projectedMovement * configuredCommissionPercent / 100),
@@ -8269,6 +8312,8 @@
                 birthDate: EH.Utils.clean(item.birthDate || ''),
                 confirmed: Boolean(item.confirmed || item.confirmedAt),
                 confirmedAt: Number(item.confirmedAt || 0),
+                cpfValid: item.cpfValid !== undefined ? Boolean(item.cpfValid) : Boolean(cpf && EH.PassengerIdentity?.validCpf?.(cpf)),
+                invalidCpfOverride: Boolean(item.invalidCpfOverride),
                 source: String(item.source || (item.confirmed || item.confirmedAt ? 'document' : 'page')),
                 fieldMeta: item.fieldMeta && typeof item.fieldMeta === 'object' ? item.fieldMeta : {},
                 requestCode: EH.Utils.clean(item.requestCode || ''),
@@ -8389,6 +8434,10 @@
                 if (data.confirmed && (!passenger.confirmed || Number(data.confirmedAt || 0) >= Number(passenger.confirmedAt || 0))) {
                     passenger.confirmed = true;
                     passenger.confirmedAt = Number(data.confirmedAt || Date.now());
+                    const cpfValid = data.cpfValid !== undefined ? Boolean(data.cpfValid) : Boolean(EH.PassengerIdentity?.validCpf?.(cpf));
+                    const invalidCpfOverride = Boolean(data.invalidCpfOverride);
+                    if (passenger.cpfValid !== cpfValid) { passenger.cpfValid = cpfValid; changed = true; }
+                    if (passenger.invalidCpfOverride !== invalidCpfOverride) { passenger.invalidCpfOverride = invalidCpfOverride; changed = true; }
                     passenger.source = String(data.source || 'document');
                     passenger.fieldMeta = data.fieldMeta && typeof data.fieldMeta === 'object' ? data.fieldMeta : passenger.fieldMeta;
                     changed = true;
@@ -8402,6 +8451,8 @@
                 birthDate: passenger.birthDate,
                 confirmed: passenger.confirmed,
                 confirmedAt: passenger.confirmedAt,
+                cpfValid: passenger.cpfValid,
+                invalidCpfOverride: passenger.invalidCpfOverride,
                 source: passenger.source,
                 fieldMeta: passenger.fieldMeta,
                 updatedAt: passenger.updatedAt || Date.now()
@@ -8808,8 +8859,8 @@
             const wanted = this.cpfDigits(cpf || active?.cpf || EH.Storage.get(this.CURRENT_KEY, null)?.cpf || '');
             if (!wanted) return null;
             const memory = EH.PassengerMemory?.findByCpf?.(wanted) || null;
-            if (memory?.confirmed && memory.name && memory.birthDate && this.validCpf(memory.cpf)) return memory;
-            if (active?.confirmed && active.name && active.birthDate && this.validCpf(active.cpf)) return active;
+            if (memory?.confirmed && memory.name && memory.birthDate && (this.validCpf(memory.cpf)||memory.invalidCpfOverride)) return memory;
+            if (active?.confirmed && active.name && active.birthDate && (this.validCpf(active.cpf)||active.invalidCpfOverride)) return active;
             return null;
         },
 
@@ -8823,6 +8874,8 @@
                 nascimento: this.parseDate(resolved.birthDate || resolved.nascimento || resolved.dataNascimento).value,
                 confirmed: Boolean(resolved.confirmed),
                 confirmedAt: Number(resolved.confirmedAt || 0),
+                cpfValid: resolved.cpfValid !== undefined ? Boolean(resolved.cpfValid) : this.validCpf(resolved.cpf),
+                invalidCpfOverride: Boolean(resolved.invalidCpfOverride),
                 fieldMeta: resolved.fieldMeta || {}
             };
             return data.nome && data.cpfDigits.length === 11 && data.nascimento && data.confirmed ? data : null;
@@ -8838,13 +8891,15 @@
                 birthDate: data.nascimento,
                 confirmed: true,
                 confirmedAt: data.confirmedAt,
+                cpfValid:data.cpfValid,
+                invalidCpfOverride:data.invalidCpfOverride,
                 fieldMeta: data.fieldMeta,
                 source: record.source || 'document'
             };
             this.state.allowMemoryFallback = true;
             this.state.fields = {
                 name: { ...this.emptyField(), value: data.nome, rawValue: data.nome, display: data.nome, confidence: 100, status: 'high', valid: true, reason: 'Dados confirmados.', source: 'confirmed', locked: true },
-                cpf: { ...this.emptyField(), value: data.cpfDigits, display: data.cpf, confidence: 100, status: 'high', valid: true, reason: 'CPF confirmado e válido.', source: 'confirmed', locked: true },
+                cpf: { ...this.emptyField(), value: data.cpfDigits, display: data.cpf, confidence: data.cpfValid?100:50, status: data.cpfValid?'high':'review', valid:data.cpfValid, reason:data.cpfValid?'CPF confirmado e válido.':'CPF mantido após confirmação explícita do usuário; alerta de validação permanece.', source: 'confirmed', locked: true },
                 birthDate: { ...this.emptyField(), value: data.nascimento, display: data.nascimento, confidence: 100, status: 'high', valid: true, reason: 'Nascimento confirmado.', source: 'confirmed', locked: true }
             };
             return data;
@@ -9152,11 +9207,17 @@
                 .filter(value => value > 0).sort((a, b) => a - b);
             const typicalGap = candidateGaps.length ? candidateGaps[Math.floor((candidateGaps.length - 1) / 2)] : 0;
             const fieldGapLimit = Math.min(candidateHeight * 2.25, Math.max(22, candidateHeight * 1.35, typicalGap * 2.6));
+            const shortTrailingGapLimit = Math.max(22, candidateHeight * 1.15, typicalGap * 2.25);
             for (let index = anchor.end + 1; index < words.length; index += 1) {
                 if (this.isAnyLabelAt(words, index)) break;
                 const previous = tail[tail.length - 1];
                 if (previous?.bbox && words[index].bbox) {
                     const gap = words[index].bbox.x0 - previous.bbox.x1;
+                    // Um token curto isolado no fim da faixa costuma pertencer a
+                    // outra coluna/idioma. Só o separamos quando já existe um nome
+                    // completo e o espaço é um outlier em relação aos demais.
+                    const shortTrailingToken = words[index].norm.length > 0 && words[index].norm.length <= 3;
+                    if (tail.length >= 2 && shortTrailingToken && gap > shortTrailingGapLimit) break;
                     if (gap > fieldGapLimit) break;
                 }
                 tail.push(words[index]);
@@ -10248,9 +10309,13 @@
             return { ok: !errors.length, errors, data: { nome, cpf, nascimento: birth.value } };
         },
 
-        confirm(input = {}) {
+        confirm(input = {}, options = {}) {
             const validation = this.validateForConfirmation(input);
-            if (!validation.ok) throw new Error(`Confira antes de confirmar: ${validation.errors.join(', ')}.`);
+            const acceptInvalidCpf=Boolean(options.acceptInvalidCpf);
+            const blockingErrors=validation.errors.filter(error=>!(acceptInvalidCpf&&error==='CPF válido'&&validation.data.cpf.length===11));
+            if (blockingErrors.length) throw new Error(`Confira antes de confirmar: ${blockingErrors.join(', ')}.`);
+            const cpfValid=this.validCpf(validation.data.cpf);
+            if(!cpfValid&&!acceptInvalidCpf)throw new Error('Confira antes de confirmar: CPF válido. Para continuar excepcionalmente, marque a confirmação explícita do alerta.');
             if (!this.state) this.state = this.freshState();
             const now = Date.now(); const proposed = this.state.fields;
             const sourceFor = (field, value) => {
@@ -10272,6 +10337,8 @@
                 birthDate: validation.data.nascimento,
                 confirmed: true,
                 confirmedAt: now,
+                cpfValid,
+                invalidCpfOverride:!cpfValid&&acceptInvalidCpf,
                 source,
                 fieldMeta,
                 updatedAt: now,
@@ -10282,7 +10349,7 @@
             const saved = EH.PassengerMemory?.upsert?.(record, { quiet: true }) || record;
             EH.Storage.set(this.CURRENT_KEY, { cpf: record.cpf, confirmedAt: now });
             this.useConfirmed(saved);
-            this.logDiagnostic('dados confirmados pelo usuário e disponíveis para reutilização');
+            this.logDiagnostic(cpfValid?'dados confirmados pelo usuário e disponíveis para reutilização':'dados confirmados manualmente com alerta persistente de CPF inválido');
             if (EH.Sync?.configured?.()) Promise.resolve(EH.Sync.syncAll({ quiet: true })).catch(error => EH.Logger.debug('Sincronização do passageiro ficará para o próximo ciclo:', error));
             return this.confirmedData(saved);
         },
@@ -10361,6 +10428,7 @@
         SERVICE_URL: 'http://127.0.0.1:8716',
         CLIENT_HEADER: 'requisicao-prefeitura-v1',
         STORAGE_KEY: 'prefeituraRequisition.current.v1',
+        DRAFT_KEY: 'prefeituraRequisition.draft.v2',
         CUSTOM_ROUTES_KEY: 'prefeituraRequisition.customRoutes.v1',
         DOCUMENT_SESSION_KEY: 'epassHelper.prefeituraDocument.v1',
         started: false,
@@ -10379,6 +10447,7 @@
         documentPreviewPhoto: null,
         documentViewMode: 'corrected',
         documentView: { zoom: 1, x: 0, y: 0 },
+        workflowStage: 1,
 
         init() {
             if (this.started) return;
@@ -10413,6 +10482,14 @@
                 .eh-pref-head div { display:grid; gap:2px; }
                 .eh-pref-head strong { font-size:17px; color:#1e1b4b; }
                 .eh-pref-head small { color:#64748b; }
+                .eh-pref-steps { display:grid; grid-template-columns:repeat(6,minmax(0,1fr)); gap:5px; padding:10px 16px; border-bottom:1px solid #e2e8f0; background:#f8fafc; }
+                .eh-pref-step-button { min-width:0; min-height:38px; padding:6px; border:1px solid #dbe3eb; border-radius:9px; background:#fff; color:#64748b; font:800 9px/1.2 Arial,sans-serif; cursor:pointer; }
+                .eh-pref-step-button.current { border-color:#4f46e5; background:#eef2ff; color:#3730a3; }
+                .eh-pref-step-button.done { border-color:#a7f3d0; background:#ecfdf5; color:#047857; }
+                .eh-pref-step-button:disabled { cursor:default; opacity:.72; }
+                .eh-pref-workflow[hidden],.eh-pref-return-fields[hidden] { display:none!important; }
+                .eh-pref-completed-summary { display:grid; gap:5px; margin:10px 16px 0; padding:10px; border:1px solid #dbe4ed; border-radius:10px; background:#f8fafc; color:#475569; font-size:10px; }
+                .eh-pref-completed-summary strong { color:#1e293b; }
                 .eh-pref-close { width:34px; height:34px; border:0; border-radius:50%; background:#eef2ff; color:#312e81; cursor:pointer; font-size:18px; }
                 .eh-pref-content { display:grid; grid-template-columns:minmax(300px,420px) minmax(0,1fr); gap:16px; padding:16px; }
                 .eh-pref-form, .eh-pref-preview { display:grid; align-content:start; gap:13px; }
@@ -10436,6 +10513,7 @@
                 .eh-pref-help { padding:9px; border-radius:9px; background:#f1f5f9; color:#475569; font-size:11px; }
                 .eh-pref-alert { display:none; padding:10px; border:1px solid #fbbf24; border-radius:9px; background:#fffbeb; color:#92400e; white-space:pre-line; }
                 .eh-pref-alert.show { display:block; }
+                .eh-pref-global-alert { margin:10px 16px 0; }
                 .eh-pref-ocr-review { display:none; gap:8px; padding:10px; border:1px solid #a7f3d0; border-radius:10px; background:#ecfdf5; }
                 .eh-pref-ocr-review.show { display:grid; }
                 .eh-pref-ocr-review strong { color:#065f46; }
@@ -10449,6 +10527,7 @@
                 .eh-pref-candidates.show { display:block; }
                 .eh-pref-photo-summary { display:grid; gap:5px; padding:8px; border-radius:9px; background:#fff7ed; color:#9a3412; font-size:10px; }
                 .eh-pref-document-pages{display:flex;flex-wrap:wrap;gap:6px}.eh-pref-document-pages:empty{display:none}.eh-pref-document-combine{padding:9px;border:1px solid #dbe4ed;border-radius:10px;background:#f8fafc}.eh-pref-errors{padding-top:6px;border-top:1px solid #d5e7de}.eh-pref-errors summary{cursor:pointer;font-size:10px;font-weight:850;color:#49655a}.eh-pref-error-details{padding-top:7px;color:#64748b;font-size:10px;overflow-wrap:anywhere}
+                .eh-pref-global-errors{margin:8px 16px 0;padding:8px 10px;border:1px solid #dbe4ed;border-radius:9px;background:#fff}
                 .eh-pref-progress { color:#4338ca; font-weight:800; }
                 .eh-pref-document-card { min-height:0; }
                 .eh-pref-document-toolbar { display:flex; flex-wrap:wrap; align-items:center; gap:6px; }
@@ -10476,7 +10555,8 @@
                 .eh-pref-invalid-override { display:none; align-items:flex-start; gap:7px; color:#92400e; }
                 .eh-pref-invalid-override.show { display:flex; }
                 @media (max-width:820px) { .eh-pref-content { grid-template-columns:1fr; } .eh-pref-document-stage { min-height:260px; max-height:48vh; } .eh-pref-preview-frame { min-height:300px; } }
-                @media (max-width:520px) { .eh-pref-grid, .eh-pref-route-list, .eh-pref-confirm-grid { grid-template-columns:1fr; } }
+                @media (max-width:700px) { .eh-pref-steps { grid-template-columns:repeat(3,minmax(0,1fr)); } }
+                @media (max-width:520px) { .eh-pref-grid, .eh-pref-route-list, .eh-pref-confirm-grid { grid-template-columns:1fr; } .eh-pref-steps { grid-template-columns:repeat(2,minmax(0,1fr)); } }
             `);
         },
 
@@ -10531,8 +10611,41 @@
                 nome: '', cpf: '', nascimento: '', origem: '', destino: '',
                 data: `${two(now.getDate())}/${two(now.getMonth() + 1)}/${now.getFullYear()}`,
                 mesAno: `${months[now.getMonth()]}/${now.getFullYear()}`,
+                tripKind:'outbound',voltaOrigem:'',voltaDestino:'',voltaData:'',voltaMesAno:'',
                 acceptInvalidCpf: false
             };
+        },
+
+        monthYearForDate(value) {
+            const raw=this.clean(value);const br=raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);const iso=raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+            if(!br&&!iso)return'';const month=Number(br?br[2]:iso[2]),year=Number(br?br[3]:iso[1]);
+            const months=['Janeiro','Fevereiro','Março','Abril','Maio','Junho','Julho','Agosto','Setembro','Outubro','Novembro','Dezembro'];
+            return month>=1&&month<=12&&year>=1900?`${months[month-1]}/${year}`:'';
+        },
+
+        validTravelDate(value) {
+            const match=this.clean(value).match(/^(\d{2})\/(\d{2})\/(\d{4})$/);if(!match)return false;
+            const date=new Date(Number(match[3]),Number(match[2])-1,Number(match[1]));
+            return date.getFullYear()===Number(match[3])&&date.getMonth()===Number(match[2])-1&&date.getDate()===Number(match[1]);
+        },
+
+        loadDraft() {
+            const draft=EH.Storage.get(this.DRAFT_KEY,{});return draft&&typeof draft==='object'&&!Array.isArray(draft)?draft:{};
+        },
+
+        saveDraft(ui, stage=this.workflowStage) {
+            if(!ui)return null;const data=this.collect(ui);const draft={version:2,...data,stage:Number(stage)||1,updatedAt:Date.now()};
+            EH.Storage.set(this.DRAFT_KEY,draft);return draft;
+        },
+
+        safeFilenameName(value) {
+            return String(value||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^A-Za-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,100)||'Passageiro';
+        },
+
+        generatedFilename(data) {
+            const type=data.tripKind==='roundtrip'?'Ida_e_Volta':data.tripKind==='return'?'Volta':'Ida';
+            const date=(data.tripKind==='return'?data.data:(data.data||'')).replace(/\//g,'-');
+            return`Requisicao_${this.safeFilenameName(data.nome)}_${type}_${date||'sem-data'}.png`;
         },
 
         currentContext() {
@@ -10609,7 +10722,13 @@
 
         saveGenerated(record) {
             this.generated = record;
-            EH.Storage.set(this.STORAGE_KEY, record);
+            // A composição horizontal pode ter vários megabytes. Ela permanece na
+            // sessão para prévia/download, mas não é gravada nem sincronizada como
+            // data URL. Dados, trechos e nome do arquivo continuam persistidos.
+            const persistent = record?.combinedDataUrl
+                ? { ...record, combinedDataUrl:'', combinedAvailableInSession:true, syncBinary:false }
+                : record;
+            EH.Storage.set(this.STORAGE_KEY, persistent);
             this.renderStatus();
         },
 
@@ -10624,9 +10743,9 @@
             wrap.appendChild(service);
             const identity = EH.PassengerIdentity?.confirmedData?.();
             const identityLine = document.createElement('div');
-            identityLine.className = `eh-pref-status-line ${identity ? 'eh-pref-status-ready' : 'eh-pref-status-warn'}`;
+            identityLine.className = `eh-pref-status-line ${identity&&identity.cpfValid!==false ? 'eh-pref-status-ready' : 'eh-pref-status-warn'}`;
             identityLine.textContent = identity
-                ? `✓ Dados confirmados • ${identity.nome} • ${identity.nascimento}`
+                ? `${identity.cpfValid===false?'⚠ Dados confirmados com alerta de CPF':'✓ Dados confirmados'} • ${identity.nome} • ${identity.nascimento}`
                 : '○ Nome, CPF e nascimento ainda não confirmados';
             wrap.appendChild(identityLine);
             if (identity && EH.Pages?.detect?.() === 'requisicao') {
@@ -10830,11 +10949,11 @@
                     }
                 });
                 processed=true;
-                this.renderIdentityReview(ui); this.renderStatus(); this.showAlert(ui, '');
+                this.renderIdentityReview(ui); this.renderStatus(); this.showAlert(ui, '');this.setWorkflowStage(ui,2);
             } catch (error) {
                 this.showAlert(ui, `⚠ Não consegui ler este documento com segurança.\n\n${error.message}\n\nEnvie outra foto ou preencha manualmente.`);
                 if(ui.errorDetails)ui.errorDetails.textContent=`Etapa: processamento do documento. ${error.message} Tente novamente ou use uma foto mais nítida; o preenchimento manual permanece disponível.`;
-                this.renderIdentityReview(ui);
+                this.renderIdentityReview(ui);this.setWorkflowStage(ui,2);
             } finally {
                 ui.progress.hidden = true; this.ocrBusy = false; this.setBusy(ui, false);
             }
@@ -10846,15 +10965,18 @@
                 ? { nome: ui.nome.value, cpf: ui.cpf.value, nascimento: ui.nascimento.value }
                 : { nome: ui.ocrName.value, cpf: ui.ocrCpf.value, nascimento: ui.ocrBirth.value };
             try {
-                const confirmed = EH.PassengerIdentity.confirm(input);
+                const confirmed = EH.PassengerIdentity.confirm(input,{acceptInvalidCpf:Boolean(ui.cpfOverride.checked)});
                 this.fillForm(ui, confirmed);
                 ui.ocrReview.classList.remove('show');
-                ui.identityConfirmed.textContent = `✓ Dados confirmados • CPF válido • ${confirmed.nascimento}`;
-                ui.identityConfirmed.className = 'eh-pref-confidence-high';
+                ui.identityConfirmed.textContent = confirmed.cpfValid===false?`⚠ Dados confirmados manualmente • CPF inválido mantido • ${confirmed.nascimento}`:`✓ Dados confirmados • CPF válido • ${confirmed.nascimento}`;
+                ui.identityConfirmed.className = confirmed.cpfValid===false?'eh-pref-confidence-review':'eh-pref-confidence-high';
+                ui.cpfOverrideWrap.classList.toggle('show',confirmed.cpfValid===false);
                 this.showAlert(ui, ''); this.renderStatus();
+                this.setWorkflowStage(ui,3);
                 EH.Toast.success('✓ Nome, CPF e nascimento confirmados');
                 return confirmed;
             } catch (error) {
+                if(this.cpfDigits(input.cpf).length===11&&!this.validCpf(input.cpf))ui.cpfOverrideWrap.classList.add('show');
                 this.showAlert(ui, error.message);
                 return null;
             }
@@ -10871,6 +10993,7 @@
             const viewButton = ui.modal.querySelector('.eh-pref-view-doc'); if (viewButton) viewButton.hidden = true;
             this.renderDocumentPages(ui);
             this.renderDocumentPreview(ui, { reset: true });
+            ui.maxStage=1;this.setWorkflowStage(ui,1);
             this.showAlert(ui, 'Novo passageiro iniciado. Os dados e fotos anteriores foram retirados deste atendimento.');
             this.renderStatus();
         },
@@ -10885,25 +11008,48 @@
                 data: this.clean(ui.data.value),
                 mesAno: this.clean(ui.mesAno.value),
                 tripKind: ui.tripKind?.value || 'outbound',
+                voltaOrigem:this.cityDisplay(ui.voltaOrigem?.value||''),
+                voltaDestino:this.cityDisplay(ui.voltaDestino?.value||''),
+                voltaData:this.clean(ui.voltaData?.value||''),
+                voltaMesAno:this.clean(ui.voltaMesAno?.value||''),
                 acceptInvalidCpf: Boolean(ui.cpfOverride.checked)
             };
         },
 
-        validate(data) {
+        validate(data,{identityOnly=false,routeOnly=false}={}) {
             const missing = [];
-            [['Nome',data.nome],['CPF',this.cpfDigits(data.cpf)],['Data de nascimento',data.nascimento],['Origem',data.origem],['Destino',data.destino],['Data',data.data],['Mês/Ano',data.mesAno]]
-                .forEach(([label, value]) => { if (!value) missing.push(label); });
+            if(!routeOnly)[['Nome',data.nome],['CPF',this.cpfDigits(data.cpf)],['Data de nascimento',data.nascimento]].forEach(([label,value])=>{if(!value)missing.push(label);});
+            if(!identityOnly)[['Origem',data.origem],['Destino',data.destino],['Data',data.data],['Mês/Ano',data.mesAno]].forEach(([label,value])=>{if(!value)missing.push(label);});
+            if(!identityOnly&&data.tripKind==='roundtrip')[['Origem da volta',data.voltaOrigem],['Destino da volta',data.voltaDestino],['Data da volta',data.voltaData],['Mês/Ano da volta',data.voltaMesAno]].forEach(([label,value])=>{if(!value)missing.push(label);});
             if (missing.length) return `Não foi possível gerar.\n\nFalta:\n${missing.map(item => `• ${item}`).join('\n')}`;
-            if (this.cpfDigits(data.cpf).length !== 11) return 'Confira o CPF antes de gerar. Ele precisa ter 11 dígitos.';
-            const birth = EH.PassengerIdentity.parseDate(data.nascimento);
-            if (!birth.valid || !birth.plausible) return `Confira a Data de nascimento. ${birth.reason || 'Use dd/mm/aaaa.'}`;
-            if (!/^\d{2}\/\d{2}\/\d{4}$/.test(data.data)) return 'Confira a data. Use dd/mm/aaaa.';
-            if (!/^[^/]+\/\d{4}$/.test(data.mesAno)) return 'Confira Mês/Ano. Use Mês/aaaa.';
+            if(!routeOnly){if(this.cpfDigits(data.cpf).length!==11)return'Confira o CPF antes de gerar. Ele precisa ter 11 dígitos.';const birth=EH.PassengerIdentity.parseDate(data.nascimento);if(!birth.valid||!birth.plausible)return`Confira a Data de nascimento. ${birth.reason||'Use dd/mm/aaaa.'}`;}
+            if(!identityOnly){
+                if(!this.validTravelDate(data.data))return'Confira a data do trecho. Use uma data real em dd/mm/aaaa.';
+                if(EH.Utils.normalize(this.monthYearForDate(data.data))!==EH.Utils.normalize(data.mesAno))return'O Mês/Ano do trecho deve corresponder à data informada.';
+                if(data.tripKind==='roundtrip'){
+                    if(!this.validTravelDate(data.voltaData))return'Confira a data da volta. Use uma data real em dd/mm/aaaa.';
+                    if(EH.Utils.normalize(this.monthYearForDate(data.voltaData))!==EH.Utils.normalize(data.voltaMesAno))return'O Mês/Ano da volta deve corresponder à data da volta.';
+                }
+            }
             return '';
         },
 
         setBusy(ui, busy, message = '') {
-            ui.modal.querySelectorAll('button').forEach(button => { if (!button.classList.contains('eh-pref-close')) button.disabled = Boolean(busy); });
+            ui.modal.querySelectorAll('button').forEach(button => {
+                if (button.classList.contains('eh-pref-close')) return;
+                if (busy) {
+                    if (!Object.prototype.hasOwnProperty.call(button.dataset, 'ehBusyWasDisabled')) {
+                        button.dataset.ehBusyWasDisabled = button.disabled ? '1' : '0';
+                    }
+                    button.disabled = true;
+                } else if (Object.prototype.hasOwnProperty.call(button.dataset, 'ehBusyWasDisabled')) {
+                    button.disabled = button.dataset.ehBusyWasDisabled === '1';
+                    delete button.dataset.ehBusyWasDisabled;
+                }
+            });
+            if (!busy && ui.stepButtons) {
+                ui.stepButtons.forEach(button => { button.disabled = Number(button.dataset.stage || 0) > Number(ui.maxStage || 1); });
+            }
             if (message) ui.alert.textContent = message;
         },
 
@@ -10921,6 +11067,10 @@
             ui.data.value = data.data || ui.data.value;
             ui.mesAno.value = data.mesAno || ui.mesAno.value;
             if(ui.tripKind&&['outbound','return','roundtrip'].includes(data.tripKind))ui.tripKind.value=data.tripKind;
+            if(ui.voltaOrigem)ui.voltaOrigem.value=data.voltaOrigem||'';
+            if(ui.voltaDestino)ui.voltaDestino.value=data.voltaDestino||'';
+            if(ui.voltaData)ui.voltaData.value=data.voltaData||'';
+            if(ui.voltaMesAno)ui.voltaMesAno.value=data.voltaMesAno||'';
         },
 
         showPreview(ui, result) {
@@ -10932,11 +11082,13 @@
             ui.confirm.classList.add('show');
             ui.ready.classList.remove('show');
             const data = result.data;
+            const requestData=this.collect(ui);
             const entries = [
-                ['Nome', data.nome], ['CPF', data.cpf], ['Origem', data.origem],
+                ['Nome', data.nome], ['CPF', data.cpf], ['Tipo',requestData.tripKind==='roundtrip'?'Ida e volta':requestData.tripKind==='return'?'Somente volta':'Somente ida'], ['Origem', data.origem],
                 ['Nascimento (não impresso)', EH.PassengerIdentity.confirmedData()?.nascimento || 'Confirmado'],
                 ['Destino', data.destino], ['Data', data.data], ['Mês/Ano', data.mesAno]
             ];
+            if(requestData.tripKind==='roundtrip')entries.push(['Volta',`${requestData.voltaOrigem} × ${requestData.voltaDestino} • ${requestData.voltaData} • ${requestData.voltaMesAno}`]);
             ui.confirmGrid.innerHTML = '';
             entries.forEach(([label, value]) => {
                 const cell = document.createElement('div');
@@ -10949,12 +11101,57 @@
                 const chip = document.createElement('span'); chip.className = 'eh-pref-check'; chip.textContent = `✓ ${label}`; ui.checks.appendChild(chip);
             });
             this.showAlert(ui, '');
+            this.setWorkflowStage(ui,5);
         },
 
         requestLegs(data) {
             const outbound={...data,tripKind:'outbound'};
-            const inbound={...data,origem:data.destino,destino:data.origem,tripKind:'return'};
+            const inbound=data.tripKind==='roundtrip'
+                ? {...data,origem:data.voltaOrigem,destino:data.voltaDestino,data:data.voltaData,mesAno:data.voltaMesAno,tripKind:'return'}
+                : {...data,tripKind:'return'};
             return data.tripKind==='roundtrip'?[outbound,inbound]:data.tripKind==='return'?[inbound]:[outbound];
+        },
+
+        workflowSummary(ui) {
+            if(!ui?.completedSummary)return;const data=this.collect(ui);const identity=EH.PassengerIdentity.matchesConfirmed(data);
+            const legs=this.requestLegs(data);ui.completedSummary.innerHTML='';
+            const title=document.createElement('strong');title.textContent=identity?`Dados confirmados • ${data.nome||'Passageiro'}`:'Dados pessoais aguardando confirmação';
+            const cpf=document.createElement('span');const digits=this.cpfDigits(data.cpf);cpf.textContent=digits.length===11?`CPF ***.***.***-${digits.slice(-2)} • Nascimento ${data.nascimento||'—'}`:'CPF ainda não confirmado';
+            ui.completedSummary.append(title,cpf);
+            if(this.workflowStage>=3){const route=document.createElement('span');route.textContent=legs.map((leg,index)=>`${index===0&&data.tripKind!=='return'?'Ida':'Volta'}: ${leg.origem||'—'} × ${leg.destino||'—'} • ${leg.data||'—'} • ${leg.mesAno||'—'}`).join(' | ');ui.completedSummary.appendChild(route);}
+        },
+
+        setWorkflowStage(ui,stage,{persist=true}={}) {
+            const next=Math.min(6,Math.max(1,Number(stage)||1));this.workflowStage=next;ui.maxStage=Math.max(Number(ui.maxStage||1),next);
+            if(ui.identityWorkflow)ui.identityWorkflow.hidden=next>2;
+            if(ui.documentWorkflow)ui.documentWorkflow.hidden=next>2;
+            if(ui.routeWorkflow)ui.routeWorkflow.hidden=next!==3;
+            if(ui.generateWorkflow)ui.generateWorkflow.hidden=next!==4;
+            if(ui.previewWorkflow)ui.previewWorkflow.hidden=next<5;
+            if(ui.confirm)ui.confirm.hidden=next!==5;
+            if(ui.ready)ui.ready.hidden=next!==6;
+            (ui.stepButtons||[]).forEach(button=>{const value=Number(button.dataset.stage||0);button.classList.toggle('current',value===next);button.classList.toggle('done',value<next);button.disabled=value>ui.maxStage;});
+            this.workflowSummary(ui);if(persist)this.saveDraft(ui,next);
+        },
+
+        confirmRoute(ui) {
+            const data=this.collect(ui);const validation=this.validate(data,{routeOnly:true});
+            if(validation){this.showAlert(ui,validation);return false;}
+            if(!EH.PassengerIdentity.matchesConfirmed(data)){this.showAlert(ui,'Os dados pessoais foram alterados. Volte e confirme Nome, CPF e Data de nascimento.');this.setWorkflowStage(ui,2);return false;}
+            this.showAlert(ui,'');this.setWorkflowStage(ui,4);return true;
+        },
+
+        recordGeneratedRequisition(data,record) {
+            const cpf=this.cpfDigits(data.cpf);if(cpf.length!==11)return null;
+            const legs=this.requestLegs(data).map(leg=>({
+                tipo:leg.tripKind==='return'?'volta':'ida',mercadoCompleto:`${leg.origem} - ${leg.destino}`,
+                origem:leg.origem,destino:leg.destino,data:leg.data,mesAno:leg.mesAno,codigo:'',filename:record?.filename||'',updatedAt:Date.now()
+            }));
+            const identity=[cpf,...legs.map(leg=>`${leg.tipo}|${EH.Utils.normalize(leg.origem)}|${EH.Utils.normalize(leg.destino)}|${leg.data}`)].join('::');
+            return EH.RequisitionManager?.upsertRequest?.({
+                id:`prefeitura:${EH.Reminders?.stableHash?.(identity)||Date.now()}`,prefeitura:'Requisição da Prefeitura',status:'prepared',
+                passengers:[{cpf,nome:data.nome,dataNascimento:data.nascimento,legs}],updatedAt:Date.now(),deviceId:EH.Device.id()
+            })||null;
         },
 
         async previewRequest(ui) {
@@ -10972,12 +11169,16 @@
             this.setBusy(ui, true);
             this.showAlert(ui, 'Gerando a prévia a partir do DOCX oficial…');
             try {
-                const results=[];
-                for(const leg of this.requestLegs(data))results.push(await this.request('POST','/preview',{requisitionData:leg}));
+                const results=[];const legs=this.requestLegs(data);this.previews=[];
+                for(let index=0;index<legs.length;index++){
+                    try{results.push(await this.request('POST','/preview',{requisitionData:legs[index]}));}
+                    catch(error){error.message=`Não foi possível gerar o trecho ${legs[index].tripKind==='return'?'de volta':'de ida'}. ${error.message||''}`.trim();throw error;}
+                }
                 this.previews=results;this.showPreview(ui,results[0]);
                 if(results[1]){const extra=document.createElement('img');extra.className='eh-pref-preview-image eh-pref-preview-image-extra';extra.alt='Prévia da requisição de volta';extra.src=`${results[1].previewUrl}?v=${Date.now()}`;ui.previewImage.parentElement.appendChild(extra);this.showAlert(ui,'Confira as requisições de ida e volta antes de finalizar.');}
             } catch (error) {
                 if (error.details?.requiresCpfOverride) ui.cpfOverrideWrap.classList.add('show');
+                if(ui.errorDetails)ui.errorDetails.textContent=`Geração da prévia: ${error.message||'falha não identificada'}`;
                 this.showAlert(ui, error.message);
             } finally {
                 this.setBusy(ui, false);
@@ -10987,16 +11188,22 @@
         async generateRequest(ui) {
             const previews=this.previews?.length?this.previews:(this.preview?.previewId?[this.preview]:[]);
             if (!previews.length) return this.showAlert(ui, 'Gere e confira a prévia antes de finalizar.');
+            const requestData=this.collect(ui);
             this.setBusy(ui, true);
             this.showAlert(ui, 'Finalizando exatamente a prévia conferida…');
             try {
-                const results=[];for(const preview of previews)results.push(await this.request('POST','/generate',{previewId:preview.previewId}));
+                const results=[];for(let index=0;index<previews.length;index++){
+                    try{results.push(await this.request('POST','/generate',{previewId:previews[index].previewId}));}
+                    catch(error){error.message=`Não foi possível finalizar o trecho ${index===1?'de volta':'de ida'}. ${error.message||''}`.trim();throw error;}
+                }
                 let result=results[0];let combinedDataUrl='';
-                if(results.length>1){const photos=[];for(const generated of results){const blob=await this.imageBlob(generated.finalUrl);photos.push({dataUrl:await EH.Clipboard.blobToDataUrl(blob)});}const combined=await EH.PassengerIdentity.combineDocumentPhotos(photos,{useCorrected:false,layout:'horizontal',margin:24});combinedDataUrl=combined.dataUrl;result={...result,filename:'Requisicao_Prefeitura_Ida_e_Volta.png',finalUrl:'',files:results.map(item=>item.filename)};EH.Clipboard.rememberImage(combinedDataUrl,result.filename);}
+                if(results.length>1){const photos=[];for(const generated of results){const blob=await this.imageBlob(generated.finalUrl);photos.push({dataUrl:await EH.Clipboard.blobToDataUrl(blob)});}const combined=await EH.PassengerIdentity.combineDocumentPhotos(photos,{useCorrected:false,layout:'horizontal',margin:24});combinedDataUrl=combined.dataUrl;result={...result,finalUrl:'',files:results.map(item=>item.filename)};}
+                result={...result,filename:this.generatedFilename(requestData)};
+                if(combinedDataUrl)EH.Clipboard.rememberImage(combinedDataUrl,result.filename);
                 const record = {
                     ...result,
                     combinedDataUrl,
-                    tripKind: previews.length>1?'roundtrip':(this.collect(ui).tripKind||'outbound'),
+                    tripKind: requestData.tripKind||'outbound',requestData,
                     generatedAt: Date.now(),
                     documentLoaded: Boolean(this.documentDataUrl),
                     documentName: this.documentName || '',
@@ -11004,12 +11211,15 @@
                     syncBinary: false
                 };
                 this.saveGenerated(record);
+                this.recordGeneratedRequisition(requestData,record);
                 ui.readyName.textContent = result.filename;
                 ui.ready.classList.add('show');
                 ui.confirm.classList.remove('show');
+                this.setWorkflowStage(ui,6);
                 this.showAlert(ui, '');
-                EH.Toast.success('✓ Requisição Prefeitura pronta');
+                EH.Toast.success('✓ Requisição da Prefeitura pronta');
             } catch (error) {
+                if(ui.errorDetails)ui.errorDetails.textContent=`Finalização: ${error.message||'falha não identificada'}`;
                 this.showAlert(ui, error.message);
             } finally {
                 this.setBusy(ui, false);
@@ -11098,13 +11308,14 @@
             this.close();
             const defaults = this.defaults();
             const current = this.currentContext();
-            const saved = this.generated?.data || EH.Storage.get(this.STORAGE_KEY, null)?.data || {};
+            const saved = this.generated?.requestData || this.generated?.data || EH.Storage.get(this.STORAGE_KEY, null)?.requestData || EH.Storage.get(this.STORAGE_KEY, null)?.data || {};
+            const draft = this.loadDraft();
             const confirmed = EH.PassengerIdentity.confirmedData();
             const initial = {
                 ...defaults,
-                origem: saved.origem || defaults.origem,
-                destino: saved.destino || defaults.destino,
-                ...(current.origem || current.destino ? { origem: current.origem || saved.origem || '', destino: current.destino || saved.destino || '' } : {}),
+                ...saved,...draft,
+                origem:draft.origem||saved.origem||current.origem||defaults.origem,
+                destino:draft.destino||saved.destino||current.destino||defaults.destino,
                 ...(confirmed ? { nome: confirmed.nome, cpf: confirmed.cpf, nascimento: confirmed.nascimento } : {})
             };
 
@@ -11114,13 +11325,24 @@
             modal.className = 'eh-pref-modal';
             modal.innerHTML = `
                 <div class="eh-pref-head">
-                    <div><strong>📄 REQUISIÇÃO PREFEITURA</strong><small>Modelo DOCX oficial • renderização local • envio final sempre manual</small></div>
+                    <div><strong>Requisição da Prefeitura</strong><small>Modelo DOCX oficial • renderização local • envio final sempre manual</small></div>
                     <button type="button" class="eh-pref-close" aria-label="Fechar">×</button>
                 </div>
+                <nav class="eh-pref-steps" aria-label="Etapas da Requisição da Prefeitura">
+                    <button type="button" class="eh-pref-step-button" data-stage="1">1. Documento e dados</button>
+                    <button type="button" class="eh-pref-step-button" data-stage="2">2. Confirmar dados</button>
+                    <button type="button" class="eh-pref-step-button" data-stage="3">3. Rota e viagem</button>
+                    <button type="button" class="eh-pref-step-button" data-stage="4">4. Gerar</button>
+                    <button type="button" class="eh-pref-step-button" data-stage="5">5. Prévia</button>
+                    <button type="button" class="eh-pref-step-button" data-stage="6">6. Baixar</button>
+                </nav>
+                <div class="eh-pref-completed-summary"></div>
+                <div class="eh-pref-alert eh-pref-global-alert"></div>
+                <details class="eh-pref-errors eh-pref-global-errors"><summary>Erros e detalhes</summary><div class="eh-pref-error-details eh-pref-global-error-details">Nenhuma falha técnica registrada nesta sessão.</div></details>
                 <div class="eh-pref-content">
                     <div class="eh-pref-form">
-                        <section class="eh-pref-card">
-                            <h3>Passageiro</h3>
+                        <section class="eh-pref-card eh-pref-workflow eh-pref-identity-workflow">
+                            <h3>Documento e dados</h3>
                             <div class="eh-pref-current"></div>
                             <div class="eh-pref-actions">
                                 <button type="button" class="eh-pref-btn eh-pref-use-current">Usar passageiro atual</button>
@@ -11159,32 +11381,37 @@
                                 <div class="eh-pref-field"><label>Data de nascimento</label><input class="eh-pref-birth" maxlength="10" inputmode="numeric" autocomplete="off"></div>
                             </div>
                             <div class="eh-pref-confidence-review eh-pref-identity-confirmed">○ Dados ainda não confirmados</div>
+                            <label class="eh-pref-invalid-override"><input type="checkbox" class="eh-pref-cpf-override"> Conferi manualmente o CPF e aceito continuar com o alerta de validação.</label>
                             <div class="eh-pref-actions"><button type="button" class="eh-pref-btn success eh-pref-confirm-form">Confirmar dados digitados</button><button type="button" class="eh-pref-btn eh-pref-fill-request">Preencher solicitação</button></div>
                         </section>
-                        <section class="eh-pref-card">
-                            <h3>Rota</h3>
+                        <section class="eh-pref-card eh-pref-workflow eh-pref-route-workflow" hidden>
+                            <h3>Rota e tipo de requisição</h3>
                             <div class="eh-pref-route-list"></div>
                             <div class="eh-pref-grid">
+                                <div class="eh-pref-field full"><label>Tipo</label><select class="eh-pref-trip-kind"><option value="outbound">Somente ida</option><option value="return">Somente volta</option><option value="roundtrip">Ida e volta</option></select></div>
                                 <div class="eh-pref-field"><label>Origem</label><input class="eh-pref-origin" maxlength="80"></div>
                                 <div class="eh-pref-field"><label>Destino</label><input class="eh-pref-destination" maxlength="80"></div>
+                                <div class="eh-pref-field"><label>Data do trecho</label><input class="eh-pref-date" maxlength="10" inputmode="numeric"></div>
+                                <div class="eh-pref-field"><label>Mês/Ano do trecho</label><input class="eh-pref-month" maxlength="30"></div>
                             </div>
-                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-save-route">+ Salvar mercado informado</button></div>
+                            <div class="eh-pref-grid eh-pref-return-fields" hidden>
+                                <div class="eh-pref-field"><label>Origem da volta</label><input class="eh-pref-return-origin" maxlength="80"></div>
+                                <div class="eh-pref-field"><label>Destino da volta</label><input class="eh-pref-return-destination" maxlength="80"></div>
+                                <div class="eh-pref-field"><label>Data da volta</label><input class="eh-pref-return-date" maxlength="10" inputmode="numeric"></div>
+                                <div class="eh-pref-field"><label>Mês/Ano da volta</label><input class="eh-pref-return-month" maxlength="30"></div>
+                            </div>
+                            <div class="eh-pref-help eh-pref-return-help" hidden>A rota inversa é apenas uma sugestão visível. Confira antes de confirmar.</div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-save-route">+ Salvar mercado informado</button><button type="button" class="eh-pref-btn success eh-pref-confirm-route">Confirmar rota e viagem</button><button type="button" class="eh-pref-btn eh-pref-back-identity">Voltar aos dados</button></div>
                         </section>
-                        <section class="eh-pref-card">
-                            <h3>Documento</h3>
-                            <div class="eh-pref-grid">
-                                <div class="eh-pref-field"><label>Trechos</label><select class="eh-pref-trip-kind"><option value="outbound">Somente ida</option><option value="return">Somente volta</option><option value="roundtrip">Ida e volta</option></select></div>
-                                <div class="eh-pref-field"><label>Data</label><input class="eh-pref-date" maxlength="10" inputmode="numeric"></div>
-                                <div class="eh-pref-field"><label>Mês/Ano</label><input class="eh-pref-month" maxlength="30"></div>
-                            </div>
-                            <label class="eh-pref-invalid-override"><input type="checkbox" class="eh-pref-cpf-override"> Conferi manualmente e desejo usar este CPF mesmo sem validação matemática.</label>
-                            <div class="eh-pref-alert"></div>
-                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-health">Verificar gerador</button><button type="button" class="eh-pref-btn primary eh-pref-preview-btn">Pré-visualizar documento oficial</button></div>
+                        <section class="eh-pref-card eh-pref-workflow eh-pref-generate-workflow" hidden>
+                            <h3>Gerar requisição</h3>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-health">Verificar gerador</button><button type="button" class="eh-pref-btn primary eh-pref-preview-btn">Gerar prévia pelo DOCX oficial</button></div>
                             <div class="eh-pref-help">A prévia é gerada do próprio DOCX. Nenhum HTML desenha a requisição.</div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-back-route">Voltar à rota</button><button type="button" class="eh-pref-btn eh-pref-edit-identity">Editar dados pessoais</button></div>
                         </section>
                     </div>
                     <div class="eh-pref-preview">
-                        <section class="eh-pref-card eh-pref-document-card">
+                        <section class="eh-pref-card eh-pref-document-card eh-pref-workflow eh-pref-document-workflow">
                             <h3>Documento para conferência</h3>
                             <div class="eh-pref-document-toolbar">
                                 <button type="button" class="eh-pref-btn eh-pref-doc-corrected" aria-pressed="false">Imagem corrigida</button>
@@ -11200,14 +11427,14 @@
                             </div>
                             <div class="eh-pref-document-meta"></div>
                         </section>
-                        <div class="eh-pref-preview-frame"><div class="eh-pref-empty-preview">A página oficial aparecerá aqui depois da renderização. Confira logos, assinatura, rodapé, nome, CPF, rota, TOTAL e data.</div><img class="eh-pref-preview-image" alt="Prévia da requisição oficial" hidden></div>
-                        <section class="eh-pref-card eh-pref-confirm">
+                        <div class="eh-pref-preview-frame eh-pref-workflow eh-pref-preview-workflow" hidden><div class="eh-pref-empty-preview">A página oficial aparecerá aqui depois da renderização. Confira logos, assinatura, rodapé, nome, CPF, rota, TOTAL e data.</div><img class="eh-pref-preview-image" alt="Prévia da requisição oficial" hidden></div>
+                        <section class="eh-pref-card eh-pref-confirm eh-pref-workflow" hidden>
                             <h3>Confirme</h3>
                             <div class="eh-pref-confirm-grid"></div>
                             <div class="eh-pref-checks"></div>
                             <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-correct">Corrigir</button><button type="button" class="eh-pref-btn success eh-pref-generate">Gerar requisição</button></div>
                         </section>
-                        <section class="eh-pref-ready">
+                        <section class="eh-pref-ready eh-pref-workflow" hidden>
                             <strong>✓ REQUISIÇÃO PRONTA</strong>
                             <code class="eh-pref-ready-name"></code>
                             <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-download">Baixar PNG</button><button type="button" class="eh-pref-btn eh-pref-fill-request">Preencher solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach">Usar na solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach-doc">Usar documentação</button><button type="button" class="eh-pref-btn eh-pref-again">Gerar novamente</button></div>
@@ -11224,7 +11451,8 @@
                 modal, form: q('.eh-pref-form'), nome: q('.eh-pref-name'), cpf: q('.eh-pref-cpf'),
                 nascimento: q('.eh-pref-birth'),
                 origem: q('.eh-pref-origin'), destino: q('.eh-pref-destination'), data: q('.eh-pref-date'),
-                mesAno: q('.eh-pref-month'), cpfOverride: q('.eh-pref-cpf-override'), cpfOverrideWrap: q('.eh-pref-invalid-override'),
+                mesAno: q('.eh-pref-month'), voltaOrigem:q('.eh-pref-return-origin'),voltaDestino:q('.eh-pref-return-destination'),voltaData:q('.eh-pref-return-date'),voltaMesAno:q('.eh-pref-return-month'),
+                cpfOverride: q('.eh-pref-cpf-override'), cpfOverrideWrap: q('.eh-pref-invalid-override'),
                 alert: q('.eh-pref-alert'), progress: q('.eh-pref-progress'), ocrReview: q('.eh-pref-ocr-review'),
                 ocrMessage: q('.eh-pref-ocr-message'), ocrName: q('.eh-pref-ocr-name'), ocrCpf: q('.eh-pref-ocr-cpf'), ocrBirth: q('.eh-pref-ocr-birth'),
                 nameStatus: q('.eh-pref-name-status'), cpfStatus: q('.eh-pref-cpf-status'), birthStatus: q('.eh-pref-birth-status'),
@@ -11232,16 +11460,30 @@
                 photoSummary: q('.eh-pref-photo-summary'), identityConfirmed: q('.eh-pref-identity-confirmed'),
                 documentPages: q('.eh-pref-document-pages'), documentPageActions: q('.eh-pref-document-page-actions'), documentCombine: q('.eh-pref-document-combine'),
                 documentSource: q('.eh-pref-doc-source'), documentLayout: q('.eh-pref-doc-layout'), documentMargin: q('.eh-pref-doc-margin'), downloadCombined: q('.eh-pref-download-combined'),
-                errorDetails: q('.eh-pref-error-details'), tripKind: q('.eh-pref-trip-kind'),
+                errorDetails: q('.eh-pref-global-error-details'), tripKind: q('.eh-pref-trip-kind'),
                 documentStage: q('.eh-pref-document-stage'), documentImage: q('.eh-pref-document-image'), documentEmpty: q('.eh-pref-document-empty'),
                 documentMeta: q('.eh-pref-document-meta'), documentCorrected: q('.eh-pref-doc-corrected'), documentOriginal: q('.eh-pref-doc-original'),
                 documentZoomIn: q('.eh-pref-doc-zoom-in'), documentZoomOut: q('.eh-pref-doc-zoom-out'), documentZoomLabel: q('.eh-pref-document-zoom'), documentFit: q('.eh-pref-doc-fit'),
                 previewImage: q('.eh-pref-preview-image'), emptyPreview: q('.eh-pref-empty-preview'), confirm: q('.eh-pref-confirm'),
-                confirmGrid: q('.eh-pref-confirm-grid'), checks: q('.eh-pref-checks'), ready: q('.eh-pref-ready'), readyName: q('.eh-pref-ready-name')
+                confirmGrid: q('.eh-pref-confirm-grid'), checks: q('.eh-pref-checks'), ready: q('.eh-pref-ready'), readyName: q('.eh-pref-ready-name'),
+                identityWorkflow:q('.eh-pref-identity-workflow'),documentWorkflow:q('.eh-pref-document-workflow'),routeWorkflow:q('.eh-pref-route-workflow'),generateWorkflow:q('.eh-pref-generate-workflow'),previewWorkflow:q('.eh-pref-preview-workflow'),
+                returnFields:q('.eh-pref-return-fields'),returnHelp:q('.eh-pref-return-help'),completedSummary:q('.eh-pref-completed-summary'),stepButtons:Array.from(modal.querySelectorAll('.eh-pref-step-button')),maxStage:1
             };
             this.bindDocumentPreview(ui);
             this.fillForm(ui, initial);
-            ui.cpf.addEventListener('input', () => { ui.cpf.value = this.formatCpf(ui.cpf.value); });
+            ui.cpfOverride.checked=Boolean(initial.acceptInvalidCpf);
+            const syncTripFields=({suggest=false}={})=>{
+                const roundtrip=ui.tripKind.value==='roundtrip';ui.returnFields.hidden=!roundtrip;ui.returnHelp.hidden=!roundtrip;
+                if(roundtrip&&suggest){if(!ui.voltaOrigem.value)ui.voltaOrigem.value=ui.destino.value;if(!ui.voltaDestino.value)ui.voltaDestino.value=ui.origem.value;if(!ui.voltaData.value)ui.voltaData.value=ui.data.value;if(!ui.voltaMesAno.value)ui.voltaMesAno.value=this.monthYearForDate(ui.voltaData.value);}
+                this.workflowSummary(ui);
+            };
+            syncTripFields();
+            ui.tripKind.addEventListener('change',()=>{syncTripFields({suggest:true});this.saveDraft(ui,3);});
+            ui.data.addEventListener('input',()=>{const month=this.monthYearForDate(ui.data.value);if(month)ui.mesAno.value=month;this.saveDraft(ui,3);});
+            ui.voltaData.addEventListener('input',()=>{const month=this.monthYearForDate(ui.voltaData.value);if(month)ui.voltaMesAno.value=month;this.saveDraft(ui,3);});
+            [ui.origem,ui.destino,ui.mesAno,ui.voltaOrigem,ui.voltaDestino,ui.voltaMesAno].forEach(input=>input.addEventListener('input',()=>this.saveDraft(ui,3)));
+            ui.stepButtons.forEach(button=>button.addEventListener('click',()=>{const stage=Number(button.dataset.stage||1);if(stage<=ui.maxStage)this.setWorkflowStage(ui,stage);}));
+            ui.cpf.addEventListener('input', () => { ui.cpf.value = this.formatCpf(ui.cpf.value);const digits=this.cpfDigits(ui.cpf.value);ui.cpfOverrideWrap.classList.toggle('show',digits.length===11&&!this.validCpf(digits)); });
             ui.ocrCpf.addEventListener('input', () => { ui.ocrCpf.value = this.formatCpf(ui.ocrCpf.value); });
             const lockManualDraft = (fieldName, input, normalizeValue, validateValue) => {
                 input.addEventListener('input', () => {
@@ -11286,8 +11528,9 @@
             });
             const identityNow = EH.PassengerIdentity.confirmedData();
             if (identityNow) {
-                ui.identityConfirmed.textContent = `✓ Dados confirmados • CPF válido • ${identityNow.nascimento}`;
-                ui.identityConfirmed.className = 'eh-pref-confidence-high eh-pref-identity-confirmed';
+                ui.identityConfirmed.textContent = identityNow.cpfValid===false?`⚠ Dados confirmados manualmente • CPF inválido mantido • ${identityNow.nascimento}`:`✓ Dados confirmados • CPF válido • ${identityNow.nascimento}`;
+                ui.identityConfirmed.className = `${identityNow.cpfValid===false?'eh-pref-confidence-review':'eh-pref-confidence-high'} eh-pref-identity-confirmed`;
+                ui.cpfOverrideWrap.classList.toggle('show',identityNow.cpfValid===false);
             }
 
             const currentBox = q('.eh-pref-current');
@@ -11300,25 +11543,24 @@
             } else currentBox.textContent = 'Nenhum passageiro atual foi identificado. Envie a documentação ou preencha manualmente.';
 
             const routeHost = q('.eh-pref-route-list');
-            const baseRoutes = [
-                ['Arenópolis','Goiânia'], ['Arenópolis','Barra do Garças'],
-                ['Arenópolis','Iporá'], ['Goiânia','Arenópolis']
-            ];
             const storedRoutes = (EH.Storage.get(this.CUSTOM_ROUTES_KEY, []) || []).filter(route => route?.origem && route?.destino);
-            const renderRoute = ([origin, destination]) => {
+            const configuredRoutes=(EH.QuickRoutes?.load?.()||[]).filter(route=>route.active!==false).map(route=>({origin:route.origin,destination:route.destination,title:EH.QuickRoutes.title(route)}));
+            const renderRoute = route => {
+                const origin=route.origin||route.origem||'',destination=route.destination||route.destino||'';
                 const button = document.createElement('button');
-                button.type = 'button'; button.className = 'eh-pref-route'; button.textContent = `${origin.toLocaleUpperCase('pt-BR')} → ${destination.toLocaleUpperCase('pt-BR')}`;
-                button.addEventListener('click', () => { ui.origem.value = origin; ui.destino.value = destination; });
+                button.type = 'button'; button.className = 'eh-pref-route'; button.textContent = route.title||`${origin} × ${destination}`;
+                button.addEventListener('click', () => { ui.origem.value = origin; ui.destino.value = destination;if(ui.tripKind.value==='roundtrip'){ui.voltaOrigem.value=destination;ui.voltaDestino.value=origin;}this.saveDraft(ui,3); });
                 routeHost.appendChild(button);
             };
-            [...baseRoutes, ...storedRoutes.map(route => [route.origem, route.destino])].forEach(renderRoute);
+            [...configuredRoutes,...storedRoutes].forEach(renderRoute);
+            if(!routeHost.children.length){const empty=document.createElement('div');empty.className='eh-pref-help';empty.textContent='Cadastre uma rota nas Configurações Gerais ou informe Origem e Destino manualmente.';routeHost.appendChild(empty);}
             q('.eh-pref-save-route').addEventListener('click', () => {
                 const origem = this.cityDisplay(ui.origem.value); const destino = this.cityDisplay(ui.destino.value);
                 if (!origem || !destino) return this.showAlert(ui, 'Informe Origem e Destino antes de salvar o mercado.');
                 const routes = (EH.Storage.get(this.CUSTOM_ROUTES_KEY, []) || []).filter(route => route?.origem && route?.destino);
                 const key = `${EH.Utils.normalize(origem)}>${EH.Utils.normalize(destino)}`;
                 if (!routes.some(route => `${EH.Utils.normalize(route.origem)}>${EH.Utils.normalize(route.destino)}` === key)) {
-                    routes.push({ origem, destino, updatedAt: Date.now() }); EH.Storage.set(this.CUSTOM_ROUTES_KEY, routes.slice(-20)); renderRoute([origem, destino]);
+                    routes.push({ origem, destino, updatedAt: Date.now() }); EH.Storage.set(this.CUSTOM_ROUTES_KEY, routes.slice(-20)); renderRoute({origem,destino});
                 }
                 this.showAlert(ui, '✓ Mercado salvo nas opções rápidas.');
             });
@@ -11368,12 +11610,14 @@
                     ui.identityConfirmed.textContent = `✓ Dados confirmados • CPF válido • ${data.nascimento}`;
                     ui.identityConfirmed.className = 'eh-pref-confidence-high';
                     this.showAlert(ui, '');
+                    this.setWorkflowStage(ui,3);
                 } else this.showAlert(ui, current.nome || current.cpf ? 'Os dados atuais foram copiados, mas ainda precisam ser confirmados com o nascimento.' : 'Nenhum passageiro atual foi encontrado.');
             });
             q('.eh-pref-ocr-confirm').addEventListener('click', () => this.confirmIdentity(ui, 'review'));
             q('.eh-pref-ocr-manual').addEventListener('click', () => {
                 this.fillForm(ui, { nome: ui.ocrName.value, cpf: ui.ocrCpf.value, nascimento: ui.ocrBirth.value });
                 ui.ocrReview.classList.remove('show'); ui.nome.focus();
+                this.setWorkflowStage(ui,2);
                 this.showAlert(ui, 'Edite os campos e clique em “Confirmar dados digitados”.');
             });
             const ocrDiagnostic = q('.eh-pref-ocr-diagnostic');
@@ -11388,6 +11632,7 @@
             const markUnconfirmed = () => {
                 if (!EH.PassengerIdentity.matchesConfirmed(this.collect(ui))) {
                     ui.identityConfirmed.textContent = '⚠ Alteração pendente de confirmação'; ui.identityConfirmed.className = 'eh-pref-confidence-review';
+                    this.setWorkflowStage(ui,2);
                 }
             };
             [ui.nome, ui.cpf, ui.nascimento].forEach(input => input.addEventListener('input', markUnconfirmed));
@@ -11402,20 +11647,28 @@
                 const health = await this.checkService();
                 this.showAlert(ui, health?.ok ? '✓ Gerador local, modelo oficial e LibreOffice prontos.' : (health?.error || 'Gerador local incompleto.'));
             });
+            q('.eh-pref-confirm-route').addEventListener('click',()=>this.confirmRoute(ui));
+            q('.eh-pref-back-identity').addEventListener('click',()=>this.setWorkflowStage(ui,2));
+            q('.eh-pref-back-route').addEventListener('click',()=>this.setWorkflowStage(ui,3));
+            q('.eh-pref-edit-identity').addEventListener('click',()=>this.setWorkflowStage(ui,2));
             q('.eh-pref-preview-btn').addEventListener('click', () => this.previewRequest(ui));
-            q('.eh-pref-correct').addEventListener('click', () => { ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null;this.previews=[];ui.previewImage.parentElement?.querySelectorAll?.('.eh-pref-preview-image-extra')?.forEach?.(image=>image.remove()); ui.nome.focus(); });
+            q('.eh-pref-correct').addEventListener('click', () => { ui.confirm.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null;this.previews=[];ui.previewImage.parentElement?.querySelectorAll?.('.eh-pref-preview-image-extra')?.forEach?.(image=>image.remove());this.setWorkflowStage(ui,3); });
             q('.eh-pref-generate').addEventListener('click', () => this.generateRequest(ui));
             q('.eh-pref-download').addEventListener('click', () => this.downloadGenerated());
             q('.eh-pref-attach').addEventListener('click', () => this.attachToRequest('request'));
             q('.eh-pref-attach-doc').addEventListener('click', () => this.attachToRequest('document'));
-            q('.eh-pref-again').addEventListener('click', () => { ui.ready.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null; ui.nome.focus(); });
+            q('.eh-pref-again').addEventListener('click', () => { ui.ready.classList.remove('show'); ui.previewImage.hidden = true; ui.emptyPreview.hidden = false; this.preview = null;this.previews=[];this.setWorkflowStage(ui,4); });
             q('.eh-pref-close').addEventListener('click', () => this.close());
             overlay.addEventListener('click', event => { if (event.target === overlay) this.close(); });
 
             if (this.generated?.filename) {
                 ui.readyName.textContent = this.generated.filename;
                 ui.ready.classList.add('show');
+                const generatedPreview=this.generated.combinedDataUrl||this.generated.finalUrl||this.generated.previewUrl||'';
+                if(generatedPreview){ui.previewImage.src=generatedPreview;ui.previewImage.hidden=false;ui.emptyPreview.hidden=true;}
             }
+            const draftStage=Number(draft.stage||1);const initialStage=this.generated?.filename?6:confirmed?Math.min(4,Math.max(3,draftStage)):((draft.nome||draft.cpf||draft.nascimento)?2:1);
+            ui.maxStage=initialStage;this.setWorkflowStage(ui,initialStage,{persist:false});
             this.checkService({ quiet: true });
         }
     };
@@ -11514,6 +11767,9 @@
                 origem: EH.Utils.clean(item.origem || parsed.origem || ''),
                 destino: EH.Utils.clean(item.destino || parsed.destino || ''),
                 codigo: EH.Utils.clean(item.codigo || ''),
+                data: EH.Utils.clean(item.data || ''),
+                mesAno: EH.Utils.clean(item.mesAno || ''),
+                filename: EH.Utils.clean(item.filename || ''),
                 updatedAt: Number(item.updatedAt || Date.now())
             };
         },
@@ -11609,7 +11865,7 @@
 
         requestFingerprint(request) {
             const people = (request.passengers || []).map(passenger => {
-                const legs = (passenger.legs || []).map(leg => `${leg.tipo}:${EH.Utils.normalize(leg.mercadoCompleto)}`).sort().join('|');
+                const legs = (passenger.legs || []).map(leg => `${leg.tipo}:${EH.Utils.normalize(leg.mercadoCompleto)}:${EH.Utils.clean(leg.data||'')}`).sort().join('|');
                 return `${passenger.cpf}:${this.normalizeName(passenger.nome)}:${passenger.dataNascimento}:${legs}`;
             }).sort().join('||');
             return [
@@ -11645,13 +11901,13 @@
             const items = this.loadStore();
             const fingerprint = this.requestFingerprint(next);
             const now = Date.now();
-            let existing = next.numeroLogico
+            let existing = items.find(item=>String(item.id||'')===String(next.id||'')) || (next.numeroLogico
                 ? items.find(item => item.numeroLogico === next.numeroLogico)
                 : items.find(item => {
                     if (item.numeroLogico || item.status === 'approved') return false;
                     if (this.requestFingerprint(item) !== fingerprint) return false;
                     return (now - Number(item.updatedAt || 0)) <= (2 * 60 * 1000);
-                });
+                }));
             if (existing) {
                 existing.prefeitura = next.prefeitura || existing.prefeitura;
                 existing.secretaria = next.secretaria || existing.secretaria;
@@ -14584,7 +14840,7 @@
             const tipo=String(leg.tipo||'ida').toLowerCase();
             const market=EH.Utils.normalize(leg.mercadoCompleto||'');
             const route=`${EH.Utils.normalize(leg.origem||'')}→${EH.Utils.normalize(leg.destino||'')}`;
-            return `${tipo}|${market||route}`;
+            return `${tipo}|${market||route}|${EH.Utils.clean(leg.data||'')}`;
         },
         mergeLeg(localLeg={},remoteLeg={}) {
             const l=EH.RequisitionManager?.normalizeLeg?.(localLeg)||localLeg, r=EH.RequisitionManager?.normalizeLeg?.(remoteLeg)||remoteLeg;
@@ -14597,6 +14853,9 @@
                 origem:this.usefulText(preferred.origem,secondary.origem),
                 destino:this.usefulText(preferred.destino,secondary.destino),
                 codigo:this.usefulText(preferred.codigo,secondary.codigo),
+                data:this.usefulText(preferred.data,secondary.data),
+                mesAno:this.usefulText(preferred.mesAno,secondary.mesAno),
+                filename:this.usefulText(preferred.filename,secondary.filename),
                 updatedAt:Math.max(Number(l.updatedAt||0),Number(r.updatedAt||0))
             };
         },
@@ -15040,6 +15299,14 @@
             const ticket = EH.Utils.clean(passenger.ticket || '');
             const service = String(record?.service || '').replace(/\D/g, '');
             const date = String(record?.date || '');
+            if(record?.mapKey){
+                const agencyCode=EH.OperationCars?.agencyCode?.()||'287';
+                const movement=passenger.movement||passenger._movement||(String(passenger?.origin?.code||'')===agencyCode?'board':String(passenger?.destination?.code||'')===agencyCode?'alight':'');
+                if(movement){const exactId=this.mapReminderId(record,passenger,movement);const exact=this.load().find(item=>String(item.id)===exactId);if(exact)return exact;}
+                const name=EH.Utils.normalize(passenger.name||''),seat=EH.Utils.clean(passenger.seat||'');
+                const mapped=this.load().filter(item=>item.mapKey===record.mapKey&&(!name||EH.Utils.normalize(item.name||'')===name)&&(!seat||EH.Utils.clean(item.seat||'')===seat));
+                if(mapped.length===1)return mapped[0];
+            }
             const candidates = this.load().filter(item => {
                 if (this.isDoneStatus(item.status) && !ticket && !cpf) return false;
                 if (ticket && item.ticketNumber && EH.Utils.clean(item.ticketNumber) === ticket) return true;
@@ -15061,6 +15328,113 @@
                 if (date && item.travelDate && item.travelDate !== date) return false;
                 return true;
             });
+        },
+
+        stableHash(value) {
+            let hash=2166136261;
+            const text=String(value||'');
+            for(let index=0;index<text.length;index++){hash^=text.charCodeAt(index);hash=Math.imul(hash,16777619);}
+            return(hash>>>0).toString(36);
+        },
+
+        mapReminderId(record, passenger, movement) {
+            const ticket=EH.Utils.clean(passenger?.ticket||passenger?.locator||'');
+            const identity=[
+                record?.mapKey,record?.date,record?.service,movement,ticket,
+                EH.Utils.normalize(passenger?.name||''),EH.Utils.clean(passenger?.seat||''),
+                passenger?.origin?.code||'',passenger?.destination?.code||''
+            ].join('|');
+            return`map:${record?.date||'sem-data'}:${record?.service||'sem-servico'}:${movement}:${this.stableHash(identity)}`;
+        },
+
+        mapMovementItems(record) {
+            if(!record?.agency?.exists||record?.agency?.multiple)return[];
+            return[
+                ...(record.agency.boarders||[]).map(passenger=>({passenger,movement:'board'})),
+                ...(record.agency.alighters||[]).map(passenger=>({passenger,movement:'alight'}))
+            ];
+        },
+
+        upsertMapRecord(record,{sync=true}={}) {
+            if(!record?.mapKey)return 0;
+            const movements=this.mapMovementItems(record);
+            if(!movements.length)return 0;
+            const items=this.loadAll();const now=Date.now();const changedIds=[];
+            movements.forEach(({passenger,movement})=>{
+                const id=this.mapReminderId(record,passenger,movement);
+                const exact=items.find(item=>String(item?.id||'')===id);
+                // Um tombstone é uma exclusão sincronizável e bloqueia recriação automática.
+                if(exact&&Number(exact.deletedAt||0))return;
+                const ticket=EH.Utils.clean(passenger?.ticket||'');
+                const locator=EH.Utils.clean(passenger?.locator||'');
+                // O mapa pode completar ou corrigir a poltrona/nome depois da primeira
+                // leitura, alterando o hash calculado. Ainda assim, uma exclusão anterior
+                // do mesmo bilhete/localizador (ou da mesma posição operacional) deve
+                // continuar prevalecendo para não ressuscitar o lembrete no próximo merge.
+                const deletedMatch=items.find(item=>{
+                    if(!Number(item?.deletedAt||0))return false;
+                    if(item.movement!==movement)return false;
+                    if(ticket&&EH.Utils.clean(item.ticketNumber||'')===ticket){
+                        if(item.travelDate&&record.date&&item.travelDate!==record.date)return false;
+                        if(item.service&&record.service&&String(item.service)!==String(record.service))return false;
+                        return true;
+                    }
+                    if(locator&&EH.Utils.clean(item.locator||'')===locator){
+                        if(item.travelDate&&record.date&&item.travelDate!==record.date)return false;
+                        return true;
+                    }
+                    if(item.mapKey!==record.mapKey)return false;
+                    const sameName=EH.Utils.normalize(item.name||'')===EH.Utils.normalize(passenger?.name||'');
+                    const sameSeat=EH.Utils.clean(item.seat||'')===EH.Utils.clean(passenger?.seat||'');
+                    return sameName&&sameSeat;
+                });
+                if(deletedMatch)return;
+                let target=exact||items.find(item=>{
+                    if(Number(item?.deletedAt||0))return false;
+                    if(ticket&&EH.Utils.clean(item.ticketNumber||'')===ticket){
+                        if(item.travelDate&&record.date&&item.travelDate!==record.date)return false;
+                        if(item.service&&record.service&&String(item.service)!==String(record.service))return false;
+                        return true;
+                    }
+                    if(locator&&EH.Utils.clean(item.locator||'')===locator){
+                        if(item.travelDate&&record.date&&item.travelDate!==record.date)return false;
+                        return true;
+                    }
+                    return false;
+                });
+                if(!target){
+                    const name=EH.Utils.normalize(passenger?.name||''),seat=EH.Utils.clean(passenger?.seat||'');
+                    const fallback=items.filter(item=>!Number(item?.deletedAt||0)&&item.mapKey===record.mapKey&&item.movement===movement&&(!name||EH.Utils.normalize(item.name||'')===name)&&(!seat||EH.Utils.clean(item.seat||'')===seat));
+                    if(fallback.length===1)target=fallback[0];
+                }
+                const travel=this.parseTravel(record.dateBr||'');
+                const next={
+                    id:target?.id||id,
+                    name:EH.PassengerIdentity?.formatPersonName?.(passenger?.name||'')||EH.Utils.clean(passenger?.name||''),
+                    cpf:this.normalizeCpf(passenger?.cpf||target?.cpf||''),
+                    seat:EH.Utils.clean(passenger?.seat||''),
+                    movement,
+                    movementLabel:movement==='alight'?'desembarque':'embarque',
+                    mapKey:String(record.mapKey),mapIdentity:String(record.mapKey),
+                    ticketNumber:ticket||EH.Utils.clean(target?.ticketNumber||''),locator:locator||EH.Utils.clean(target?.locator||''),
+                    service:String(record.service||passenger?.service||'').replace(/\D/g,''),
+                    travelDate:String(record.date||passenger?.travelDate||''),travelDateBr:String(record.dateBr||travel.dateBr||''),
+                    travelRaw:String(record.dateBr||''),travelTimestamp:travel.timestamp||Number(target?.travelTimestamp||0),travelTime:String(record.operationalTime||record.lineDeparture||''),
+                    origin:EH.OperationCars?.shortLocation?.(passenger?.origin)||'',destination:EH.OperationCars?.shortLocation?.(passenger?.destination)||'',
+                    status:['pending','checked','printed','completed'].includes(String(target?.status||''))?String(target.status):'pending',
+                    source:'map-287',createdAt:Number(target?.createdAt||now),updatedAt:Number(target?.updatedAt||now),completedAt:Number(target?.completedAt||0),
+                    deletedAt:0,deviceId:String(target?.deviceId||EH.Device.id()),syncState:target?.syncState||'local'
+                };
+                const relevant=item=>JSON.stringify({name:item?.name||'',cpf:item?.cpf||'',seat:item?.seat||'',movement:item?.movement||'',mapKey:item?.mapKey||'',ticketNumber:item?.ticketNumber||'',locator:item?.locator||'',service:item?.service||'',travelDate:item?.travelDate||'',travelDateBr:item?.travelDateBr||'',travelTime:item?.travelTime||'',origin:item?.origin||'',destination:item?.destination||''});
+                if(target&&relevant(target)===relevant(next))return;
+                next.updatedAt=now;next.deviceId=EH.Device.id();next.syncState=EH.Sync?.configured?.()?'pending':'local';
+                if(target)Object.assign(target,next);else items.push(next);
+                changedIds.push(String(next.id));
+            });
+            if(!changedIds.length)return 0;
+            this.save(items,{changedIds});
+            if(sync)EH.Sync?.syncReminders?.({quiet:true});
+            return changedIds.length;
         },
 
         linkMapRecord(record) {
@@ -15723,9 +16097,19 @@
         lastMapModal: null,
         lastMapDomFingerprint: '',
         lastMapDomRecords: [],
+        mapObserver: null,
+        mapObservedRoot: null,
+        mapOpenedAt: 0,
+        pendingMapFingerprint: '',
+        pendingMapSince: 0,
+        mapAnalysis: { state:'idle', message:'Aguardando o mapa do E-Pass.', records:[], signature:'', diagnostic:'' },
 
         normalize(value) {
             return EH.Utils.normalize(value || '');
+        },
+
+        normalizeMapSeparators(value) {
+            return EH.Utils.clean(String(value || '').replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, '-'));
         },
 
         todayKey(date = new Date()) {
@@ -15812,14 +16196,14 @@
         },
 
         trailingCode(value) {
-            const normalized = this.normalize(EH.Utils.clean(value || ''));
+            const normalized = this.normalize(this.normalizeMapSeparators(value));
             const match = normalized.match(/(?:^|\s*-\s*)(\d+)\s*$/);
             return match ? String(match[1]) : '';
         },
 
         parseLocation(value) {
             const raw = EH.Utils.clean(value || '');
-            const normalized = this.normalize(raw);
+            const normalized = this.normalize(this.normalizeMapSeparators(raw));
             const code = this.trailingCode(raw);
             const withoutCode = code
                 ? normalized.replace(new RegExp(`\\s*-\\s*${code}\\s*$`), '').trim()
@@ -16200,7 +16584,8 @@
             const indexOf = patterns => headers.findIndex(header => patterns.some(pattern => header.includes(pattern)));
             const idx = {
                 name:indexOf(['NOME']), ticket:indexOf(['BILHETE']), cpf:indexOf(['CPF']),
-                seat:indexOf(['POLTRONA']), origin:indexOf(['ORIGEM']), destination:indexOf(['DESTINO'])
+                locator:indexOf(['LOCALIZADOR']), service:indexOf(['SERVICO']), date:indexOf(['DATA']),
+                movement:indexOf(['MOVIMENTO','TIPO']), seat:indexOf(['POLTRONA']), origin:indexOf(['ORIGEM']), destination:indexOf(['DESTINO'])
             };
             return Array.from(table?.querySelectorAll?.('tbody tr') || []).map((row,rowIndex)=>{
                 const cells=Array.from(row.querySelectorAll('td')).map(td=>EH.Utils.clean(td.textContent));
@@ -16210,6 +16595,10 @@
                     name:idx.name>=0?cells[idx.name]||'':'',
                     ticket:idx.ticket>=0?cells[idx.ticket]||'':'',
                     cpf:idx.cpf>=0?String(cells[idx.cpf]||'').replace(/\D/g,''):'',
+                    locator:idx.locator>=0?cells[idx.locator]||'':'',
+                    service:idx.service>=0?String(cells[idx.service]||'').replace(/\D/g,''):'',
+                    travelDate:idx.date>=0?this.brDateToKey(cells[idx.date]||''):'',
+                    movementRaw:idx.movement>=0?cells[idx.movement]||'':'',
                     seat:idx.seat>=0?cells[idx.seat]||'':'',
                     origin:this.parseLocation(idx.origin>=0?cells[idx.origin]||'':''),
                     destination:this.parseLocation(idx.destination>=0?cells[idx.destination]||'':'')
@@ -16409,6 +16798,35 @@
             };
         },
 
+        mapDomFingerprint(modal) {
+            const body=modal?.querySelector?.('.nsm-body')||modal;
+            if(!body)return'';
+            const tables=Array.from(body.querySelectorAll?.('table')||[]).map(table=>{
+                const headers=this.tableHeaders(table).join('|');
+                const rows=table.querySelectorAll?.('tbody tr')?.length||0;
+                return`${headers}:${rows}`;
+            });
+            return[
+                EH.Utils.clean(body.textContent||'').slice(0,80000),
+                `cards:${body.querySelectorAll?.('.card')?.length||0}`,
+                `tables:${tables.join('||')}`
+            ].join('~~');
+        },
+
+        inspectMapReadiness(modal) {
+            if(!modal?.isConnected)return{ready:false,reason:'modal-closed',diagnostic:'O modal do Mapa de Viagem não está conectado ao DOM.'};
+            const body=modal.querySelector?.('.nsm-body')||modal;
+            if(!EH.Utils.clean(body?.textContent||''))return{ready:false,reason:'empty',diagnostic:'A área real do mapa ainda está vazia.'};
+            const sections=this.findMapSections(modal);
+            if(!sections.length)return{ready:false,reason:'metadata',diagnostic:'Os cartões reais de Serviço, Data do Serviço e Linha ainda não foram localizados.'};
+            const incomplete=sections.filter(section=>!section.passengerTable||!section.localityTable);
+            if(incomplete.length)return{ready:false,reason:'tables',diagnostic:`${incomplete.length} área(s) ainda não possuem as duas tabelas reais do mapa.`};
+            const schedules=this.assignSchedulesToSections(sections);
+            const records=sections.map((section,index)=>this.buildRecord(section,schedules[index]||null)).filter(record=>record.date&&record.service);
+            if(records.length!==sections.length)return{ready:false,reason:'records',diagnostic:'Serviço ou data ainda não puderam ser lidos em todas as áreas do mapa.'};
+            return{ready:true,sections,records,diagnostic:`${sections.length} área(s) estáveis e completas.`};
+        },
+
         readVehicleMap() {
             const modal=EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
             if(!modal){
@@ -16417,7 +16835,7 @@
                 this.lastMapDomRecords=[];
                 return[];
             }
-            const fingerprint=EH.Utils.clean(modal.textContent||'').slice(0,40000);
+            const fingerprint=this.mapDomFingerprint(modal);
             if(this.lastMapModal===modal&&this.lastMapDomFingerprint===fingerprint&&this.lastMapDomRecords.length){
                 return this.lastMapDomRecords;
             }
@@ -16437,9 +16855,91 @@
         mapSignature(records=[]) {
             return records.map(record=>{
                 const agency=record.agency||{};
-                const tickets=[...(agency.boarders||[]),...(agency.alighters||[])].map(item=>item.ticket).filter(Boolean).sort().join(',');
-                return[record.mapKey,agency.exists,agency.multiple,agency.board,agency.alight,agency.balance,tickets].join('~');
+                const passengers=[
+                    ...(agency.boarders||[]).map(item=>({...item,movement:'board'})),
+                    ...(agency.alighters||[]).map(item=>({...item,movement:'alight'}))
+                ].map(item=>[
+                    item.movement,item.ticket,item.locator,item.cpf,item.seat,
+                    this.normalize(item.name),item.origin?.code,item.destination?.code
+                ].join(':')).sort().join(',');
+                return[record.mapKey,agency.exists,agency.multiple,agency.board,agency.alight,agency.balance,passengers].join('~');
             }).join('||');
+        },
+
+        analysisForRecords(records=[], signature=this.mapSignature(records)) {
+            const unique=Array.from(new Map((records||[]).filter(record=>record?.mapKey).map(record=>[record.mapKey,record])).values());
+            if(!unique.length)return{state:'error',message:'Não foi possível verificar este mapa.',records:[],signature,diagnostic:'Nenhum registro completo foi produzido pelo parser do mapa.'};
+            const ambiguous=unique.filter(record=>record.agency?.multiple);
+            const incomplete=unique.filter(record=>record.agency?.exists&&!record.agency?.multiple&&(!Number.isFinite(Number(record.agency.board))||!Number.isFinite(Number(record.agency.alight))));
+            if(ambiguous.length||incomplete.length){
+                const details=[...ambiguous.map(record=>record.agency?.warning||`Agência ${this.agencyCode()} ambígua no serviço ${record.service}.`),...incomplete.map(record=>`Contagens incompletas no serviço ${record.service}.`)];
+                return{state:'error',message:'Não foi possível verificar este mapa.',records:unique,signature,diagnostic:details.join(' • ')};
+            }
+            const valid=unique.filter(record=>record.agency?.exists&&!record.agency?.multiple);
+            const board=valid.reduce((sum,record)=>sum+Number(record.agency.board||0),0);
+            const alight=valid.reduce((sum,record)=>sum+Number(record.agency.alight||0),0);
+            const passengers=valid.reduce((sum,record)=>sum+(record.agency.boarders?.length||0)+(record.agency.alighters?.length||0),0);
+            if(!valid.length||(!board&&!alight&&!passengers))return{state:'empty',message:'Não há embarque nem desembarque.',records:unique,signature,board:0,alight:0,diagnostic:`Mapa analisado por completo; agência ${this.agencyCode()} sem movimento.`};
+            return{state:'movement',message:`Agência ${this.agencyCode()} • ${board} embarque(s) • ${alight} desembarque(s)`,records:unique,signature,board,alight,diagnostic:`${unique.length} área(s) analisada(s) sem ambiguidade.`};
+        },
+
+        publishMapAnalysis(next={}, { autoOpen=false }={}) {
+            const previousSignature=this.mapAnalysis?.signature||'';
+            this.mapAnalysis={state:'idle',message:'Aguardando o mapa do E-Pass.',records:[],signature:'',diagnostic:'',...next,updatedAt:Date.now()};
+            EH.ContextualPanels?.refresh?.('operation');
+            if(autoOpen&&['movement','empty','error'].includes(this.mapAnalysis.state)&&this.mapAnalysis.signature!==previousSignature){
+                EH.ContextualPanels?.open?.('operation');
+            }
+            return this.mapAnalysis;
+        },
+
+        disconnectMapObserver({ reset=true }={}) {
+            this.mapObserver?.disconnect?.();this.mapObserver=null;this.mapObservedRoot=null;this.mapOpenedAt=0;this.pendingMapFingerprint='';this.pendingMapSince=0;
+            EH.Runtime?.clearTimeout?.('operation-map-stability');
+            if(reset&&this.mapAnalysis?.state!=='idle')this.publishMapAnalysis({state:'idle',message:'Aguardando o mapa do E-Pass.',records:[],signature:'',diagnostic:''});
+        },
+
+        scheduleMapAnalysis(reason='change') {
+            const modal=EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
+            if(!modal){this.disconnectMapObserver();return;}
+            const fingerprint=this.mapDomFingerprint(modal);
+            if(fingerprint!==this.pendingMapFingerprint){this.pendingMapFingerprint=fingerprint;this.pendingMapSince=Date.now();}
+            this.publishMapAnalysis({state:'loading',message:'Verificando o mapa…',records:this.mapAnalysis?.records||[],signature:this.mapAnalysis?.signature||'',diagnostic:`Aguardando estabilidade após ${reason}.`});
+            EH.Runtime.timeout('operation-map-stability',()=>this.analyzeStableMap(),460);
+        },
+
+        analyzeStableMap() {
+            const modal=EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
+            if(!modal){this.disconnectMapObserver();return;}
+            const fingerprint=this.mapDomFingerprint(modal);
+            if(fingerprint!==this.pendingMapFingerprint){this.pendingMapFingerprint=fingerprint;this.pendingMapSince=Date.now();EH.Runtime.timeout('operation-map-stability',()=>this.analyzeStableMap(),460);return;}
+            const readiness=this.inspectMapReadiness(modal);
+            const elapsed=Date.now()-Number(this.mapOpenedAt||Date.now());
+            if(!readiness.ready){
+                if(elapsed<7000){this.publishMapAnalysis({state:'loading',message:'Verificando o mapa…',records:[],signature:'',diagnostic:readiness.diagnostic});EH.Runtime.timeout('operation-map-stability',()=>this.analyzeStableMap(),600);return;}
+                EH.Logger.warn('Mapa 287: estrutura não pôde ser interpretada.',readiness.reason);
+                this.publishMapAnalysis({state:'error',message:'Não foi possível verificar este mapa.',records:[],signature:`error:${EH.Reminders?.stableHash?.(fingerprint)||fingerprint.length}`,diagnostic:readiness.diagnostic},{autoOpen:true});
+                return;
+            }
+            const result=this.scanCurrentMap({quiet:true,automatic:true,records:readiness.records});
+            const analysis=this.analysisForRecords(result.records,result.signature);
+            this.publishMapAnalysis(analysis,{autoOpen:true});
+        },
+
+        watchCurrentMap() {
+            const modal=EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
+            if(!modal){if(this.mapObservedRoot)this.disconnectMapObserver();return;}
+            const root=modal.querySelector?.('.nsm-body')||modal;
+            if(this.mapObservedRoot!==root){
+                this.disconnectMapObserver({reset:false});
+                this.mapObservedRoot=root;this.mapOpenedAt=Date.now();
+                this.mapObserver=new MutationObserver(()=>this.scheduleMapAnalysis('atualização do conteúdo'));
+                this.mapObserver.observe(root,{childList:true,subtree:true,characterData:true});
+                this.scheduleMapAnalysis('abertura do mapa');
+                return;
+            }
+            const fingerprint=this.mapDomFingerprint(modal);
+            if(fingerprint!==this.pendingMapFingerprint)this.scheduleMapAnalysis('nova versão do mapa');
         },
 
         loadMaps() {
@@ -16511,11 +17011,11 @@
             return records[0]||null;
         },
 
-        scanCurrentMap({quiet=false}={}) {
-            const records=this.readVehicleMap();
+        scanCurrentMap({quiet=false,automatic=false,records:providedRecords=null}={}) {
+            const records=Array.isArray(providedRecords)?providedRecords:this.readVehicleMap();
             if(!records.length){
-                if(!quiet)EH.Toast.warning('Abra o Mapa de Viagem para atualizar o código 287.');
-                return{found:false,updated:false,records:[]};
+                if(!quiet)EH.Toast.warning(EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL)?'Não foi possível verificar este mapa.':'Abra o Mapa de Viagem para verificar a agência 287.');
+                return{found:false,updated:false,records:[],signature:''};
             }
             const signature=this.mapSignature(records);
             const preferred=this.preferredRecord(records);
@@ -16531,16 +17031,19 @@
                     line:{code:preferred.lineCode,raw:preferred.lineRaw}
                 });
                 if(schedule)this.selectCar(schedule,{quiet:true});
-                EH.Reminders?.linkMapRecord?.(preferred);
             }
+            let remindersChanged=0;
+            records.forEach(record=>{remindersChanged+=Number(EH.Reminders?.upsertMapRecord?.(record,{sync:false})||0);});
+            if(remindersChanged)EH.Sync?.syncReminders?.({quiet:true});
             this.render();
             if(!quiet&&preferred){
                 const agency=preferred.agency||{};
-                if(!agency.exists)EH.Toast.info(`Serviço ${preferred.service} • código ${this.agencyCode()} não aparece no resumo do mapa.`);
-                else if(agency.multiple)EH.Toast.warning(`Serviço ${preferred.service} • ${agency.warning||`mais de um registro da agência ${this.agencyCode()}.`}`);
-                else EH.Toast.success(`Serviço ${preferred.service} • Agência ${this.agencyCode()}: ↑ ${agency.board??'—'} • ↓ ${agency.alight??'—'} • 🚌 ${agency.balance??'—'}`);
+                if(!agency.exists)EH.Toast.info('Não há embarque nem desembarque.');
+                else if(agency.multiple)EH.Toast.warning('Não foi possível verificar este mapa.');
+                else EH.Toast.success(`Agência ${this.agencyCode()}: ${agency.board??'—'} embarque(s) • ${agency.alight??'—'} desembarque(s)`);
             }
-            return{found:true,updated:changed,records};
+            if(!automatic){const analysis=this.analysisForRecords(records,signature);this.publishMapAnalysis(analysis,{autoOpen:true});}
+            return{found:true,updated:changed,records,signature,remindersChanged};
         },
 
         seatLabel(value) {
@@ -16783,6 +17286,67 @@
             return ordered.find(state=>state.minutes>=current)||ordered[0]||null;
         },
 
+        async copyMapCpf(passenger) {
+            const cpf=String(passenger?.cpf||'').replace(/\D/g,'').slice(0,11);
+            if(cpf.length!==11)return EH.Toast.warning('CPF precisa ser consultado na passagem.');
+            await EH.Clipboard.copyText(cpf);EH.Toast.success('CPF copiado.');
+        },
+
+        openMapPassenger(passenger,record) {
+            const reminder=EH.Reminders?.matchPassenger?.(passenger,record);
+            const cpf=String(passenger?.cpf||reminder?.cpf||'').replace(/\D/g,'').slice(0,11);
+            if(cpf.length===11)return EH.Reminders?.searchTicket?.(reminder||{...passenger,cpf,id:''});
+            const ticket=EH.Utils.clean(passenger?.ticket||passenger?.locator||'');
+            if(ticket){EH.Clipboard.copyText(ticket);EH.SaleContext?.navigateToPassagens?.();EH.Toast.info('Bilhete/localizador copiado. Consulte a passagem no E-Pass para obter o CPF.');return;}
+            EH.SaleContext?.navigateToPassagens?.();EH.Toast.warning('CPF não disponível no mapa. A consulta foi aberta para conferência manual.');
+        },
+
+        renderContext(body) {
+            const analysis=this.mapAnalysis||{state:'idle',message:'Aguardando o mapa do E-Pass.',records:[]};
+            const message=document.createElement('div');message.className='eh-context-empty';message.textContent=analysis.message;
+            if(analysis.state==='idle'||analysis.state==='loading'){
+                const actions=document.createElement('div');actions.className='eh-context-actions';
+                if(analysis.state==='idle')actions.append(EH.ContextualPanels.action('Verificar mapa aberto',()=>this.watchCurrentMap(),'primary'));
+                body.append(message,actions);return;
+            }
+            if(analysis.state==='empty'){
+                const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Verificar novamente',()=>this.scheduleMapAnalysis('verificação manual')));
+                body.append(message,actions);return;
+            }
+            if(analysis.state==='error'){
+                const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Ver detalhes';const text=document.createElement('div');text.className='eh-pref-error-details';text.textContent=analysis.diagnostic||'A estrutura real do mapa não pôde ser confirmada.';details.append(summary,text);
+                const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Tentar novamente',()=>this.scheduleMapAnalysis('nova tentativa'),'primary'));
+                body.append(message,details,actions);return;
+            }
+            const records=(analysis.records||[]).filter(record=>record?.agency?.exists&&!record.agency.multiple);
+            const metrics=document.createElement('div');metrics.className='eh-context-data';metrics.append(EH.ContextualPanels.cell('Embarques',String(analysis.board||0)),EH.ContextualPanels.cell('Desembarques',String(analysis.alight||0)));body.appendChild(metrics);
+            const list=document.createElement('div');list.className='eh-operation-passenger-list';
+            const rows=[];records.forEach(record=>{
+                (record.agency.boarders||[]).forEach(passenger=>rows.push({passenger,record,movement:'board'}));
+                (record.agency.alighters||[]).forEach(passenger=>rows.push({passenger,record,movement:'alight'}));
+            });
+            rows.sort((a,b)=>Number(String(a.passenger.seat||'').match(/\d+/)?.[0]||9999)-Number(String(b.passenger.seat||'').match(/\d+/)?.[0]||9999));
+            rows.forEach(({passenger,record,movement})=>{
+                const contextualPassenger={...passenger,movement};
+                const row=document.createElement('article');row.className='eh-operation-passenger';
+                const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(passenger.seat);
+                const info=document.createElement('div');info.className='eh-operation-passenger-info';
+                const name=document.createElement('strong');name.textContent=passenger.name||'Passageiro sem nome';
+                const cpf=String(passenger.cpf||'').replace(/\D/g,'').slice(0,11);const meta=document.createElement('small');meta.textContent=`${movement==='alight'?'Desembarque':'Embarque'} • ${cpf.length===11?EH.SaleContext.maskCpf(cpf):'CPF precisa ser consultado'}`;
+                const reminder=EH.Reminders?.matchPassenger?.(contextualPassenger,record);const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders?.isDoneStatus?.(reminder?.status)?'done':'pending'}`;
+                const statusLabels={pending:'Pendente',checked:'Conferido',printed:'Impresso',completed:'Concluído',concluded:'Concluído'};
+                state.textContent=reminder?`Lembrete: ${statusLabels[String(reminder.status||'pending').toLowerCase()]||'Pendente'}`:'Lembrete pendente de criação';
+                const actions=document.createElement('div');actions.className='eh-operation-detail-actions';
+                const copy=document.createElement('button');copy.type='button';copy.className='eh-modal-btn';copy.textContent='Copiar CPF';copy.disabled=cpf.length!==11;copy.addEventListener('click',()=>this.copyMapCpf(passenger));
+                const search=document.createElement('button');search.type='button';search.className='eh-modal-btn primary';search.textContent='Buscar passagem';search.addEventListener('click',()=>this.openMapPassenger(contextualPassenger,record));
+                const statusButton=(label,status)=>{const button=document.createElement('button');button.type='button';button.className='eh-modal-btn';button.textContent=label;button.disabled=!reminder;button.addEventListener('click',()=>{if(reminder)EH.Reminders.markStatus(reminder.id,status);EH.ContextualPanels.refresh('operation');});return button;};
+                actions.append(copy,search,statusButton('Conferido','checked'),statusButton('Impresso','printed'),statusButton('Concluir','completed'));
+                info.append(name,meta,state,actions);row.append(seat,info);list.appendChild(row);
+            });
+            body.appendChild(list);
+            const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Ver detalhes',()=>records.length===1?this.showDetails(records[0]):this.showCars()),EH.ContextualPanels.action('Verificar novamente',()=>this.scheduleMapAnalysis('verificação manual')));body.appendChild(actions);
+        },
+
         render() {
             const host=EH.OperationDock?.host||EH.UI?.operationBox;
             if(EH.UI?.operationBox&&EH.OperationDock?.host)EH.UI.operationBox.hidden=true;
@@ -16894,13 +17458,13 @@
         onPageUpdate(page) {
             if(page==='pesquisa')this.readScheduleResults();
             else if(!EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL))this.visibleScheduleRecords=[];
-            if(EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL))this.scanCurrentMap({quiet:true});
+            this.watchCurrentMap();
             this.render();
         },
 
         init() {
             if(this.started||EH.WhatsAppBridge.isWhatsAppHost())return;
-            this.started=true;this.injectStyles();this.render();
+            this.started=true;this.injectStyles();this.watchCurrentMap();this.render();
         }
     };
 
@@ -18998,9 +19562,9 @@
                 const time=document.createElement('input');time.type='time';time.value=String(item.time||'');
                 const origin=document.createElement('input');origin.type='text';origin.value=String(item.origin||'');origin.placeholder='Origem';
                 const destination=document.createElement('input');destination.type='text';destination.value=String(item.destination||'');destination.placeholder='Destino';
-                const alias=document.createElement('input');alias.type='text';alias.value=String(item.alias||'');alias.placeholder='Apelido opcional';
+                const alias=document.createElement('input');alias.type='text';alias.value=String(item.alias||'');alias.placeholder='Ex.: Arenópolis × Goiânia';
                 const wrap=(labelText,input)=>{const field=document.createElement('div');field.className='eh-field';const label=document.createElement('label');label.textContent=labelText;field.append(label,input);return field;};
-                rowGrid.append(wrap('Horário',time),wrap('Origem',origin),wrap('Destino',destination),wrap('Apelido',alias));
+                rowGrid.append(wrap('Horário relacionado',time),wrap('Origem',origin),wrap('Destino',destination),wrap('Título resumido',alias));
                 const active=document.createElement('input');active.type='checkbox';active.checked=item.active!==false;
                 const visible=document.createElement('input');visible.type='checkbox';visible.checked=item.visible!==false;
                 const flags=document.createElement('div');flags.className='eh-settings-inline-actions';
@@ -19016,7 +19580,7 @@
             };
             EH.QuickRoutes.load().forEach(addQuickRouteRow);
             const addQuickRoute=document.createElement('button');addQuickRoute.type='button';addQuickRoute.className='eh-modal-btn';addQuickRoute.textContent='+ Adicionar rota';addQuickRoute.addEventListener('click',()=>addQuickRouteRow());
-            quickRoutesCard.append(quickRouteList,addQuickRoute,note('Cada rota possui ID próprio. Horário e serviço não são usados como identificador interno.'));
+            quickRoutesCard.append(quickRouteList,addQuickRoute,note('O painel mostra apenas o título resumido. Sem título personalizado, usa Origem × Destino. Horário e serviço não são identificadores internos.'));
             sections.rotas.pane.appendChild(quickRoutesCard);
 
             // APARÊNCIA
@@ -19810,7 +20374,7 @@
             return clean;
         },
         active() { return this.load().filter(item => item.active && item.visible); },
-        title(route) { return route.alias || `${route.origin} → ${route.destination}`; },
+        title(route) { return route.alias || `${route.origin} × ${route.destination}`; },
         currentResult(route) {
             if (EH.Pages?.detect?.() !== 'pesquisa') return { data:null, item:null };
             const data = EH.Parser?.parsePesquisa?.();
@@ -19859,7 +20423,10 @@
             EH.Toast.success(mode === 'details' ? 'Horário completo copiado.' : 'Horário resumido copiado.');
         },
         async search(route) {
-            await EH.Routes.apply({ id:route.id, origem:route.origin, destino:route.destination, observacao:route.alias || '' }, { search:true, autoCapture:false });
+            await EH.Routes.apply(
+                { id:route.id, origem:route.origin, destino:route.destination, observacao:route.alias || '' },
+                { autoSearch:true, autoCapture:false }
+            );
         },
         previewWhatsApp(route) {
             document.querySelector('#eh-quick-wa-preview')?.remove();
@@ -19896,9 +20463,9 @@
         contexts: {
             routes:['pesquisa'], seats:['reserva'], passenger:['reserva','passagens','requisicao'],
             payment:['pagamento'], confirmation:['confirmacao'], tickets:['passagens'], reminders:['passagens'],
-            finance:['caixa','comissoes'], prefeitura:['requisicao'], operation:['pesquisa','passagens']
+            finance:['caixa','comissoes'], prefeitura:['requisicao'], operation:null
         },
-        titles: { routes:'Rotas e horários', seats:'Poltronas', passenger:'Dados do passageiro', payment:'Pagamento e PIX', confirmation:'Resumo da compra', tickets:'Passagens emitidas', reminders:'Lembretes', finance:'Caixa e financeiro', prefeitura:'Requisição da Prefeitura', operation:'Mapa do carro e fila', menu:'Ferramentas' },
+        titles: { routes:'Rotas', seats:'Poltronas', passenger:'Dados do passageiro', payment:'Pagamento e PIX', confirmation:'Resumo da compra', tickets:'Passagens emitidas', reminders:'Lembretes', finance:'Caixa', prefeitura:'Requisição da Prefeitura', operation:'Mapa do carro', menu:'Ferramentas' },
         init() {
             if (this.settingsButton || !document.body) return;
             // A UI antiga continua montada para reutilizar captura/configuração, mas deixa
@@ -19910,7 +20477,7 @@
             GM_addStyle(`
                 #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
                 html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 34px));min-width:270px;min-height:190px;overflow:hidden;resize:both;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
-                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:6px;padding:9px;border:1px solid #dfe5eb;border-radius:10px;background:#fff}.eh-context-route-head{display:flex;justify-content:space-between;gap:8px}.eh-context-route-head strong{font-size:11px}.eh-context-route-head time{font-size:12px;font-weight:900;color:#2f6ea5}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}
+                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:38px!important;justify-content:flex-start;padding:9px 11px!important;border-color:#d9e2ea!important;background:#fff!important;color:#263e58!important;text-align:left;font-size:10px!important}.eh-context-route-choice[aria-expanded="true"]{border-color:#8fb6db!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-detail{display:grid;gap:7px;padding:9px;border:1px solid #dfe5eb;border-radius:9px;background:#fafcfe}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}
                 @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:auto!important;height:min(72vh,560px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
@@ -19920,7 +20487,7 @@
             all[id]={x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height),updatedAt:Date.now()};EH.Storage.set(this.KEY,all);
         },
         position(id,panel) {
-            const cfg=this.saved()[id]||{};const width=Math.min(window.innerWidth-24,Math.max(270,Number(cfg.width)||390));const height=Math.min(window.innerHeight-34,Math.max(190,Number(cfg.height)||520));
+            const cfg=this.saved()[id]||{};const defaultHeight=id==='operation'?430:520;const width=Math.min(window.innerWidth-24,Math.max(270,Number(cfg.width)||390));const height=Math.min(window.innerHeight-34,Math.max(190,Number(cfg.height)||defaultHeight));
             const fallbackX=EH.Config.OVERLAY_SIDE==='left'?12:Math.max(12,window.innerWidth-width-62);const x=Math.min(window.innerWidth-80,Math.max(0,Number.isFinite(Number(cfg.x))?Number(cfg.x):fallbackX));const y=Math.min(window.innerHeight-48,Math.max(0,Number.isFinite(Number(cfg.y))?Number(cfg.y):92));
             Object.assign(panel.style,{width:`${width}px`,height:`${height}px`,left:`${x}px`,top:`${y}px`});
         },
@@ -19937,7 +20504,23 @@
         action(label,callback,className='') { const button=document.createElement('button');button.type='button';button.textContent=label;button.className=className;button.addEventListener('click',callback);return button; },
         renderRoutes(body) {
             const routes=EH.QuickRoutes.active();if(!routes.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota rápida ativa. Cadastre nas Configurações Gerais.';body.appendChild(empty);return;}
-            routes.forEach(route=>{const card=document.createElement('article');card.className='eh-context-route';const head=document.createElement('div');head.className='eh-context-route-head';const title=document.createElement('strong');title.textContent=EH.QuickRoutes.title(route);const time=document.createElement('time');time.textContent=route.time;head.append(title,time);const path=document.createElement('small');path.textContent=`${route.origin} → ${route.destination}`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Pesquisar',()=>EH.QuickRoutes.search(route),'primary'),this.action('Copiar resumido',()=>EH.QuickRoutes.copy(route,'summary')),this.action('Copiar completo',()=>EH.QuickRoutes.copy(route,'details')),this.action('WhatsApp',()=>EH.QuickRoutes.previewWhatsApp(route),'success'));card.append(head,path,actions);body.appendChild(card);});
+            routes.forEach(route=>{
+                const card=document.createElement('article');card.className='eh-context-route';
+                const choose=this.action(EH.QuickRoutes.title(route),()=>{});choose.className='eh-context-route-choice';choose.setAttribute('aria-expanded','false');
+                choose.addEventListener('click',()=>{
+                    const current=card.querySelector('.eh-context-route-detail');
+                    if(current){current.remove();choose.setAttribute('aria-expanded','false');return;}
+                    body.querySelectorAll('.eh-context-route-detail').forEach(detail=>detail.remove());
+                    body.querySelectorAll('.eh-context-route-choice').forEach(button=>button.setAttribute('aria-expanded','false'));
+                    choose.setAttribute('aria-expanded','true');
+                    const detail=document.createElement('div');detail.className='eh-context-route-detail';
+                    const {data,item}=EH.QuickRoutes.currentResult(route);const grid=document.createElement('div');grid.className='eh-context-data';
+                    grid.append(this.cell('Horário configurado',route.time),this.cell('Serviço do dia',item?.servicos?.join(', ')||'Será detectado na pesquisa'),this.cell('Empresa',item?.empresa||item?.linha||''),this.cell('Data pesquisada',data?.data||''));
+                    const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Pesquisar horários',()=>EH.QuickRoutes.search(route),'primary'),this.action('Copiar resumido',()=>EH.QuickRoutes.copy(route,'summary')),this.action('Copiar completo',()=>EH.QuickRoutes.copy(route,'details')),this.action('WhatsApp',()=>EH.QuickRoutes.previewWhatsApp(route),'success'));
+                    detail.append(grid,actions);card.appendChild(detail);
+                });
+                card.appendChild(choose);body.appendChild(card);
+            });
         },
         renderSeats(body) {
             const data=EH.Parser?.parseReserva?.()||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',EH.SaleContext?.getActivePassenger?.()?.name||''),this.cell('Rota',data.origemDestino),this.cell('Horário',data.horaSaida),this.cell('Poltrona',data.poltronasSelecionadas?.join(', ')),this.cell('Disponíveis',data.poltronasLivres?.length?String(data.poltronasLivres.length):''),this.cell('Valor',data.valorTotalNum>0?EH.Utils.formatMoney(data.valorTotalNum):''));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Gerar poltronas',()=>EH.UI?.captureAction?.('reserva'),'primary'),this.action('Copiar dados',async()=>{await EH.Clipboard.copyText(EH.Parser.formatReservaResumo(data));EH.Toast.success('Dados das poltronas copiados.');}));body.append(grid,actions);
@@ -19948,8 +20531,25 @@
         renderConfirmation(body) {
             const sale=EH.SaleContext?.loadSale?.()||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const cpf=EH.SaleContext?.maskCpfPublic?.(passenger.cpf||'')||'';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Nome',passenger.name),this.cell('CPF',cpf),this.cell('Origem',sale.origem),this.cell('Destino',sale.destino),this.cell('Horário',sale.horario||sale.time),this.cell('Poltrona',passenger.seat||passenger.poltrona),this.cell('Pagamento',sale.paymentMethod||sale.formaPagamento),this.cell('Valor final',sale.valorFinal||sale.total));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Copiar resumo',()=>EH.UI?.copyCurrentSummary?.(),'primary'));body.append(grid,actions);
         },
+        renderFinance(body) {
+            const today=EH.FinanceLedger?.todaySummary?.()||{};const stats=EH.FinanceLedger?.monthStats?.();const month=stats?.summary||EH.FinanceLedger?.monthSummary?.()||{};
+            const money=value=>EH.Utils.formatMoney(Number(value||0));const grid=document.createElement('div');grid.className='eh-context-data eh-context-finance';
+            grid.append(
+                this.cell('Vendas de hoje',money(today.passageValue)),
+                this.cell('Vendido no mês',money(month.passageValue)),
+                this.cell('Média diária do mês',money(stats?.average?.movement||0)),
+                this.cell('Projeção do mês • estimativa',money(stats?.projection?.movement||0)),
+                this.cell('Comissão acumulada',money(month.commission)),
+                this.cell('Quantidade de operações',String(month.operations||0)),
+                this.cell(`Mercadorias recebidas • ${month.merchandiseReceivedCount||0}`,money(month.merchandiseReceivedValue)),
+                this.cell(`Mercadorias enviadas • ${month.merchandiseSentCount||0}`,money(month.merchandiseSentValue))
+            );
+            const note=document.createElement('div');note.className='eh-context-empty';note.textContent=stats?`Realizado em ${stats.elapsedDays} dia(s) corrido(s). A projeção usa ${stats.daysInMonth} dias e não é valor realizado.`:'Sem período mensal válido.';
+            const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Ver detalhes',()=>EH.UI?.showFinanceModal?.('resumo'),'primary'),this.action('Atualizar dados',()=>EH.FinanceLedger?.syncFromCurrentPage?.()));
+            body.append(grid,note,actions);
+        },
         renderMenu(body) {
-            const actions=document.createElement('div');actions.className='eh-context-actions';[['Rotas','routes'],['Poltronas','seats'],['Passageiro / Document AI','passenger'],['Pagamento / PIX','payment'],['Confirmação','confirmation'],['Lembretes','reminders'],['Passagens','tickets'],['Caixa / Financeiro','finance'],['Requisição Prefeitura','prefeitura'],['Mapa / Fila','operation']].forEach(([label,id])=>actions.append(this.action(label,()=>this.open(id))));body.appendChild(actions);
+            const actions=document.createElement('div');actions.className='eh-context-actions';[['Rotas','routes'],['Poltronas','seats'],['Passageiro / Document AI','passenger'],['Pagamento / PIX','payment'],['Confirmação','confirmation'],['Lembretes','reminders'],['Passagens','tickets'],['Caixa / Financeiro','finance'],['Requisição da Prefeitura','prefeitura'],['Mapa / Fila','operation']].forEach(([label,id])=>actions.append(this.action(label,()=>this.open(id))));body.appendChild(actions);
         },
         render(id,body) {
             body.innerHTML='';
@@ -19960,8 +20560,8 @@
             if(id==='passenger'||id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent=id==='prefeitura'?'Use o documento oficial, confira os dados e prepare o anexo.':'A imagem e os campos permanecerão juntos durante a conferência.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action(id==='prefeitura'?'Abrir Requisição da Prefeitura':'Abrir dados e Document AI',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));body.append(note,actions);return;}
             if(id==='reminders'){const count=EH.Reminders?.pending?.()?.length||0;const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${count} lembrete(s) pendente(s).`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir lembretes',()=>EH.Reminders?.openModal?.(),'primary'));body.append(note,actions);return;}
             if(id==='tickets'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Selecionar passagem',()=>EH.Tickets?.activateSelection?.(),'primary'),this.action('Abrir fila',()=>EH.TicketVerificationQueue?.render?.()));body.appendChild(actions);return;}
-            if(id==='finance'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir resumo financeiro',()=>EH.UI?.showFinanceModal?.('resumo'),'primary'));body.appendChild(actions);return;}
-            if(id==='operation'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Carros de hoje',()=>EH.OperationCars?.showCars?.(),'primary'),this.action('Atualizar mapa',()=>EH.OperationCars?.scanCurrentMap?.()));body.appendChild(actions);return;}
+            if(id==='finance')return this.renderFinance(body);
+            if(id==='operation'){EH.OperationCars?.renderContext?.(body);return;}
             this.renderMenu(body);
         },
         open(id) {
