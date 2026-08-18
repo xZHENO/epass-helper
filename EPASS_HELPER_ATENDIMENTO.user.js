@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.70.0
+// @version      5.71.0
 // @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.70.0',
+        VERSION: '5.71.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 12,
+        STORAGE_SCHEMA_VERSION: 13,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -104,6 +104,9 @@
         QUICK_ROUTE_COPY_BEFORE_WHATSAPP: true,
         // Rotina operacional: horário/nome são configuração; SERVIÇO é sempre dado detectado do dia.
         OPERATION_TIME_TOLERANCE_MINUTES: 20,
+        // Após o horário previsto, a passagem permanece operacional por esta
+        // janela. Sem confirmação real do movimento, depois vai para revisão.
+        OPERATION_QUEUE_GRACE_MINUTES: 180,
         OPERATION_ROUTINES: [
             { id: 'gyn-barra-0700', name: 'Goiânia → Barra do Garças', operationalTime: '07:00', active: true, originHint: 'GOIANIA', destinationHint: 'BARRA DO GARCAS', companyHint: '', lineHint: '' },
             { id: 'barra-gyn-0730', name: 'Barra do Garças → Goiânia', operationalTime: '07:30', active: true, originHint: 'BARRA DO GARCAS', destinationHint: 'GOIANIA', companyHint: '', lineHint: '' },
@@ -371,6 +374,10 @@
                 const value = EH.Utils.parseFiniteNumber(this.get('operationTimeToleranceMinutes', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES), EH.Config.OPERATION_TIME_TOLERANCE_MINUTES);
                 EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = Math.min(90, Math.max(0, value));
             }
+            {
+                const value = EH.Utils.parseFiniteNumber(this.get('operationQueueGraceMinutes', EH.Config.OPERATION_QUEUE_GRACE_MINUTES), EH.Config.OPERATION_QUEUE_GRACE_MINUTES);
+                EH.Config.OPERATION_QUEUE_GRACE_MINUTES = Math.min(1440, Math.max(15, value));
+            }
             EH.Config.REMINDER_CREATE_AFTER_TICKET = EH.Utils.parseBoolean(this.get('reminderCreateAfterTicket', EH.Config.REMINDER_CREATE_AFTER_TICKET), EH.Config.REMINDER_CREATE_AFTER_TICKET);
             EH.Config.REMINDER_ASK_AFTER_TICKET = EH.Utils.parseBoolean(this.get('reminderAskAfterTicket', EH.Config.REMINDER_ASK_AFTER_TICKET), EH.Config.REMINDER_ASK_AFTER_TICKET);
             EH.Config.REMINDER_MASK_CPF = EH.Utils.parseBoolean(this.get('reminderMaskCpf', EH.Config.REMINDER_MASK_CPF), EH.Config.REMINDER_MASK_CPF);
@@ -596,6 +603,10 @@
             if (tolerance !== undefined) {
                 EH.Storage.set('operationTimeToleranceMinutes', Math.min(90, Math.max(0, EH.Utils.parseFiniteNumber(tolerance, 20))));
             }
+            const queueGrace = EH.Storage.get('operationQueueGraceMinutes', undefined);
+            if (queueGrace !== undefined) {
+                EH.Storage.set('operationQueueGraceMinutes', Math.min(1440, Math.max(15, EH.Utils.parseFiniteNumber(queueGrace, 180))));
+            }
         },
 
         migrateContextualWorkspace() {
@@ -639,6 +650,35 @@
             }
         },
 
+        migrateOperationalQueueV13() {
+            const key = 'ticketReminders.v1';
+            const rows = EH.Storage.get(key, []);
+            if (!Array.isArray(rows)) return;
+            const terminal = new Set(['completed','concluded','canceled','cancelled','archived']);
+            const now = Date.now();
+            const graceMs = Math.max(15, Number(EH.Storage.get('operationQueueGraceMinutes', 180)) || 180) * 60000;
+            let changed = false;
+            const next = rows.map(item => {
+                if (!item || typeof item !== 'object') return item;
+                const status = String(item.status || 'pending').toLowerCase();
+                const movement = String(item.movement || '').toLowerCase();
+                const timestamp = Number(item.travelTimestamp || 0);
+                const source = String(item.source || 'legacy');
+                const recordOrigin = String(item.recordOrigin || (source.includes('map') ? 'Mapa' : source.includes('epass') || source.includes('emission') ? 'Emissão' : 'Legado'));
+                let queueState = String(item.queueState || '');
+                if (!queueState) {
+                    if (terminal.has(status)) queueState = 'history';
+                    else if (!timestamp || !['board','alight'].includes(movement) || (timestamp + graceMs < now)) queueState = 'review';
+                    else queueState = 'active';
+                }
+                const normalized = { ...item, recordOrigin, queueState, migratedOperationalAt: Number(item.migratedOperationalAt || now) };
+                if (JSON.stringify(normalized) !== JSON.stringify(item)) changed = true;
+                return normalized;
+            });
+            if (changed) EH.Storage.set(key, next);
+            if (EH.Storage.get('operationQueueGraceMinutes', undefined) === undefined) EH.Storage.set('operationQueueGraceMinutes', 180);
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -653,6 +693,7 @@
             this.migrateSettingsTypes();
             this.migrateContextualWorkspace();
             this.migrateContextualMapWorkflow();
+            this.migrateOperationalQueueV13();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -678,7 +719,7 @@
                 'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
                 'financeAskCompanyMerch','financeConfirmDelete',
                 'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
-                'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes',
+                'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes','operationQueueGraceMinutes',
                 'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
                 'reminderHighlightToday','panelManager.v1',
                 'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail',
@@ -14817,7 +14858,7 @@
         },
         statusRank(status) {
             const value=String(status||'').toLowerCase();
-            return value==='pending'?0:value==='checked'?1:value==='printed'?2:(value==='completed'||value==='concluded')?3:0;
+            return value==='pending'?0:value==='checked'?1:value==='printed'?2:(value==='completed'||value==='concluded'||value==='canceled'||value==='cancelled'||value==='archived')?4:0;
         },
         requestStatusRank(status) {
             const value=String(status||'').toLowerCase();
@@ -14830,7 +14871,8 @@
             // deletedAt sempre vence para impedir ressurreição após merge entre PCs.
             merged.deletedAt=Math.max(Number(localData?.deletedAt||0),Number(remoteData?.deletedAt||0));
             const localStatus=String(localData?.status||'pending').toLowerCase(), remoteStatus=String(remoteData?.status||'pending').toLowerCase();
-            merged.status=this.statusRank(remoteStatus)>this.statusRank(localStatus)?remoteStatus:localStatus;
+            const localRank=this.statusRank(localStatus),remoteRank=this.statusRank(remoteStatus);
+            merged.status=remoteRank>localRank?remoteStatus:localRank>remoteRank?localStatus:(remoteNewer?remoteStatus:localStatus);
             merged.completedAt=Math.max(Number(localData?.completedAt||0),Number(remoteData?.completedAt||0));
             merged.createdAt=Math.min(Number(localData?.createdAt||Date.now()),Number(remoteData?.createdAt||Date.now()));
             merged.updatedAt=Math.max(Number(localTs||localData?.updatedAt||0),Number(remoteTs||remoteData?.updatedAt||0),merged.deletedAt);
@@ -14915,7 +14957,7 @@
                 (EH.PassengerMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('passenger',item.id||`cpf:${item.cpf}`,item,item.updatedAt||item.createdAt)));
                 (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
             }
-            if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;const quickUpdated=Number(EH.Storage.get('quickRoutes.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,updatedAt:opUpdated},opUpdated));rows.push(this.envelope('config','quick-routes',{routes:EH.QuickRoutes?.load?.()||[],updatedAt:quickUpdated},quickUpdated));}
+            if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;const quickUpdated=Number(EH.Storage.get('quickRoutes.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,queueGraceMinutes:EH.Config.OPERATION_QUEUE_GRACE_MINUTES,updatedAt:opUpdated},opUpdated));rows.push(this.envelope('config','quick-routes',{routes:EH.QuickRoutes?.load?.()||[],updatedAt:quickUpdated},quickUpdated));}
             return rows.filter(row=>row.recordId);
         },
         applyEnvelope(env){
@@ -14944,9 +14986,11 @@
                         if(env.data?.agencyCode)EH.Config.OPERATION_AGENCY_CODE=String(env.data.agencyCode).replace(/\D/g,'')||EH.Config.OPERATION_AGENCY_CODE;
                         if(Array.isArray(env.data?.routines)&&env.data.routines.length)EH.Config.OPERATION_ROUTINES=env.data.routines;
                         if(Number.isFinite(Number(env.data?.tolerance)))EH.Config.OPERATION_TIME_TOLERANCE_MINUTES=Number(env.data.tolerance);
+                        if(Number.isFinite(Number(env.data?.queueGraceMinutes)))EH.Config.OPERATION_QUEUE_GRACE_MINUTES=Math.min(1440,Math.max(15,Number(env.data.queueGraceMinutes)));
                         EH.Storage.set('operationAgencyCode',EH.Config.OPERATION_AGENCY_CODE);
                         EH.Storage.set('operationRoutines',EH.Config.OPERATION_ROUTINES);
                         EH.Storage.set('operationTimeToleranceMinutes',EH.Config.OPERATION_TIME_TOLERANCE_MINUTES);
+                        EH.Storage.set('operationQueueGraceMinutes',EH.Config.OPERATION_QUEUE_GRACE_MINUTES);
                         EH.Storage.set('operationConfig.updatedAt',Number(env.updatedAt||env.data.updatedAt||Date.now()));
                     }
                     if(env.recordId==='quick-routes'&&Array.isArray(env.data?.routes)){
@@ -15069,7 +15113,7 @@
 
     // Sanitização compatível com lembretes antigos.
     EH.SyncLegacyReminder = {
-        sanitize(item={}){const createdAt=Number(item.createdAt||Date.now()),deletedAt=Math.max(0,Number(item.deletedAt||0)),updatedAt=Math.max(Number(item.updatedAt||item.completedAt||createdAt),deletedAt),{syncState:_syncState,...rest}=item;return{...rest,id:String(item.id||''),name:EH.PassengerIdentity?.formatPersonName?.(item.name||'')||EH.Utils.clean(item.name||''),cpf:String(item.cpf||'').replace(/\D/g,'').slice(0,11),origin:EH.Utils.clean(item.origin||''),destination:EH.Utils.clean(item.destination||''),service:String(item.service||'').replace(/\D/g,''),seat:EH.Utils.clean(item.seat||''),ticketNumber:EH.Utils.clean(item.ticketNumber||''),status:['pending','printed','checked','completed'].includes(String(item.status||'').toLowerCase())?String(item.status).toLowerCase():'pending',createdAt,updatedAt,deletedAt,completedAt:Number(item.completedAt||0),deviceId:String(item.deviceId||EH.Device.id())};}
+        sanitize(item={}){const createdAt=Number(item.createdAt||Date.now()),deletedAt=Math.max(0,Number(item.deletedAt||0)),updatedAt=Math.max(Number(item.updatedAt||item.completedAt||createdAt),deletedAt),{syncState:_syncState,...rest}=item;const allowed=['pending','printed','checked','completed','concluded','canceled','cancelled','archived'];return{...rest,id:String(item.id||''),name:EH.PassengerIdentity?.formatPersonName?.(item.name||'')||EH.Utils.clean(item.name||''),cpf:String(item.cpf||'').replace(/\D/g,'').slice(0,11),origin:EH.Utils.clean(item.origin||''),destination:EH.Utils.clean(item.destination||''),service:String(item.service||'').replace(/\D/g,''),seat:EH.Utils.clean(item.seat||''),ticketNumber:EH.Utils.clean(item.ticketNumber||''),status:allowed.includes(String(item.status||'').toLowerCase())?String(item.status).toLowerCase():'pending',createdAt,updatedAt,deletedAt,completedAt:Number(item.completedAt||0),deviceId:String(item.deviceId||EH.Device.id())};}
     };
 
     EH.Reminders = {
@@ -15079,6 +15123,7 @@
         searchBusy: false,
         deletionBusy: false,
         stylesInjected: false,
+        lastIssuedCardsSignature: '',
 
         normalizeCpf(value) { return String(value || '').replace(/\D/g, '').slice(0, 11); },
         loadAll() {
@@ -15113,6 +15158,8 @@
                 if (!EH.Sync?.applyingRemote && item?.id && (!changed || changed.has(String(item.id)))) EH.Sync?.markPendingRecord?.('reminder', item.id);
             });
             this.render();
+            EH.ContextualPanels?.refresh?.('operation');
+            EH.ContextualPanels?.refresh?.('reminders');
             return all;
         },
         parseTravel(raw) {
@@ -15133,10 +15180,17 @@
         keyFor(item, ticket, cpf) {
             const number = EH.Utils.clean(ticket?.number || '');
             if (number) return `ticket:${number}`;
+            const locator = EH.Utils.clean(ticket?.locator || item?.locator || '');
+            if (locator) return `locator:${locator}`;
+            const saleReference = EH.Utils.clean(item?.saleReference || item?.saleId || '');
+            const passengerReference = EH.Utils.clean(item?.salePassengerId || item?.passengerId || '');
+            if (saleReference && passengerReference) return `sale:${saleReference}:${passengerReference}`;
             const date = EH.Utils.clean(ticket?.date || '');
             const origin = EH.Utils.normalize(ticket?.origin || '');
             const destination = EH.Utils.normalize(ticket?.destination || '');
-            return `route:${cpf}|${date}|${origin}|${destination}`;
+            const service = String(ticket?.service || item?.service || '').replace(/\D/g, '');
+            const seat = EH.Utils.clean(ticket?.seat || item?.seat || '');
+            return `trip:${this.stableHash([cpf,date,origin,destination,service,seat].join('|'))}`;
         },
         candidateItems(items=[]) {
             const result=[];
@@ -15145,62 +15199,141 @@
                 const passenger = item?.passengerId ? EH.SaleContext?.load?.().find(p=>p.id===item.passengerId) : (cpf ? EH.SaleContext?.findPassengerByCpf?.(cpf) : null);
                 const name=EH.Utils.clean(item?.name || passenger?.name || '');
                 const tickets=(item?.data?.tickets || item?.tickets || []).filter(Boolean);
+                const summary=item?.data?.summary||{};
+                const rawStatus=EH.Utils.normalize(item?.data?.status||item?.status||'');
                 tickets.forEach(ticket => {
                     const travel=this.parseTravel(ticket.date);
-                    result.push({
+                    const canceled=/CANCEL|ANULAD/.test(rawStatus);
+                    const replaced=/SUBSTITUID|REEMITID|REMARCAD/.test(rawStatus);
+                    const candidate={
                         id:this.keyFor(item,ticket,cpf), ticketNumber:EH.Utils.clean(ticket.number||''),
+                        locator:EH.Utils.clean(ticket.locator||item?.locator||''), saleReference:EH.Utils.clean(item?.saleReference||item?.saleId||''),
                         cpf, name, passengerId:item?.passengerId || passenger?.id || null,
                         origin:EH.Utils.clean(ticket.origin||''), destination:EH.Utils.clean(ticket.destination||''),
                         travelRaw:EH.Utils.clean(ticket.date||''), travelDate:travel.key, travelDateBr:travel.dateBr,
                         travelTime:travel.time, travelTimestamp:travel.timestamp,
-                        service:String(item?.service || ticket?.service || '').replace(/\D/g,''),
-                        status:'pending', source:'epass-ticket', createdAt:Date.now(), updatedAt:Date.now(), completedAt:0,
+                        service:String(item?.service || ticket?.service || summary.service || '').replace(/\D/g,''),
+                        line:EH.Utils.clean(item?.line||ticket?.line||''),seat:EH.Utils.clean(item?.seat||ticket?.seat||summary.seat||''),
+                        paymentMethod:EH.Utils.clean(item?.paymentMethod||''),value:EH.Utils.clean(item?.value||summary.value||''),
+                        status:canceled?'canceled':replaced?'archived':'pending', queueState:(canceled||replaced)?'history':'review',
+                        recordOrigin:'Emissão', emissionConfirmed:true, confirmedEvidence:'issued-ticket-card', issuedAt:Date.now(),
+                        source:'epass-issued', createdAt:Date.now(), updatedAt:Date.now(), completedAt:(canceled||replaced)?Date.now():0,
                         deviceId:EH.Device.id(), syncState:EH.Sync?.configured?.() ? 'pending' : 'local'
-                    });
+                    };
+                    const movement=this.movementFor(candidate);if(movement){candidate.movement=movement;candidate.movementLabel=movement==='board'?'embarque':'desembarque';}
+                    candidate.queueState=this.queueStateFor(candidate);
+                    result.push(candidate);
                 });
             });
             return result;
         },
-        captureItems(items=[]) {
+        captureItems(items=[], options={}) {
             EH.EmissionMemory?.captureItems?.(items);
             if (!EH.Config.REMINDER_CREATE_AFTER_TICKET) return 0;
             const candidates=this.candidateItems(items);
             if (!candidates.length) return 0;
             const existing=this.loadAll();
-            const ids=new Set(existing.map(x=>String(x.id||'')));
-            // Tombstones também bloqueiam recriação automática do mesmo bilhete.
-            const fresh=candidates.filter(x=>!ids.has(x.id));
-            if (!fresh.length) return 0;
-            if (EH.Config.REMINDER_ASK_AFTER_TICKET) {
+            const fresh=[];const changedIds=[];
+            candidates.forEach(candidate=>{
+                const identifierMatch=row=>String(row.id||'')===String(candidate.id)||Boolean(candidate.ticketNumber&&row.ticketNumber&&EH.Utils.clean(row.ticketNumber)===candidate.ticketNumber)||Boolean(candidate.locator&&row.locator&&EH.Utils.clean(row.locator)===candidate.locator)||Boolean(candidate.saleReference&&row.saleReference&&String(row.saleReference)===String(candidate.saleReference)&&candidate.passengerId&&String(row.passengerId||row.salePassengerId||'')===String(candidate.passengerId));
+                const matches=existing.filter(identifierMatch);
+                if(matches.some(row=>Number(row.deletedAt||0)))return;
+                const target=matches.find(row=>!Number(row.deletedAt||0));
+                if(!target){fresh.push(candidate);return;}
+                const combined=String(target.recordOrigin||'').includes('Mapa')?'Emissão + Mapa':'Emissão';
+                const detectedTerminal=this.isDoneStatus(candidate.status)?candidate.status:'';
+                const next={...target,
+                    name:EH.Utils.clean(target.name||candidate.name),cpf:this.normalizeCpf(target.cpf||candidate.cpf),
+                    origin:EH.Utils.clean(target.origin||candidate.origin),destination:EH.Utils.clean(target.destination||candidate.destination),
+                    travelRaw:target.travelRaw||candidate.travelRaw,travelDate:target.travelDate||candidate.travelDate,travelDateBr:target.travelDateBr||candidate.travelDateBr,travelTime:target.travelTime||candidate.travelTime,travelTimestamp:Number(target.travelTimestamp||candidate.travelTimestamp||0),
+                    service:String(target.service||candidate.service||''),line:target.line||candidate.line,seat:target.seat||candidate.seat,
+                    ticketNumber:target.ticketNumber||candidate.ticketNumber,locator:target.locator||candidate.locator,saleReference:target.saleReference||candidate.saleReference,
+                    status:detectedTerminal||target.status,completedAt:detectedTerminal?Date.now():Number(target.completedAt||0),
+                    recordOrigin:combined,source:combined==='Emissão + Mapa'?'epass-issued+map-287':'epass-issued',emissionConfirmed:true,confirmedEvidence:candidate.confirmedEvidence,issuedAt:Number(target.issuedAt||candidate.issuedAt||Date.now())
+                };
+                const before=JSON.stringify(target);Object.assign(target,next);target.queueState=this.queueStateFor(target);
+                if(before!==JSON.stringify(target)){target.updatedAt=Date.now();target.deviceId=EH.Device.id();target.syncState=EH.Sync?.configured?.()?'pending':'local';changedIds.push(String(target.id));}
+            });
+            if (!fresh.length&&!changedIds.length) return 0;
+            // Cartão com VENDA REALIZADA + VALOR PAGO + número do bilhete é
+            // evidência real de emissão. Nunca dependemos do clique em Confirmar.
+            if (fresh.length&&EH.Config.REMINDER_ASK_AFTER_TICKET && !options.confirmedEvidence) {
                 const ok=window.confirm(`Criar lembrete de impressão/embarque para ${fresh.length} passagem(ns)?`);
                 if (!ok) return 0;
             }
-            this.save([...existing,...fresh]);
+            this.save([...existing,...fresh],{changedIds:[...changedIds,...fresh.map(item=>item.id)]});
             EH.Sync?.syncReminders?.({ quiet: true });
-            EH.Toast?.success?.(`${fresh.length} lembrete(s) de passagem criado(s).`);
+            if(!options.quiet)EH.Toast?.success?.(`${fresh.length} passagem(ns) confirmada(s) adicionada(s) à operação.`);
             return fresh.length;
         },
         complete(id) { const item=this.markStatus(id,'printed'); if(item) EH.Toast?.success?.('Lembrete marcado como impresso.'); },
-        reopen(id) { this.markStatus(id,'pending'); },
+        reopen(id) { this.restore(id); },
         todayKey(offset=0) {
             const d=new Date(); d.setDate(d.getDate()+offset);
             return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
         },
+        movementFor(item={}) {
+            const explicit=String(item.movement||'').toLowerCase();
+            if(['board','alight'].includes(explicit))return explicit;
+            const agency=EH.OperationCars?.agencyCode?.()||String(EH.Config.OPERATION_AGENCY_CODE||'287');
+            const originCode=EH.OperationCars?.parseLocation?.(item.origin||'')?.code||'';
+            const destinationCode=EH.OperationCars?.parseLocation?.(item.destination||'')?.code||'';
+            if(originCode===agency&&destinationCode!==agency)return'board';
+            if(destinationCode===agency&&originCode!==agency)return'alight';
+            return'';
+        },
+        queueStateFor(item={}, now=Date.now()) {
+            if(this.isDoneStatus(item.status))return'history';
+            if(Number(item.manualActiveUntil||0)>now&&this.movementFor(item))return'active';
+            const movement=this.movementFor(item),timestamp=Number(item.travelTimestamp||0);
+            if(!movement||!timestamp)return'review';
+            const grace=Math.max(15,Number(EH.Config.OPERATION_QUEUE_GRACE_MINUTES||180))*60000;
+            return timestamp+grace<now?'review':'active';
+        },
+        reconcileLifecycle({save=true}={}) {
+            const rows=this.loadAll(),now=Date.now(),changedIds=[];
+            rows.forEach(item=>{
+                if(!item||Number(item.deletedAt||0))return;
+                const movement=this.movementFor(item),queueState=this.queueStateFor(item,now);
+                if((movement&&item.movement!==movement)||item.queueState!==queueState){
+                    if(movement)item.movement=movement;
+                    item.movementLabel=movement==='board'?'embarque':movement==='alight'?'desembarque':'';
+                    item.queueState=queueState;item.updatedAt=Math.max(Number(item.updatedAt||0),now);item.deviceId=EH.Device.id();item.syncState=EH.Sync?.configured?.()?'pending':'local';changedIds.push(String(item.id));
+                }
+            });
+            if(save&&changedIds.length)this.save(rows,{changedIds});
+            return rows.filter(item=>!Number(item?.deletedAt||0));
+        },
+        queueGroups() {
+            const rows=this.reconcileLifecycle();
+            const sort=(a,b)=>(Number(a.travelTimestamp||0)||9e15)-(Number(b.travelTimestamp||0)||9e15)||Number(a.createdAt||0)-Number(b.createdAt||0);
+            return{
+                board:rows.filter(item=>item.queueState==='active'&&this.movementFor(item)==='board').sort(sort),
+                alight:rows.filter(item=>item.queueState==='active'&&this.movementFor(item)==='alight').sort(sort),
+                review:rows.filter(item=>item.queueState==='review').sort(sort),
+                history:rows.filter(item=>item.queueState==='history').sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))
+            };
+        },
         pending() { return this.load().filter(x=>!this.isDoneStatus(x.status)).sort((a,b)=>(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15)||a.createdAt-b.createdAt); },
         maskCpf(cpf) { return EH.Config.REMINDER_MASK_CPF ? EH.SaleContext.maskCpfPublic(cpf) : EH.SaleContext.maskCpf(cpf); },
-        isDoneStatus(status) { return ['printed','checked','completed','concluded'].includes(String(status || '').toLowerCase()); },
+        isDoneStatus(status) { return ['completed','concluded','canceled','cancelled','archived'].includes(String(status || '').toLowerCase()); },
         statusRank(status) {
             const value=String(status||'').toLowerCase();
-            return value==='pending'?0:value==='checked'?1:value==='printed'?2:(value==='completed'||value==='concluded')?3:0;
+            return value==='pending'?0:value==='checked'?1:value==='printed'?2:this.isDoneStatus(value)?4:0;
         },
-        markStatus(id, status) {
+        statusLabel(status) { const value=String(status||'pending').toLowerCase();return({pending:'Pendente',checked:'Conferido',printed:'Impresso',completed:'Concluído',concluded:'Concluído',canceled:'Cancelado',cancelled:'Cancelado',archived:'Arquivado'})[value]||'Pendente'; },
+        markStatus(id, status, { force=false } = {}) {
             const items=this.loadAll(); const item=items.find(x=>x.id===id&&!Number(x.deletedAt||0)); if(!item)return null;
-            const allowed=['pending','printed','checked','completed'];
+            const allowed=['pending','printed','checked','completed','canceled','archived'];
             const requested=allowed.includes(String(status||'').toLowerCase())?String(status).toLowerCase():'pending';
-            item.status=requested==='pending'?'pending':(this.statusRank(requested)>=this.statusRank(item.status)?requested:String(item.status||'pending').toLowerCase());
-            item.completedAt=this.isDoneStatus(item.status)?Date.now():0; item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local';
+            item.status=force?requested:(this.statusRank(requested)>=this.statusRank(item.status)?requested:String(item.status||'pending').toLowerCase());
+            item.completedAt=this.isDoneStatus(item.status)?Date.now():0;
+            item.queueState=this.isDoneStatus(item.status)?'history':'active';
+            if(force&&requested==='pending')item.manualActiveUntil=Date.now()+Math.max(15,Number(EH.Config.OPERATION_QUEUE_GRACE_MINUTES||180))*60000;
+            item.updatedAt=Date.now(); item.deviceId=EH.Device.id(); item.syncState=EH.Sync?.configured?.()?'pending':'local';
             this.save(items,{changedIds:[id]}); EH.Sync?.syncAll?.({quiet:true}); return item;
         },
+        restore(id) { return this.markStatus(id,'pending',{force:true}); },
 
         tombstone(ids = []) {
             const wanted = new Set((Array.isArray(ids) ? ids : [ids]).map(value => String(value || '')).filter(Boolean));
@@ -15285,7 +15418,41 @@
                 EH.Toast.success('CPF preenchido e busca iniciada.');
             } finally { this.searchBusy=false; }
         },
-        onPageUpdate(page) { if(page==='passagens') EH.Runtime.timeout('reminder-pending-search',()=>this.runPendingSearch(),350); },
+        captureConfirmedCards() {
+            if(EH.Pages?.detect?.()!=='passagens')return 0;
+            const cards=EH.Tickets?.findCards?.()||[];
+            if(!cards.length)return 0;
+            const signature=[EH.Tickets?.cardsSignature?.(cards)||'',...cards.map(card=>{const summary=EH.Tickets?.summary?.(card)||{};return[summary.status,summary.service,summary.seat,summary.value].join('|');})].join('||');
+            if(signature&&signature===this.lastIssuedCardsSignature)return 0;
+            const searchedCpf=this.normalizeCpf(EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT)?.value||'');
+            const active=EH.SaleContext?.getActivePassenger?.()||null;
+            const sale=EH.SaleContext?.loadSale?.()||{};
+            const items=[];
+            cards.forEach(card=>{
+                try{
+                    // qualifiesAsTicketCard exige simultaneamente VENDA REALIZADA,
+                    // VALOR PAGO, BILHETE(S) e número real do bilhete.
+                    if(!EH.Tickets.qualifiesAsTicketCard(card))return;
+                    const data=EH.Tickets.extractTicketData(card);
+                    const raw=EH.Utils.clean(card.innerText||card.textContent||'');
+                    const cpf=this.normalizeCpf(raw.match(/CPF\s*:\s*([\d.\/-]+)/i)?.[1]||searchedCpf||active?.cpf||'');
+                    const name=EH.Utils.clean(raw.match(/PASSAGEIR[OA]\s*:\s*([^\n]+)/i)?.[1]||active?.name||'');
+                    const summary=EH.Tickets.summary(card);
+                    items.push({passengerId:active?.id||null,saleId:sale?.id||'',salePassengerId:active?.id||'',cpf,name,data:{...data,summary},tickets:data.tickets,ticket:data.tickets[0],service:summary.service,seat:summary.seat,value:summary.value,saleReference:sale?.id||''});
+                }catch(error){EH.Logger.debug('Cartão emitido ainda não pôde ser capturado:',error);}
+            });
+            if(!items.length)return 0;
+            const created=this.captureItems(items,{confirmedEvidence:true,automatic:true,quiet:true});
+            this.lastIssuedCardsSignature=signature;
+            if(created)EH.Toast?.success?.(`${created} passagem(ns) confirmada(s) entrou(aram) na fila operacional.`);
+            return created;
+        },
+        onPageUpdate(page) {
+            if(page==='passagens'){
+                EH.Runtime.timeout('reminder-pending-search',()=>this.runPendingSearch(),350);
+                EH.Runtime.timeout('reminder-confirmed-cards',()=>this.captureConfirmedCards(),650);
+            }
+        },
         labelFor(item) {
             const today=this.todayKey(0), tomorrow=this.todayKey(1);
             if(item.travelDate===today) return `HOJE${item.travelTime?` — ${item.travelTime}`:''}`;
@@ -15407,12 +15574,14 @@
                     const fallback=items.filter(item=>!Number(item?.deletedAt||0)&&item.mapKey===record.mapKey&&item.movement===movement&&(!name||EH.Utils.normalize(item.name||'')===name)&&(!seat||EH.Utils.clean(item.seat||'')===seat));
                     if(fallback.length===1)target=fallback[0];
                 }
-                const travel=this.parseTravel(record.dateBr||'');
+                const travel=this.parseTravel(`${record.dateBr||''} ${record.operationalTime||record.lineDeparture||''}`);
+                const targetOrigin=String(target?.recordOrigin||'');
+                const combinedOrigin=targetOrigin==='Emissão'||targetOrigin==='Emissão + Mapa'||String(target?.source||'').includes('epass')?'Emissão + Mapa':'Mapa';
                 const next={
                     id:target?.id||id,
-                    name:EH.PassengerIdentity?.formatPersonName?.(passenger?.name||'')||EH.Utils.clean(passenger?.name||''),
+                    name:EH.Utils.clean(target?.name||'')||(EH.PassengerIdentity?.formatPersonName?.(passenger?.name||'')||EH.Utils.clean(passenger?.name||'')),
                     cpf:this.normalizeCpf(passenger?.cpf||target?.cpf||''),
-                    seat:EH.Utils.clean(passenger?.seat||''),
+                    seat:EH.Utils.clean(passenger?.seat||target?.seat||''),
                     movement,
                     movementLabel:movement==='alight'?'desembarque':'embarque',
                     mapKey:String(record.mapKey),mapIdentity:String(record.mapKey),
@@ -15420,12 +15589,13 @@
                     service:String(record.service||passenger?.service||'').replace(/\D/g,''),
                     travelDate:String(record.date||passenger?.travelDate||''),travelDateBr:String(record.dateBr||travel.dateBr||''),
                     travelRaw:String(record.dateBr||''),travelTimestamp:travel.timestamp||Number(target?.travelTimestamp||0),travelTime:String(record.operationalTime||record.lineDeparture||''),
-                    origin:EH.OperationCars?.shortLocation?.(passenger?.origin)||'',destination:EH.OperationCars?.shortLocation?.(passenger?.destination)||'',
-                    status:['pending','checked','printed','completed'].includes(String(target?.status||''))?String(target.status):'pending',
-                    source:'map-287',createdAt:Number(target?.createdAt||now),updatedAt:Number(target?.updatedAt||now),completedAt:Number(target?.completedAt||0),
+                    origin:EH.Utils.clean(target?.origin||'')||EH.OperationCars?.shortLocation?.(passenger?.origin)||'',destination:EH.Utils.clean(target?.destination||'')||EH.OperationCars?.shortLocation?.(passenger?.destination)||'',
+                    status:['pending','checked','printed','completed','canceled','archived'].includes(String(target?.status||''))?String(target.status):'pending',
+                    source:combinedOrigin==='Emissão + Mapa'?'epass-issued+map-287':'map-287',recordOrigin:combinedOrigin,emissionConfirmed:Boolean(target?.emissionConfirmed),mapFoundAt:now,queueState:this.isDoneStatus(target?.status)?'history':'active',
+                    createdAt:Number(target?.createdAt||now),updatedAt:Number(target?.updatedAt||now),completedAt:Number(target?.completedAt||0),
                     deletedAt:0,deviceId:String(target?.deviceId||EH.Device.id()),syncState:target?.syncState||'local'
                 };
-                const relevant=item=>JSON.stringify({name:item?.name||'',cpf:item?.cpf||'',seat:item?.seat||'',movement:item?.movement||'',mapKey:item?.mapKey||'',ticketNumber:item?.ticketNumber||'',locator:item?.locator||'',service:item?.service||'',travelDate:item?.travelDate||'',travelDateBr:item?.travelDateBr||'',travelTime:item?.travelTime||'',origin:item?.origin||'',destination:item?.destination||''});
+                const relevant=item=>JSON.stringify({name:item?.name||'',cpf:item?.cpf||'',seat:item?.seat||'',movement:item?.movement||'',mapKey:item?.mapKey||'',ticketNumber:item?.ticketNumber||'',locator:item?.locator||'',service:item?.service||'',travelDate:item?.travelDate||'',travelDateBr:item?.travelDateBr||'',travelTime:item?.travelTime||'',origin:item?.origin||'',destination:item?.destination||'',source:item?.source||'',recordOrigin:item?.recordOrigin||'',queueState:item?.queueState||''});
                 if(target&&relevant(target)===relevant(next))return;
                 next.updatedAt=now;next.deviceId=EH.Device.id();next.syncState=EH.Sync?.configured?.()?'pending':'local';
                 if(target)Object.assign(target,next);else items.push(next);
@@ -15447,22 +15617,26 @@
             passengers.forEach(passenger=>{
                 const cpf=this.normalizeCpf(passenger?.cpf||'');
                 const ticket=EH.Utils.clean(passenger?.ticket||'');
+                const locator=EH.Utils.clean(passenger?.locator||'');
+                const seat=EH.Utils.clean(passenger?.seat||'');
                 const candidates=items.filter(item=>{
                     if(Number(item.deletedAt||0))return false;
                     if(ticket && item.ticketNumber && EH.Utils.clean(item.ticketNumber)===ticket)return true;
-                    if(cpf && this.normalizeCpf(item.cpf)===cpf){
-                        if(item.travelDate && record.date && item.travelDate!==record.date)return false;
-                        return true;
-                    }
+                    if(locator&&item.locator&&EH.Utils.clean(item.locator)===locator)return true;
+                    // Fallback composto: CPF nunca identifica sozinho uma passagem.
+                    if(cpf&&seat&&record.date&&record.service&&this.normalizeCpf(item.cpf)===cpf&&EH.Utils.clean(item.seat||'')===seat&&item.travelDate===record.date&&String(item.service||'')===String(record.service||''))return true;
                     return false;
                 });
                 if(candidates.length!==1)return;
                 const item=candidates[0];
                 const nextService=String(record.service||'').replace(/\D/g,'');
-                const nextSeat=EH.Utils.clean(passenger?.seat||'');
-                if(String(item.service||'')!==nextService || (nextSeat && EH.Utils.clean(item.seat||'')!==nextSeat)){
+                const nextSeat=seat;
+                const movement=String(passenger?.origin?.code||'')===String(EH.OperationCars?.agencyCode?.()||'287')?'board':String(passenger?.destination?.code||'')===String(EH.OperationCars?.agencyCode?.()||'287')?'alight':'';
+                if(String(item.service||'')!==nextService || (nextSeat && EH.Utils.clean(item.seat||'')!==nextSeat) || (movement&&item.movement!==movement) || item.recordOrigin!=='Emissão + Mapa'){
                     item.service=nextService;
                     if(nextSeat)item.seat=nextSeat;
+                    if(movement){item.movement=movement;item.movementLabel=movement==='board'?'embarque':'desembarque';item.queueState='active';}
+                    item.recordOrigin='Emissão + Mapa';item.source='epass-issued+map-287';
                     item.mapFoundAt=Date.now();
                     item.updatedAt=Date.now();
                     item.deviceId=EH.Device.id();
@@ -15478,45 +15652,58 @@
             return changed;
         },
 
-        openModal() {
+        dateGroupLabel(item={}) {
+            if(item.travelDate===this.todayKey(0))return'Hoje';
+            if(item.travelDate===this.todayKey(1))return'Amanhã';
+            return'Próximas viagens';
+        },
+        renderOperationalCard(item, refresh=()=>{}) {
+            const card=document.createElement('article');card.className=`eh-reminder-card ${this.isDoneStatus(item.status)?'completed':''}`;card.dataset.recordId=item.id;
+            const top=document.createElement('div');top.className='eh-reminder-card-top';
+            const when=document.createElement('strong');when.textContent=[item.travelTime||'—',item.name||'Passageiro'].join(' • ');
+            const state=document.createElement('span');state.textContent=this.statusLabel(item.status).toUpperCase();top.append(when,state);
+            const cpf=document.createElement('div');cpf.className='eh-reminder-cpf';cpf.textContent=`CPF: ${this.maskCpf(item.cpf)}`;
+            const route=document.createElement('small');route.textContent=[item.origin,item.destination].filter(Boolean).join(' → ')||'Trecho não identificado';
+            const details=document.createElement('small');details.textContent=[item.seat?`Poltrona ${item.seat}`:'Poltrona —',item.service?`Serviço ${item.service}`:'',item.ticketNumber?`Bilhete ${item.ticketNumber}`:'',item.recordOrigin||''].filter(Boolean).join(' • ');
+            const actions=document.createElement('div');actions.className='eh-reminder-actions';
+            const action=(label,callback,className='')=>{const button=document.createElement('button');button.type='button';button.className=`eh-modal-btn ${className}`.trim();button.textContent=label;button.addEventListener('click',async()=>{await callback();refresh();});return button;};
+            actions.append(action('Copiar CPF',()=>this.copyCpf(item)),action('Buscar passagem',()=>this.searchTicket(item),'primary'));
+            if(item.queueState==='history'){
+                // Histórico é somente consulta. Restauração é oferecida apenas na
+                // área de revisão, evitando ressuscitar concluídos/cancelados.
+            }else if(item.queueState==='review'){
+                actions.append(action('Restaurar para fila',()=>this.restore(item.id)),action('Concluir',()=>this.markStatus(item.id,'completed')),action('Cancelar',()=>this.markStatus(item.id,'canceled'),'danger'));
+            }else{
+                actions.append(action('Conferido',()=>this.markStatus(item.id,'checked')),action('Impresso',()=>this.markStatus(item.id,'printed')),action('Concluir',()=>this.markStatus(item.id,'completed')),action('Cancelar',()=>this.markStatus(item.id,'canceled'),'danger'));
+            }
+            card.append(top,cpf,route,details,actions);return card;
+        },
+        renderOperational(container,{mode='active',compact=false}={}) {
+            if(!container)return;
+            const groups=this.queueGroups();
+            const lists=mode==='review'?[['Pendente de conferência',groups.review]]:mode==='history'?[['Histórico',groups.history]]:[['Embarques',groups.board],['Desembarques',groups.alight]];
+            const refresh=()=>{container.innerHTML='';this.renderOperational(container,{mode,compact});EH.ContextualPanels?.refresh?.('operation');};
+            lists.forEach(([title,items])=>{
+                const section=document.createElement('section');section.className='eh-operational-group';
+                const heading=document.createElement('h3');heading.textContent=`${title} • ${items.length}`;section.appendChild(heading);
+                if(!items.length){const empty=document.createElement('div');empty.className='eh-reminder-empty';empty.textContent=mode==='active'?'Nenhuma passagem operacional nesta área.':'Nenhum registro nesta área.';section.appendChild(empty);container.appendChild(section);return;}
+                let lastGroup='';items.slice(0,compact?12:500).forEach(item=>{
+                    if(mode==='active'){const group=this.dateGroupLabel(item);if(group!==lastGroup){const label=document.createElement('div');label.className='eh-operational-date-group';label.textContent=group;section.appendChild(label);lastGroup=group;}}
+                    section.appendChild(this.renderOperationalCard(item,refresh));
+                });container.appendChild(section);
+            });
+        },
+        openModal(initialMode='active') {
             document.querySelector('#eh-reminders-overlay')?.remove();
-            const overlay=document.createElement('div'); overlay.className='eh-overlay'; overlay.id='eh-reminders-overlay';
-            const modal=document.createElement('div'); modal.className='eh-modal'; modal.style.width='min(760px,96vw)';
-            const head=document.createElement('div'); head.className='eh-modal-head';
-            const title=document.createElement('div'); title.className='eh-modal-title'; title.textContent='Lembretes de passagens';
-            const close=document.createElement('button'); close.type='button'; close.className='eh-modal-close'; close.textContent='✕'; head.append(title,close);
-            const content=document.createElement('div'); content.className='eh-modal-content eh-reminder-list';
-            const renderList=()=>{
-                content.innerHTML=''; const items=this.load().slice().sort((a,b)=>(this.isDoneStatus(a.status)?1:0)-(this.isDoneStatus(b.status)?1:0)||(a.travelTimestamp||9e15)-(b.travelTimestamp||9e15));
-                if(!items.length){ const empty=document.createElement('div'); empty.className='eh-reminder-empty'; empty.textContent='Nenhum lembrete salvo.'; content.appendChild(empty); return; }
-                items.forEach(item=>{
-                    const card=document.createElement('div'); card.className=`eh-reminder-card ${this.isDoneStatus(item.status)?'completed':''}`;
-                    const top=document.createElement('div'); top.className='eh-reminder-card-top';
-                    const when=document.createElement('strong'); when.textContent=this.labelFor(item);
-                    const state=document.createElement('span'); state.textContent=this.isDoneStatus(item.status)?(String(item.status).toLowerCase()==='checked'?'✓ CONFERIDO':'✓ IMPRESSO'):'PENDENTE'; top.append(when,state);
-                    const name=document.createElement('b'); name.textContent=item.name || 'Passageiro';
-                    const cpf=document.createElement('div'); cpf.className='eh-reminder-cpf'; cpf.textContent=`CPF: ${this.maskCpf(item.cpf)}`;
-                    const route=document.createElement('small'); route.textContent=[item.origin,item.destination].filter(Boolean).join(' → ') || 'Trecho não identificado';
-                    const id=document.createElement('small'); id.textContent=item.ticketNumber?`Bilhete ${item.ticketNumber}`:'Identificador por CPF + trecho + data';
-                    const mapInfo=document.createElement('small'); mapInfo.textContent=[item.service?`Serviço ${item.service}`:'',item.seat?`Poltrona ${item.seat}`:''].filter(Boolean).join(' • '); mapInfo.hidden=!mapInfo.textContent;
-                    const requestCodes=EH.RequisitionManager?.codesForCpf?.(item.cpf)||[];
-                    const requestInfo=document.createElement('small');
-                    requestInfo.textContent=requestCodes.length?`Requisição: ${requestCodes.map(row=>`${String(row.tipo||'ida').toUpperCase()} ${row.codigo}`).join(' • ')}`:'';
-                    requestInfo.hidden=!requestInfo.textContent;
-                    const actions=document.createElement('div'); actions.className='eh-reminder-actions';
-                    const copy=document.createElement('button'); copy.type='button'; copy.className='eh-modal-btn'; copy.textContent='Copiar CPF'; copy.addEventListener('click',()=>this.copyCpf(item));
-                    const search=document.createElement('button'); search.type='button'; search.className='eh-modal-btn primary'; search.textContent='Buscar passagem'; search.addEventListener('click',()=>this.searchTicket(item));
-                    const done=document.createElement('button'); done.type='button'; done.className='eh-modal-btn'; done.textContent=this.isDoneStatus(item.status)?'Reabrir':'✓ Impresso'; done.addEventListener('click',()=>{ this.isDoneStatus(item.status)?this.reopen(item.id):this.complete(item.id); renderList(); });
-                    const remove=document.createElement('button'); remove.type='button'; remove.className='eh-modal-btn danger'; remove.textContent='Excluir'; remove.addEventListener('click',()=>{ this.deleteOne(item.id); renderList(); });
-                    actions.append(copy,search,done,remove); card.append(top,name,cpf,route,id,mapInfo,requestInfo,actions); content.appendChild(card);
-                });
-            }; renderList();
-            const foot=document.createElement('div'); foot.className='eh-modal-actions';
-            const deleteLatest=document.createElement('button'); deleteLatest.type='button'; deleteLatest.className='eh-modal-btn danger'; deleteLatest.textContent='Excluir último'; deleteLatest.addEventListener('click',()=>{this.deleteLatest();renderList();});
-            const deleteAll=document.createElement('button'); deleteAll.type='button'; deleteAll.className='eh-modal-btn danger'; deleteAll.textContent='Excluir todos'; deleteAll.addEventListener('click',()=>{this.deleteAll();renderList();});
-            const close2=document.createElement('button'); close2.type='button'; close2.className='eh-modal-btn'; close2.textContent='Fechar'; foot.append(deleteLatest,deleteAll,close2);
-            modal.append(head,content,foot); overlay.appendChild(modal); document.body.appendChild(overlay);
-            const dismiss=()=>overlay.remove(); close.onclick=dismiss; close2.onclick=dismiss; overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
+            const overlay=document.createElement('div');overlay.className='eh-overlay';overlay.id='eh-reminders-overlay';
+            const modal=document.createElement('div');modal.className='eh-modal';modal.style.width='min(900px,96vw)';
+            const head=document.createElement('div');head.className='eh-modal-head';const title=document.createElement('div');title.className='eh-modal-title';title.textContent='Fila operacional de passagens';const close=document.createElement('button');close.type='button';close.className='eh-modal-close';close.textContent='✕';head.append(title,close);
+            const tabs=document.createElement('div');tabs.className='eh-operational-tabs';const content=document.createElement('div');content.className='eh-modal-content eh-reminder-list';let mode=initialMode;
+            const render=()=>{content.innerHTML='';this.renderOperational(content,{mode});Array.from(tabs.children).forEach(button=>button.classList.toggle('active',button.dataset.mode===mode));};
+            [['active','Fila atual'],['review','Pendente de conferência'],['history','Histórico']].forEach(([value,label])=>{const button=document.createElement('button');button.type='button';button.dataset.mode=value;button.textContent=label;button.addEventListener('click',()=>{mode=value;render();});tabs.appendChild(button);});
+            const foot=document.createElement('div');foot.className='eh-modal-actions';const deleteLatest=document.createElement('button');deleteLatest.type='button';deleteLatest.className='eh-modal-btn danger';deleteLatest.textContent='Excluir último';deleteLatest.addEventListener('click',()=>{this.deleteLatest();render();});const deleteAll=document.createElement('button');deleteAll.type='button';deleteAll.className='eh-modal-btn danger';deleteAll.textContent='Excluir todos';deleteAll.addEventListener('click',()=>{this.deleteAll();render();});const close2=document.createElement('button');close2.type='button';close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(deleteLatest,deleteAll,close2);
+            modal.append(head,tabs,content,foot);overlay.appendChild(modal);document.body.appendChild(overlay);render();
+            const dismiss=()=>overlay.remove();close.onclick=dismiss;close2.onclick=dismiss;overlay.addEventListener('click',event=>{if(event.target===overlay)dismiss();});
         },
         render() {
             const host=EH.UI?.reminderBox; if(!host)return;
@@ -15557,9 +15744,10 @@
                 #eh-root .eh-reminder-section-summary{list-style:none;cursor:pointer;padding:8px;color:#6b5734;font-size:9px;font-weight:900}.eh-reminder-section-summary::-webkit-details-marker{display:none}.eh-reminder-section-summary::after{content:'＋';float:right}.eh-reminder-host[open]>.eh-reminder-section-summary::after{content:'−'}.eh-reminder-section-body{display:grid;gap:6px;padding:0 8px 8px}.eh-reminder-host:not([open])>.eh-reminder-section-body{display:none!important}
                 .eh-reminder-sync{font-size:7.4px;color:#7a6c54}.eh-reminder-sync.synced{color:#2f7a5f}.eh-reminder-sync.offline,.eh-reminder-sync.error{color:#a36535}.eh-reminder-host-summary{display:grid;grid-template-columns:repeat(2,1fr);gap:4px}.eh-reminder-host-summary button{min-height:27px;border:1px solid #e4d7ba;border-radius:7px;background:#fff;color:#6b5734;font-size:8px;font-weight:850;cursor:pointer}.eh-reminder-next{display:grid;gap:2px;padding-top:5px;border-top:1px solid #eee2c9}.eh-reminder-next strong{font-size:9px}.eh-reminder-next small{font-size:7.8px;color:#746956;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
                 .eh-reminder-list{display:grid;gap:8px}.eh-reminder-card{display:grid;gap:5px;padding:11px;border:1px solid #dfe5eb;border-radius:10px;background:#fff}.eh-reminder-card.completed{opacity:.68;background:#f7f9fa}.eh-reminder-card-top{display:flex;align-items:center;justify-content:space-between;gap:10px}.eh-reminder-card-top strong{font-size:12px;color:#253348}.eh-reminder-card-top span{font-size:8px;font-weight:900;color:#697687}.eh-reminder-card>b{font-size:12px}.eh-reminder-cpf{font-size:11px;font-weight:800;color:#334155}.eh-reminder-card small{font-size:10px;color:#6d7888}.eh-reminder-actions{display:flex;flex-wrap:wrap;gap:6px;margin-top:3px}.eh-reminder-empty{padding:25px;text-align:center;color:#718092}
+                .eh-operational-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;padding:8px 12px;border-bottom:1px solid #e4e9ef;background:#fafbfd}.eh-operational-tabs button{min-height:34px;border:1px solid #d6dee7;border-radius:8px;background:#fff;color:#40536a;font-size:10px;font-weight:850;cursor:pointer}.eh-operational-tabs button.active{border-color:#78a6d1;background:#edf6ff;color:#245d8f}.eh-operational-group{display:grid;gap:7px}.eh-operational-group h3{margin:5px 0 0;font-size:12px;color:#263b53}.eh-operational-date-group{padding:5px 2px 2px;border-bottom:1px solid #e8edf2;color:#66778a;font-size:9px;font-weight:900;text-transform:uppercase;letter-spacing:.35px}@media(max-width:620px){.eh-operational-tabs{grid-template-columns:1fr}.eh-reminder-card-top{align-items:flex-start}.eh-reminder-actions .eh-modal-btn{flex:1 1 120px}}
             `);
         },
-        init(){ this.injectStyles(); this.render(); }
+        init(){ this.injectStyles(); this.reconcileLifecycle(); this.render(); if(EH.Pages?.detect?.()==='passagens')EH.Runtime.timeout('reminder-confirmed-cards-init',()=>this.captureConfirmedCards(),700); }
     };
 
 
@@ -17156,7 +17344,7 @@
         showGroupPassengers(group,kind='board') { if(!group?.maps?.length)return EH.Toast.info('Nenhum mapa deste horário foi lido.'); const records=group.maps.filter(r=>r?.agency?.exists&&!r?.agency?.multiple); const q=EH.TicketVerificationQueue.fromRecords(records,kind,{date:records[0]?.date,operationalTime:group.routine?.operationalTime,name:group.routine?.name,routineId:group.routine?.id}); if(!EH.TicketVerificationQueue.activeList(q).length)return EH.Toast.info(`Nenhum ${kind==='alight'?'desembarque':'embarque'} da agência ${this.agencyCode()} encontrado nos mapas lidos.`); this.showPassengersCombined(records,kind,group); },
         showPassengersCombined(records=[],kind='board',group=null){
             document.querySelector('#eh-operation-passengers-modal')?.remove();const overlay=document.createElement('div');overlay.id='eh-operation-passengers-modal';overlay.className='eh-overlay eh-operation-overlay';const modal=document.createElement('div');modal.className='eh-modal eh-operation-modal';const head=document.createElement('div');head.className='eh-modal-head';const title=document.createElement('div');title.className='eh-modal-title';title.textContent=`${kind==='alight'?'DESEMBARQUES':'EMBARQUES'} — ${group?.routine?.operationalTime||'—'} — AGÊNCIA ${this.agencyCode()}`;const close=document.createElement('button');close.className='eh-modal-close';close.textContent='×';head.append(title,close);const content=document.createElement('div');content.className='eh-modal-content eh-operation-passenger-list';
-            const items=[];records.forEach(record=>(kind==='alight'?(record.agency.alighters||[]):(record.agency.boarders||[])).forEach(item=>items.push({item,record})));items.sort((a,b)=>Number(a.item.seat||999)-Number(b.item.seat||999));items.forEach(({item,record})=>{const row=document.createElement('div');row.className='eh-operation-passenger';const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(item.seat);const info=document.createElement('div');info.className='eh-operation-passenger-info';const name=document.createElement('strong');name.textContent=item.name||'Passageiro';const route=document.createElement('small');route.textContent=`${this.passengerSecondary(item,kind)}${record.floor?` • ${record.floor}`:''} • Serviço ${record.service}`;const reminder=EH.Reminders?.matchPassenger?.(item,record);if(reminder){const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders.isDoneStatus(reminder.status)?'done':'pending'}`;state.textContent=EH.Reminders.isDoneStatus(reminder.status)?'✓ Bilhete impresso/concluído':'⚠ Impressão pendente';info.append(name,route,state);}else info.append(name,route);const buttons=document.createElement('div');buttons.className='eh-operation-detail-actions';const cpf=document.createElement('button');cpf.className='eh-modal-btn';cpf.textContent='CPF';cpf.addEventListener('click',()=>EH.TicketVerificationQueue.copyCpf(item));const ver=document.createElement('button');ver.className='eh-modal-btn primary';ver.textContent='Ver passagem';ver.addEventListener('click',()=>{const q=EH.TicketVerificationQueue.fromRecords(records,kind,{date:record.date,operationalTime:group?.routine?.operationalTime,name:group?.routine?.name,routineId:group?.routine?.id});const target=EH.TicketVerificationQueue.activeList(q).find(p=>p.cpf&&p.cpf===String(item.cpf||'').replace(/\\D/g,'').slice(0,11));if(target)EH.TicketVerificationQueue.search(target);});buttons.append(cpf,ver);info.append(buttons);row.append(seat,info);content.append(row);});const foot=document.createElement('div');foot.className='eh-modal-actions';const queueBtn=document.createElement('button');queueBtn.className='eh-modal-btn primary';queueBtn.textContent='Abrir fila de conferência';queueBtn.addEventListener('click',()=>{EH.TicketVerificationQueue.fromRecords(records,kind,{date:records[0]?.date,operationalTime:group?.routine?.operationalTime,name:group?.routine?.name,routineId:group?.routine?.id});EH.SaleContext.navigateToPassagens();});const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(queueBtn,close2);modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);const dismiss=()=>overlay.remove();close.onclick=dismiss;close2.onclick=dismiss;overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
+            const items=[];records.forEach(record=>(kind==='alight'?(record.agency.alighters||[]):(record.agency.boarders||[])).forEach(item=>items.push({item,record})));items.sort((a,b)=>Number(a.item.seat||999)-Number(b.item.seat||999));items.forEach(({item,record})=>{const row=document.createElement('div');row.className='eh-operation-passenger';const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(item.seat);const info=document.createElement('div');info.className='eh-operation-passenger-info';const name=document.createElement('strong');name.textContent=item.name||'Passageiro';const route=document.createElement('small');route.textContent=`${this.passengerSecondary(item,kind)}${record.floor?` • ${record.floor}`:''} • Serviço ${record.service}`;const reminder=EH.Reminders?.matchPassenger?.(item,record);if(reminder){const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders.isDoneStatus(reminder.status)?'done':'pending'}`;state.textContent=EH.Reminders.isDoneStatus(reminder.status)?'✓ Movimento encerrado':`⚠ ${EH.Reminders.statusLabel(reminder.status)}`;info.append(name,route,state);}else info.append(name,route);const buttons=document.createElement('div');buttons.className='eh-operation-detail-actions';const cpf=document.createElement('button');cpf.className='eh-modal-btn';cpf.textContent='CPF';cpf.addEventListener('click',()=>EH.TicketVerificationQueue.copyCpf(item));const ver=document.createElement('button');ver.className='eh-modal-btn primary';ver.textContent='Ver passagem';ver.addEventListener('click',()=>{const reminder=EH.Reminders?.matchPassenger?.({...item,movement:kind},record);if(reminder)EH.Reminders.searchTicket(reminder);else EH.OperationCars.openMapPassenger({...item,movement:kind},record);});buttons.append(cpf,ver);info.append(buttons);row.append(seat,info);content.append(row);});const foot=document.createElement('div');foot.className='eh-modal-actions';const queueBtn=document.createElement('button');queueBtn.className='eh-modal-btn primary';queueBtn.textContent='Abrir fila operacional';queueBtn.addEventListener('click',()=>EH.Reminders?.openModal?.('active'));const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(queueBtn,close2);modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);const dismiss=()=>overlay.remove();close.onclick=dismiss;close2.onclick=dismiss;overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
         showCarSearch() {
@@ -17302,6 +17490,10 @@
         },
 
         renderContext(body) {
+            const queue=document.createElement('div');queue.className='eh-context-operational-queue';
+            EH.Reminders?.renderOperational?.(queue,{mode:'active',compact:true});body.appendChild(queue);
+            const queueActions=document.createElement('div');queueActions.className='eh-context-actions';
+            queueActions.append(EH.ContextualPanels.action('Fila completa',()=>EH.Reminders?.openModal?.('active'),'primary'),EH.ContextualPanels.action('Pendente de conferência',()=>EH.Reminders?.openModal?.('review')));body.appendChild(queueActions);
             const analysis=this.mapAnalysis||{state:'idle',message:'Aguardando o mapa do E-Pass.',records:[]};
             const message=document.createElement('div');message.className='eh-context-empty';message.textContent=analysis.message;
             if(analysis.state==='idle'||analysis.state==='loading'){
@@ -18394,7 +18586,7 @@
                     ticket: prepared.data?.tickets?.[0] || null
                 }];
                 EH.Tickets.rememberCapturedItems(reminderCaptureItems);
-                EH.Reminders?.captureItems?.(reminderCaptureItems);
+                EH.Reminders?.captureItems?.(reminderCaptureItems,{confirmedEvidence:true});
                 EH.Tickets.clearSelection();
 
                 const canvasPromise = EH.Capture.renderTicket(prepared);
@@ -18461,7 +18653,7 @@
             try {
                 this.setBusy(true, selectedItems.length > 1 ? `Juntando ${selectedItems.length} bilhetes…` : 'Capturando bilhete…');
                 EH.Tickets.rememberCapturedItems(selectedItems);
-                EH.Reminders?.captureItems?.(selectedItems);
+                EH.Reminders?.captureItems?.(selectedItems,{confirmedEvidence:true});
                 const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
                 const canvases = selectedItems.map(item => EH.Capture.renderTicketCanvas(item.data, width));
                 const canvas = EH.Capture.combineTicketCanvases(canvases);
@@ -18560,7 +18752,7 @@
             }
 
             try {
-                EH.Reminders?.captureItems?.(selectedItems);
+                EH.Reminders?.captureItems?.(selectedItems,{confirmedEvidence:true});
                 this.setBusy(true, selectedItems.length > 1 ? `Gerando imagem com ${selectedItems.length} bilhetes…` : 'Preparando bilhete…');
                 const width = Math.min(520, Math.max(360, Number(EH.Config.TICKET_CAPTURE_WIDTH) || 430));
                 const canvases = selectedItems.map(item => EH.Capture.renderTicketCanvas(item.data, width));
@@ -19511,7 +19703,7 @@
                 financeiro: makePane('financeiro', 'Financeiro', 'Comissão e comportamento do controle local de Caixa e Comissões.'),
                 carros: makePane('carros', 'Carros / Operação', 'Agência 287 e serviços usados na consulta rápida do Mapa de Viagem.'),
                 atalhos: makePane('atalhos', 'Botões contextuais', 'Tamanho e aparência apenas dos botões que abrem as ferramentas.'),
-                rotas: makePane('rotas', 'Rotas rápidas', 'Horários configuráveis. O serviço continua sendo detectado na pesquisa real do dia.'),
+                rotas: makePane('rotas', 'Rotas', 'Cadastro, edição, exclusão e ordem das rotas operacionais. O serviço continua sendo detectado na pesquisa real do dia.'),
                 lembretes: makePane('lembretes', 'Lembretes', 'Passagens emitidas/capturadas que precisam ser localizadas e impressas posteriormente.'),
                 sincronizacao: makePane('sincronizacao', 'Sincronização', 'Dados operacionais compartilhados entre os computadores autorizados.'),
                 avancado: makePane('avancado', 'Avançado', 'Diagnóstico e opções técnicas que normalmente não precisam ser alteradas.')
@@ -19777,7 +19969,8 @@
             const operationGeneralGrid = grid();
             operationGeneralGrid.append(
                 textField('operationAgencyCode', 'Código da minha agência', EH.Config.OPERATION_AGENCY_CODE, 'A leitura principal do mapa procura exatamente este código no resumo por localidade.'),
-                numberField('operationTolerance', 'Tolerância do horário (min)', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES, { min:0, max:90, step:5, hint:'Ex.: 12:00 operacional pode aparecer como 11:50 no E-Pass.' })
+                numberField('operationTolerance', 'Tolerância do horário (min)', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES, { min:0, max:90, step:5, hint:'Ex.: 12:00 operacional pode aparecer como 11:50 no E-Pass.' }),
+                numberField('operationQueueGrace', 'Janela operacional após a viagem (min)', EH.Config.OPERATION_QUEUE_GRACE_MINUTES, { min:15, max:1440, step:15, hint:'Sem confirmação do mapa, depois desta janela o registro vai para Pendente de conferência.' })
             );
             operationGeneralCard.append(
                 checkField('operationCarsEnabled', 'Exibir módulo Carros', EH.Config.OPERATION_CARS_ENABLED),
@@ -19834,8 +20027,8 @@
             // LEMBRETES
             const reminderCard = card('Impressão / embarque');
             reminderCard.append(
-                checkField('reminderCreate','Criar lembrete após capturar bilhete emitido',EH.Config.REMINDER_CREATE_AFTER_TICKET),
-                checkField('reminderAsk','Perguntar antes de criar o lembrete',EH.Config.REMINDER_ASK_AFTER_TICKET),
+                checkField('reminderCreate','Criar registro operacional ao detectar passagem realmente emitida',EH.Config.REMINDER_CREATE_AFTER_TICKET),
+                checkField('reminderAsk','Perguntar somente quando a origem não tiver evidência automática de emissão',EH.Config.REMINDER_ASK_AFTER_TICKET),
                 checkField('reminderMaskCpf','Mostrar CPF mascarado no painel',EH.Config.REMINDER_MASK_CPF),
                 checkField('reminderHighlightToday','Destacar lembretes de hoje',EH.Config.REMINDER_HIGHLIGHT_TODAY),
                 note('O CPF completo é usado para copiar/buscar a passagem e, quando a sincronização de dados de emissão estiver ativa, integra o registro operacional sincronizado.')
@@ -20076,6 +20269,7 @@
                 Object.keys(defaultPanels).forEach(key => panelDrafts[key] = { ...defaultPanels[key] });
                 loadPanelDraft(fields.managedPanel.value);
                 fields.operationTolerance.value = String(EH.Utils.parseFiniteNumber(d.OPERATION_TIME_TOLERANCE_MINUTES, 20));
+                fields.operationQueueGrace.value = String(EH.Utils.parseFiniteNumber(d.OPERATION_QUEUE_GRACE_MINUTES, 180));
                 rebuildRoutineRows(d.OPERATION_ROUTINES || []);
                 fields.debug.checked = Boolean(d.DEBUG);
                 Object.entries(presetButtons).forEach(([name, button]) => button.classList.toggle('active', name === 'padrao'));
@@ -20225,6 +20419,7 @@
                 EH.Config.OPERATION_AGENCY_CODE = String(fields.operationAgencyCode.value || '').replace(/\D/g, '') || '287';
                 EH.Config.OPERATION_SORT_BY_SEAT = fields.operationSortBySeat.checked;
                 EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = clamp(fields.operationTolerance.value, 0, 90, 20);
+                EH.Config.OPERATION_QUEUE_GRACE_MINUTES = clamp(fields.operationQueueGrace.value, 15, 1440, 180);
                 EH.Config.OPERATION_ROUTINES = operationRoutines;
                 EH.Storage.set('operationConfig.updatedAt', Date.now());
                 EH.Sync?.markPendingRecord?.('config','operation');
@@ -20272,6 +20467,7 @@
                     operationSortBySeat: EH.Config.OPERATION_SORT_BY_SEAT,
                     operationDockEnabled: EH.Config.OPERATION_DOCK_ENABLED,
                     operationTimeToleranceMinutes: EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,
+                    operationQueueGraceMinutes: EH.Config.OPERATION_QUEUE_GRACE_MINUTES,
                     operationRoutines: EH.Config.OPERATION_ROUTINES,
                     reminderCreateAfterTicket: EH.Config.REMINDER_CREATE_AFTER_TICKET,
                     reminderAskAfterTicket: EH.Config.REMINDER_ASK_AFTER_TICKET,
@@ -20374,7 +20570,8 @@
             return clean;
         },
         active() { return this.load().filter(item => item.active && item.visible); },
-        title(route) { return route.alias || `${route.origin} × ${route.destination}`; },
+        shortPlace(value) { return EH.Utils.clean(value || '').replace(/\s*-\s*[A-Z]{2}(?:\s*-\s*\d+)?\s*$/i, ''); },
+        title(route) { return `${this.shortPlace(route?.origin)} × ${this.shortPlace(route?.destination)}`; },
         currentResult(route) {
             if (EH.Pages?.detect?.() !== 'pesquisa') return { data:null, item:null };
             const data = EH.Parser?.parsePesquisa?.();
@@ -20460,6 +20657,7 @@
         KEY: 'contextualPanels.v1',
         panels: new Map(),
         settingsButton: null,
+        routeBusy: false,
         contexts: {
             routes:['pesquisa'], seats:['reserva'], passenger:['reserva','passagens','requisicao'],
             payment:['pagamento'], confirmation:['confirmacao'], tickets:['passagens'], reminders:['passagens'],
@@ -20477,7 +20675,7 @@
             GM_addStyle(`
                 #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
                 html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 34px));min-width:270px;min-height:190px;overflow:hidden;resize:both;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
-                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:38px!important;justify-content:flex-start;padding:9px 11px!important;border-color:#d9e2ea!important;background:#fff!important;color:#263e58!important;text-align:left;font-size:10px!important}.eh-context-route-choice[aria-expanded="true"]{border-color:#8fb6db!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-detail{display:grid;gap:7px;padding:9px;border:1px solid #dfe5eb;border-radius:9px;background:#fafcfe}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}
+                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}
                 @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:auto!important;height:min(72vh,560px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
@@ -20503,22 +20701,11 @@
         cell(label,value) { const cell=document.createElement('div');const span=document.createElement('span');span.textContent=label;const strong=document.createElement('b');strong.textContent=value||'—';cell.append(span,strong);return cell; },
         action(label,callback,className='') { const button=document.createElement('button');button.type='button';button.textContent=label;button.className=className;button.addEventListener('click',callback);return button; },
         renderRoutes(body) {
-            const routes=EH.QuickRoutes.active();if(!routes.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota rápida ativa. Cadastre nas Configurações Gerais.';body.appendChild(empty);return;}
+            const routes=EH.QuickRoutes.active();body.classList.remove('eh-route-size-small','eh-route-size-normal','eh-route-size-large','eh-route-size-xlarge');body.classList.add(`eh-route-size-${EH.Config.CONTEXT_BUTTON_SIZE||'normal'}`);if(!routes.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota configurada.';body.appendChild(empty);return;}
+            const selectedId=String(EH.Storage.get('selectedQuickRouteId.v1','')||'');
             routes.forEach(route=>{
                 const card=document.createElement('article');card.className='eh-context-route';
-                const choose=this.action(EH.QuickRoutes.title(route),()=>{});choose.className='eh-context-route-choice';choose.setAttribute('aria-expanded','false');
-                choose.addEventListener('click',()=>{
-                    const current=card.querySelector('.eh-context-route-detail');
-                    if(current){current.remove();choose.setAttribute('aria-expanded','false');return;}
-                    body.querySelectorAll('.eh-context-route-detail').forEach(detail=>detail.remove());
-                    body.querySelectorAll('.eh-context-route-choice').forEach(button=>button.setAttribute('aria-expanded','false'));
-                    choose.setAttribute('aria-expanded','true');
-                    const detail=document.createElement('div');detail.className='eh-context-route-detail';
-                    const {data,item}=EH.QuickRoutes.currentResult(route);const grid=document.createElement('div');grid.className='eh-context-data';
-                    grid.append(this.cell('Horário configurado',route.time),this.cell('Serviço do dia',item?.servicos?.join(', ')||'Será detectado na pesquisa'),this.cell('Empresa',item?.empresa||item?.linha||''),this.cell('Data pesquisada',data?.data||''));
-                    const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Pesquisar horários',()=>EH.QuickRoutes.search(route),'primary'),this.action('Copiar resumido',()=>EH.QuickRoutes.copy(route,'summary')),this.action('Copiar completo',()=>EH.QuickRoutes.copy(route,'details')),this.action('WhatsApp',()=>EH.QuickRoutes.previewWhatsApp(route),'success'));
-                    detail.append(grid,actions);card.appendChild(detail);
-                });
+                const choose=this.action(EH.QuickRoutes.title(route),async()=>{if(this.routeBusy)return;this.routeBusy=true;body.querySelectorAll('.eh-context-route-choice').forEach(button=>{button.disabled=true;button.classList.remove('is-selected');button.setAttribute('aria-pressed','false');});choose.classList.add('is-selected');choose.setAttribute('aria-pressed','true');EH.Storage.set('selectedQuickRouteId.v1',route.id);try{await EH.QuickRoutes.search(route);}catch(error){EH.Toast?.error?.(error?.message||'Não foi possível pesquisar esta rota.');}finally{this.routeBusy=false;if(body.isConnected)body.querySelectorAll('.eh-context-route-choice').forEach(button=>{button.disabled=false;});}});choose.className='eh-context-route-choice';choose.classList.toggle('is-selected',String(route.id)===selectedId);choose.dataset.routeId=route.id;choose.setAttribute('aria-pressed',String(route.id===selectedId));
                 card.appendChild(choose);body.appendChild(card);
             });
         },
@@ -20558,8 +20745,8 @@
             if(id==='payment')return this.renderPayment(body);
             if(id==='confirmation')return this.renderConfirmation(body);
             if(id==='passenger'||id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent=id==='prefeitura'?'Use o documento oficial, confira os dados e prepare o anexo.':'A imagem e os campos permanecerão juntos durante a conferência.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action(id==='prefeitura'?'Abrir Requisição da Prefeitura':'Abrir dados e Document AI',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));body.append(note,actions);return;}
-            if(id==='reminders'){const count=EH.Reminders?.pending?.()?.length||0;const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${count} lembrete(s) pendente(s).`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir lembretes',()=>EH.Reminders?.openModal?.(),'primary'));body.append(note,actions);return;}
-            if(id==='tickets'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Selecionar passagem',()=>EH.Tickets?.activateSelection?.(),'primary'),this.action('Abrir fila',()=>EH.TicketVerificationQueue?.render?.()));body.appendChild(actions);return;}
+            if(id==='reminders'){const groups=EH.Reminders?.queueGroups?.()||{board:[],alight:[],review:[],history:[]};const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${groups.board.length} embarque(s) • ${groups.alight.length} desembarque(s) • ${groups.review.length} para conferência.`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir fila operacional',()=>EH.Reminders?.openModal?.('active'),'primary'),this.action('Ver pendências',()=>EH.Reminders?.openModal?.('review')));body.append(note,actions);return;}
+            if(id==='tickets'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Selecionar passagem',()=>EH.Tickets?.activateSelection?.(),'primary'),this.action('Abrir fila operacional',()=>EH.Reminders?.openModal?.('active')));body.appendChild(actions);return;}
             if(id==='finance')return this.renderFinance(body);
             if(id==='operation'){EH.OperationCars?.renderContext?.(body);return;}
             this.renderMenu(body);
