@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.72.0
+// @version      5.73.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.72.0',
+        VERSION: '5.73.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 14,
+        STORAGE_SCHEMA_VERSION: 15,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -761,6 +761,17 @@
             if (changed) EH.Storage.set(key, next);
         },
 
+        migrateAttendanceV15() {
+            // O atendimento corrente deixou de existir somente na aba atual. A
+            // migração copia o contexto legado de sessionStorage para o registro
+            // persistente sem remover nem reescrever passageiros, requisições,
+            // emissões ou bilhetes já existentes.
+            EH.Attendance?.migrateLegacy?.();
+            // A leitura aplica a deduplicação canônica somente em requisições
+            // equivalentes próximas no tempo; a cópia pré-v15 permanece no backup.
+            EH.RequisitionManager?.loadStore?.();
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -777,6 +788,7 @@
             this.migrateContextualMapWorkflow();
             this.migrateOperationalQueueV13();
             this.migrateConfirmedEmissionV14();
+            this.migrateAttendanceV15();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -8960,24 +8972,79 @@
     // ============================================================
     EH.Attendance = {
         KEY: 'epassHelper.attendance.v1',
+        STORE_KEY: 'attendances.v2',
+        CURRENT_KEY: 'attendance.current.v2',
+        VERSION: 2,
+        MAX_RECORDS: 60,
+        STAGES: Object.freeze({
+            NEW:'new', DOCUMENT_UPLOADED:'document_uploaded', DATA_DETECTED:'data_detected', DATA_CONFIRMED:'data_confirmed',
+            ROUTE_DEFINED:'route_defined', REQUISITION_DOCUMENTS_READY:'requisition_documents_ready', PROTOCOL_DEFINED:'protocol_defined',
+            REQUEST_FILLED:'request_filled', REQUEST_SUBMITTED:'request_submitted', AWAITING_CODES:'awaiting_codes', CODES_CAPTURED:'codes_captured',
+            OUTBOUND_SALE_PENDING:'outbound_sale_pending', OUTBOUND_SALE_PREPARED:'outbound_sale_prepared',
+            RETURN_SALE_PENDING:'return_sale_pending', RETURN_SALE_PREPARED:'return_sale_prepared', PAYMENT_PENDING:'payment_pending',
+            EMISSION_CONFIRMED:'emission_confirmed', TICKETS_LOOKUP_PENDING:'tickets_lookup_pending', TICKETS_FOUND:'tickets_found',
+            TICKETS_READY:'tickets_ready', COMPLETED:'completed', CANCELED:'canceled', ERROR:'error'
+        }),
+        STAGE_ORDER: Object.freeze([
+            'new','document_uploaded','data_detected','data_confirmed','route_defined','requisition_documents_ready','protocol_defined',
+            'request_filled','request_submitted','awaiting_codes','codes_captured','outbound_sale_pending','outbound_sale_prepared',
+            'return_sale_pending','return_sale_prepared','payment_pending','emission_confirmed','tickets_lookup_pending','tickets_found','tickets_ready','completed'
+        ]),
         started: false,
         normalizeText(value) { return EH.Utils.clean(value || ''); },
         makeId(prefix = 'att') { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`; },
+        stageRank(stage) {
+            const value=String(stage||'');
+            if(value===this.STAGES.CANCELED)return this.STAGE_ORDER.length+1;
+            if(value===this.STAGES.ERROR)return -1;
+            return this.STAGE_ORDER.indexOf(value);
+        },
+        advanceStage(context, stage) {
+            const next=String(stage||'');
+            if(!next)return context;
+            const current=String(context?.stage||this.STAGES.NEW);
+            if(current===this.STAGES.CANCELED||current===this.STAGES.COMPLETED)return context;
+            if(next===this.STAGES.ERROR||this.stageRank(next)>=this.stageRank(current))context.stage=next;
+            return context;
+        },
+        emptyTrip() {
+            return { origin:'', destination:'', date:'', service:'', line:'', company:'', departure:'', arrival:'', seat:'', value:0, requestCode:'', requestCodeStatus:'pending', requestCodeUpdatedAt:0, requestCodeUsedAt:0 };
+        },
+        normalizeTrip(raw = {}) {
+            const base=this.emptyTrip();
+            return {
+                ...base,...raw,
+                origin:this.normalizeText(raw.origin),destination:this.normalizeText(raw.destination),date:this.normalizeText(raw.date),
+                service:String(raw.service||'').replace(/\D/g,''),line:this.normalizeText(raw.line),company:this.normalizeText(raw.company),
+                departure:EH.Utils.extractTime(raw.departure)||this.normalizeText(raw.departure),arrival:EH.Utils.extractTime(raw.arrival)||this.normalizeText(raw.arrival),
+                seat:this.normalizeText(raw.seat),value:Math.max(0,Number(raw.value||0)||0),requestCode:this.normalizeText(raw.requestCode),
+                requestCodeStatus:String(raw.requestCodeStatus||(raw.requestCode?'available':'pending')),
+                requestCodeUpdatedAt:Number(raw.requestCodeUpdatedAt||0),requestCodeUsedAt:Number(raw.requestCodeUsedAt||0)
+            };
+        },
         empty(sale = null) {
             const now = Date.now();
             return {
+                version: this.VERSION,
                 id: this.makeId(),
                 saleId: String(sale?.id || ''),
                 status: 'active',
-                stage: 'route_search',
+                stage: this.STAGES.NEW,
                 page: 'desconhecida',
-                nextAction: 'Abrir a pesquisa de horários.',
+                nextAction: 'Confirmar os dados do passageiro.',
                 passengerIds: [],
-                journey: { origin:'', destination:'', date:'', service:'', line:'', company:'', departure:'', arrival:'', seat:'', value:0 },
+                currentLeg: 'ida',
+                journey: this.emptyTrip(),
+                trips: { ida:this.emptyTrip(), volta:this.emptyTrip() },
+                requisition: { id:'', logicalNumber:'', protocol:'', status:'not_started', codes:{ ida:'', volta:'' }, updatedAt:0 },
+                documents: { identity:'pending', requisition:'pending', identityUploadedAt:0, requisitionUploadedAt:0 },
                 payment: { method:'', value:0, installments:'', state:'not_defined', observedAt:0 },
                 ticketRefs: [],
                 requisitionRefs: [],
+                delivery: { state:'pending', printedAt:0, downloadedAt:0, preparedAt:0, deliveredAt:0 },
                 evidence: {},
+                stageHistory: [{ stage:this.STAGES.NEW, at:now, evidence:'created' }],
+                lastError: '',
                 createdAt: now,
                 updatedAt: now
             };
@@ -8986,24 +9053,45 @@
             const sale = EH.SaleContext?.loadSale?.() || null;
             const base = this.empty(sale);
             const journey = raw.journey && typeof raw.journey === 'object' ? raw.journey : {};
+            const rawTrips = raw.trips && typeof raw.trips === 'object' ? raw.trips : {};
+            const currentLeg = raw.currentLeg === 'volta' ? 'volta' : 'ida';
+            const mergeCurrent=(trip,current)=>this.normalizeTrip({...trip,origin:current.origin||trip.origin,destination:current.destination||trip.destination,date:current.date||trip.date,service:current.service||trip.service,line:current.line||trip.line,company:current.company||trip.company,departure:current.departure||trip.departure,arrival:current.arrival||trip.arrival,seat:current.seat||trip.seat,value:Number(current.value||0)>0?current.value:trip.value,requestCode:current.requestCode||trip.requestCode,requestCodeStatus:current.requestCodeStatus&&current.requestCodeStatus!=='pending'?current.requestCodeStatus:trip.requestCodeStatus,requestCodeUpdatedAt:Math.max(Number(current.requestCodeUpdatedAt||0),Number(trip.requestCodeUpdatedAt||0)),requestCodeUsedAt:Math.max(Number(current.requestCodeUsedAt||0),Number(trip.requestCodeUsedAt||0))});
+            const ida = currentLeg==='ida'?mergeCurrent(this.normalizeTrip(rawTrips.ida||{}),journey):this.normalizeTrip(rawTrips.ida||{});
+            const volta = currentLeg==='volta'?mergeCurrent(this.normalizeTrip(rawTrips.volta||{}),journey):this.normalizeTrip(rawTrips.volta||{});
+            const activeTrip = currentLeg === 'volta' ? volta : ida;
+            const requisition = raw.requisition && typeof raw.requisition === 'object' ? raw.requisition : {};
+            const codes = requisition.codes && typeof requisition.codes === 'object' ? requisition.codes : {};
+            if (!ida.requestCode && codes.ida){ida.requestCode=this.normalizeText(codes.ida);ida.requestCodeStatus='available';}
+            if (!volta.requestCode && codes.volta){volta.requestCode=this.normalizeText(codes.volta);volta.requestCodeStatus='available';}
             const payment = raw.payment && typeof raw.payment === 'object' ? raw.payment : {};
+            const documents = raw.documents && typeof raw.documents === 'object' ? raw.documents : {};
+            const delivery = raw.delivery && typeof raw.delivery === 'object' ? raw.delivery : {};
+            const legacyStages={route_search:this.STAGES.NEW,journey_selected:this.STAGES.ROUTE_DEFINED,seat_selection:this.STAGES.OUTBOUND_SALE_PENDING,seat_selected:this.STAGES.OUTBOUND_SALE_PREPARED,passenger_confirmation:this.STAGES.DATA_CONFIRMED,payment:this.STAGES.PAYMENT_PENDING,pix_generated:this.STAGES.PAYMENT_PENDING,ticket_lookup:this.STAGES.TICKETS_LOOKUP_PENDING,ticket_issued:this.STAGES.TICKETS_FOUND,requisition:this.STAGES.REQUEST_FILLED,finance_reconciliation:this.STAGES.EMISSION_CONFIRMED};
+            const requestedStage=legacyStages[String(raw.stage||'')]||String(raw.stage||'');
+            const normalizedStatus=['active','completed','canceled','archived'].includes(String(raw.status||''))?String(raw.status):'active';
             return {
                 ...base, ...raw,
+                version: this.VERSION,
                 id: String(raw.id || base.id),
                 saleId: String(raw.saleId || sale?.id || ''),
-                status: String(raw.status || 'active'),
-                stage: String(raw.stage || 'route_search'),
+                status: normalizedStatus,
+                stage: this.STAGE_ORDER.includes(requestedStage) || [this.STAGES.CANCELED,this.STAGES.ERROR].includes(requestedStage) ? requestedStage : this.STAGES.NEW,
                 page: String(raw.page || 'desconhecida'),
                 nextAction: this.normalizeText(raw.nextAction || ''),
                 passengerIds: Array.from(new Set(Array.isArray(raw.passengerIds) ? raw.passengerIds.map(String).filter(Boolean) : [])),
-                journey: {
-                    ...base.journey, ...journey,
-                    origin:this.normalizeText(journey.origin), destination:this.normalizeText(journey.destination),
-                    date:this.normalizeText(journey.date), service:String(journey.service || '').replace(/\D/g, ''),
-                    line:this.normalizeText(journey.line), company:this.normalizeText(journey.company),
-                    departure:EH.Utils.extractTime(journey.departure) || this.normalizeText(journey.departure),
-                    arrival:EH.Utils.extractTime(journey.arrival) || this.normalizeText(journey.arrival),
-                    seat:this.normalizeText(journey.seat), value:Math.max(0, Number(journey.value || 0) || 0)
+                currentLeg,
+                journey: mergeCurrent(activeTrip,journey),
+                trips: { ida, volta },
+                requisition: {
+                    ...base.requisition,...requisition,
+                    id:String(requisition.id||''),logicalNumber:this.normalizeText(requisition.logicalNumber||requisition.numeroLogico||''),
+                    protocol:this.normalizeText(requisition.protocol||requisition.protocolo||''),status:String(requisition.status||'not_started'),
+                    codes:{ ida:this.normalizeText(codes.ida||ida.requestCode),volta:this.normalizeText(codes.volta||volta.requestCode) },
+                    updatedAt:Number(requisition.updatedAt||0)
+                },
+                documents: {
+                    ...base.documents,...documents,identity:String(documents.identity||'pending'),requisition:String(documents.requisition||'pending'),
+                    identityUploadedAt:Number(documents.identityUploadedAt||0),requisitionUploadedAt:Number(documents.requisitionUploadedAt||0)
                 },
                 payment: {
                     ...base.payment, ...payment,
@@ -9013,41 +9101,101 @@
                 },
                 ticketRefs: Array.from(new Set(Array.isArray(raw.ticketRefs) ? raw.ticketRefs.map(String).filter(Boolean) : [])),
                 requisitionRefs: Array.from(new Set(Array.isArray(raw.requisitionRefs) ? raw.requisitionRefs.map(String).filter(Boolean) : [])),
+                delivery: {
+                    ...base.delivery,...delivery,state:String(delivery.state||'pending'),printedAt:Number(delivery.printedAt||0),
+                    downloadedAt:Number(delivery.downloadedAt||0),preparedAt:Number(delivery.preparedAt||0),deliveredAt:Number(delivery.deliveredAt||0)
+                },
                 evidence: raw.evidence && typeof raw.evidence === 'object' ? { ...raw.evidence } : {},
+                stageHistory: (Array.isArray(raw.stageHistory)?raw.stageHistory:base.stageHistory).slice(-80).map(item=>({stage:String(item?.stage||''),at:Number(item?.at||0),evidence:this.normalizeText(item?.evidence||'')})),
+                lastError:this.normalizeText(raw.lastError||''),
                 createdAt: Number(raw.createdAt || base.createdAt),
                 updatedAt: Number(raw.updatedAt || base.updatedAt)
             };
         },
-        load() {
+        loadAll() {
+            const rows=EH.Storage.get(this.STORE_KEY,[]);
+            return (Array.isArray(rows)?rows:[]).map(item=>this.normalize(item)).filter(item=>item.id).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+        },
+        migrateLegacy() {
+            if(this.loadAll().length)return false;
             try {
-                const parsed = JSON.parse(sessionStorage.getItem(this.KEY) || 'null');
-                if (!parsed) return this.empty(EH.SaleContext?.loadSale?.());
-                if (Date.now() - Number(parsed.updatedAt || parsed.createdAt || 0) > EH.Config.SALE_CPF_TTL_MS) {
-                    sessionStorage.removeItem(this.KEY);
-                    return this.empty(EH.SaleContext?.loadSale?.());
-                }
-                return this.normalize(parsed);
-            } catch (error) {
-                EH.Logger.warn('Não foi possível ler o contexto operacional.', error);
-                return this.empty(EH.SaleContext?.loadSale?.());
-            }
+                const parsed=JSON.parse(sessionStorage.getItem(this.KEY)||'null');
+                if(!parsed||typeof parsed!=='object')return false;
+                const next=this.normalize({...parsed,version:this.VERSION,updatedAt:Number(parsed.updatedAt||Date.now())});
+                EH.Storage.set(this.STORE_KEY,[next]);EH.Storage.set(this.CURRENT_KEY,next.id);
+                return true;
+            } catch(error) { EH.Logger.warn('Não foi possível migrar o atendimento temporário.',error);return false; }
+        },
+        load() {
+            let rows=this.loadAll();
+            if(!rows.length&&this.migrateLegacy())rows=this.loadAll();
+            const currentId=String(EH.Storage.get(this.CURRENT_KEY,'')||'');
+            const terminal=new Set(['completed','canceled','archived']);
+            const current=rows.find(item=>item.id===currentId&&!terminal.has(item.status))||rows.find(item=>item.status==='active');
+            return current||this.empty(EH.SaleContext?.loadSale?.());
         },
         same(left, right) {
             const clean = item => { const copy = this.normalize(item); delete copy.updatedAt; return copy; };
             try { return JSON.stringify(clean(left)) === JSON.stringify(clean(right)); }
             catch (_error) { return false; }
         },
-        save(raw, { emit = true } = {}) {
-            const previous = this.load();
+        save(raw, { emit = true, fromSync = false, setCurrent = true } = {}) {
+            const rows=this.loadAll();
+            const rawId=String(raw?.id||'');
+            const previous=rows.find(item=>item.id===rawId)||this.empty(EH.SaleContext?.loadSale?.());
             const next = this.normalize({ ...raw, updatedAt:Date.now() });
             if (this.same(previous, next)) return previous;
+            const index=rows.findIndex(item=>item.id===next.id);if(index>=0)rows[index]=next;else rows.unshift(next);
+            const compact=rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0,this.MAX_RECORDS);
+            EH.Storage.set(this.STORE_KEY,compact);
+            if(setCurrent&&next.status==='active')EH.Storage.set(this.CURRENT_KEY,next.id);
+            else if(String(EH.Storage.get(this.CURRENT_KEY,'')||'')===next.id&&next.status!=='active')EH.Storage.remove(this.CURRENT_KEY);
             try { sessionStorage.setItem(this.KEY, JSON.stringify(next)); }
-            catch (error) { EH.Logger.warn('Não foi possível salvar o contexto operacional.', error); }
+            catch (error) { EH.Logger.debug('A cópia temporária do atendimento não pôde ser atualizada.', error); }
+            if(!fromSync)EH.Sync?.markPendingRecord?.('attendance',next.id);
             if (emit) EH.DomainEvents.emit('attendance:changed', { attendanceId:next.id, stage:next.stage, page:next.page }, { idempotencyKey:`${next.id}|${next.updatedAt}` });
             EH.ContextualPanels?.refresh?.('seats');
             EH.ContextualPanels?.refresh?.('confirmation');
             EH.ContextualPanels?.refresh?.('payment');
+            EH.ContextualPanels?.refresh?.('prefeitura');
+            EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||next.page);
             return next;
+        },
+        applyRemote(raw={}) {
+            const rows=this.loadAll();const local=rows.find(item=>item.id===String(raw.id||''))||{};
+            const merged=EH.Sync?.mergeAttendanceData?.(local,raw,Number(local.updatedAt||0),Number(raw.updatedAt||0))||raw;
+            const hasCurrent=Boolean(String(EH.Storage.get(this.CURRENT_KEY,'')||''));
+            return this.save(merged,{fromSync:true,setCurrent:!hasCurrent||String(EH.Storage.get(this.CURRENT_KEY,''))===String(raw.id||'')});
+        },
+        transitionRequirements(stage, context=this.load()) {
+            const trips=context.trips||{},current=trips[context.currentLeg||'ida']||context.journey||{};
+            const hasPassenger=Boolean(context.passengerIds?.length);
+            const codes=context.requisition?.codes||{};
+            if(stage===this.STAGES.DATA_CONFIRMED&&!hasPassenger)return 'Confirme Nome, CPF e Data de nascimento.';
+            if(stage===this.STAGES.ROUTE_DEFINED&&!(current.origin&&current.destination))return 'Defina origem e destino.';
+            if(stage===this.STAGES.PROTOCOL_DEFINED&&!context.requisition?.protocol)return 'Informe e confirme o protocolo.';
+            if(stage===this.STAGES.REQUEST_SUBMITTED&&!context.evidence?.requestSubmitted)return 'A solicitação ainda não possui confirmação real de envio.';
+            if(stage===this.STAGES.CODES_CAPTURED&&!(codes.ida||codes.volta))return 'Nenhum código foi validado para esta requisição.';
+            if(stage===this.STAGES.OUTBOUND_SALE_PREPARED&&!trips.ida?.seat)return 'A poltrona da ida ainda não foi confirmada.';
+            if(stage===this.STAGES.RETURN_SALE_PREPARED&&!trips.volta?.seat)return 'A poltrona da volta ainda não foi confirmada.';
+            if(stage===this.STAGES.EMISSION_CONFIRMED&&!context.evidence?.issue)return 'A emissão ainda não foi confirmada pelo E-Pass.';
+            if(stage===this.STAGES.TICKETS_FOUND&&!context.ticketRefs?.length)return 'Nenhum bilhete correspondente foi confirmado.';
+            return '';
+        },
+        transition(stage,{evidence='',force=false}={}) {
+            const context=this.load();const target=String(stage||'');
+            if(!this.STAGE_ORDER.includes(target)&&![this.STAGES.CANCELED,this.STAGES.ERROR].includes(target))return{ok:false,reason:'Etapa de atendimento inválida.',context};
+            const reason=force?'':this.transitionRequirements(target,context);if(reason)return{ok:false,reason,context};
+            const before=context.stage;context.stage=target;context.lastError=target===this.STAGES.ERROR?this.normalizeText(evidence):'';
+            if(before!==target)context.stageHistory=[...(context.stageHistory||[]),{stage:target,at:Date.now(),evidence:this.normalizeText(evidence)}].slice(-80);
+            context.nextAction=this.nextActionFor(context.page,context);return{ok:true,context:this.save(context)};
+        },
+        setCurrentLeg(leg) {
+            const context=this.load();const next=leg==='volta'?'volta':'ida';context.currentLeg=next;context.journey=this.normalizeTrip(context.trips?.[next]||{});context.nextAction=this.nextActionFor(context.page,context);return this.save(context);
+        },
+        commitJourney(context,journey={}) {
+            const leg=context.currentLeg==='volta'?'volta':'ida';context.trips=context.trips||{ida:this.emptyTrip(),volta:this.emptyTrip()};
+            context.trips[leg]=this.normalizeTrip({...context.trips[leg],...journey});context.journey=this.normalizeTrip(context.trips[leg]);return context;
         },
         routeParts(value) {
             const text = this.normalizeText(value);
@@ -9070,12 +9218,21 @@
             const journey = context.journey || {};
             const hasSeat = Boolean(journey.seat);
             const hasPassengers = Boolean(context.passengerIds?.length || EH.SaleContext?.loadSale?.()?.passengers?.length);
+            const stage=String(context.stage||this.STAGES.NEW),codes=context.requisition?.codes||{};
+            if(stage===this.STAGES.CANCELED)return 'Atendimento cancelado. Inicie um novo atendimento quando necessário.';
+            if(stage===this.STAGES.ERROR)return 'Corrigir a falha informada e retomar da última etapa confirmada.';
+            if(!hasPassengers)return 'Confirmar Nome, CPF e Data de nascimento.';
+            if(stage===this.STAGES.AWAITING_CODES)return codes.ida||codes.volta?'Aguardar e capturar o código restante.':'Abrir Solicitações e capturar os códigos gerados.';
+            if(stage===this.STAGES.CODES_CAPTURED)return codes.ida?'Emitir a ida usando o passageiro e o código confirmados.':'Selecionar explicitamente o trecho que será emitido.';
+            if(stage===this.STAGES.RETURN_SALE_PENDING||stage===this.STAGES.RETURN_SALE_PREPARED)return 'Emitir a volta sem substituir os dados da ida.';
+            if(stage===this.STAGES.EMISSION_CONFIRMED||stage===this.STAGES.TICKETS_LOOKUP_PENDING)return 'Localizar os bilhetes emitidos pelos identificadores confirmados.';
+            if(stage===this.STAGES.TICKETS_FOUND||stage===this.STAGES.TICKETS_READY)return 'Conferir, imprimir ou preparar os bilhetes para entrega.';
             if (page === 'pesquisa') return journey.service ? 'Continuar com o horário selecionado no E-Pass.' : 'Escolher um horário real nos resultados.';
             if (page === 'reserva') return hasSeat ? 'Confirmar a poltrona no E-Pass.' : 'Selecionar uma poltrona disponível.';
             if (page === 'confirmacao') return hasPassengers ? 'Conferir os dados e avançar conscientemente para pagamento.' : 'Preencher e confirmar os dados do passageiro.';
             if (page === 'pagamento') return context.payment?.state === 'pix_generated' ? 'Consultar o pagamento no E-Pass; cobrança gerada ainda não é quitação.' : 'Definir a forma de pagamento no E-Pass.';
             if (page === 'passagens') return context.ticketRefs?.length ? 'Conferir ou imprimir o bilhete emitido.' : 'Pesquisar e conferir o bilhete; esta página não confirma emissão.';
-            if (page === 'requisicao') return 'Conferir os dados e concluir a solicitação manualmente.';
+            if (page === 'requisicao') return context.requisition?.logicalNumber?'Conferir os códigos desta solicitação.':'Conferir os dados e concluir a solicitação manualmente.';
             if (page === 'caixa' || page === 'comissoes') return 'Conciliar os movimentos oficiais do E-Pass.';
             return 'Abrir a ferramenta relacionada à tarefa atual.';
         },
@@ -9099,8 +9256,8 @@
         },
         setJourney(journey = {}, evidenceType = 'dom') {
             const current = this.load();
-            current.journey = { ...current.journey, ...journey };
-            current.stage = current.journey.service ? 'journey_selected' : 'route_search';
+            this.commitJourney(current,{ ...current.journey, ...journey });
+            this.advanceStage(current,current.journey.service?(current.currentLeg==='volta'?this.STAGES.RETURN_SALE_PENDING:this.STAGES.OUTBOUND_SALE_PENDING):this.STAGES.ROUTE_DEFINED);
             current.evidence.journey = { type:evidenceType, at:Date.now() };
             current.nextAction = this.nextActionFor(current.page, current);
             const saved = this.save(current);
@@ -9116,24 +9273,26 @@
             const signature = [data.origem,data.destino,data.data].join('|');
             const hasOld=Boolean(context.journey.origin||context.journey.destination||context.journey.date);
             if (signature !== oldSignature && hasOld) {
-                context.journey = { ...this.empty().journey, origin:data.origem || '', destination:data.destino || '', date:data.data || '' };
+                this.commitJourney(context,{ ...this.emptyTrip(), origin:data.origem || '', destination:data.destino || '', date:data.data || '',requestCode:context.trips?.[context.currentLeg||'ida']?.requestCode||'' });
             } else {
-                Object.assign(context.journey, { origin:data.origem || context.journey.origin, destination:data.destino || context.journey.destination, date:data.data || context.journey.date });
+                this.commitJourney(context,{ origin:data.origem || context.journey.origin, destination:data.destino || context.journey.destination, date:data.data || context.journey.date });
             }
-            context.stage = context.journey.service ? 'journey_selected' : 'route_search';
+            this.advanceStage(context,context.journey.service?(context.currentLeg==='volta'?this.STAGES.RETURN_SALE_PENDING:this.STAGES.OUTBOUND_SALE_PENDING):this.STAGES.ROUTE_DEFINED);
             context.evidence.search = { type:'real-search-dom', at:Date.now() };
         },
         captureReservation(context) {
             if (!EH.Utils.first(EH.Selectors.RESERVATION_ROOT) && !EH.Utils.first(EH.Selectors.DADOS_RESERVA) && !EH.Utils.first(EH.Selectors.MAPA_POLTRONAS)) return;
             const data = EH.Parser?.parseReserva?.() || {};
             const route = this.routeParts(data.origemDestino);
-            Object.assign(context.journey, {
+            this.commitJourney(context,{
                 origin:route.origin || context.journey.origin, destination:route.destination || context.journey.destination,
                 service:String(data.servico || context.journey.service || '').replace(/\D/g, ''),
                 line:data.linha || context.journey.line, departure:data.horaSaida || context.journey.departure,
                 seat:(data.poltronasSelecionadas || []).join(', '), value:Number(data.valorTotalNum || context.journey.value || 0)
             });
-            context.stage = context.journey.seat ? 'seat_selected' : 'seat_selection';
+            const prepared=context.currentLeg==='volta'?this.STAGES.RETURN_SALE_PREPARED:this.STAGES.OUTBOUND_SALE_PREPARED;
+            const pending=context.currentLeg==='volta'?this.STAGES.RETURN_SALE_PENDING:this.STAGES.OUTBOUND_SALE_PENDING;
+            this.advanceStage(context,context.journey.seat?prepared:pending);
             context.evidence.seat = { type:'real-seat-dom', at:Date.now() };
         },
         captureSummary(context) {
@@ -9141,7 +9300,7 @@
             const first = summary?.cards?.[0];
             if (!first) return;
             const route = this.summaryRouteDate(first.routeDate);
-            Object.assign(context.journey, {
+            this.commitJourney(context,{
                 origin:route.origin || context.journey.origin, destination:route.destination || context.journey.destination,
                 date:route.date || context.journey.date, departure:route.departure || context.journey.departure,
                 seat:first.seat || context.journey.seat,
@@ -9165,7 +9324,7 @@
                 state:pix ? 'pix_generated' : (method || value ? 'defined' : context.payment.state),
                 observedAt:Date.now()
             };
-            context.stage = pix ? 'pix_generated' : 'payment';
+            this.advanceStage(context,this.STAGES.PAYMENT_PENDING);
             context.evidence.payment = { type:pix ? 'real-pix-charge-dom' : 'real-payment-dom', at:Date.now() };
             EH.DomainEvents.emit('payment:observed', { attendanceId:context.id, state:context.payment.state }, { idempotencyKey:`${context.id}|${context.payment.state}|${context.payment.value}` });
         },
@@ -9188,16 +9347,31 @@
         },
         linkPassenger(passenger = {}) {
             const id=String(passenger.id||'');if(!id)return null;
-            const context=this.load();context.passengerIds=Array.from(new Set([...(context.passengerIds||[]),id]));
+            const memoryId=EH.PassengerMemory?.findByCpf?.(passenger.cpf||'')?.id||'';const context=this.load();context.passengerIds=Array.from(new Set([...(context.passengerIds||[]),id,memoryId].filter(Boolean)));
             const sale=EH.SaleContext?.loadSale?.();if(sale?.id)context.saleId=String(sale.id);
             context.evidence.passenger={type:passenger.confirmed?'confirmed-passenger':'real-passenger-dom',at:Date.now()};
+            if(passenger.confirmed)this.advanceStage(context,this.STAGES.DATA_CONFIRMED);
             context.nextAction=this.nextActionFor(context.page,context);
             const saved=this.save(context);EH.DomainEvents.emit('passenger:confirmed',{attendanceId:saved.id,passengerId:id},{idempotencyKey:`${saved.id}|${id}|${passenger.confirmedAt||passenger.updatedAt||''}`});return saved;
         },
         linkRequisition(request = {}) {
             const id=String(request.id||'');if(!id)return null;
             const context=this.load();context.requisitionRefs=Array.from(new Set([...(context.requisitionRefs||[]),id]));
+            const requestPassengerIds=(request.passengers||[]).map(passenger=>EH.PassengerMemory?.findByCpf?.(passenger.cpf||'')?.id||'').filter(Boolean);context.passengerIds=Array.from(new Set([...(context.passengerIds||[]),...requestPassengerIds]));
+            const legs=(request.passengers||[]).flatMap(passenger=>passenger.legs||[]);const byType={ida:legs.find(leg=>leg.tipo!=='volta'),volta:legs.find(leg=>leg.tipo==='volta')};
+            const codes={ida:this.normalizeText(byType.ida?.codigo||''),volta:this.normalizeText(byType.volta?.codigo||'')};
+            context.requisition={
+                ...(context.requisition||{}),id,logicalNumber:this.normalizeText(request.numeroLogico||context.requisition?.logicalNumber||''),
+                protocol:this.normalizeText(request.protocolo||context.requisition?.protocol||''),status:String(request.status||context.requisition?.status||'prepared'),
+                codes,updatedAt:Number(request.updatedAt||Date.now())
+            };
+            ['ida','volta'].forEach(tipo=>{const leg=byType[tipo];if(!leg)return;const trip=context.trips?.[tipo]||this.emptyTrip();context.trips[tipo]=this.normalizeTrip({...trip,origin:leg.origem||trip.origin,destination:leg.destino||trip.destination,date:leg.data||trip.date,requestCode:leg.codigo||trip.requestCode,requestCodeStatus:leg.codigo?'available':trip.requestCodeStatus,requestCodeUpdatedAt:Number(leg.updatedAt||trip.requestCodeUpdatedAt||0)});});
+            context.journey=this.normalizeTrip(context.trips?.[context.currentLeg||'ida']||context.journey||{});
             context.evidence.requisition={type:'persisted-requisition',at:Date.now()};
+            const expected=legs.length;const captured=legs.filter(leg=>leg.codigo).length;
+            if(expected&&captured===expected)this.advanceStage(context,this.STAGES.CODES_CAPTURED);
+            else if(request.numeroLogico||['analyzed','approved','submitted'].includes(String(request.status||'')))this.advanceStage(context,this.STAGES.AWAITING_CODES);
+            else this.advanceStage(context,this.STAGES.REQUISITION_DOCUMENTS_READY);
             context.nextAction=this.nextActionFor(context.page,context);
             const saved=this.save(context);EH.DomainEvents.emit('requisition:linked',{attendanceId:saved.id,requisitionId:id},{idempotencyKey:`${saved.id}|${id}|${request.updatedAt||''}`});return saved;
         },
@@ -9206,11 +9380,10 @@
             context.page = page || 'desconhecida';
             if (page === 'pesquisa') this.captureSearch(context);
             else if (page === 'reserva') this.captureReservation(context);
-            else if (page === 'confirmacao') { this.captureSummary(context); context.stage='passenger_confirmation'; }
+            else if (page === 'confirmacao') { this.captureSummary(context);if(context.passengerIds?.length)this.advanceStage(context,this.STAGES.DATA_CONFIRMED); }
             else if (page === 'pagamento') this.capturePayment(context);
-            else if (page === 'passagens') context.stage = context.ticketRefs.length ? 'ticket_issued' : 'ticket_lookup';
-            else if (page === 'requisicao') context.stage='requisition';
-            else if (page === 'caixa' || page === 'comissoes') context.stage='finance_reconciliation';
+            // Navegar para Passagens, Solicitações ou Caixa não comprova nenhuma
+            // etapa de negócio. A transição ocorre somente por evidência do DOM.
             this.syncLegacy(context);
             context.nextAction = this.nextActionFor(page, context);
             return this.save(context);
@@ -9222,21 +9395,28 @@
             const refs = new Set(context.ticketRefs || []);
             candidates.forEach(item => refs.add(String(item.ticketNumber ? `ticket:${item.ticketNumber}` : item.id || '')));
             context.ticketRefs = Array.from(refs).filter(Boolean);
-            context.status = 'issued'; context.stage = 'ticket_issued';
             context.evidence.issue = { type:'qualified-ticket-card', at:Date.now(), count:candidates.length };
-            context.nextAction = 'Conferir, imprimir e acompanhar o bilhete emitido.';
+            const leg=context.currentLeg==='volta'?'volta':'ida';context.trips[leg]=this.normalizeTrip({...context.trips[leg],requestCodeStatus:context.trips[leg]?.requestCode?'used':context.trips[leg]?.requestCodeStatus,requestCodeUsedAt:context.trips[leg]?.requestCode?Date.now():context.trips[leg]?.requestCodeUsedAt});
+            const hasReturn=Boolean(context.requisition?.codes?.volta||context.trips?.volta?.origin||context.trips?.volta?.destination);const returnIssued=Boolean(context.evidence?.returnIssue);
+            if(leg==='ida'&&hasReturn&&candidates.length<2&&!returnIssued){context.evidence.idaIssue={...context.evidence.issue};context.currentLeg='volta';context.journey=this.normalizeTrip(context.trips.volta);context.status='active';context.stage=this.STAGES.RETURN_SALE_PENDING;context.nextAction='Emitir a volta sem substituir os dados e o bilhete da ida.';}
+            else{if(leg==='volta')context.evidence.returnIssue={...context.evidence.issue};context.status='active';context.stage=this.STAGES.TICKETS_FOUND;context.nextAction='Conferir, imprimir e acompanhar os bilhetes emitidos.';}
             this.save(context);
             EH.FinanceLedger?.recordIssuedTickets?.(candidates, context);
             candidates.forEach(item => EH.DomainEvents.emit('ticket:confirmed', { attendanceId:context.id, ticketNumber:item.ticketNumber || '' }, { idempotencyKey:item.ticketNumber || item.id }));
             return candidates.length;
         },
-        clear() {
+        clear({status='completed'}={}) {
+            const current=this.load();
+            if(current?.id){current.status=['completed','canceled','archived'].includes(status)?status:'completed';current.stage=current.status==='canceled'?this.STAGES.CANCELED:this.STAGES.COMPLETED;current.nextAction=current.status==='canceled'?'Atendimento cancelado.':'Atendimento concluído.';this.save(current,{setCurrent:false});}
+            EH.Storage.remove(this.CURRENT_KEY);
             try { sessionStorage.removeItem(this.KEY); }
-            catch (error) { EH.Logger.debug('Não foi possível limpar o contexto operacional.', error); }
+            catch (error) { EH.Logger.debug('Não foi possível limpar a cópia temporária do atendimento.', error); }
+            EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');
         },
         init() {
             if (this.started || EH.WhatsAppBridge?.isWhatsAppHost?.()) return;
             this.started = true;
+            this.migrateLegacy();
             EH.Runtime.on('attendance-result-choice', document, 'click', event => {
                 const button = event.target?.closest?.(EH.Selectors.SEARCH_RESERVE_BUTTON);
                 if (!button || !button.closest?.('app-pesquisa-venda')) return;
@@ -12191,9 +12371,11 @@
     // ============================================================
     EH.RequisitionManager = {
         STORAGE_KEY: 'requisitionsV1',
+        CODE_CAPTURE_KEY: 'requisitionCodeCaptures.v1',
         ACTIVE_KEY: 'epassHelper.activeRequisitionEmission.v1',
         started: false,
         pendingNumeroLogico: '',
+        pendingCodeContext: null,
         lastModalFingerprint: '',
 
         normalizeCpf(value) {
@@ -12222,6 +12404,7 @@
 
         normalizeCity(value) {
             return EH.Utils.normalize(value)
+                .replace(/^\s*[A-Z]{2}\s*-\s*/, '')
                 .replace(/\s*-\s*[A-Z]{2}\s*$/, '')
                 .replace(/\s+/g, ' ')
                 .trim();
@@ -12234,12 +12417,14 @@
         parseMarket(value) {
             const mercadoCompleto = this.cleanMarket(value);
             if (!mercadoCompleto) return { mercadoCompleto: '', origem: '', destino: '' };
-            const match = mercadoCompleto.match(/^(.*?)\s+-\s+(.*)$/);
+            const serviceSuffix = /\s+(?:CONVENCIONAL(?:\s+COM\s+SANIT[ÁA]RIO)?|EXECUTIVO(?:\s+COM\s+SANIT[ÁA]RIO)?|SEMI[\s-]?LEITO(?:\s+COM\s+SANIT[ÁA]RIO)?|SEMILEITO(?:\s+COM\s+SANIT[ÁA]RIO)?|LEITO(?:\s+CAMA)?(?:\s+COM\s+SANIT[ÁA]RIO)?|CAMA(?:\s+TOTAL)?|PREMIUM|DUPLO\s+DECK|DD)\s*$/i;
+            const routeText=mercadoCompleto.replace(serviceSuffix,'').trim();
+            const withStates=routeText.match(/^(.*?)\s*-\s*([A-Z]{2})\s*-\s*(.*?)\s*-\s*([A-Z]{2})\s*$/i);
+            if(withStates)return{mercadoCompleto,origem:EH.Utils.clean(withStates[1]),destino:EH.Utils.clean(withStates[3])};
+            const match = routeText.match(/^(.*?)\s+-\s+(.*)$/);
             if (!match) return { mercadoCompleto, origem: '', destino: '' };
             const origem = EH.Utils.clean(match[1]);
-            let destino = EH.Utils.clean(match[2]);
-            const serviceSuffix = /\s+(?:CONVENCIONAL(?:\s+COM\s+SANITARIO)?|EXECUTIVO(?:\s+COM\s+SANITARIO)?|SEMI[\s-]?LEITO(?:\s+COM\s+SANITARIO)?|SEMILEITO(?:\s+COM\s+SANITARIO)?|LEITO(?:\s+CAMA)?(?:\s+COM\s+SANITARIO)?|CAMA(?:\s+TOTAL)?|PREMIUM|DUPLO\s+DECK|DD)\s*$/i;
-            destino = destino.replace(serviceSuffix, '').trim();
+            const destino = EH.Utils.clean(match[2]);
             return { mercadoCompleto, origem, destino };
         },
 
@@ -12280,6 +12465,9 @@
                 data: EH.Utils.clean(item.data || ''),
                 mesAno: EH.Utils.clean(item.mesAno || ''),
                 filename: EH.Utils.clean(item.filename || ''),
+                codigoOrigem: EH.Utils.clean(item.codigoOrigem || ''),
+                codigoConfirmadoManualmente: Boolean(item.codigoConfirmadoManualmente),
+                codigoConfirmadoAt: Number(item.codigoConfirmadoAt || 0),
                 updatedAt: Number(item.updatedAt || Date.now())
             };
         },
@@ -12300,6 +12488,7 @@
             return {
                 id: item.id || `req-${now}-${Math.random().toString(36).slice(2, 8)}`,
                 numeroLogico: EH.Utils.clean(item.numeroLogico || ''),
+                protocolo: EH.Utils.clean(item.protocolo || ''),
                 prefeitura: EH.Utils.clean(item.prefeitura || ''),
                 secretaria: EH.Utils.clean(item.secretaria || ''),
                 contrato: EH.Utils.clean(item.contrato || ''),
@@ -12308,18 +12497,99 @@
                     .map(passenger => this.normalizePassenger(passenger))
                     .filter(passenger => passenger.cpf.length === 11),
                 createdAt: Number(item.createdAt || now),
+                submittedAt: Number(item.submittedAt || 0),
                 updatedAt: Number(item.updatedAt || now),
                 deviceId: String(item.deviceId || EH.Device.id())
             };
         },
 
+        sameLegIdentity(left = {}, right = {}) {
+            const sameType=String(left.tipo||'ida')===String(right.tipo||'ida');
+            const exact=EH.Utils.normalize(left.mercadoCompleto||'')===EH.Utils.normalize(right.mercadoCompleto||'');
+            const route=Boolean(left.origem&&left.destino&&right.origem&&right.destino&&this.sameRoute(left.origem,left.destino,right.origem,right.destino));
+            const compatibleDate=!left.data||!right.data||EH.Utils.clean(left.data)===EH.Utils.clean(right.data);
+            return sameType&&compatibleDate&&(exact||route);
+        },
+
+        mergeLegCollections(previous = [], incoming = []) {
+            const result=(previous||[]).map(leg=>this.normalizeLeg(leg));
+            (incoming||[]).map(leg=>this.normalizeLeg(leg)).forEach(next=>{
+                const index=result.findIndex(old=>this.sameLegIdentity(old,next));
+                if(index<0){result.push(next);return;}
+                const old=result[index];const nextIsNewer=Number(next.updatedAt||0)>=Number(old.updatedAt||0);
+                const preferred=nextIsNewer?next:old,secondary=nextIsNewer?old:next;
+                const manual=old.codigoConfirmadoManualmente?old:(next.codigoConfirmadoManualmente?next:null);
+                result[index]=this.normalizeLeg({
+                    ...secondary,...preferred,
+                    tipo:old.tipo||next.tipo,
+                    mercadoCompleto:preferred.mercadoCompleto||secondary.mercadoCompleto,
+                    origem:preferred.origem||secondary.origem,destino:preferred.destino||secondary.destino,
+                    codigo:manual?.codigo||preferred.codigo||secondary.codigo,
+                    codigoOrigem:manual?.codigoOrigem||preferred.codigoOrigem||secondary.codigoOrigem,
+                    codigoConfirmadoManualmente:Boolean(manual),codigoConfirmadoAt:Number(manual?.codigoConfirmadoAt||preferred.codigoConfirmadoAt||secondary.codigoConfirmadoAt||0),
+                    data:preferred.data||secondary.data,mesAno:preferred.mesAno||secondary.mesAno,filename:preferred.filename||secondary.filename,
+                    updatedAt:Math.max(Number(old.updatedAt||0),Number(next.updatedAt||0))
+                });
+            });
+            return result;
+        },
+
+        requestsCompatible(left = {}, right = {}, { windowMs = 24 * 60 * 60 * 1000 } = {}) {
+            const a=this.normalizeRequest(left),b=this.normalizeRequest(right);
+            if(a.numeroLogico&&b.numeroLogico&&a.numeroLogico!==b.numeroLogico)return false;
+            if(a.protocolo&&b.protocolo&&a.protocolo!==b.protocolo)return false;
+            if(!a.numeroLogico&&!b.numeroLogico&&!a.protocolo&&!b.protocolo&&Math.abs(Number(a.createdAt||0)-Number(b.createdAt||0))>windowMs)return false;
+            const aCpfs=a.passengers.map(item=>item.cpf).sort(),bCpfs=b.passengers.map(item=>item.cpf).sort();
+            if(aCpfs.length!==bCpfs.length||aCpfs.some((cpf,index)=>cpf!==bCpfs[index]))return false;
+            return a.passengers.every(passenger=>{
+                const other=b.passengers.find(item=>item.cpf===passenger.cpf);if(!other||passenger.legs.length!==other.legs.length)return false;
+                return passenger.legs.every(leg=>other.legs.some(candidate=>this.sameLegIdentity(leg,candidate)));
+            });
+        },
+
+        mergeRequestRecords(left = {}, right = {}) {
+            const a=this.normalizeRequest(left),b=this.normalizeRequest(right);
+            const linked=new Set(EH.Attendance?.load?.()?.requisitionRefs||[]);
+            const primary=linked.has(a.id)?a:linked.has(b.id)?b:(Number(a.createdAt||0)<=Number(b.createdAt||0)?a:b);
+            const secondary=primary.id===a.id?b:a;
+            const byCpf=new Map();
+            [...primary.passengers,...secondary.passengers].forEach(passenger=>{
+                const current=byCpf.get(passenger.cpf);
+                if(!current){byCpf.set(passenger.cpf,this.normalizePassenger(passenger));return;}
+                byCpf.set(passenger.cpf,this.normalizePassenger({
+                    ...current,...passenger,nome:passenger.nome||current.nome,dataNascimento:passenger.dataNascimento||current.dataNascimento,
+                    legs:this.mergeLegCollections(current.legs,passenger.legs)
+                }));
+            });
+            const ranks={pending:0,prepared:1,submitted:2,analyzed:3,approved:4};
+            const status=(ranks[b.status]??0)>(ranks[a.status]??0)?b.status:a.status;
+            return this.normalizeRequest({
+                ...secondary,...primary,id:primary.id,numeroLogico:a.numeroLogico||b.numeroLogico,protocolo:a.protocolo||b.protocolo,
+                prefeitura:primary.prefeitura||secondary.prefeitura,secretaria:primary.secretaria||secondary.secretaria,contrato:primary.contrato||secondary.contrato,
+                status,passengers:Array.from(byCpf.values()),createdAt:Math.min(Number(a.createdAt||Date.now()),Number(b.createdAt||Date.now())),
+                submittedAt:Math.max(Number(a.submittedAt||0),Number(b.submittedAt||0)),updatedAt:Math.max(Number(a.updatedAt||0),Number(b.updatedAt||0))
+            });
+        },
+
+        deduplicateRequests(items = []) {
+            const rows=(items||[]).map(item=>this.normalizeRequest(item)).sort((a,b)=>Number(a.createdAt||0)-Number(b.createdAt||0));
+            const result=[];let changed=false;
+            rows.forEach(item=>{
+                const index=result.findIndex(current=>this.requestsCompatible(current,item,{windowMs:30*60*1000}));
+                if(index<0){result.push(item);return;}
+                result[index]=this.mergeRequestRecords(result[index],item);changed=true;
+            });
+            return { items:result,changed };
+        },
+
         loadStore() {
             const raw = EH.Storage.get(this.STORAGE_KEY, { version: 1, items: [] });
             const limit = Date.now() - EH.Config.REQUISITION_TTL_MS;
-            const items = (Array.isArray(raw?.items) ? raw.items : [])
+            const loaded = (Array.isArray(raw?.items) ? raw.items : [])
                 .map(item => this.normalizeRequest(item))
                 .filter(item => item.passengers.length && item.updatedAt >= limit);
-            if ((raw?.items || []).length !== items.length) this.saveStore(items);
+            const deduped=this.deduplicateRequests(loaded);const items=deduped.items;
+            if ((raw?.items || []).length !== items.length||deduped.changed) this.saveStore(items);
             return items;
         },
 
@@ -12387,22 +12657,13 @@
         },
 
         mergePassengerData(previous = [], incoming = []) {
-            const byCpf = new Map((previous || []).map(passenger => [this.normalizeCpf(passenger.cpf), passenger]));
-            return (incoming || []).map(passenger => {
-                const nextPassenger = this.normalizePassenger(passenger);
-                const oldPassenger = byCpf.get(nextPassenger.cpf);
-                if (!oldPassenger) return nextPassenger;
-                nextPassenger.legs = (nextPassenger.legs || []).map(leg => {
-                    const oldLeg = (oldPassenger.legs || []).find(candidate => {
-                        const exact = EH.Utils.normalize(candidate.mercadoCompleto) === EH.Utils.normalize(leg.mercadoCompleto);
-                        return exact || this.sameRoute(candidate.origem, candidate.destino, leg.origem, leg.destino);
-                    });
-                    if (oldLeg?.codigo && !leg.codigo) leg.codigo = oldLeg.codigo;
-                    if (oldLeg?.updatedAt) leg.updatedAt = Math.max(Number(leg.updatedAt || 0), Number(oldLeg.updatedAt || 0));
-                    return leg;
-                });
-                return nextPassenger;
+            const byCpf = new Map();
+            [...(previous||[]),...(incoming||[])].forEach(passenger=>{
+                const next=this.normalizePassenger(passenger);if(next.cpf.length!==11)return;
+                const old=byCpf.get(next.cpf);if(!old){byCpf.set(next.cpf,next);return;}
+                byCpf.set(next.cpf,this.normalizePassenger({...old,...next,nome:next.nome||old.nome,dataNascimento:next.dataNascimento||old.dataNascimento,legs:this.mergeLegCollections(old.legs,next.legs)}));
             });
+            return Array.from(byCpf.values());
         },
 
         upsertRequest(request) {
@@ -12411,19 +12672,22 @@
             const items = this.loadStore();
             const fingerprint = this.requestFingerprint(next);
             const now = Date.now();
-            let existing = items.find(item=>String(item.id||'')===String(next.id||'')) || (next.numeroLogico
-                ? items.find(item => item.numeroLogico === next.numeroLogico)
-                : items.find(item => {
-                    if (item.numeroLogico || item.status === 'approved') return false;
-                    if (this.requestFingerprint(item) !== fingerprint) return false;
-                    return (now - Number(item.updatedAt || 0)) <= (2 * 60 * 1000);
-                }));
+            let existing = items.find(item=>String(item.id||'')===String(next.id||'')) || (next.numeroLogico?items.find(item=>item.numeroLogico===next.numeroLogico):null);
+            if(!existing){
+                const compatible=items.filter(item=>this.requestsCompatible(item,next,{windowMs:30*60*1000}));
+                if(compatible.length===1)existing=compatible[0];
+                else if(compatible.length>1){const refs=new Set(EH.Attendance?.load?.()?.requisitionRefs||[]);existing=compatible.find(item=>refs.has(item.id))||null;}
+            }
+            if(!existing)existing=items.find(item=>!item.numeroLogico&&item.status!=='approved'&&this.requestFingerprint(item)===fingerprint&&(now-Number(item.updatedAt||0))<=(2*60*1000));
             if (existing) {
                 existing.prefeitura = next.prefeitura || existing.prefeitura;
                 existing.secretaria = next.secretaria || existing.secretaria;
                 existing.contrato = next.contrato || existing.contrato;
                 existing.numeroLogico = next.numeroLogico || existing.numeroLogico;
-                if (existing.status !== 'approved') existing.status = next.status || existing.status;
+                existing.protocolo = next.protocolo || existing.protocolo;
+                existing.submittedAt = Math.max(Number(existing.submittedAt||0),Number(next.submittedAt||0));
+                const statusRank={pending:0,prepared:1,submitted:2,analyzed:3,approved:4};
+                if((statusRank[next.status]??0)>(statusRank[existing.status]??0))existing.status=next.status;
                 existing.passengers = this.mergePassengerData(existing.passengers, next.passengers);
                 existing.updatedAt = now;
                 this.saveStore(items);
@@ -12448,6 +12712,7 @@
             const prefeitura = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_prefeitura"]'));
             const secretaria = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_secretaria"]'));
             const contrato = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_contrato"]'));
+            const protocolo = EH.Utils.clean(root.querySelector('input[formcontrolname="idRequisicao"]')?.value || '');
             const passengers = [];
             const cpfInputs = Array.from(info.querySelectorAll('input[formcontrolname="cpf"][id^="cpf_"]'));
 
@@ -12474,7 +12739,7 @@
             });
 
             if (!passengers.length) return null;
-            const saved = this.upsertRequest({ prefeitura, secretaria, contrato, status: 'pending', passengers });
+            const saved = this.upsertRequest({ prefeitura, secretaria, contrato, protocolo, status: 'pending', passengers });
             passengers.forEach(passenger => {
                 const memory = EH.PassengerMemory?.findByCpf?.(passenger.cpf) || null;
                 EH.SaleContext?.upsertPassenger?.({
@@ -12536,26 +12801,30 @@
                 if (!numeroLogico) return;
                 const blocks = Array.from(card.querySelectorAll('.mt-4.border-top')).map(block => this.parseRequestSummaryBlock(block)).filter(Boolean);
                 if (!blocks.length) return;
-                const exact = items.filter(item => item.numeroLogico === numeroLogico);
+                const exact = items.filter(item => item.numeroLogico === numeroLogico && this.requestContainsSummary(item,blocks));
                 const candidates = exact.length ? exact : items.filter(item => !item.numeroLogico && this.requestContainsSummary(item, blocks));
-                if (candidates.length !== 1) return;
-                const request = candidates[0];
+                const refs=new Set(EH.Attendance?.load?.()?.requisitionRefs||[]);
+                const request=candidates.length===1?candidates[0]:candidates.find(item=>refs.has(item.id));
+                if (!request) return;
                 const statusText = EH.Utils.normalize(card.textContent || '');
-                const nextStatus = statusText.includes('SOLICITACAO ANALISADA') ? 'analyzed' : request.status;
+                const nextStatus = statusText.includes('SOLICITACAO ANALISADA') ? 'analyzed' : statusText.includes('SOLICITACAO EM ANALISE') ? 'submitted' : request.status;
                 if (request.numeroLogico !== numeroLogico || request.status !== nextStatus) {
                     request.numeroLogico = numeroLogico;
                     request.status = nextStatus;
+                    request.submittedAt = Number(request.submittedAt||Date.now());
                     request.updatedAt = Date.now();
                     changed += 1;
                 }
             });
-            if (changed) this.saveStore(items);
+            if (changed){this.saveStore(items);items.filter(item=>item.numeroLogico).forEach(item=>EH.Attendance?.linkRequisition?.(item));}
             return changed;
         },
 
         findCodeButtonContext(element) {
             const card = element?.closest?.('.dados-passagem');
-            return card ? this.numeroLogicoFromCard(card) : '';
+            if(!card)return null;
+            const summaries=Array.from(card.querySelectorAll('.mt-4.border-top')).map(block=>this.parseRequestSummaryBlock(block)).filter(Boolean);
+            return {numeroLogico:this.numeroLogicoFromCard(card),summaries,clickedAt:Date.now(),cardFingerprint:summaries.map(item=>`${this.normalizeName(item.nome)}|${item.dataNascimento}|${EH.Utils.normalize(item.mercadoCompleto)}`).join('||')};
         },
 
         parseCodeBlock(codeElement) {
@@ -12569,13 +12838,32 @@
             return { nome, dataNascimento, codigo, ...this.parseMarket(mercadoCompleto) };
         },
 
+        pendingCodeCaptures() {
+            const rows=EH.Storage.get(this.CODE_CAPTURE_KEY,[]);return (Array.isArray(rows)?rows:[]).filter(item=>item&&item.codigo).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0,80);
+        },
+
+        preservePendingCode(block, reason='ambiguous') {
+            const logical=this.pendingCodeContext?.numeroLogico||this.pendingNumeroLogico||'';
+            const rows=this.pendingCodeCaptures();const key=[logical,this.normalizeName(block.nome),block.dataNascimento,EH.Utils.normalize(block.mercadoCompleto),block.codigo].join('|');
+            const entry={id:`code:${EH.Reminders?.stableHash?.(key)||key}`,numeroLogico:logical,nome:block.nome,dataNascimento:block.dataNascimento,mercadoCompleto:block.mercadoCompleto,origem:block.origem,destino:block.destino,codigo:block.codigo,status:'pending',reason,updatedAt:Date.now(),deviceId:EH.Device.id()};
+            const index=rows.findIndex(item=>item.id===entry.id);if(index>=0)rows[index]={...rows[index],...entry};else rows.unshift(entry);EH.Storage.set(this.CODE_CAPTURE_KEY,rows.slice(0,80));return entry;
+        },
+
+        resolvePendingCapture(block, requestId, legType) {
+            const rows=this.pendingCodeCaptures();let changed=false;const logical=this.pendingCodeContext?.numeroLogico||this.pendingNumeroLogico||'';
+            rows.forEach(item=>{if(item.status!=='pending')return;const sameLogical=!logical||!item.numeroLogico||item.numeroLogico===logical;const sameCode=item.codigo===block.codigo;const sameRoute=this.sameRoute(item.origem,item.destino,block.origem,block.destino);if(sameLogical&&sameCode&&sameRoute){item.status='assigned';item.requestId=requestId;item.legType=legType;item.updatedAt=Date.now();changed=true;}});if(changed)EH.Storage.set(this.CODE_CAPTURE_KEY,rows);return changed;
+        },
+
         findCodeTargets(items, block) {
             const targets = [];
             let requests = Array.isArray(items) ? items : [];
-            if (this.pendingNumeroLogico) {
-                const exactLogical = requests.filter(request => request.numeroLogico === this.pendingNumeroLogico);
+            const logical=this.pendingCodeContext?.numeroLogico||this.pendingNumeroLogico||'';
+            if (logical) {
+                const exactLogical = requests.filter(request => request.numeroLogico === logical);
                 requests = exactLogical.length ? exactLogical : requests.filter(request => !request.numeroLogico);
             }
+            const summaries=this.pendingCodeContext?.summaries||[];
+            if(summaries.length)requests=requests.filter(request=>this.requestContainsSummary(request,summaries));
             requests.forEach(request => {
                 (request.passengers || []).forEach(passenger => {
                     if (this.normalizeName(passenger.nome) !== this.normalizeName(block.nome)) return;
@@ -12597,23 +12885,31 @@
                 .map(element => this.parseCodeBlock(element))
                 .filter(Boolean);
             if (!blocks.length) return 0;
-            const fingerprint = blocks.map(block => `${EH.Utils.normalize(block.mercadoCompleto)}|${this.normalizeName(block.nome)}|${block.dataNascimento}|${block.codigo}`).join('||');
+            const logical=this.pendingCodeContext?.numeroLogico||this.pendingNumeroLogico||'';
+            const fingerprint = `${logical}::${blocks.map(block => `${EH.Utils.normalize(block.mercadoCompleto)}|${this.normalizeName(block.nome)}|${block.dataNascimento}|${block.codigo}`).join('||')}`;
             if (fingerprint === this.lastModalFingerprint) return 0;
             this.lastModalFingerprint = fingerprint;
 
             const items = this.loadStore();
             let updated = 0;
             let ambiguous = 0;
+            let statusChanged = 0;
+            const linked=new Set();
             blocks.forEach(block => {
                 const targets = this.findCodeTargets(items, block);
                 if (targets.length !== 1) {
                     ambiguous += 1;
+                    this.preservePendingCode(block,targets.length?'multiple-targets':'target-not-found');
                     return;
                 }
                 const { request, leg } = targets[0];
-                if (this.pendingNumeroLogico && !request.numeroLogico) request.numeroLogico = this.pendingNumeroLogico;
+                if(leg.codigoConfirmadoManualmente&&leg.codigo&&leg.codigo!==block.codigo){ambiguous+=1;this.preservePendingCode(block,'manual-code-locked');return;}
+                if (logical && !request.numeroLogico) request.numeroLogico = logical;
                 if (leg.codigo !== block.codigo || leg.mercadoCompleto !== block.mercadoCompleto) {
                     leg.codigo = block.codigo;
+                    leg.codigoOrigem = 'modalCodigoPrefeitura';
+                    leg.codigoConfirmadoManualmente = false;
+                    leg.codigoConfirmadoAt = Date.now();
                     leg.mercadoCompleto = block.mercadoCompleto;
                     const parsed = this.parseMarket(block.mercadoCompleto);
                     leg.origem = parsed.origem || leg.origem;
@@ -12622,18 +12918,77 @@
                     request.updatedAt = Date.now();
                     updated += 1;
                 }
+                this.resolvePendingCapture(block,request.id,leg.tipo);
+                linked.add(request.id);
             });
 
             items.forEach(request => {
                 const legs = request.passengers.flatMap(passenger => passenger.legs || []);
-                if (legs.length && legs.every(leg => leg.codigo)) request.status = 'approved';
+                if (legs.length && legs.every(leg => leg.codigo)&&request.status!=='approved'){request.status='approved';request.updatedAt=Date.now();statusChanged+=1;}
             });
-            if (updated) {
+            if (updated||statusChanged) {
                 this.saveStore(items);
-                EH.Toast.success(`${updated} código${updated === 1 ? '' : 's'} de requisição associado${updated === 1 ? '' : 's'} ao trecho correto.`);
+                items.filter(request=>linked.has(request.id)).forEach(request=>EH.Attendance?.linkRequisition?.(request));
+                if(updated)EH.Toast.success(`${updated} código${updated === 1 ? '' : 's'} de requisição associado${updated === 1 ? '' : 's'} ao trecho correto.`);
             }
-            if (ambiguous) EH.Toast.warning('Há código de requisição que não pôde ser associado com segurança. Nenhum passageiro foi escolhido automaticamente.');
+            else items.filter(request=>linked.has(request.id)).forEach(request=>EH.Attendance?.linkRequisition?.(request));
+            if (ambiguous) EH.Toast.warning(`${ambiguous} código${ambiguous===1?' foi preservado':'s foram preservados'} para conferência. Abra Requisição para associar manualmente sem perder os dados.`);
             return updated;
+        },
+
+        sanitizeRequestCode(value) {
+            const code=EH.Utils.clean(value||'').toUpperCase().replace(/\s+/g,'');
+            return /^[A-Z0-9-]{4,24}$/.test(code)?code:'';
+        },
+
+        setManualCode({requestId='',cpf='',tipo='ida',codigo='',confirmed=false}={}) {
+            if(!confirmed)throw new Error('A correção manual precisa de confirmação explícita.');
+            const code=this.sanitizeRequestCode(codigo);if(!code)throw new Error('Informe um código de requisição válido.');
+            const rows=this.loadStore(),request=rows.find(item=>item.id===String(requestId||''));if(!request)throw new Error('Não foi possível localizar esta solicitação.');
+            const digits=this.normalizeCpf(cpf);const passengers=digits?request.passengers.filter(item=>item.cpf===digits):request.passengers;
+            if(passengers.length!==1)throw new Error('Selecione um único passageiro antes de corrigir o código.');
+            const legs=passengers[0].legs.filter(leg=>(tipo==='volta'?'volta':'ida')===leg.tipo);if(legs.length!==1)throw new Error('O trecho não pôde ser identificado com segurança.');
+            const leg=legs[0];leg.codigo=code;leg.codigoOrigem='manual-confirmed';leg.codigoConfirmadoManualmente=true;leg.codigoConfirmadoAt=Date.now();leg.updatedAt=Date.now();request.updatedAt=Date.now();
+            const all=request.passengers.flatMap(item=>item.legs||[]);if(all.length&&all.every(item=>item.codigo))request.status='approved';
+            this.saveStore(rows);EH.Attendance?.linkRequisition?.(request);return{request,passenger:passengers[0],leg};
+        },
+
+        requestForContext() {
+            const rows=this.loadStore();if(!rows.length)return null;const attendance=EH.Attendance?.load?.();
+            const linked=(attendance?.requisitionRefs||[]).map(id=>rows.find(item=>item.id===id)).filter(Boolean).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+            if(linked.length)return linked[0];const active=this.getActiveEmission();if(active?.requestId){const request=rows.find(item=>item.id===active.requestId);if(request)return request;}
+            if(EH.Pages?.detect?.()==='requisicao')return rows.slice().sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))[0]||null;
+            return null;
+        },
+
+        async copyBothCodes(request=this.requestForContext()) {
+            const legs=(request?.passengers||[]).flatMap(item=>item.legs||[]);const ida=legs.find(leg=>leg.tipo!=='volta'&&leg.codigo)?.codigo||'',volta=legs.find(leg=>leg.tipo==='volta'&&leg.codigo)?.codigo||'';
+            const text=[ida&&`Ida: ${ida}`,volta&&`Volta: ${volta}`].filter(Boolean).join('\n');if(!text)return EH.Toast.warning('Nenhum código disponível.');await EH.Clipboard.copyText(text);EH.Toast.success('Códigos da requisição copiados.');return true;
+        },
+
+        renderContext(body,{page=EH.Pages?.detect?.()||'desconhecida'}={}) {
+            const request=this.requestForContext();const pending=this.pendingCodeCaptures().filter(item=>item.status==='pending');
+            if(!request&&!pending.length)return null;
+            const wrap=document.createElement('section');wrap.className='eh-requisition-context';
+            const heading=document.createElement('strong');heading.textContent=request?`Requisição${request.numeroLogico?` • ${request.numeroLogico}`:''}`:'Códigos aguardando associação';wrap.appendChild(heading);
+            if(request){
+                const activeCpf=EH.SaleContext?.getActivePassenger?.()?.cpf||'';const passenger=request.passengers.find(item=>item.cpf===this.normalizeCpf(activeCpf))||(request.passengers.length===1?request.passengers[0]:null);
+                if(passenger){
+                    const grid=document.createElement('div');grid.className='eh-context-data';
+                    ['ida','volta'].forEach(tipo=>{const leg=passenger.legs.find(item=>item.tipo===tipo);if(!leg)return;const cell=document.createElement('div');const label=document.createElement('span');label.textContent=tipo==='ida'?'Código da ida':'Código da volta';const value=document.createElement('b');value.textContent=leg.codigo?`${leg.codigo} • disponível`:'Aguardando código';cell.append(label,value);grid.appendChild(cell);});wrap.appendChild(grid);
+                    const actions=document.createElement('div');actions.className='eh-context-actions';
+                    passenger.legs.filter(leg=>leg.codigo).forEach(leg=>actions.append(EH.ContextualPanels.action(`Copiar ${leg.tipo}`,()=>this.copyLegCode(leg.codigo))));
+                    if(passenger.legs.filter(leg=>leg.codigo).length>1)actions.append(EH.ContextualPanels.action('Copiar ambos',()=>this.copyBothCodes(request)));
+                    if(page==='pagamento')actions.append(EH.ContextualPanels.action('Preencher código do trecho',()=>this.fillPaymentCode(),'primary'));
+                    wrap.appendChild(actions);
+                    const more=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Mais opções';const manual=document.createElement('div');manual.className='eh-context-actions';
+                    passenger.legs.forEach(leg=>manual.append(EH.ContextualPanels.action(`Corrigir ${leg.tipo}`,()=>{const value=window.prompt(`Informe o código confirmado da ${leg.tipo}:`,leg.codigo||'');if(value===null)return;const code=this.sanitizeRequestCode(value);if(!code)return EH.Toast.warning('Código inválido. Confira e tente novamente.');if(!window.confirm(`Confirmar ${code} como código oficial da ${leg.tipo}?`))return;try{this.setManualCode({requestId:request.id,cpf:passenger.cpf,tipo:leg.tipo,codigo:code,confirmed:true});EH.Toast.success(`Código da ${leg.tipo} corrigido e protegido.`);EH.ContextualPanels?.refresh?.(page==='pagamento'?'payment':'prefeitura');}catch(error){EH.Toast.error(error.message);}})));
+                    pending.forEach(item=>{if(this.normalizeName(item.nome)!==this.normalizeName(passenger.nome)||item.dataNascimento!==passenger.dataNascimento)return;const legs=passenger.legs.filter(leg=>this.sameRoute(leg.origem,leg.destino,item.origem,item.destino));if(legs.length!==1)return;const leg=legs[0];manual.append(EH.ContextualPanels.action(`Associar ${item.codigo} à ${leg.tipo}`,()=>{if(!window.confirm(`Associar ${item.codigo} ao trecho de ${leg.tipo} desta requisição?`))return;try{this.setManualCode({requestId:request.id,cpf:passenger.cpf,tipo:leg.tipo,codigo:item.codigo,confirmed:true});this.resolvePendingCapture(item,request.id,leg.tipo);EH.Toast.success(`Código associado à ${leg.tipo}.`);EH.ContextualPanels?.refresh?.(page==='pagamento'?'payment':'prefeitura');}catch(error){EH.Toast.error(error.message);}}));});
+                    more.append(summary,manual);wrap.appendChild(more);
+                }
+            }
+            if(pending.length){const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${pending.length} código${pending.length===1?' preservado aguarda':'s preservados aguardam'} associação manual. Nenhum foi descartado.`;wrap.appendChild(note);}
+            body.appendChild(wrap);return wrap;
         },
 
         parseRouteText(value) {
@@ -12819,6 +13174,7 @@
                 tipo: matched?.leg?.tipo || '',
                 codigo: matched?.leg?.codigo || ''
             });
+            if(matched?.leg?.tipo)EH.Attendance?.setCurrentLeg?.(matched.leg.tipo);
             EH.SaleContext.upsertPassenger({
                 cpf: passenger.cpf,
                 name: passenger.nome || EH.Utils.clean(nameInput.value || ''),
@@ -12837,12 +13193,20 @@
             const raw = summary?.cards?.[0]?.routeDate || '';
             const parsed = this.parseRouteText(raw);
             if (parsed) return parsed;
-            const active = this.getActiveEmission();
+            const active = this.getActiveEmission()||this.activeRequestIdentity();
             return active?.origem && active?.destino ? { origem: active.origem, destino: active.destino } : null;
         },
 
+        activeRequestIdentity() {
+            const active=this.getActiveEmission();if(active?.cpf)return active;
+            const context=EH.Attendance?.load?.();const ids=new Set(context?.passengerIds||[]);const memory=(EH.PassengerMemory?.load?.()||[]).find(item=>ids.has(item.id));
+            const request=this.requestForContext();const passenger=memory?request?.passengers?.find(item=>item.cpf===memory.cpf):(request?.passengers?.length===1?request.passengers[0]:null);
+            const trip=context?.trips?.[context.currentLeg||'ida']||context?.journey||{};
+            return passenger?{requestId:request?.id||'',numeroLogico:request?.numeroLogico||'',cpf:passenger.cpf,nome:passenger.nome,origem:trip.origin||'',destino:trip.destination||'',tipo:context?.currentLeg||'',codigo:trip.requestCode||''}:null;
+        },
+
         resolvePaymentMatch() {
-            const active = this.getActiveEmission();
+            const active = this.activeRequestIdentity();
             if (!active?.cpf) return { match: null, reason: 'Nenhuma passageira de requisição está ativa nesta emissão.' };
             const route = this.paymentRoute();
             if (!route?.origem || !route?.destino) return { match: null, reason: 'A rota atual não pôde ser identificada com segurança.' };
@@ -12978,12 +13342,14 @@
                 const button = event.target?.closest?.('button');
                 if (!button) return;
                 const label = EH.Utils.normalize(button.textContent || button.title || '');
-                if (button.closest('app-solicitacao-requisicoes-prefeitura') && button.type === 'submit' && label.includes('ENVIAR SOLICITACAO')) {
+                if (button.closest('app-solicitacao-requisicoes-prefeitura') && button.type === 'submit' && /ENVIAR|SOLICITAR|CONFIRMAR/.test(label)) {
                     this.captureRequestForm();
                     return;
                 }
                 if (button.closest('app-solicitacoes') && label.includes('CODIGO DA REQUISICAO')) {
-                    this.pendingNumeroLogico = this.findCodeButtonContext(button);
+                    this.pendingCodeContext = this.findCodeButtonContext(button);
+                    this.pendingNumeroLogico = this.pendingCodeContext?.numeroLogico || '';
+                    this.scanRequestCards();
                     this.lastModalFingerprint = '';
                 }
             };
@@ -15294,7 +15660,7 @@
             if(!cfg.enabled||cfg.provider!=='supabase')return false;
             if(kind==='reminder')return cfg.reminders;
             if(kind==='requisition')return cfg.requisitions;
-            if(kind==='passenger'||kind==='emission')return cfg.emission;
+            if(kind==='passenger'||kind==='emission'||kind==='attendance')return cfg.emission;
             if(kind==='config')return cfg.settings;
             return false;
         },
@@ -15337,7 +15703,7 @@
         },
         requestStatusRank(status) {
             const value=String(status||'').toLowerCase();
-            return value==='pending'?0:(value==='analyzed'||value==='analysed')?1:value==='approved'?2:0;
+            return value==='pending'?0:value==='prepared'?1:value==='submitted'?2:(value==='analyzed'||value==='analysed')?3:value==='approved'?4:0;
         },
         mergeReminderData(localData={},remoteData={},localTs=0,remoteTs=0) {
             const remoteNewer=Number(remoteTs||0)>=Number(localTs||0);
@@ -15363,13 +15729,17 @@
             const l=EH.RequisitionManager?.normalizeLeg?.(localLeg)||localLeg, r=EH.RequisitionManager?.normalizeLeg?.(remoteLeg)||remoteLeg;
             const remoteNewer=Number(r.updatedAt||0)>=Number(l.updatedAt||0);
             const preferred=remoteNewer?r:l, secondary=remoteNewer?l:r;
+            const manual=l.codigoConfirmadoManualmente?l:(r.codigoConfirmadoManualmente?r:null);
             return {
                 ...secondary,...preferred,
                 tipo: preferred.tipo||secondary.tipo||'ida',
                 mercadoCompleto:this.usefulText(preferred.mercadoCompleto,secondary.mercadoCompleto),
                 origem:this.usefulText(preferred.origem,secondary.origem),
                 destino:this.usefulText(preferred.destino,secondary.destino),
-                codigo:this.usefulText(preferred.codigo,secondary.codigo),
+                codigo:manual?.codigo||this.usefulText(preferred.codigo,secondary.codigo),
+                codigoOrigem:manual?.codigoOrigem||preferred.codigoOrigem||secondary.codigoOrigem||'',
+                codigoConfirmadoManualmente:Boolean(manual),
+                codigoConfirmadoAt:Math.max(Number(l.codigoConfirmadoAt||0),Number(r.codigoConfirmadoAt||0)),
                 data:this.usefulText(preferred.data,secondary.data),
                 mesAno:this.usefulText(preferred.mesAno,secondary.mesAno),
                 filename:this.usefulText(preferred.filename,secondary.filename),
@@ -15400,14 +15770,40 @@
             const lStatus=String(localData.status||'pending'),rStatus=String(remoteData.status||'pending');
             merged.status=this.requestStatusRank(rStatus)>this.requestStatusRank(lStatus)?rStatus:lStatus;
             merged.numeroLogico=this.usefulText(preferred.numeroLogico,secondary.numeroLogico);
+            merged.protocolo=this.usefulText(preferred.protocolo,secondary.protocolo);
+            merged.submittedAt=Math.max(Number(localData.submittedAt||0),Number(remoteData.submittedAt||0));
             merged.createdAt=Math.min(Number(localData.createdAt||Date.now()),Number(remoteData.createdAt||Date.now()));
             merged.updatedAt=Math.max(Number(localTs||localData.updatedAt||0),Number(remoteTs||remoteData.updatedAt||0));
             merged.deviceId=remoteNewer?(remoteData.deviceId||localData.deviceId||EH.Device.id()):(localData.deviceId||remoteData.deviceId||EH.Device.id());
             return merged;
         },
+        mergeAttendanceData(localData={},remoteData={},localTs=0,remoteTs=0) {
+            const remoteNewer=Number(remoteTs||remoteData.updatedAt||0)>=Number(localTs||localData.updatedAt||0);
+            const preferred=remoteNewer?remoteData:localData,secondary=remoteNewer?localData:remoteData;
+            const merged=this.smartMerge(secondary,preferred);
+            const normalizeTrip=trip=>EH.Attendance?.normalizeTrip?.(trip)||trip||{};
+            merged.trips={};
+            ['ida','volta'].forEach(tipo=>{
+                const localTrip=normalizeTrip(localData?.trips?.[tipo]||{}),remoteTrip=normalizeTrip(remoteData?.trips?.[tipo]||{});
+                const primary=remoteNewer?remoteTrip:localTrip,other=remoteNewer?localTrip:remoteTrip;
+                merged.trips[tipo]={...other,...primary,requestCode:this.usefulText(primary.requestCode,other.requestCode),requestCodeUpdatedAt:Math.max(Number(localTrip.requestCodeUpdatedAt||0),Number(remoteTrip.requestCodeUpdatedAt||0)),requestCodeUsedAt:Math.max(Number(localTrip.requestCodeUsedAt||0),Number(remoteTrip.requestCodeUsedAt||0))};
+            });
+            const localCodes=localData?.requisition?.codes||{},remoteCodes=remoteData?.requisition?.codes||{};
+            merged.requisition={...(secondary.requisition||{}),...(preferred.requisition||{}),codes:{ida:this.usefulText(remoteNewer?remoteCodes.ida:localCodes.ida,remoteNewer?localCodes.ida:remoteCodes.ida),volta:this.usefulText(remoteNewer?remoteCodes.volta:localCodes.volta,remoteNewer?localCodes.volta:remoteCodes.volta)},updatedAt:Math.max(Number(localData?.requisition?.updatedAt||0),Number(remoteData?.requisition?.updatedAt||0))};
+            ['passengerIds','requisitionRefs','ticketRefs'].forEach(key=>{merged[key]=Array.from(new Set([...(Array.isArray(localData?.[key])?localData[key]:[]),...(Array.isArray(remoteData?.[key])?remoteData[key]:[])].map(String).filter(Boolean)));});
+            const lRank=EH.Attendance?.stageRank?.(localData.stage)??-1,rRank=EH.Attendance?.stageRank?.(remoteData.stage)??-1;
+            merged.stage=rRank>lRank?remoteData.stage:lRank>rRank?localData.stage:(remoteNewer?remoteData.stage:localData.stage);
+            const statusRank=value=>value==='completed'?4:value==='canceled'?3:value==='archived'?2:1;
+            const lStatus=String(localData.status||'active'),rStatus=String(remoteData.status||'active');
+            merged.status=statusRank(rStatus)>statusRank(lStatus)?rStatus:statusRank(lStatus)>statusRank(rStatus)?lStatus:(remoteNewer?rStatus:lStatus);
+            merged.createdAt=Math.min(Number(localData.createdAt||Date.now()),Number(remoteData.createdAt||Date.now()));
+            merged.updatedAt=Math.max(Number(localTs||localData.updatedAt||0),Number(remoteTs||remoteData.updatedAt||0));
+            return EH.Attendance?.normalize?.(merged)||merged;
+        },
         mergeRecordData(type,localData={},remoteData={},localTs=0,remoteTs=0) {
             if(type==='reminder')return this.mergeReminderData(localData,remoteData,localTs,remoteTs);
             if(type==='requisition')return this.mergeRequisitionData(localData,remoteData,localTs,remoteTs);
+            if(type==='attendance')return this.mergeAttendanceData(localData,remoteData,localTs,remoteTs);
             if(type==='emission'){
                 if(EH.EmissionMemory?.merge)return EH.EmissionMemory.merge({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs});
             }
@@ -15431,6 +15827,7 @@
             if(cfg.emission){
                 (EH.PassengerMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('passenger',item.id||`cpf:${item.cpf}`,item,item.updatedAt||item.createdAt)));
                 (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
+                (EH.Attendance?.loadAll?.()||[]).forEach(item=>rows.push(this.envelope('attendance',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
             }
             if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;const quickUpdated=Number(EH.Storage.get('quickRoutes.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,queueGraceMinutes:EH.Config.OPERATION_QUEUE_GRACE_MINUTES,updatedAt:opUpdated},opUpdated));rows.push(this.envelope('config','quick-routes',{routes:EH.QuickRoutes?.load?.()||[],updatedAt:quickUpdated},quickUpdated));}
             return rows.filter(row=>row.recordId);
@@ -15455,6 +15852,8 @@
                     EH.PassengerMemory?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
                 } else if(env.recordType==='emission'){
                     EH.EmissionMemory?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
+                } else if(env.recordType==='attendance'){
+                    EH.Attendance?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
                 } else if(env.recordType==='config'&&this.config().settings){
                     if(env.recordId==='boarding-fees'&&Array.isArray(env.data?.fees))EH.BoardingFeeManager?.save?.(env.data.fees,{fromSync:true});
                     if(env.recordId==='operation'){
@@ -21173,10 +21572,10 @@
         routeBusy: false,
         contexts: {
             routes:['pesquisa'], seats:['reserva'], passenger:['reserva','passagens','requisicao'],
-            payment:['pagamento'], confirmation:['confirmacao'], tickets:['passagens'], reminders:['passagens'],
-            finance:['caixa','comissoes'], prefeitura:['requisicao'], operation:null
+            payment:['pagamento'], confirmation:['confirmacao'], tickets:['passagens'], reminders:[],
+            finance:['caixa','comissoes'], prefeitura:['requisicao'], operation:null, attendance:null
         },
-        titles: { routes:'Rotas', seats:'Poltronas', passenger:'Dados do passageiro', payment:'Pagamento e PIX', confirmation:'Resumo da compra', tickets:'Passagens emitidas', reminders:'Lembretes', finance:'Caixa', prefeitura:'Requisição da Prefeitura', operation:'Mapa do carro', menu:'Ferramentas' },
+        titles: { routes:'Rotas', seats:'Poltronas', passenger:'Dados do passageiro', payment:'Pagamento e PIX', confirmation:'Resumo da compra', tickets:'Passagens emitidas', reminders:'Lembretes', finance:'Caixa', prefeitura:'Requisição da Prefeitura', operation:'Mapa do carro', attendance:'Atendimento ativo', menu:'Ferramentas' },
         init() {
             if (this.settingsButton || !document.body) return;
             // A UI antiga continua montada para reutilizar captura/configuração, mas deixa
@@ -21188,7 +21587,7 @@
             GM_addStyle(`
                 #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
                 html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 34px));min-width:270px;min-height:190px;overflow:hidden;resize:both;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
-                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}
+                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}
                 @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:auto!important;height:min(72vh,560px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
@@ -21227,7 +21626,7 @@
             const context=EH.Attendance?.load?.()||{};const journey=context.journey||{};const data=EH.Parser?.parseReserva?.()||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',EH.SaleContext?.getActivePassenger?.()?.name||''),this.cell('Rota',data.origemDestino||[journey.origin,journey.destination].filter(Boolean).join(' → ')),this.cell('Serviço',data.servico||journey.service),this.cell('Horário',data.horaSaida||journey.departure),this.cell('Poltrona',data.poltronasSelecionadas?.join(', ')||journey.seat),this.cell('Disponíveis',data.poltronasLivres?.length?String(data.poltronasLivres.length):''),this.cell('Valor',data.valorTotalNum>0?EH.Utils.formatMoney(data.valorTotalNum):(journey.value?EH.Utils.formatMoney(journey.value):'')));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Gerar poltronas',()=>EH.UI?.captureAction?.('reserva'),'primary'),this.action('Copiar dados',async()=>{await EH.Clipboard.copyText(EH.Parser.formatReservaResumo(data));EH.Toast.success('Dados das poltronas copiados.');}));body.append(grid);this.nextAction(body,context);body.append(actions);
         },
         renderPayment(body) {
-            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const pix=EH.Payment?.parsePix?.();const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name),this.cell('Rota',[journey.origin,journey.destination].filter(Boolean).join(' → ')),this.cell('Data',journey.date),this.cell('Horário',journey.departure),this.cell('Poltrona',journey.seat),this.cell('Forma',payment.method),this.cell('Valor',payment.value?EH.Utils.formatMoney(payment.value):''),this.cell('Status PIX',pix?.validation?.valid?'Cobrança gerada — pagamento não confirmado':'Aguardando E-Pass'));const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid)actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));body.append(grid);this.nextAction(body,context);body.append(actions);
+            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const pix=EH.Payment?.parsePix?.();const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name),this.cell('Rota',[journey.origin,journey.destination].filter(Boolean).join(' → ')),this.cell('Data',journey.date),this.cell('Horário',journey.departure),this.cell('Poltrona',journey.seat),this.cell('Forma',payment.method),this.cell('Valor',payment.value?EH.Utils.formatMoney(payment.value):''),this.cell('Status PIX',pix?.validation?.valid?'Cobrança gerada — pagamento não confirmado':'Aguardando E-Pass'));const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid)actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));body.append(grid);this.nextAction(body,context);body.append(actions);EH.RequisitionManager?.renderContext?.(body,{page:'pagamento'});
         },
         renderConfirmation(body) {
             const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const cpf=EH.SaleContext?.maskCpfPublic?.(passenger.cpf||'')||'';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Nome',passenger.name),this.cell('CPF',cpf),this.cell('Origem',journey.origin),this.cell('Destino',journey.destination),this.cell('Serviço',journey.service),this.cell('Horário',journey.departure),this.cell('Poltrona',journey.seat),this.cell('Pagamento',payment.method),this.cell('Valor final',payment.value?EH.Utils.formatMoney(payment.value):(journey.value?EH.Utils.formatMoney(journey.value):'')));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Copiar resumo',()=>EH.UI?.copyCurrentSummary?.(),'primary'));body.append(grid);this.nextAction(body,context);body.append(actions);
@@ -21249,6 +21648,13 @@
             const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Ver detalhes',()=>EH.UI?.showFinanceModal?.('resumo'),'primary'),this.action('Atualizar dados',()=>EH.FinanceLedger?.syncFromCurrentPage?.()));
             body.append(grid,note,actions);
         },
+        renderAttendance(body) {
+            const context=EH.Attendance?.load?.()||{};const ids=new Set(context.passengerIds||[]);const memory=(EH.PassengerMemory?.load?.()||[]).find(item=>ids.has(item.id));const refs=new Set(context.requisitionRefs||[]);const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>refs.has(item.id));const passenger=memory?.name||request?.passengers?.[0]?.nome||'Novo atendimento';
+            const stageLabels={new:'Novo atendimento',document_uploaded:'Documento enviado',data_detected:'Dados detectados',data_confirmed:'Dados confirmados',route_defined:'Rota definida',requisition_documents_ready:'Documentos da requisição prontos',protocol_defined:'Protocolo definido',request_filled:'Solicitação preenchida',request_submitted:'Solicitação enviada',awaiting_codes:'Aguardando códigos',codes_captured:'Códigos capturados',outbound_sale_pending:'Venda da ida pendente',outbound_sale_prepared:'Venda da ida preparada',return_sale_pending:'Venda da volta pendente',return_sale_prepared:'Venda da volta preparada',payment_pending:'Pagamento pendente',emission_confirmed:'Emissão confirmada',tickets_lookup_pending:'Localização de bilhetes pendente',tickets_found:'Bilhetes encontrados',tickets_ready:'Bilhetes preparados',completed:'Concluído',canceled:'Cancelado',error:'Atendimento com erro'};
+            const codes=context.requisition?.codes||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger),this.cell('Etapa',stageLabels[context.stage]||context.stage),this.cell('Requisição',context.requisition?.logicalNumber||'—'),this.cell('Código da ida',codes.ida?'Disponível':'Pendente'),this.cell('Código da volta',codes.volta?'Disponível':'Pendente'),this.cell('Trecho atual',context.currentLeg==='volta'?'Volta':'Ida'));body.appendChild(grid);this.nextAction(body,context);
+            const actions=document.createElement('div');actions.className='eh-context-actions';const hasIda=Boolean(context.trips?.ida?.origin||codes.ida),hasVolta=Boolean(context.trips?.volta?.origin||codes.volta);if(hasIda)actions.append(this.action('Trabalhar na ida',()=>{EH.Attendance?.setCurrentLeg?.('ida');this.refresh('attendance');},context.currentLeg==='ida'?'primary':''));if(hasVolta)actions.append(this.action('Trabalhar na volta',()=>{EH.Attendance?.setCurrentLeg?.('volta');this.refresh('attendance');},context.currentLeg==='volta'?'primary':''));body.appendChild(actions);
+            const more=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Mais opções';const secondary=document.createElement('div');secondary.className='eh-context-actions';secondary.append(this.action('Arquivar como concluído',()=>{if(!window.confirm('Arquivar este atendimento como concluído?'))return;EH.Attendance?.clear?.({status:'completed'});this.close('attendance');}),this.action('Cancelar atendimento',()=>{if(!window.confirm('Cancelar este atendimento? Os registros já salvos não serão apagados.'))return;EH.Attendance?.clear?.({status:'canceled'});this.close('attendance');}));more.append(summary,secondary);body.appendChild(more);
+        },
         renderMenu(body) {
             const actions=document.createElement('div');actions.className='eh-context-actions';[['Rotas','routes'],['Poltronas','seats'],['Passageiro / Document AI','passenger'],['Pagamento / PIX','payment'],['Confirmação','confirmation'],['Lembretes','reminders'],['Passagens','tickets'],['Caixa / Financeiro','finance'],['Requisição da Prefeitura','prefeitura'],['Mapa / Fila','operation']].forEach(([label,id])=>actions.append(this.action(label,()=>this.open(id))));body.appendChild(actions);
         },
@@ -21258,11 +21664,19 @@
             if(id==='seats')return this.renderSeats(body);
             if(id==='payment')return this.renderPayment(body);
             if(id==='confirmation')return this.renderConfirmation(body);
-            if(id==='passenger'||id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent=id==='prefeitura'?'Use o documento oficial, confira os dados e prepare o anexo.':'A imagem e os campos permanecerão juntos durante a conferência.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action(id==='prefeitura'?'Abrir Requisição da Prefeitura':'Abrir dados e Document AI',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));body.append(note,actions);return;}
+            if(id==='passenger'){
+                const page=EH.Pages?.detect?.()||'desconhecida';const request=EH.RequisitionManager?.requestForContext?.();const activeCpf=EH.SaleContext?.getActivePassenger?.()?.cpf||'';const passenger=request?.passengers?.find(item=>item.cpf===EH.RequisitionManager.normalizeCpf(activeCpf))||(request?.passengers?.length===1?request.passengers[0]:null);const note=document.createElement('div');note.className='eh-context-empty';note.textContent=passenger?`${passenger.nome} • dados confirmados disponíveis`:'Envie ou confirme o documento uma única vez.';const actions=document.createElement('div');actions.className='eh-context-actions';
+                if(passenger&&EH.RequisitionManager?.findEmissionCards?.().length)actions.append(this.action('Preencher passageiro',()=>EH.RequisitionManager.usePassenger(request.id,passenger.cpf),'primary'));
+                else if(passenger&&page==='passagens')actions.append(this.action('Buscar bilhetes',()=>EH.SaleContext?.searchTicket?.({cpf:passenger.cpf,name:passenger.nome}),'primary'));
+                else actions.append(this.action('Abrir dados e Document AI',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));
+                body.append(note,actions);if(passenger){const more=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Mais opções';const extra=document.createElement('div');extra.className='eh-context-actions';extra.append(this.action('Conferir documento e dados',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();}));more.append(summary,extra);body.appendChild(more);}return;
+            }
+            if(id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent='Use o documento oficial, confira os dados e prepare o anexo.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir Requisição da Prefeitura',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));body.append(note,actions);EH.RequisitionManager?.renderContext?.(body,{page:'requisicao'});return;}
             if(id==='reminders'){const groups=EH.Reminders?.queueGroups?.()||{board:[],alight:[],review:[],history:[]};const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${groups.board.length} embarque(s) • ${groups.alight.length} desembarque(s) • ${groups.review.length} para conferência.`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir fila operacional',()=>EH.Reminders?.openModal?.('active'),'primary'),this.action('Ver pendências',()=>EH.Reminders?.openModal?.('review')));body.append(note,actions);return;}
-            if(id==='tickets'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Selecionar passagem',()=>EH.Tickets?.activateSelection?.(),'primary'),this.action('Abrir fila operacional',()=>EH.Reminders?.openModal?.('active')));body.appendChild(actions);return;}
+            if(id==='tickets'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Selecionar passagem',()=>EH.Tickets?.activateSelection?.(),'primary'));body.appendChild(actions);return;}
             if(id==='finance')return this.renderFinance(body);
             if(id==='operation'){EH.OperationCars?.renderContext?.(body);return;}
+            if(id==='attendance')return this.renderAttendance(body);
             this.renderMenu(body);
         },
         open(id) {
@@ -21285,15 +21699,16 @@
             EH.ContextualPanels.init();
             const root=document.createElement('nav');root.id='eh-context-shortcuts';root.setAttribute('aria-label','Atalhos contextuais do E-Pass Helper');document.body.appendChild(root);this.root=root;
             GM_addStyle(`
-                #eh-context-shortcuts{position:fixed;right:8px;top:142px;z-index:2147482950;display:flex;flex-direction:column;gap:var(--eh-context-gap,6px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}.eh-context-next-pill{box-sizing:border-box;max-width:230px;padding:7px 9px;border:1px solid #d7e2ec;border-radius:9px;background:rgba(248,251,254,.97);color:#526579;box-shadow:0 4px 12px rgba(31,48,70,.09);font:750 9px/1.3 Inter,"Segoe UI",Arial,sans-serif}
+                #eh-context-shortcuts{position:fixed;right:8px;top:142px;z-index:2147482950;display:flex;flex-direction:column;gap:var(--eh-context-gap,6px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}.eh-context-next-pill{pointer-events:auto;cursor:pointer;box-sizing:border-box;display:grid;gap:2px;max-width:230px;padding:7px 9px;border:1px solid #d7e2ec;border-radius:9px;background:rgba(248,251,254,.97);color:#526579;box-shadow:0 4px 12px rgba(31,48,70,.09);font:750 9px/1.3 Inter,"Segoe UI",Arial,sans-serif}.eh-context-next-pill:focus-visible{outline:2px solid rgba(59,130,246,.25)}.eh-context-next-pill strong{color:#2b425b;font-size:10px}.eh-context-next-pill small{font:inherit}
                 #eh-context-shortcuts button{pointer-events:auto;display:flex;align-items:center;gap:6px;min-width:var(--eh-context-min,38px);min-height:var(--eh-context-height,36px);padding:7px 9px;border:1px solid #cbd5e1;border-radius:10px;background:rgba(255,255,255,var(--eh-context-opacity,.96));color:#28415e;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:800 var(--eh-context-font,10px)/1.15 Inter,"Segoe UI",Arial,sans-serif;text-align:left}.eh-context-shortcut-icon{font-size:var(--eh-context-icon,15px)}#eh-context-shortcuts button:hover,#eh-context-shortcuts button:focus-visible{border-color:#6b9ed8;background:#fff;outline:2px solid rgba(59,130,246,.18)}
                 html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:auto}@media(max-width:760px){#eh-context-shortcuts{top:auto;right:8px;bottom:10px;flex-direction:row;max-width:calc(100vw - 16px);overflow-x:auto}html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:8px}}
             `);this.render(EH.Pages?.detect?.()||'desconhecida');
         },
         button(icon,label,title,action){const button=document.createElement('button');button.type='button';button.title=title;button.setAttribute('aria-label',title);const i=document.createElement('span');i.className='eh-context-shortcut-icon';i.textContent=icon;button.appendChild(i);if(EH.Config.CONTEXT_BUTTON_SHOW_TEXT){const text=document.createElement('span');text.textContent=label;button.appendChild(text);}button.addEventListener('click',event=>{event.stopPropagation();action();});return button;},
-        definitions(page){const open=id=>()=>EH.ContextualPanels.open(id);if(page==='pesquisa')return[['🧭','Rotas','Rotas e horários rápidos',open('routes')],['🗓️','Horários','Capturar horários encontrados',()=>EH.UI?.captureAction?.('pesquisa')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];if(page==='reserva')return[['💺','Poltronas','Poltronas e passageiro atual',open('seats')],['👤','Dados','Dados do passageiro e Document AI',open('passenger')]];if(page==='confirmacao')return[['✅','Conferir','Resumo e confirmação consciente',open('confirmation')]];if(page==='pagamento')return[['💳','Pagamento','Pagamento e PIX',open('payment')]];if(page==='passagens')return[['🎫','Bilhetes','Passagens emitidas',open('tickets')],['🔔','Lembretes','Lembretes de impressão',open('reminders')],['👤','Passageiro','Dados confirmados do passageiro',open('passenger')]];if(page==='caixa'||page==='comissoes')return[['📊','Financeiro','Caixa e financeiro',open('finance')]];if(page==='requisicao')return[['📄','Requisição','Requisição da Prefeitura',open('prefeitura')],['👤','Preencher','Preencher somente campos reais compatíveis',async()=>{try{await EH.PassengerIdentity?.fillSolicitation?.();EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.');}catch(error){EH.Toast?.warning?.(error.message||'A tela atual não possui campos compatíveis para preenchimento.');}}]];return[['☰','Ferramentas','Abrir menu compacto de ferramentas',open('menu')]];},
+        definitions(page){const open=id=>()=>EH.ContextualPanels.open(id);if(page==='pesquisa')return[['🧭','Rotas','Rotas e horários rápidos',open('routes')],['🗓️','Horários','Capturar horários encontrados',()=>EH.UI?.captureAction?.('pesquisa')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];if(page==='reserva')return[['💺','Poltronas','Poltronas e passageiro atual',open('seats')],['👤','Dados','Dados do passageiro e Document AI',open('passenger')]];if(page==='confirmacao')return[['✅','Conferir','Resumo e confirmação consciente',open('confirmation')]];if(page==='pagamento')return[['💳','Pagamento','Pagamento e código da requisição',open('payment')]];if(page==='passagens')return[['🎫','Bilhetes','Passagens emitidas',open('tickets')],['👤','Passageiro','Dados confirmados do passageiro',open('passenger')]];if(page==='caixa'||page==='comissoes')return[['📊','Financeiro','Caixa e financeiro',open('finance')]];if(page==='requisicao')return[['📄','Requisição','Requisição da Prefeitura e códigos',open('prefeitura')],['👤','Preencher','Preencher somente campos reais compatíveis',async()=>{try{await EH.PassengerIdentity?.fillSolicitation?.();EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.');}catch(error){EH.Toast?.warning?.(error.message||'A tela atual não possui campos compatíveis para preenchimento.');}}]];return[];},
         applyPreferences(){if(!this.root)return;const sizes={small:[32,32],normal:[38,36],large:[46,42],xlarge:[56,50]};const [min,height]=sizes[EH.Config.CONTEXT_BUTTON_SIZE]||sizes.normal;this.root.style.setProperty('--eh-context-min',`${min}px`);this.root.style.setProperty('--eh-context-height',`${height}px`);this.root.style.setProperty('--eh-context-font',`${EH.Config.CONTEXT_BUTTON_FONT_SIZE}px`);this.root.style.setProperty('--eh-context-icon',`${EH.Config.CONTEXT_BUTTON_ICON_SIZE}px`);this.root.style.setProperty('--eh-context-gap',`${EH.Config.CONTEXT_BUTTON_GAP}px`);this.root.style.setProperty('--eh-context-opacity',String(EH.Config.CONTEXT_BUTTON_OPACITY));},
-        render(page=EH.Pages?.detect?.()||'desconhecida'){if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);const context=EH.Attendance?.load?.();const next=document.createElement('div');next.className='eh-context-next-pill';next.setAttribute('role','status');next.textContent=`Próxima: ${context?.nextAction||EH.Attendance?.nextActionFor?.(page,context)||'conferir a etapa atual'}`;this.root.replaceChildren(next,...definitions.map(args=>this.button(...args)));this.root.hidden=!definitions.length;EH.ContextualPanels?.sync?.(page);}
+        activePassengerName(context){const active=EH.SaleContext?.getActivePassenger?.();if(active?.name)return active.name;const ids=new Set(context?.passengerIds||[]);const remembered=(EH.PassengerMemory?.load?.()||[]).find(item=>ids.has(item.id));if(remembered?.name)return remembered.name;const refs=new Set(context?.requisitionRefs||[]);const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>refs.has(item.id));return request?.passengers?.[0]?.nome||'';},
+        render(page=EH.Pages?.detect?.()||'desconhecida'){if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);const context=EH.Attendance?.load?.();const next=document.createElement('div');next.className='eh-context-next-pill';next.setAttribute('role','button');next.tabIndex=0;next.title='Abrir resumo do atendimento ativo';const openAttendance=()=>EH.ContextualPanels?.open?.('attendance');next.addEventListener('click',openAttendance);next.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openAttendance();}});const passenger=this.activePassengerName(context);if(passenger){const name=document.createElement('strong');name.textContent=passenger;next.appendChild(name);}const action=document.createElement('small');action.textContent=`Próxima: ${context?.nextAction||EH.Attendance?.nextActionFor?.(page,context)||'conferir a etapa atual'}`;next.appendChild(action);this.root.replaceChildren(next,...definitions.map(args=>this.button(...args)));this.root.hidden=false;EH.ContextualPanels?.sync?.(page);}
     };
 
     // ============================================================
