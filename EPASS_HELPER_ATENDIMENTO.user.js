@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.73.0
+// @version      5.74.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.73.0',
+        VERSION: '5.74.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 15,
+        STORAGE_SCHEMA_VERSION: 16,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -772,6 +772,29 @@
             EH.RequisitionManager?.loadStore?.();
         },
 
+        migrateRequestJourneyV16() {
+            // A v16 acrescenta a memória do rascunho por requestId e o estado
+            // de compartilhamento da emissão. Registros anteriores continuam
+            // intactos e não viram pendência de compartilhamento retroativa.
+            EH.RequestFlow?.migrateLegacy?.();
+            const key = 'emissionMemory.v1';
+            const rows = EH.Storage.get(key, []);
+            if (!Array.isArray(rows)) return;
+            let changed = false;
+            const next = rows.map(item => {
+                if (!item || typeof item !== 'object') return item;
+                if (item.shareStatus !== undefined) return item;
+                changed = true;
+                return {
+                    ...item,
+                    shareStatus: 'not_queued',
+                    sharedAt: Number(item.sharedAt || 0),
+                    shareFoundAt: Number(item.shareFoundAt || 0)
+                };
+            });
+            if (changed) EH.Storage.set(key, next);
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -789,6 +812,7 @@
             this.migrateOperationalQueueV13();
             this.migrateConfirmedEmissionV14();
             this.migrateAttendanceV15();
+            this.migrateRequestJourneyV16();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -5677,6 +5701,7 @@
             safe('Contexto de vendas', () => EH.SaleCpfs?.captureFromDom?.());
             safe('Contexto operacional', () => EH.Attendance?.onPageUpdate?.(page));
             safe('Requisições', () => EH.RequisitionManager?.scanDom?.());
+            if(page==='requisicao')safe('Memória da solicitação',()=>EH.RequestFlow?.captureFromDom?.({immediate:true,reason:'angular-render'}));
             safe('Requisição Prefeitura', () => EH.PrefeituraRequisition?.onPageUpdate?.(page));
             safe('Atendimento', () => EH.UI?.updateState?.(page));
             safe('Atalhos contextuais', () => EH.ContextualShortcuts?.render?.(page));
@@ -8783,24 +8808,28 @@
                 const found = await EH.Utils.waitFor(() => {
                     const cards = EH.Tickets?.findCards?.() || [];
                     if (!cards.length) return null;
+                    if(item?.emissionId&&EH.EmissionMemory?.matchTicketCards?.(item,cards)?.length)return cards;
                     const signature = EH.Tickets?.cardsSignature?.(cards) || '';
                     if (!signature) return null;
                     if (!beforeSignature || signature !== beforeSignature) return cards;
                     return null;
                 }, 9000, 220);
 
+                const matchedFound=item?.emissionId?EH.EmissionMemory?.matchTicketCards?.(item,found||[])||[]:(found||[]);
+                const acceptedFound=item?.emissionId?matchedFound:(found||[]);
                 const refreshed = this.loadSale();
                 const current = refreshed.passengers.find(p => p.cpf === cpf);
                 if (current) {
-                    current.ticketStatus = found?.length ? 'found' : 'pending';
+                    current.ticketStatus = acceptedFound.length ? 'found' : 'pending';
                     this.saveSale(refreshed);
                 }
 
-                if (found?.length) {
-                    EH.Toast.success(`${found.length} passagem(ns) encontrada(s). Selecione até 2 para capturar.`);
+                if (acceptedFound.length) {
+                    if(item?.emissionId)EH.EmissionMemory?.markShareStatus?.(item.emissionId,'found');
+                    EH.Toast.success(`${acceptedFound.length} passagem(ns) da emissão atual encontrada(s). Selecione até 2 para capturar.`);
                     EH.Tickets.activateSelection();
                 } else {
-                    EH.Toast.warning('A busca foi executada, mas nenhuma passagem nova apareceu dentro do tempo esperado.');
+                    EH.Toast.warning(found?.length?'A busca retornou passagens, mas nenhuma corresponde aos identificadores da emissão atual. Confira antes de abrir.':'A busca foi executada, mas nenhuma passagem nova apareceu dentro do tempo esperado.');
                 }
             } finally {
                 this.searchBusy = false;
@@ -9391,6 +9420,9 @@
         confirmIssuedTickets(items = []) {
             const candidates = EH.Reminders?.candidateItems?.(items) || [];
             if (!candidates.length) return 0;
+            // A mesma evidência real que confirma a emissão cria, de forma
+            // idempotente, a tarefa pós-emissão. Chegar ao Pagamento nunca basta.
+            EH.EmissionMemory?.captureItems?.(items);
             const context = this.load();
             const refs = new Set(context.ticketRefs || []);
             candidates.forEach(item => refs.add(String(item.ticketNumber ? `ticket:${item.ticketNumber}` : item.id || '')));
@@ -9399,7 +9431,7 @@
             const leg=context.currentLeg==='volta'?'volta':'ida';context.trips[leg]=this.normalizeTrip({...context.trips[leg],requestCodeStatus:context.trips[leg]?.requestCode?'used':context.trips[leg]?.requestCodeStatus,requestCodeUsedAt:context.trips[leg]?.requestCode?Date.now():context.trips[leg]?.requestCodeUsedAt});
             const hasReturn=Boolean(context.requisition?.codes?.volta||context.trips?.volta?.origin||context.trips?.volta?.destination);const returnIssued=Boolean(context.evidence?.returnIssue);
             if(leg==='ida'&&hasReturn&&candidates.length<2&&!returnIssued){context.evidence.idaIssue={...context.evidence.issue};context.currentLeg='volta';context.journey=this.normalizeTrip(context.trips.volta);context.status='active';context.stage=this.STAGES.RETURN_SALE_PENDING;context.nextAction='Emitir a volta sem substituir os dados e o bilhete da ida.';}
-            else{if(leg==='volta')context.evidence.returnIssue={...context.evidence.issue};context.status='active';context.stage=this.STAGES.TICKETS_FOUND;context.nextAction='Conferir, imprimir e acompanhar os bilhetes emitidos.';}
+            else{if(leg==='volta')context.evidence.returnIssue={...context.evidence.issue};context.status='active';context.stage=this.STAGES.TICKETS_FOUND;context.nextAction='Buscar o bilhete confirmado e compartilhar com o passageiro.';}
             this.save(context);
             EH.FinanceLedger?.recordIssuedTickets?.(candidates, context);
             candidates.forEach(item => EH.DomainEvents.emit('ticket:confirmed', { attendanceId:context.id, ticketNumber:item.ticketNumber || '' }, { idempotencyKey:item.ticketNumber || item.id }));
@@ -12459,6 +12491,9 @@
             return {
                 tipo: item.tipo === 'volta' ? 'volta' : 'ida',
                 mercadoCompleto: parsed.mercadoCompleto || this.cleanMarket(item.mercadoCompleto || item.mercado || ''),
+                mercadoId: EH.Utils.clean(item.mercadoId || item.marketId || ''),
+                mercadoValor: EH.Utils.clean(item.mercadoValor || item.marketValue || ''),
+                mercadoTexto: this.cleanMarket(item.mercadoTexto || item.marketText || parsed.mercadoCompleto || ''),
                 origem: EH.Utils.clean(item.origem || parsed.origem || ''),
                 destino: EH.Utils.clean(item.destino || parsed.destino || ''),
                 codigo: EH.Utils.clean(item.codigo || ''),
@@ -12473,26 +12508,45 @@
         },
 
         normalizePassenger(item = {}) {
+            const cpf = this.normalizeCpf(item.cpf);
+            const dataNascimento = this.normalizeBirthDate(item.dataNascimento || item.birthDate || '');
             return {
-                cpf: this.normalizeCpf(item.cpf),
-                nome: EH.PassengerIdentity?.formatPersonName?.(item.nome || item.name || '') || EH.Utils.clean(item.nome || item.name || ''),
-                dataNascimento: this.normalizeBirthDate(item.dataNascimento || item.birthDate || ''),
+                id: String(item.id || item.passengerId || (cpf ? `passenger:${cpf}` : `passenger:${Date.now()}-${Math.random().toString(36).slice(2,7)}`)),
+                cpf,
+                cpfRaw: EH.Utils.clean(item.cpfRaw || item.cpf || ''),
+                cpfValid: item.cpfValid !== undefined ? Boolean(item.cpfValid) : Boolean(cpf && EH.PassengerIdentity?.validCpf?.(cpf)),
+                nome: EH.Utils.clean(item.nome || item.name || '').replace(/\s+/g, ' '),
+                dataNascimento,
+                nascimentoValido: item.nascimentoValido !== undefined ? Boolean(item.nascimentoValido) : Boolean(EH.RequestFlow?.validBirth?.(dataNascimento)),
+                temVolta: Boolean(item.temVolta || (Array.isArray(item.legs) && item.legs.some(leg => leg?.tipo === 'volta'))),
+                mercadoIda: item.mercadoIda && typeof item.mercadoIda === 'object' ? { ...item.mercadoIda } : null,
+                mercadoVolta: item.mercadoVolta && typeof item.mercadoVolta === 'object' ? { ...item.mercadoVolta } : null,
+                manualFields: item.manualFields && typeof item.manualFields === 'object' ? { ...item.manualFields } : {},
                 legs: (Array.isArray(item.legs) ? item.legs : Array.isArray(item.mercados) ? item.mercados : [])
                     .map(leg => this.normalizeLeg(leg))
-                    .filter(leg => leg.mercadoCompleto || (leg.origem && leg.destino))
+                    .filter(leg => leg.mercadoCompleto || (leg.origem && leg.destino)),
+                updatedAt:Number(item.updatedAt||Date.now())
             };
         },
 
         normalizeRequest(item = {}) {
             const now = Date.now();
+            const id = item.id || item.requestId || `req-${now}-${Math.random().toString(36).slice(2, 8)}`;
             return {
-                id: item.id || `req-${now}-${Math.random().toString(36).slice(2, 8)}`,
+                id,
+                requestId: String(item.requestId || id),
+                stableRequestId: Boolean(item.stableRequestId),
                 numeroLogico: EH.Utils.clean(item.numeroLogico || ''),
                 protocolo: EH.Utils.clean(item.protocolo || ''),
                 prefeitura: EH.Utils.clean(item.prefeitura || ''),
                 secretaria: EH.Utils.clean(item.secretaria || ''),
                 contrato: EH.Utils.clean(item.contrato || ''),
                 status: EH.Utils.clean(item.status || 'pending'),
+                source: EH.Utils.clean(item.source || 'epass-request'),
+                manualFields: item.manualFields && typeof item.manualFields === 'object' ? { ...item.manualFields } : {},
+                active: item.active !== false,
+                canceledAt: Number(item.canceledAt || 0),
+                completedAt: Number(item.completedAt || 0),
                 passengers: (Array.isArray(item.passengers) ? item.passengers : [])
                     .map(passenger => this.normalizePassenger(passenger))
                     .filter(passenger => passenger.cpf.length === 11),
@@ -12536,6 +12590,10 @@
 
         requestsCompatible(left = {}, right = {}, { windowMs = 24 * 60 * 60 * 1000 } = {}) {
             const a=this.normalizeRequest(left),b=this.normalizeRequest(right);
+            // requestIds estáveis representam atendimentos diferentes, mesmo
+            // quando CPF e rota coincidem. A deduplicação antiga continua
+            // somente para registros legados sem essa garantia.
+            if(a.stableRequestId&&b.stableRequestId&&a.id!==b.id)return false;
             if(a.numeroLogico&&b.numeroLogico&&a.numeroLogico!==b.numeroLogico)return false;
             if(a.protocolo&&b.protocolo&&a.protocolo!==b.protocolo)return false;
             if(!a.numeroLogico&&!b.numeroLogico&&!a.protocolo&&!b.protocolo&&Math.abs(Number(a.createdAt||0)-Number(b.createdAt||0))>windowMs)return false;
@@ -12604,6 +12662,7 @@
             EH.Storage.set(this.STORAGE_KEY, { version: 1, updatedAt: Date.now(), items: normalized });
             normalized.forEach(request => {
                 (request.passengers || []).forEach(passenger => EH.PassengerMemory?.upsert?.({ cpf:passenger.cpf, name:passenger.nome, birthDate:passenger.dataNascimento, updatedAt:request.updatedAt }, { fromSync:Boolean(EH.Sync?.applyingRemote) }));
+                if(EH.Sync?.applyingRemote)EH.RequestFlow?.linkRequest?.(request,{evidence:'synced-requisition',fromSync:true});
                 if (!EH.Sync?.applyingRemote) {
                     const previous = previousById.get(String(request.id || ''));
                     const changed = !previous || Number(request.updatedAt || 0) > Number(previous.updatedAt || 0) || JSON.stringify(previous) !== JSON.stringify(request);
@@ -12661,7 +12720,8 @@
             [...(previous||[]),...(incoming||[])].forEach(passenger=>{
                 const next=this.normalizePassenger(passenger);if(next.cpf.length!==11)return;
                 const old=byCpf.get(next.cpf);if(!old){byCpf.set(next.cpf,next);return;}
-                byCpf.set(next.cpf,this.normalizePassenger({...old,...next,nome:next.nome||old.nome,dataNascimento:next.dataNascimento||old.dataNascimento,legs:this.mergeLegCollections(old.legs,next.legs)}));
+                const legs=next.temVolta===false?next.legs.filter(leg=>leg.tipo!=='volta'):this.mergeLegCollections(old.legs,next.legs);
+                byCpf.set(next.cpf,this.normalizePassenger({...old,...next,nome:next.nome||old.nome,dataNascimento:next.dataNascimento||old.dataNascimento,legs,updatedAt:Math.max(Number(old.updatedAt||0),Number(next.updatedAt||0))}));
             });
             return Array.from(byCpf.values());
         },
@@ -12678,7 +12738,7 @@
                 if(compatible.length===1)existing=compatible[0];
                 else if(compatible.length>1){const refs=new Set(EH.Attendance?.load?.()?.requisitionRefs||[]);existing=compatible.find(item=>refs.has(item.id))||null;}
             }
-            if(!existing)existing=items.find(item=>!item.numeroLogico&&item.status!=='approved'&&this.requestFingerprint(item)===fingerprint&&(now-Number(item.updatedAt||0))<=(2*60*1000));
+            if(!existing&&!next.stableRequestId)existing=items.find(item=>!item.stableRequestId&&!item.numeroLogico&&item.status!=='approved'&&this.requestFingerprint(item)===fingerprint&&(now-Number(item.updatedAt||0))<=(2*60*1000));
             if (existing) {
                 existing.prefeitura = next.prefeitura || existing.prefeitura;
                 existing.secretaria = next.secretaria || existing.secretaria;
@@ -12691,6 +12751,7 @@
                 existing.passengers = this.mergePassengerData(existing.passengers, next.passengers);
                 existing.updatedAt = now;
                 this.saveStore(items);
+                EH.RequestFlow?.linkRequest?.(existing, { evidence:'request-upsert' });
                 EH.Attendance?.linkRequisition?.(existing);
                 return existing;
             }
@@ -12698,61 +12759,16 @@
             next.updatedAt = now;
             items.unshift(next);
             this.saveStore(items);
+            EH.RequestFlow?.linkRequest?.(next, { evidence:'request-created' });
             EH.Attendance?.linkRequisition?.(next);
             return next;
         },
 
         captureRequestForm() {
-            const root = EH.Utils.first(EH.Selectors.REQUISITION_FORM_ROOT);
-            if (!root) return null;
-            const form = root.querySelector('form');
-            const info = root.querySelector('[formarrayname="info"]');
-            if (!form || !info) return null;
-
-            const prefeitura = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_prefeitura"]'));
-            const secretaria = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_secretaria"]'));
-            const contrato = this.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_contrato"]'));
-            const protocolo = EH.Utils.clean(root.querySelector('input[formcontrolname="idRequisicao"]')?.value || '');
-            const passengers = [];
-            const cpfInputs = Array.from(info.querySelectorAll('input[formcontrolname="cpf"][id^="cpf_"]'));
-
-            cpfInputs.forEach((cpfInput, position) => {
-                const indexMatch = String(cpfInput.id || '').match(/_(\d+)$/);
-                const index = indexMatch ? indexMatch[1] : String(position);
-                const cpf = this.normalizeCpf(cpfInput.value);
-                if (cpf.length !== 11) return;
-                const memory = EH.PassengerMemory?.findByCpf?.(cpf) || null;
-                const nome = memory?.confirmed ? EH.Utils.clean(memory.name) : EH.Utils.clean(root.querySelector(`#nome_${index}[formcontrolname="nome"]`)?.value || '');
-                const dataNascimento = memory?.confirmed
-                    ? this.normalizeBirthDate(memory.birthDate)
-                    : this.normalizeBirthDate(root.querySelector(`#data_nascimento_${index}[formcontrolname="data_nascimento"]`)?.value || '');
-                const idaEl = root.querySelector(`#id_mercado_ida_${index}[formcontrolname="id_mercado_ida"]`);
-                const voltaEl = root.querySelector(`#id_mercado_volta_${index}[formcontrolname="id_mercado_volta"]`);
-                const switchEl = root.querySelector(`#tem_volta${index}[formcontrolname="tem_volta"]`);
-                const temVolta = String(switchEl?.querySelector('button[role="switch"]')?.getAttribute('aria-checked') || '').toLowerCase() === 'true';
-                const legs = [];
-                const idaText = this.selectedNgValue(idaEl);
-                if (idaText) legs.push(this.normalizeLeg({ tipo: 'ida', mercadoCompleto: idaText }));
-                const voltaText = this.selectedNgValue(voltaEl);
-                if (temVolta && voltaText) legs.push(this.normalizeLeg({ tipo: 'volta', mercadoCompleto: voltaText }));
-                passengers.push({ cpf, nome, dataNascimento, legs });
-            });
-
-            if (!passengers.length) return null;
-            const saved = this.upsertRequest({ prefeitura, secretaria, contrato, protocolo, status: 'pending', passengers });
-            passengers.forEach(passenger => {
-                const memory = EH.PassengerMemory?.findByCpf?.(passenger.cpf) || null;
-                EH.SaleContext?.upsertPassenger?.({
-                    cpf: passenger.cpf,
-                    name: memory?.confirmed ? memory.name : passenger.nome,
-                    birthDate: memory?.confirmed ? memory.birthDate : passenger.dataNascimento,
-                    confirmed: Boolean(memory?.confirmed),
-                    confirmedAt: memory?.confirmedAt,
-                    source: memory?.source,
-                    fieldMeta: memory?.fieldMeta
-                });
-            });
-            if (saved) EH.Toast.success(`Requisição salva: ${passengers.length} passageiro${passengers.length === 1 ? '' : 's'}.`);
+            const draft = EH.RequestFlow?.captureFromDom?.({ immediate:true, reason:'submit-intent' });
+            if (!draft) return null;
+            const saved = EH.RequestFlow?.promote?.(draft.id, { submittedIntent:true }) || null;
+            if (saved) EH.Toast.success(`Dados da solicitação preservados para ${saved.passengers.length} passageiro${saved.passengers.length === 1 ? '' : 's'}. O envio ainda depende da confirmação do E-Pass.`);
             return saved;
         },
 
@@ -12816,7 +12832,13 @@
                     changed += 1;
                 }
             });
-            if (changed){this.saveStore(items);items.filter(item=>item.numeroLogico).forEach(item=>EH.Attendance?.linkRequisition?.(item));}
+            if (changed){
+                this.saveStore(items);
+                items.filter(item=>item.numeroLogico).forEach(item=>{
+                    EH.RequestFlow?.linkRequest?.(item, { evidence:'real-request-card' });
+                    EH.Attendance?.linkRequisition?.(item);
+                });
+            }
             return changed;
         },
 
@@ -12928,10 +12950,10 @@
             });
             if (updated||statusChanged) {
                 this.saveStore(items);
-                items.filter(request=>linked.has(request.id)).forEach(request=>EH.Attendance?.linkRequisition?.(request));
+                items.filter(request=>linked.has(request.id)).forEach(request=>{EH.RequestFlow?.linkRequest?.(request,{evidence:'real-code-modal'});EH.Attendance?.linkRequisition?.(request);});
                 if(updated)EH.Toast.success(`${updated} código${updated === 1 ? '' : 's'} de requisição associado${updated === 1 ? '' : 's'} ao trecho correto.`);
             }
-            else items.filter(request=>linked.has(request.id)).forEach(request=>EH.Attendance?.linkRequisition?.(request));
+            else items.filter(request=>linked.has(request.id)).forEach(request=>{EH.RequestFlow?.linkRequest?.(request,{evidence:'real-code-modal'});EH.Attendance?.linkRequisition?.(request);});
             if (ambiguous) EH.Toast.warning(`${ambiguous} código${ambiguous===1?' foi preservado':'s foram preservados'} para conferência. Abra Requisição para associar manualmente sem perder os dados.`);
             return updated;
         },
@@ -12950,14 +12972,19 @@
             const legs=passengers[0].legs.filter(leg=>(tipo==='volta'?'volta':'ida')===leg.tipo);if(legs.length!==1)throw new Error('O trecho não pôde ser identificado com segurança.');
             const leg=legs[0];leg.codigo=code;leg.codigoOrigem='manual-confirmed';leg.codigoConfirmadoManualmente=true;leg.codigoConfirmadoAt=Date.now();leg.updatedAt=Date.now();request.updatedAt=Date.now();
             const all=request.passengers.flatMap(item=>item.legs||[]);if(all.length&&all.every(item=>item.codigo))request.status='approved';
-            this.saveStore(rows);EH.Attendance?.linkRequisition?.(request);return{request,passenger:passengers[0],leg};
+            this.saveStore(rows);EH.RequestFlow?.linkRequest?.(request,{evidence:'manual-code-confirmed'});EH.Attendance?.linkRequisition?.(request);return{request,passenger:passengers[0],leg};
         },
 
         requestForContext() {
-            const rows=this.loadStore();if(!rows.length)return null;const attendance=EH.Attendance?.load?.();
-            const linked=(attendance?.requisitionRefs||[]).map(id=>rows.find(item=>item.id===id)).filter(Boolean).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
-            if(linked.length)return linked[0];const active=this.getActiveEmission();if(active?.requestId){const request=rows.find(item=>item.id===active.requestId);if(request)return request;}
-            if(EH.Pages?.detect?.()==='requisicao')return rows.slice().sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))[0]||null;
+            const rows=this.loadStore();
+            const selected=EH.RequestFlow?.requestForContext?.(rows);
+            if(selected)return this.normalizeRequest(selected);
+            if(!rows.length)return null;
+            const active=this.getActiveEmission();if(active?.requestId){const request=rows.find(item=>item.id===active.requestId);if(request)return request;}
+            const attendance=EH.Attendance?.load?.();
+            const linked=(attendance?.requisitionRefs||[]).map(id=>rows.find(item=>item.id===id)).filter(Boolean);
+            if(linked.length===1)return linked[0];
+            if(EH.Pages?.detect?.()==='requisicao'&&rows.length===1)return rows[0];
             return null;
         },
 
@@ -12967,12 +12994,20 @@
         },
 
         renderContext(body,{page=EH.Pages?.detect?.()||'desconhecida'}={}) {
-            const request=this.requestForContext();const pending=this.pendingCodeCaptures().filter(item=>item.status==='pending');
-            if(!request&&!pending.length)return null;
+            const request=this.requestForContext();const pending=page==='requisicao'?this.pendingCodeCaptures().filter(item=>item.status==='pending'):[];
+            const selectedPassenger=request?(request.passengers.find(item=>item.cpf===this.normalizeCpf(EH.SaleContext?.getActivePassenger?.()?.cpf||''))||(request.passengers.length===1?request.passengers[0]:null)):null;
+            const hasCode=Boolean(selectedPassenger?.legs?.some(leg=>leg.codigo));
+            if(page==='pagamento'&&!hasCode)return null;
+            if(!request&&!pending.length){
+                const activeDraft=EH.RequestFlow?.current?.();if(!activeDraft)return EH.RequestFlow?.renderSelector?.(body,{page})||null;
+                const draftWrap=document.createElement('section');draftWrap.className='eh-requisition-context';EH.RequestFlow?.renderSelector?.(draftWrap,{page});const draftHeading=document.createElement('strong');draftHeading.textContent='Solicitação em preenchimento';draftWrap.appendChild(draftHeading);EH.RequestFlow?.renderSummary?.(draftWrap);body.appendChild(draftWrap);return draftWrap;
+            }
             const wrap=document.createElement('section');wrap.className='eh-requisition-context';
+            EH.RequestFlow?.renderSelector?.(wrap,{page});
             const heading=document.createElement('strong');heading.textContent=request?`Requisição${request.numeroLogico?` • ${request.numeroLogico}`:''}`:'Códigos aguardando associação';wrap.appendChild(heading);
+            if(page==='requisicao')EH.RequestFlow?.renderSummary?.(wrap);
             if(request){
-                const activeCpf=EH.SaleContext?.getActivePassenger?.()?.cpf||'';const passenger=request.passengers.find(item=>item.cpf===this.normalizeCpf(activeCpf))||(request.passengers.length===1?request.passengers[0]:null);
+                const passenger=selectedPassenger;
                 if(passenger){
                     const grid=document.createElement('div');grid.className='eh-context-data';
                     ['ida','volta'].forEach(tipo=>{const leg=passenger.legs.find(item=>item.tipo===tipo);if(!leg)return;const cell=document.createElement('div');const label=document.createElement('span');label.textContent=tipo==='ida'?'Código da ida':'Código da volta';const value=document.createElement('b');value.textContent=leg.codigo?`${leg.codigo} • disponível`:'Aguardando código';cell.append(label,value);grid.appendChild(cell);});wrap.appendChild(grid);
@@ -13071,6 +13106,7 @@
             const request = this.loadStore().find(item => item.id === requestId);
             const passenger = request?.passengers?.find(item => item.cpf === this.normalizeCpf(cpf));
             if (!request || !passenger) return EH.Toast.warning('Passageiro da requisição não encontrado.');
+            if(!EH.RequestFlow?.validPassenger?.(passenger))return EH.Toast.warning('Confirme Nome, CPF válido e Data de nascimento antes de preencher a venda.');
 
             const initialCard = this.chooseEmissionCard(passenger.cpf);
             if (!initialCard) return EH.Toast.warning('Abra os dados do passageiro ou deixe um cadastro vazio para usar esta requisição.');
@@ -13079,6 +13115,8 @@
             // Nome e nascimento só são tratados depois que a plataforma retorna o passageiro.
             const cpfInput = initialCard.querySelector('input[formcontrolname="cpf"]');
             if (!cpfInput) return EH.Toast.warning('Não encontrei o campo CPF nos dados do passageiro.');
+            const existingCpf=this.normalizeCpf(cpfInput.value||'');
+            if(existingCpf.length===11&&existingCpf!==passenger.cpf&&!window.confirm('Os dados abertos pertencem a outro CPF. Substituir pelo passageiro da solicitação selecionada?'))return false;
 
             cpfInput.focus();
             EH.SaleContext.setNativeValue(cpfInput, EH.SaleContext.maskCpf(passenger.cpf));
@@ -13178,7 +13216,10 @@
             EH.SaleContext.upsertPassenger({
                 cpf: passenger.cpf,
                 name: passenger.nome || EH.Utils.clean(nameInput.value || ''),
-                birthDate: passenger.dataNascimento || (birthInput ? this.normalizeBirthDate(birthInput.value) : '')
+                birthDate: passenger.dataNascimento || (birthInput ? this.normalizeBirthDate(birthInput.value) : ''),
+                confirmed:true,
+                confirmedAt:Date.now(),
+                source:'requisition-memory'
             });
             EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.() || 'desconhecida');
 
@@ -13342,10 +13383,6 @@
                 const button = event.target?.closest?.('button');
                 if (!button) return;
                 const label = EH.Utils.normalize(button.textContent || button.title || '');
-                if (button.closest('app-solicitacao-requisicoes-prefeitura') && button.type === 'submit' && /ENVIAR|SOLICITAR|CONFIRMAR/.test(label)) {
-                    this.captureRequestForm();
-                    return;
-                }
                 if (button.closest('app-solicitacoes') && label.includes('CODIGO DA REQUISICAO')) {
                     this.pendingCodeContext = this.findCodeButtonContext(button);
                     this.pendingNumeroLogico = this.pendingCodeContext?.numeroLogico || '';
@@ -13359,6 +13396,263 @@
             EH.Runtime.on('requisition-click', document, 'click', beforeClick, true);
             EH.Runtime.on('requisition-submit', document, 'submit', beforeSubmit, true);
             this.scanDom();
+        }
+    };
+
+    // ============================================================
+    // MEMÓRIA CONTÍNUA DA SOLICITAÇÃO — v5.74
+    // Um requestId nasce no primeiro campo e acompanha o atendimento até a
+    // emissão. O rascunho aceita dados incompletos; a requisição operacional
+    // só é promovida depois que identidade e rota foram realmente validadas.
+    // ============================================================
+    EH.RequestFlow = {
+        KEY:'requisitionDrafts.v1',
+        ACTIVE_KEY:'requestFlow.activeRequestId.v1',
+        VERSION:1,
+        MAX_RECORDS:200,
+        DEBOUNCE_MS:380,
+        started:false,
+        captureTimer:0,
+        lastInvalidCpfNotice:'',
+
+        makeId(){return `request-${Date.now()}-${Math.random().toString(36).slice(2,9)}`;},
+        terminal(status){return new Set(['canceled','cancelled','completed','concluded','shared','archived']).has(String(status||'').toLowerCase());},
+        statusRank(status){const value=String(status||'draft').toLowerCase();const order=['draft','incomplete','ready','prepared','submitted','awaiting_codes','analyzed','approved','sale','issued','tickets_pending','tickets_found','shared','completed'];if(value==='canceled'||value==='cancelled')return order.length+1;return Math.max(0,order.indexOf(value));},
+        validBirth(value){const parsed=EH.PassengerIdentity?.parseDate?.(value);return Boolean(parsed?.valid&&parsed?.plausible);},
+        validPassenger(passenger={}){
+            const cpf=EH.RequisitionManager?.normalizeCpf?.(passenger.cpf||'')||'';
+            const nome=EH.Utils.clean(passenger.nome||passenger.name||'').replace(/\s+/g,' ');
+            const birth=EH.RequisitionManager?.normalizeBirthDate?.(passenger.dataNascimento||passenger.birthDate||'')||'';
+            return Boolean(cpf.length===11&&EH.PassengerIdentity?.validCpf?.(cpf)&&nome&&this.validBirth(birth));
+        },
+        normalizeMarket(value={}){
+            const raw=value&&typeof value==='object'?value:{text:String(value||'')};
+            const text=EH.RequisitionManager?.cleanMarket?.(raw.text||raw.label||raw.mercadoCompleto||'')||'';
+            const parsed=EH.RequisitionManager?.parseMarket?.(text)||{origem:'',destino:''};
+            return {
+                id:EH.Utils.clean(raw.id||raw.internalId||''),
+                value:EH.Utils.clean(raw.value||raw.internalValue||''),
+                text,
+                origem:EH.Utils.clean(raw.origem||parsed.origem||''),
+                destino:EH.Utils.clean(raw.destino||parsed.destino||''),
+                valueSource:EH.Utils.clean(raw.valueSource||'')
+            };
+        },
+        normalizePassenger(item={},index=0,requestId=''){
+            const cpfRaw=EH.Utils.clean(item.cpfRaw||item.cpf||'');
+            const cpf=EH.RequisitionManager?.normalizeCpf?.(cpfRaw)||'';
+            const nome=EH.Utils.clean(item.nome||item.name||'').replace(/\s+/g,' ');
+            const dataNascimento=EH.RequisitionManager?.normalizeBirthDate?.(item.dataNascimento||item.birthDate||'')||'';
+            const mercadoIda=this.normalizeMarket(item.mercadoIda||item.ida||{});
+            const mercadoVolta=this.normalizeMarket(item.mercadoVolta||item.volta||{});
+            const temVolta=Boolean(item.temVolta);
+            const trechoIda=mercadoIda.origem&&mercadoIda.destino?{origem:mercadoIda.origem,destino:mercadoIda.destino,mercadoId:mercadoIda.id,mercadoValor:mercadoIda.value,mercadoTexto:mercadoIda.text}:null;
+            const trechoVolta=temVolta&&mercadoVolta.origem&&mercadoVolta.destino?{origem:mercadoVolta.origem,destino:mercadoVolta.destino,mercadoId:mercadoVolta.id,mercadoValor:mercadoVolta.value,mercadoTexto:mercadoVolta.text}:null;
+            return {
+                id:String(item.id||item.passengerId||`${requestId||'request'}:passenger:${index}`),index:Number(item.index??index),
+                cpfRaw,cpf,cpfValid:item.cpfValid!==undefined?Boolean(item.cpfValid):Boolean(EH.PassengerIdentity?.validCpf?.(cpf)),
+                nome,dataNascimento,nascimentoValido:item.nascimentoValido!==undefined?Boolean(item.nascimentoValido):this.validBirth(dataNascimento),
+                mercadoIda,temVolta,mercadoVolta,trechoIda,trechoVolta,
+                manualFields:item.manualFields&&typeof item.manualFields==='object'?{...item.manualFields}:{},
+                updatedAt:Number(item.updatedAt||Date.now())
+            };
+        },
+        normalize(item={}){
+            const now=Date.now(),id=String(item.id||item.requestId||this.makeId());
+            const passengers=(Array.isArray(item.passengers)?item.passengers:[]).map((passenger,index)=>this.normalizePassenger(passenger,index,id));
+            return {
+                version:this.VERSION,id,requestId:id,requisitionId:String(item.requisitionId||''),attendanceId:String(item.attendanceId||''),
+                prefeitura:EH.Utils.clean(item.prefeitura||''),secretaria:EH.Utils.clean(item.secretaria||''),contrato:EH.Utils.clean(item.contrato||''),
+                protocolo:EH.Utils.clean(item.protocolo||''),numeroLogico:EH.Utils.clean(item.numeroLogico||''),
+                codes:{ida:EH.Utils.clean(item.codes?.ida||item.codigoIda||''),volta:EH.Utils.clean(item.codes?.volta||item.codigoVolta||'')},
+                status:String(item.status||'draft').toLowerCase(),active:item.active!==false,passengers,
+                source:EH.Utils.clean(item.source||'real-requisition-form'),
+                manualFields:item.manualFields&&typeof item.manualFields==='object'?{...item.manualFields}:{},
+                submittedIntentAt:Number(item.submittedIntentAt||0),submittedAt:Number(item.submittedAt||0),promotedAt:Number(item.promotedAt||0),
+                canceledAt:Number(item.canceledAt||0),completedAt:Number(item.completedAt||0),
+                createdAt:Number(item.createdAt||now),updatedAt:Number(item.updatedAt||now),deviceId:String(item.deviceId||EH.Device.id()),
+                syncState:EH.Utils.clean(item.syncState||'local')||'local'
+            };
+        },
+        loadAll(){
+            const raw=EH.Storage.get(this.KEY,{version:this.VERSION,items:[]});
+            return (Array.isArray(raw?.items)?raw.items:[]).map(item=>this.normalize(item)).filter(item=>item.id).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+        },
+        same(left={},right={}){const clean=value=>{const copy=this.normalize(value);delete copy.updatedAt;delete copy.deviceId;delete copy.syncState;return copy;};try{return JSON.stringify(clean(left))===JSON.stringify(clean(right));}catch(_error){return false;}},
+        saveAll(rows,{changedIds=[],fromSync=false}={}){
+            const unique=new Map();(Array.isArray(rows)?rows:[]).forEach(row=>{const next=this.normalize(row),old=unique.get(next.id);if(!old||Number(next.updatedAt||0)>=Number(old.updatedAt||0))unique.set(next.id,next);});
+            const items=Array.from(unique.values()).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0,this.MAX_RECORDS);
+            EH.Storage.set(this.KEY,{version:this.VERSION,updatedAt:Date.now(),items});
+            if(!fromSync)Array.from(new Set(changedIds.map(String).filter(Boolean))).forEach(id=>EH.Sync?.markPendingRecord?.('request-draft',id));
+            EH.ContextualPanels?.refresh?.('routes');EH.ContextualPanels?.refresh?.('passenger');EH.ContextualPanels?.refresh?.('prefeitura');EH.ContextualPanels?.refresh?.('payment');
+            EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');
+            return items;
+        },
+        upsert(raw,{fromSync=false}={}){
+            let next=this.normalize(raw);const rows=this.loadAll(),index=rows.findIndex(item=>item.id===next.id),previous=index>=0?rows[index]:null;
+            if(previous){next=this.merge(previous,next);if(!fromSync&&this.same(previous,next))return previous;}
+            if(!fromSync){next.updatedAt=Date.now();next.deviceId=EH.Device.id();next.syncState=EH.Sync?.configured?.()?'pending':'local';}else next.syncState='synced';
+            if(index>=0)rows[index]=next;else rows.unshift(next);this.saveAll(rows,{changedIds:fromSync?[]:[next.id],fromSync});return next;
+        },
+        merge(local={},remote={}){
+            const a=this.normalize(local),b=this.normalize(remote),remoteNewer=Number(b.updatedAt||0)>=Number(a.updatedAt||0),preferred=remoteNewer?b:a,secondary=remoteNewer?a:b;
+            const merged=EH.Sync?.smartMerge?.(secondary,preferred)||{...secondary,...preferred};
+            const rankA=this.statusRank(a.status),rankB=this.statusRank(b.status);merged.status=rankB>rankA?b.status:rankA>rankB?a.status:preferred.status;
+            merged.id=a.id||b.id;merged.requestId=merged.id;merged.active=this.terminal(merged.status)?false:Boolean(preferred.active||secondary.active);
+            merged.createdAt=Math.min(Number(a.createdAt||Date.now()),Number(b.createdAt||Date.now()));merged.updatedAt=Math.max(Number(a.updatedAt||0),Number(b.updatedAt||0));
+            return this.normalize(merged);
+        },
+        applyRemote(raw={}){return this.upsert(raw,{fromSync:true});},
+        migrateLegacy(){
+            const current=EH.Storage.get(this.KEY,null);if(current&&Array.isArray(current.items))return false;
+            const requests=EH.RequisitionManager?.loadStore?.()||[];
+            const items=requests.map(request=>this.fromRequest(request,{source:'migrated-requisition'}));
+            EH.Storage.set(this.KEY,{version:this.VERSION,updatedAt:Date.now(),items});
+            const attendance=EH.Attendance?.load?.();const linked=(attendance?.requisitionRefs||[]).find(id=>items.some(item=>item.id===id));if(linked)EH.Storage.set(this.ACTIVE_KEY,linked);
+            return Boolean(items.length);
+        },
+        fromRequest(request={},extra={}){
+            const normalized=EH.RequisitionManager?.normalizeRequest?.(request)||request;
+            const allLegs=(normalized.passengers||[]).flatMap(passenger=>passenger.legs||[]),idaCode=allLegs.find(leg=>leg.tipo!=='volta'&&leg.codigo)?.codigo||'',voltaCode=allLegs.find(leg=>leg.tipo==='volta'&&leg.codigo)?.codigo||'';
+            return this.normalize({
+                ...extra,id:normalized.id,requisitionId:normalized.id,numeroLogico:normalized.numeroLogico,protocolo:normalized.protocolo,
+                codes:{ida:idaCode||extra.codes?.ida||'',volta:voltaCode||extra.codes?.volta||''},
+                prefeitura:normalized.prefeitura,secretaria:normalized.secretaria,contrato:normalized.contrato,status:normalized.status||'prepared',active:normalized.active!==false,
+                passengers:(normalized.passengers||[]).map((passenger,index)=>({
+                    ...passenger,id:passenger.id||`${normalized.id}:passenger:${index}`,cpfRaw:passenger.cpf,
+                    mercadoIda:passenger.mercadoIda||this.marketFromLeg((passenger.legs||[]).find(leg=>leg.tipo!=='volta')),
+                    mercadoVolta:passenger.mercadoVolta||this.marketFromLeg((passenger.legs||[]).find(leg=>leg.tipo==='volta')),
+                    temVolta:passenger.temVolta!==undefined?Boolean(passenger.temVolta):Boolean((passenger.legs||[]).some(leg=>leg.tipo==='volta'))
+                })),createdAt:normalized.createdAt,updatedAt:normalized.updatedAt
+            });
+        },
+        marketFromLeg(leg={}){return this.normalizeMarket({id:leg.mercadoId,value:leg.mercadoValor,text:leg.mercadoTexto||leg.mercadoCompleto,origem:leg.origem,destino:leg.destino});},
+        candidates(rows=EH.RequisitionManager?.loadStore?.()||[]){
+            const map=new Map();this.loadAll().filter(item=>item.active&&!this.terminal(item.status)).forEach(item=>map.set(item.id,item));
+            (rows||[]).map(request=>this.fromRequest(request)).filter(item=>item.active&&!this.terminal(item.status)).forEach(item=>{const old=map.get(item.id);map.set(item.id,old?this.merge(old,item):item);});
+            return Array.from(map.values()).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+        },
+        activeId({allowSingle=true}={}){
+            const candidates=this.candidates(),stored=String(EH.Storage.get(this.ACTIVE_KEY,'')||'');
+            if(stored&&candidates.some(item=>item.id===stored))return stored;
+            if(allowSingle){
+                const attendance=EH.Attendance?.load?.()||{},refs=new Set(attendance.requisitionRefs||[]),activeCpf=EH.RequisitionManager?.normalizeCpf?.(EH.SaleContext?.getActivePassenger?.()?.cpf||'')||'',activeEmission=EH.RequisitionManager?.getActiveEmission?.();
+                let compatible=candidates.filter(item=>refs.has(item.id)||Boolean(activeEmission?.requestId&&activeEmission.requestId===item.id)||Boolean(activeCpf&&item.passengers?.some(passenger=>passenger.cpf===activeCpf)));
+                if(!compatible.length&&EH.Pages?.detect?.()==='requisicao')compatible=candidates;
+                if(compatible.length===1){EH.Storage.set(this.ACTIVE_KEY,compatible[0].id);return compatible[0].id;}
+            }
+            return '';
+        },
+        current(){const id=this.activeId({allowSingle:true});return id?this.loadAll().find(item=>item.id===id)||this.candidates().find(item=>item.id===id)||null:null;},
+        select(id,{ensureAttendance=true}={}){
+            const candidate=this.candidates().find(item=>item.id===String(id||''));if(!candidate)return null;
+            EH.Storage.set(this.ACTIVE_KEY,candidate.id);if(ensureAttendance)this.ensureAttendance(candidate);
+            EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');['routes','passenger','payment','prefeitura','tickets'].forEach(panel=>EH.ContextualPanels?.refresh?.(panel));return candidate;
+        },
+        ensureAttendance(record={}){
+            if(!EH.Attendance)return null;const all=EH.Attendance.loadAll?.()||[];let context=all.find(item=>item.status==='active'&&(item.requisitionRefs||[]).includes(record.id));
+            if(!context){context=EH.Attendance.empty();context.requisitionRefs=[record.id];context.evidence.requestDraft={type:'persistent-request-draft',at:Date.now()};const passenger=record.passengers?.[0],leg=passenger?.trechoIda;if(leg){context.trips.ida=EH.Attendance.normalizeTrip({origin:leg.origem,destination:leg.destino});context.journey=context.trips.ida;}if(passenger?.temVolta&&passenger?.trechoVolta)context.trips.volta=EH.Attendance.normalizeTrip({origin:passenger.trechoVolta.origem,destination:passenger.trechoVolta.destino});context=EH.Attendance.save(context);}
+            else context=EH.Attendance.save(context);
+            const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>item.id===record.id);if(request)EH.Attendance.linkRequisition(request);return context;
+        },
+        requestForContext(rows=EH.RequisitionManager?.loadStore?.()||[]){
+            const id=this.activeId({allowSingle:true});if(!id)return null;
+            const request=(rows||[]).find(item=>item.id===id);if(request)return request;
+            const draft=this.loadAll().find(item=>item.id===id);if(!draft||!draft.passengers.some(passenger=>this.validPassenger(passenger)))return null;
+            return this.asRequest(draft);
+        },
+        asRequest(record={}){
+            const draft=this.normalize(record);return {
+                id:draft.id,requestId:draft.id,stableRequestId:true,numeroLogico:draft.numeroLogico,protocolo:draft.protocolo,prefeitura:draft.prefeitura,secretaria:draft.secretaria,contrato:draft.contrato,
+                status:draft.status==='ready'?'prepared':draft.status,source:draft.source,active:draft.active,createdAt:draft.createdAt,updatedAt:draft.updatedAt,
+                passengers:draft.passengers.filter(passenger=>passenger.cpf.length===11).map(passenger=>({
+                    id:passenger.id,cpf:passenger.cpf,cpfRaw:passenger.cpfRaw,cpfValid:passenger.cpfValid,nome:passenger.nome,dataNascimento:passenger.dataNascimento,nascimentoValido:passenger.nascimentoValido,
+                    temVolta:passenger.temVolta,mercadoIda:passenger.mercadoIda,mercadoVolta:passenger.mercadoVolta,manualFields:passenger.manualFields,updatedAt:passenger.updatedAt,
+                    legs:[passenger.trechoIda&&{tipo:'ida',mercadoCompleto:passenger.mercadoIda.text,mercadoId:passenger.mercadoIda.id,mercadoValor:passenger.mercadoIda.value,mercadoTexto:passenger.mercadoIda.text,origem:passenger.trechoIda.origem,destino:passenger.trechoIda.destino},passenger.temVolta&&passenger.trechoVolta&&{tipo:'volta',mercadoCompleto:passenger.mercadoVolta.text,mercadoId:passenger.mercadoVolta.id,mercadoValor:passenger.mercadoVolta.value,mercadoTexto:passenger.mercadoVolta.text,origem:passenger.trechoVolta.origem,destino:passenger.trechoVolta.destino}].filter(Boolean)
+                }))
+            };
+        },
+        componentMeta(element){
+            if(!element)return this.normalizeMarket({});const text=EH.RequisitionManager?.selectedNgValue?.(element)||'';let value='';let source='';
+            if(['string','number'].includes(typeof element.value)&&String(element.value||'').trim()){value=String(element.value);source='value-property';}
+            if(!value&&element.getAttributeNames){const name=element.getAttributeNames().find(attr=>!/^(?:id|class|formcontrolname)$/i.test(attr)&&/(?:model|value|selected)/i.test(attr)&&String(element.getAttribute(attr)||'').trim());if(name){value=String(element.getAttribute(name)||'');source=name;}}
+            return this.normalizeMarket({id:value,value,text,valueSource:source});
+        },
+        snapshot(){
+            const root=EH.Utils.first(EH.Selectors.REQUISITION_FORM_ROOT);if(!root)return null;const info=root.querySelector('[formarrayname="info"]');if(!info)return null;
+            const passengers=Array.from(info.querySelectorAll('input[formcontrolname="cpf"][id^="cpf_"]')).map((cpfInput,position)=>{
+                const index=String(cpfInput.id||'').match(/_(\d+)$/)?.[1]||String(position),cpfRaw=EH.Utils.clean(cpfInput.value||''),cpf=EH.RequisitionManager.normalizeCpf(cpfRaw);
+                const nome=EH.Utils.clean(root.querySelector(`#nome_${index}[formcontrolname="nome"]`)?.value||'').replace(/\s+/g,' ');
+                const dataNascimento=EH.RequisitionManager.normalizeBirthDate(root.querySelector(`#data_nascimento_${index}[formcontrolname="data_nascimento"]`)?.value||'');
+                const mercadoIda=this.componentMeta(root.querySelector(`#id_mercado_ida_${index}[formcontrolname="id_mercado_ida"]`));
+                const mercadoVolta=this.componentMeta(root.querySelector(`#id_mercado_volta_${index}[formcontrolname="id_mercado_volta"]`));
+                const switchRoot=root.querySelector(`#tem_volta${index}[formcontrolname="tem_volta"]`),switchButton=switchRoot?.querySelector('button[role="switch"]');
+                const temVolta=String(switchButton?.getAttribute('aria-checked')||'').toLowerCase()==='true';
+                return {index:Number(index),cpfRaw,cpf,cpfValid:EH.PassengerIdentity.validCpf(cpf),nome,dataNascimento,nascimentoValido:this.validBirth(dataNascimento),mercadoIda,temVolta,mercadoVolta,manualFields:{cpf:Boolean(cpfRaw),nome:Boolean(nome),dataNascimento:Boolean(dataNascimento),mercadoIda:Boolean(mercadoIda.text),temVolta:true,mercadoVolta:Boolean(temVolta&&mercadoVolta.text)}};
+            });
+            return {prefeitura:EH.RequisitionManager.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_prefeitura"]')),secretaria:EH.RequisitionManager.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_secretaria"]')),contrato:EH.RequisitionManager.selectedNgValue(root.querySelector('ng-select[formcontrolname="id_contrato"]')),protocolo:EH.Utils.clean(root.querySelector('input[formcontrolname="idRequisicao"]')?.value||''),passengers,source:'real-requisition-form'};
+        },
+        hasAny(snapshot={}){return Boolean(snapshot.prefeitura||snapshot.secretaria||snapshot.contrato||snapshot.protocolo||(snapshot.passengers||[]).some(item=>item.cpfRaw||item.nome||item.dataNascimento||item.mercadoIda?.text||item.temVolta||item.mercadoVolta?.text));},
+        ready(snapshot={}){return Boolean(snapshot.passengers?.length&&snapshot.passengers.every(passenger=>this.validPassenger(passenger)&&passenger.mercadoIda?.origem&&passenger.mercadoIda?.destino&&(!passenger.temVolta||(passenger.mercadoVolta?.origem&&passenger.mercadoVolta?.destino))));},
+        dataFingerprint(value={}){return JSON.stringify({prefeitura:EH.Utils.normalize(value.prefeitura||''),secretaria:EH.Utils.normalize(value.secretaria||''),contrato:EH.Utils.normalize(value.contrato||''),protocolo:EH.Utils.normalize(value.protocolo||''),passengers:(value.passengers||[]).map(item=>({cpf:EH.RequisitionManager.normalizeCpf(item.cpf||item.cpfRaw||''),nome:EH.Utils.normalize(item.nome||''),data:EH.RequisitionManager.normalizeBirthDate(item.dataNascimento||''),ida:EH.Utils.normalize(item.mercadoIda?.text||''),temVolta:Boolean(item.temVolta),volta:Boolean(item.temVolta)?EH.Utils.normalize(item.mercadoVolta?.text||''):''}))});},
+        shouldStartNew(current,snapshot={}){
+            if(!current||this.terminal(current.status))return true;const oldCpf=current.passengers?.[0]?.cpf||'',newCpf=snapshot.passengers?.[0]?.cpf||'';
+            if(['submitted','awaiting_codes','analyzed','approved','issued','tickets_found','shared','completed'].includes(String(current.status||'')))return this.dataFingerprint(current)!==this.dataFingerprint(snapshot);
+            return Boolean((current.requisitionId||current.promotedAt||current.submittedIntentAt)&&oldCpf&&newCpf&&oldCpf!==newCpf);
+        },
+        captureFromDom({immediate=true,reason='change'}={}){
+            if(!immediate){this.scheduleCapture(reason);return null;}const snapshot=this.snapshot();if(!snapshot||!this.hasAny(snapshot))return null;
+            let current=this.current();if(this.shouldStartNew(current,snapshot)){current=this.normalize({id:this.makeId(),status:'draft',active:true,source:'real-requisition-form'});EH.Storage.set(this.ACTIVE_KEY,current.id);this.ensureAttendance(current);}
+            const previousByIndex=new Map((current.passengers||[]).map(item=>[Number(item.index),item]));const passengers=snapshot.passengers.map((item,index)=>{const old=previousByIndex.get(Number(item.index??index));const merged={...old,...item,id:old?.id||`${current.id}:passenger:${item.index??index}`};if(!item.temVolta&&!item.mercadoVolta?.text&&old?.mercadoVolta?.text)merged.mercadoVolta=old.mercadoVolta;return merged;});
+            const status=this.ready({...snapshot,passengers})?'ready':'incomplete';const next=this.upsert({...current,...snapshot,passengers,status,active:true,lastCaptureReason:reason});EH.Storage.set(this.ACTIVE_KEY,next.id);
+            const invalid=passengers.find(passenger=>passenger.cpf.length===11&&!passenger.cpfValid),notice=invalid?`${next.id}|${invalid.cpf}`:'';
+            if(invalid&&['blur','change','submit-intent'].includes(reason)&&notice!==this.lastInvalidCpfNotice){this.lastInvalidCpfNotice=notice;EH.Toast?.warning?.('O CPF informado não passou na validação. Os dígitos foram preservados sem correção automática.');}
+            return next;
+        },
+        scheduleCapture(reason='input'){if(this.captureTimer)clearTimeout(this.captureTimer);this.captureTimer=setTimeout(()=>{this.captureTimer=0;this.captureFromDom({immediate:true,reason});},this.DEBOUNCE_MS);},
+        flush(reason='route-change'){if(this.captureTimer){clearTimeout(this.captureTimer);this.captureTimer=0;}return this.captureFromDom({immediate:true,reason});},
+        promote(id,{submittedIntent=false}={}){
+            const draft=this.loadAll().find(item=>item.id===String(id||''));if(!draft)return null;if(!this.ready(draft)){this.upsert({...draft,status:'incomplete',submittedIntentAt:submittedIntent?Date.now():draft.submittedIntentAt});if(submittedIntent)EH.Toast?.warning?.('O rascunho foi preservado, mas ainda existem dados de passageiro ou rota para conferir.');return null;}
+            const now=Date.now(),request=this.asRequest({...draft,status:'prepared',promotedAt:draft.promotedAt||now,submittedIntentAt:submittedIntent?now:draft.submittedIntentAt});
+            request.status='prepared';request.stableRequestId=true;const saved=EH.RequisitionManager?.upsertRequest?.(request);if(!saved)return null;
+            const linked=this.upsert({...draft,requisitionId:saved.id,status:'prepared',promotedAt:draft.promotedAt||now,submittedIntentAt:submittedIntent?now:draft.submittedIntentAt});this.select(linked.id);return saved;
+        },
+        linkRequest(request={}, {evidence='persisted-request',fromSync=Boolean(EH.Sync?.applyingRemote)}={}){
+            if(!request?.id)return null;const rows=this.loadAll(),index=rows.findIndex(item=>item.id===String(request.id));const base=index>=0?rows[index]:this.fromRequest(request);const next=this.fromRequest({...request,id:base.id},{...base,requisitionId:request.id,status:request.status||base.status,submittedAt:request.numeroLogico?Math.max(Number(base.submittedAt||0),Date.now()):base.submittedAt,source:base.source||evidence});
+            next.requisitionId=request.id;next.numeroLogico=request.numeroLogico||base.numeroLogico;next.protocolo=request.protocolo||base.protocolo;next.status=request.status||base.status;next.active=!this.terminal(next.status);const saved=this.upsert(next,{fromSync});if(!String(EH.Storage.get(this.ACTIVE_KEY,'')||''))EH.Storage.set(this.ACTIVE_KEY,saved.id);return saved;
+        },
+        activePassenger(request=EH.RequisitionManager?.requestForContext?.()){
+            if(!request)return null;const activeCpf=EH.RequisitionManager.normalizeCpf(EH.SaleContext?.getActivePassenger?.()?.cpf||'');return request.passengers?.find(item=>item.cpf===activeCpf)||(request.passengers?.length===1?request.passengers[0]:null);
+        },
+        routeFor(record=this.current(),tipo=EH.Attendance?.load?.()?.currentLeg||'ida'){
+            const passenger=record?.passengers?.[0];if(!passenger)return null;const useVolta=tipo==='volta'&&passenger.temVolta;const leg=useVolta?passenger.trechoVolta:passenger.trechoIda;return leg?.origem&&leg?.destino?{tipo:useVolta?'volta':'ida',origem:leg.origem,destino:leg.destino}:null;
+        },
+        label(record={}){const passenger=record.passengers?.[0]||{},route=this.routeFor(record,'ida');return [passenger.nome||'Solicitação',route?[route.origem,route.destino].join(' × '):'',record.numeroLogico||record.protocolo||''].filter(Boolean).join(' • ');},
+        renderSummary(host){
+            const record=this.current();if(!record||this.terminal(record.status))return null;const passenger=record.passengers?.[0];if(!passenger)return null;const grid=document.createElement('div');grid.className='eh-context-data';const ida=this.routeFor(record,'ida'),volta=passenger.temVolta?this.routeFor(record,'volta'):null;
+            grid.append(EH.ContextualPanels.cell('Nome',passenger.nome),EH.ContextualPanels.cell('CPF',passenger.cpf?EH.SaleContext.maskCpfPublic(passenger.cpf):'Em preenchimento'),EH.ContextualPanels.cell('Nascimento',passenger.dataNascimento?EH.RequisitionManager.displayBirthDate(passenger.dataNascimento):'Em preenchimento'),EH.ContextualPanels.cell('Mercado Ida',ida?[ida.origem,ida.destino].join(' → '):'Em preenchimento'));
+            if(passenger.temVolta)grid.append(EH.ContextualPanels.cell('Tem volta','Sim'),EH.ContextualPanels.cell('Mercado Volta',volta?[volta.origem,volta.destino].join(' → '):'Em preenchimento'));host.appendChild(grid);return grid;
+        },
+        renderSelector(host,{page=''}={}){
+            const candidates=this.candidates();if(candidates.length<2)return null;const wrap=document.createElement('label');wrap.className='eh-request-context-selector';const text=document.createElement('span');text.textContent='Solicitação ativa';const select=document.createElement('select');const current=this.activeId({allowSingle:false});const placeholder=document.createElement('option');placeholder.value='';placeholder.textContent='Escolha a solicitação correta';placeholder.selected=!current;select.appendChild(placeholder);candidates.forEach(item=>{const option=document.createElement('option');option.value=item.id;option.textContent=this.label(item);option.selected=item.id===current;select.appendChild(option);});select.addEventListener('change',()=>{if(!select.value)return;this.select(select.value);EH.ContextualPanels?.refresh?.(page==='pagamento'?'payment':page==='pesquisa'?'routes':'prefeitura');});wrap.append(text,select);host.appendChild(wrap);return wrap;
+        },
+        renderScheduleHint(body){
+            const record=this.current();if(!record||this.terminal(record.status))return null;const context=EH.Attendance?.load?.()||{},passenger=record.passengers?.[0];let suggested=context.currentLeg==='volta'?'volta':'ida';if(passenger?.temVolta&&context.trips?.ida?.service&&!context.trips?.volta?.service)suggested='volta';const route=this.routeFor(record,suggested);if(!route)return null;
+            const useRoute=async target=>{const selected=this.routeFor(record,target);if(!selected)return;EH.Attendance?.setCurrentLeg?.(selected.tipo);await EH.Routes.apply({id:`${record.id}:${selected.tipo}`,origem:selected.origem,destino:selected.destino,observacao:`Solicitação ${record.numeroLogico||record.protocolo||''}`},{autoSearch:true,autoCapture:false});};
+            const card=document.createElement('section');card.className='eh-requisition-context eh-request-route-hint';const title=document.createElement('strong');title.textContent='REQUISIÇÃO ATIVA';const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${passenger?.nome||'Passageiro'} • ${route.origem} × ${route.destino} • Próximo: selecionar horário da ${route.tipo}`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action(`Usar rota da ${route.tipo}`,()=>useRoute(route.tipo),'primary'));if(passenger?.temVolta){const other=route.tipo==='ida'?'volta':'ida';actions.append(EH.ContextualPanels.action(`Selecionar horário da ${other}`,()=>useRoute(other)));}card.append(title,note,actions);body.appendChild(card);return card;
+        },
+        cancel(id){const row=this.loadAll().find(item=>item.id===String(id||''));if(!row)return null;const saved=this.upsert({...row,status:'canceled',active:false,canceledAt:Date.now()});if(String(EH.Storage.get(this.ACTIVE_KEY,'')||'')===saved.id)EH.Storage.remove(this.ACTIVE_KEY);return saved;},
+        init(){
+            if(this.started||EH.WhatsAppBridge?.isWhatsAppHost?.())return;this.started=true;this.migrateLegacy();
+            const belongs=target=>Boolean(target?.closest?.('app-solicitacao-requisicoes-prefeitura'));
+            EH.Runtime.on('request-flow-input',document,'input',event=>{if(belongs(event.target))this.scheduleCapture('input');},true);
+            EH.Runtime.on('request-flow-change',document,'change',event=>{if(belongs(event.target))this.flush('change');},true);
+            EH.Runtime.on('request-flow-blur',document,'focusout',event=>{if(belongs(event.target))this.flush('blur');},true);
+            EH.Runtime.on('request-flow-switch',document,'click',event=>{if(!belongs(event.target))return;if(event.target?.closest?.('[formcontrolname="tem_volta"], ng-select[formcontrolname="id_mercado_ida"], ng-select[formcontrolname="id_mercado_volta"]'))EH.Runtime.timeout('request-flow-control',()=>this.flush('selection'),40);},true);
+            EH.Runtime.on('request-flow-pagehide',window,'pagehide',()=>this.flush('pagehide'));
+            EH.Runtime.on('request-flow-beforeunload',window,'beforeunload',()=>this.flush('beforeunload'));
+            EH.Runtime.on('request-flow-route',window,EH.Navigation.EVENT,()=>this.flush('route-change'));
+            this.captureFromDom({immediate:true,reason:'init'});
         }
     };
 
@@ -15659,7 +15953,7 @@
             const cfg=this.config(),kind=String(type||'');
             if(!cfg.enabled||cfg.provider!=='supabase')return false;
             if(kind==='reminder')return cfg.reminders;
-            if(kind==='requisition')return cfg.requisitions;
+            if(kind==='requisition'||kind==='request-draft')return cfg.requisitions;
             if(kind==='passenger'||kind==='emission'||kind==='attendance')return cfg.emission;
             if(kind==='config')return cfg.settings;
             return false;
@@ -15748,6 +16042,7 @@
         },
         mergeRequestPassenger(localPassenger={},remotePassenger={}) {
             const l=EH.RequisitionManager?.normalizePassenger?.(localPassenger)||localPassenger, r=EH.RequisitionManager?.normalizePassenger?.(remotePassenger)||remotePassenger;
+            const remoteNewer=Number(r.updatedAt||0)>=Number(l.updatedAt||0),preferred=remoteNewer?r:l;
             const legs=new Map();
             (l.legs||[]).forEach(leg=>legs.set(this.legKey(leg),leg));
             (r.legs||[]).forEach(leg=>{const key=this.legKey(leg);legs.set(key,legs.has(key)?this.mergeLeg(legs.get(key),leg):leg);});
@@ -15756,7 +16051,9 @@
                 cpf:String(r.cpf||l.cpf||'').replace(/\D/g,'').slice(0,11),
                 nome:this.usefulText(r.nome,l.nome),
                 dataNascimento:this.usefulText(r.dataNascimento,l.dataNascimento),
-                legs:Array.from(legs.values())
+                temVolta:Boolean(preferred.temVolta),
+                legs:Array.from(legs.values()).filter(leg=>preferred.temVolta||leg.tipo!=='volta'),
+                updatedAt:Math.max(Number(l.updatedAt||0),Number(r.updatedAt||0))
             };
         },
         mergeRequisitionData(localData={},remoteData={},localTs=0,remoteTs=0) {
@@ -15803,6 +16100,7 @@
         mergeRecordData(type,localData={},remoteData={},localTs=0,remoteTs=0) {
             if(type==='reminder')return this.mergeReminderData(localData,remoteData,localTs,remoteTs);
             if(type==='requisition')return this.mergeRequisitionData(localData,remoteData,localTs,remoteTs);
+            if(type==='request-draft')return EH.RequestFlow?.merge?.({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs})||this.smartMerge(localData,remoteData);
             if(type==='attendance')return this.mergeAttendanceData(localData,remoteData,localTs,remoteTs);
             if(type==='emission'){
                 if(EH.EmissionMemory?.merge)return EH.EmissionMemory.merge({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs});
@@ -15824,6 +16122,7 @@
             const cfg=this.config(),rows=[];
             if(cfg.reminders)(EH.Reminders?.loadAll?.()||[]).forEach(item=>rows.push(this.envelope('reminder',item.id,EH.SyncLegacyReminder?.sanitize?.(item)||item,item.updatedAt||item.createdAt)));
             if(cfg.requisitions)(EH.RequisitionManager?.loadStore?.()||[]).forEach(item=>rows.push(this.envelope('requisition',item.id,item,item.updatedAt||item.createdAt)));
+            if(cfg.requisitions)(EH.RequestFlow?.loadAll?.()||[]).forEach(item=>rows.push(this.envelope('request-draft',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
             if(cfg.emission){
                 (EH.PassengerMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('passenger',item.id||`cpf:${item.cpf}`,item,item.updatedAt||item.createdAt)));
                 (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
@@ -15848,6 +16147,8 @@
                     merged.id=env.recordId;
                     if(idx>=0)rows[idx]=merged;else rows.push(merged);
                     EH.RequisitionManager?.saveStore?.(rows);
+                } else if(env.recordType==='request-draft'){
+                    EH.RequestFlow?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
                 } else if(env.recordType==='passenger'){
                     EH.PassengerMemory?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
                 } else if(env.recordType==='emission'){
@@ -15952,6 +16253,8 @@
                 EH.Reminders?.render?.();
                 EH.OperationCars?.render?.();
                 EH.TicketVerificationQueue?.render?.();
+                EH.ContextualPanels?.refresh?.('tickets');
+                EH.ContextualShortcuts?.render?.(page);
                 EH.UI?.renderAutomation?.(page);
                 EH.UI?.renderSaleSummary?.(page);
 
@@ -16082,6 +16385,7 @@
                     const candidate={
                         id:this.keyFor(item,ticket,cpf), ticketNumber:EH.Utils.clean(ticket.number||''),
                         locator:EH.Utils.clean(ticket.locator||item?.locator||''), saleReference:EH.Utils.clean(item?.saleReference||item?.saleId||''),
+                        saleId:EH.Utils.clean(item?.saleId||''),salePassengerId:EH.Utils.clean(item?.salePassengerId||item?.passengerId||''),
                         cpf, name, passengerId:item?.passengerId || passenger?.id || null,
                         origin:EH.Utils.clean(ticket.origin||''), destination:EH.Utils.clean(ticket.destination||''),
                         travelRaw:EH.Utils.clean(ticket.date||''), travelDate:travel.key, travelDateBr:travel.dateBr,
@@ -16319,13 +16623,13 @@
                     const cpf=this.normalizeCpf(raw.match(/CPF\s*:\s*([\d.\/-]+)/i)?.[1]||searchedCpf||active?.cpf||'');
                     const name=EH.Utils.clean(raw.match(/PASSAGEIR[OA]\s*:\s*([^\n]+)/i)?.[1]||active?.name||'');
                     const summary=EH.Tickets.summary(card);
-                    items.push({passengerId:active?.id||null,saleId:sale?.id||'',salePassengerId:active?.id||'',cpf,name,data:{...data,summary},tickets:data.tickets,ticket:data.tickets[0],service:summary.service,seat:summary.seat,value:summary.value,saleReference:sale?.id||''});
+                    items.push({passengerId:active?.id||null,saleId:sale?.id||'',salePassengerId:active?.id||'',cpf,name,data:{...data,summary},tickets:data.tickets,ticket:data.tickets[0],service:summary.service,seat:summary.seat,value:summary.value,paymentMethod:sale?.paymentMethod||EH.Attendance?.load?.()?.payment?.method||'',saleReference:sale?.id||''});
                 }catch(error){EH.Logger.debug('Cartão emitido ainda não pôde ser capturado:',error);}
             });
             if(!items.length)return 0;
             const created=this.captureItems(items,{confirmedEvidence:true,automatic:true,quiet:true});
             this.lastIssuedCardsSignature=signature;
-            if(created)EH.Toast?.success?.(`${created} passagem(ns) confirmada(s) entrou(aram) na fila operacional.`);
+            EH.Toast?.success?.(`Emissão confirmada. ${items.length} bilhete(s) entrou(aram) na fila para compartilhar.`);
             return created;
         },
         onPageUpdate(page) {
@@ -16673,6 +16977,9 @@
             return {
                 id: String(item.id || fallbackId),
                 saleId, salePassengerId, cpf,
+                attendanceId: EH.Utils.clean(item.attendanceId || ''),
+                requestId: EH.Utils.clean(item.requestId || ''),
+                legType: String(item.legType || item.tipo || '').toLowerCase()==='volta'?'volta':'ida',
                 name: EH.PassengerIdentity?.formatPersonName?.(item.name || '') || EH.Utils.clean(item.name || ''),
                 birthDate: EH.Utils.clean(item.birthDate || ''),
                 origin, destination, travelDate,
@@ -16699,6 +17006,10 @@
                 paymentMethod: EH.Utils.clean(item.paymentMethod || ''),
                 paymentValue: Math.max(0, EH.Utils.parseMoney(item.paymentValue ?? item.value ?? 0)),
                 saleFinalized: Boolean(item.saleFinalized),
+                shareStatus: ['not_queued','pending','found','shared'].includes(String(item.shareStatus||'').toLowerCase())?String(item.shareStatus).toLowerCase():'not_queued',
+                shareFoundAt: Number(item.shareFoundAt || 0),
+                sharedAt: Number(item.sharedAt || 0),
+                shareChannel: EH.Utils.clean(item.shareChannel || ''),
                 createdAt: Number(item.createdAt || Date.now()),
                 updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
                 deviceId: String(item.deviceId || EH.Device.id()),
@@ -16720,6 +17031,9 @@
                 id: old.id || next.id,
                 saleId: preferred.saleId || secondary.saleId,
                 salePassengerId: preferred.salePassengerId || secondary.salePassengerId,
+                attendanceId: preferred.attendanceId || secondary.attendanceId,
+                requestId: preferred.requestId || secondary.requestId,
+                legType: preferred.legType || secondary.legType || 'ida',
                 cpf: preferred.cpf || secondary.cpf,
                 name: useful(preferred.name, secondary.name),
                 birthDate: useful(preferred.birthDate, secondary.birthDate),
@@ -16749,6 +17063,10 @@
                 paymentMethod: preferred.paymentMethod || secondary.paymentMethod,
                 paymentValue: Math.max(Number(old.paymentValue || 0), Number(next.paymentValue || 0)),
                 saleFinalized: Boolean(old.saleFinalized||next.saleFinalized),
+                shareStatus:(()=>{const rank={not_queued:0,pending:1,found:2,shared:3};return (rank[next.shareStatus]||0)>(rank[old.shareStatus]||0)?next.shareStatus:(rank[old.shareStatus]||0)>(rank[next.shareStatus]||0)?old.shareStatus:preferred.shareStatus;})(),
+                shareFoundAt:Math.max(Number(old.shareFoundAt||0),Number(next.shareFoundAt||0)),
+                sharedAt:Math.max(Number(old.sharedAt||0),Number(next.sharedAt||0)),
+                shareChannel:preferred.shareChannel||secondary.shareChannel||'',
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
                 updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
                 deviceId: preferred.deviceId || secondary.deviceId || EH.Device.id(),
@@ -16855,11 +17173,16 @@
         },
         captureItems(items = []) {
             const candidates = EH.Reminders?.candidateItems?.(items) || [];
+            const attendance=EH.Attendance?.load?.()||{};
+            const requestId=EH.RequestFlow?.activeId?.({allowSingle:true})||attendance?.requisition?.id||'';
+            const legType=attendance?.currentLeg==='volta'?'volta':'ida';
             let count = 0;
             candidates.forEach(candidate => {
-                const saved = this.upsert({ ...candidate, issueStatus:'captured', ticketStatus:'captured', printStatus:'pending', confirmedEvidence:true, evidenceType:'qualified-ticket-card', issuedAt:Number(candidate.issuedAt||Date.now()), requiresConfirmation:false });
+                let resolvedLeg=legType;const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>item.id===requestId),passenger=request?.passengers?.find(item=>item.cpf===this.normalizeCpf(candidate.cpf));const matches=(passenger?.legs||[]).filter(leg=>EH.RequisitionManager?.sameRoute?.(leg.origem,leg.destino,candidate.origin,candidate.destination));if(matches.length===1)resolvedLeg=matches[0].tipo==='volta'?'volta':'ida';
+                const saved = this.upsert({ ...candidate, attendanceId:attendance?.id||'',requestId,legType:resolvedLeg,issueStatus:'captured', ticketStatus:'captured', printStatus:'pending', confirmedEvidence:true, evidenceType:'qualified-ticket-card', issuedAt:Number(candidate.issuedAt||Date.now()), requiresConfirmation:false,shareStatus:'pending' });
                 if (saved) count += 1;
             });
+            if(count){EH.ContextualPanels?.refresh?.('tickets');EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');}
             return count;
         },
         markStatus(id,status) {
@@ -16881,15 +17204,49 @@
             const excluded=String(excludeSaleId||'');
             return this.load().map(row=>this.normalize(row)).filter(row=>this.isPending(row)&&(!excluded||row.saleId!==excluded)).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
         },
+        shareQueue(){return this.load().map(row=>this.normalize(row)).filter(row=>this.isIssued(row)&&['pending','found'].includes(row.shareStatus)).sort((a,b)=>Number(a.issuedAt||a.createdAt||0)-Number(b.issuedAt||b.createdAt||0));},
+        markShareStatus(id,status,{channel=''}={}){
+            const requested=['pending','found','shared'].includes(String(status||'').toLowerCase())?String(status).toLowerCase():'';if(!requested)return null;
+            const rows=this.load(),index=rows.findIndex(row=>String(row.id)===String(id||''));if(index<0)return null;const current=this.normalize(rows[index]),rank={not_queued:0,pending:1,found:2,shared:3};if((rank[requested]||0)<(rank[current.shareStatus]||0))return current;
+            current.shareStatus=requested;if(requested==='found')current.shareFoundAt=Math.max(current.shareFoundAt,Date.now());if(requested==='shared'){current.sharedAt=Math.max(current.sharedAt,Date.now());current.shareChannel=EH.Utils.clean(channel||current.shareChannel||'manual-confirmed');}
+            current.updatedAt=Date.now();current.deviceId=EH.Device.id();current.syncState=EH.Sync?.configured?.()?'pending':'local';rows[index]=current;EH.Storage.set(this.KEY,rows);EH.Sync?.markPendingRecord?.('emission',current.id);EH.Sync?.syncAll?.({quiet:true});
+            if(requested==='shared')this.completeRequestIfShared(current.requestId);EH.ContextualPanels?.refresh?.('tickets');EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');return current;
+        },
+        completeRequestIfShared(requestId){
+            const id=String(requestId||'');if(!id)return false;const flow=EH.RequestFlow?.loadAll?.().find(item=>item.id===id);if(!flow)return false;
+            const expected=flow.passengers?.some(passenger=>passenger.temVolta)?['ida','volta']:['ida'];const related=this.load().map(row=>this.normalize(row)).filter(row=>row.requestId===id&&this.isIssued(row));
+            if(!expected.every(tipo=>related.some(row=>row.legType===tipo&&row.shareStatus==='shared')))return false;
+            EH.RequestFlow?.upsert?.({...flow,status:'shared',active:false,completedAt:Date.now()});if(String(EH.Storage.get(EH.RequestFlow.ACTIVE_KEY,'')||'')===id)EH.Storage.remove(EH.RequestFlow.ACTIVE_KEY);
+            const attendance=(EH.Attendance?.loadAll?.()||[]).find(item=>item.status==='active'&&(item.requisitionRefs||[]).includes(id));if(attendance){attendance.delivery={...(attendance.delivery||{}),state:'delivered',deliveredAt:Date.now()};attendance.stage=EH.Attendance.STAGES.COMPLETED;attendance.status='completed';attendance.nextAction='Atendimento concluído e bilhete compartilhado.';EH.Attendance.save(attendance,{setCurrent:false});}
+            return true;
+        },
         maskCpf(cpf){return EH.SaleContext?.maskCpfPublic?.(cpf)||'CPF não identificado';},
+        async copyCpf(item){const cpf=this.normalizeCpf(item?.cpf);if(cpf.length!==11)return EH.Toast.warning('CPF não disponível nesta emissão.');await EH.Clipboard.copyText(cpf);EH.Toast.success('CPF copiado.');return true;},
+        matchTicketCards(item,cards=EH.Tickets?.findCards?.()||[]){
+            const row=this.normalize(item||{});if(!cards?.length)return[];if(row.ticketNumber)return cards.filter(card=>EH.Utils.clean(EH.Tickets?.summary?.(card)?.ticket||'')===row.ticketNumber);
+            const origin=EH.Utils.normalize(row.origin||''),destination=EH.Utils.normalize(row.destination||''),service=String(row.service||'');
+            return cards.filter(card=>{const raw=EH.Utils.normalize(card?.innerText||card?.textContent||''),summary=EH.Tickets?.summary?.(card)||{};if(origin&&!raw.includes(origin))return false;if(destination&&!raw.includes(destination))return false;if(service&&summary.service&&String(summary.service)!==service)return false;if(row.seat&&summary.seat&&String(summary.seat)!==String(row.seat))return false;return Boolean(origin&&destination);});
+        },
+        openTicket(item){
+            const matches=this.matchTicketCards(item);if(matches.length!==1)return EH.Toast.warning(matches.length?'Mais de um bilhete corresponde à emissão. Confira antes de selecionar.':'O bilhete desta emissão ainda não está visível. Use Buscar CPF primeiro.');
+            EH.Tickets?.activateSelection?.();const button=matches[0].querySelector?.('.eh-ticket-pick-btn');if(button&&!matches[0].classList?.contains?.('eh-ticket-selected'))button.click();matches[0].scrollIntoView?.({behavior:'smooth',block:'center'});this.markShareStatus(item.id,'found');return true;
+        },
         async searchTicket(item){
             const cpf=this.normalizeCpf(item?.cpf);if(cpf.length!==11)return EH.Toast.warning('CPF não disponível nesta emissão.');
-            if(EH.Pages?.detect?.()==='passagens')return EH.SaleContext.searchTicket({cpf,name:item.name});
+            if(EH.Pages?.detect?.()==='passagens')return EH.SaleContext.searchTicket({...item,cpf,name:item.name,emissionId:item.id});
             EH.Storage.set('emissionMemory.pendingSearch.v1',{cpf,emissionId:item.id,expiresAt:Date.now()+60000});EH.SaleContext.navigateToPassagens();
         },
         async runPendingSearch(){
             if(this.searchBusy)return;const pending=EH.Storage.get('emissionMemory.pendingSearch.v1',null);if(!pending?.cpf||Number(pending.expiresAt||0)<Date.now()){EH.Storage.remove('emissionMemory.pendingSearch.v1');return;}if(EH.Pages?.detect?.()!=='passagens')return;
-            this.searchBusy=true;try{await EH.SaleContext.searchTicket({cpf:pending.cpf,name:'Emissão sincronizada'});EH.Storage.remove('emissionMemory.pendingSearch.v1');}finally{this.searchBusy=false;}
+            const item=this.load().map(row=>this.normalize(row)).find(row=>row.id===String(pending.emissionId||''))||{cpf:pending.cpf,name:'Emissão sincronizada',id:pending.emissionId||''};
+            this.searchBusy=true;try{await EH.SaleContext.searchTicket({...item,emissionId:item.id});EH.Storage.remove('emissionMemory.pendingSearch.v1');}finally{this.searchBusy=false;}
+        },
+        renderShareQueue(body){
+            const items=this.shareQueue();if(!items.length)return null;const activeKey='emissionMemory.activeShare.v1';let selectedId=String(EH.Storage.get(activeKey,'')||'');if(!items.some(item=>item.id===selectedId))selectedId=items[0].id;EH.Storage.set(activeKey,selectedId);const item=items.find(row=>row.id===selectedId)||items[0];
+            const wrap=document.createElement('section');wrap.className='eh-requisition-context eh-share-queue';const title=document.createElement('strong');title.textContent=`BILHETES PARA COMPARTILHAR • ${items.length}`;wrap.appendChild(title);
+            if(items.length>1){const select=document.createElement('select');items.forEach((row,index)=>{const option=document.createElement('option');option.value=row.id;option.selected=row.id===item.id;option.textContent=`${index+1}. ${row.name||'Passageiro'} — ${[row.origin,row.destination].filter(Boolean).join(' × ')}`;select.appendChild(option);});select.addEventListener('change',()=>{EH.Storage.set(activeKey,select.value);EH.ContextualPanels?.refresh?.('tickets');});wrap.appendChild(select);}
+            const meta=document.createElement('div');meta.className='eh-context-data';meta.append(EH.ContextualPanels.cell('Nome',item.name),EH.ContextualPanels.cell('CPF',this.maskCpf(item.cpf)),EH.ContextualPanels.cell('Rota',[item.origin,item.destination].filter(Boolean).join(' → ')),EH.ContextualPanels.cell('Trecho',item.legType==='volta'?'Volta':'Ida'),EH.ContextualPanels.cell('Bilhete',item.ticketNumber||item.locator),EH.ContextualPanels.cell('Status',item.shareStatus==='found'?'Bilhete localizado':'Aguardando localização'));wrap.appendChild(meta);
+            const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Buscar CPF',()=>this.searchTicket(item),'primary'),EH.ContextualPanels.action('Copiar CPF',()=>this.copyCpf(item)),EH.ContextualPanels.action('Abrir bilhete',()=>this.openTicket(item)),EH.ContextualPanels.action('Marcar como enviado',()=>{if(!window.confirm('Confirmar que este bilhete foi compartilhado com o passageiro?'))return;this.markShareStatus(item.id,'shared',{channel:'manual-confirmed'});EH.Toast.success('Bilhete marcado como compartilhado.');},'success'));wrap.appendChild(actions);body.appendChild(wrap);return wrap;
         },
         renderPendingBlock({ excludeSaleId = '' } = {}) {
             const items=this.pending({excludeSaleId});if(!items.length)return null;
@@ -17110,30 +17467,10 @@
             this.search(item);
         },
         render() {
-            const existing=document.querySelector('#eh-ticket-verification-queue'),q=this.load();
-            if(EH.Pages.detect()!=='passagens'||!q||(q.lists?.board?.length||0)+(q.lists?.alight?.length||0)===0){existing?.remove();return;}
-            let box=existing;
-            if(!box){box=document.createElement('div');box.id='eh-ticket-verification-queue';box.className='eh-verification-queue';document.body.append(box);}
-            box.innerHTML='';
-            const title=document.createElement('strong');title.textContent=`CONFERÊNCIA DO CARRO • ${q.operationalTime||'—'} • ${q.name||''}`;
-            const tabs=document.createElement('div');tabs.className='eh-verification-tabs';
-            ['board','alight'].forEach(kind=>{
-                const label=kind==='board'?'Embarques':'Desembarques',list=q.lists?.[kind]||[],pending=list.filter(p=>p.status==='pending').length;
-                const btn=document.createElement('button');btn.className=q.activeKind===kind?'active':'';btn.textContent=`${label} ${pending}/${list.length}`;btn.addEventListener('click',()=>this.switchKind(kind));tabs.append(btn);
-            });
-            box.append(title,tabs);
-            const active=this.activeList(q);
-            if(!active.length){const empty=document.createElement('small');empty.textContent=q.activeKind==='alight'?'Nenhum desembarque da agência 287 nesta fila.':'Nenhum embarque da agência 287 nesta fila.';box.append(empty);}
-            active.forEach(item=>{
-                const row=document.createElement('div');row.className='eh-verification-row';
-                const text=document.createElement('span');text.textContent=`${item.status==='pending'?'○':item.status==='printed'?'🖨':'✓'} ${EH.OperationCars?.seatLabel?.(item.seat)||item.seat||'—'} — ${item.name||'Passageiro'}${item.floor?` • ${item.floor}`:''}`;
-                const cpf=document.createElement('button');cpf.textContent='CPF';cpf.addEventListener('click',()=>this.copyCpf(item));
-                const search=document.createElement('button');search.textContent='Buscar';search.addEventListener('click',()=>this.search(item));
-                const checked=document.createElement('button');checked.textContent='✓';checked.title='Marcar conferido';checked.addEventListener('click',()=>this.setStatus(item.id,'checked'));
-                const printed=document.createElement('button');printed.textContent='🖨';printed.title='Marcar impresso';printed.addEventListener('click',()=>this.setStatus(item.id,'printed'));
-                row.append(text,cpf,search,checked,printed);box.append(row);
-            });
-            const next=document.createElement('button');next.className='eh-modal-btn';next.textContent='Próximo pendente';next.addEventListener('click',()=>this.next());box.append(next);
+            // A fila 287 permanece no Mapa do Carro. Em Passagens este módulo
+            // reutiliza apenas a busca por CPF iniciada pelo mapa, sem desenhar
+            // embarques ou desembarques sobre a fila pós-emissão.
+            document.querySelector('#eh-ticket-verification-queue')?.remove();
         },
         onPageUpdate(page) {
             if(page==='passagens'){EH.Runtime.timeout('verification-search',()=>this.runPendingSearch(),350);}
@@ -21587,7 +21924,7 @@
             GM_addStyle(`
                 #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
                 html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 34px));min-width:270px;min-height:190px;overflow:hidden;resize:both;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
-                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}
+                .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}.eh-request-context-selector{display:grid;gap:4px;color:#607286;font-size:8px;font-weight:800}.eh-request-context-selector select,.eh-share-queue>select{width:100%;min-height:32px;padding:5px 7px;border:1px solid #d3dce6;border-radius:7px;background:#fff;color:#30445a;font-size:9px}.eh-share-queue .eh-context-empty,.eh-request-route-hint .eh-context-empty{padding:6px;text-align:left}
                 @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:auto!important;height:min(72vh,560px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
@@ -21614,7 +21951,7 @@
         action(label,callback,className='') { const button=document.createElement('button');button.type='button';button.textContent=label;button.className=className;button.addEventListener('click',callback);return button; },
         nextAction(body, context=EH.Attendance?.load?.()) { const note=document.createElement('div');note.className='eh-context-empty eh-context-next-action';note.textContent=`Próxima ação: ${context?.nextAction||EH.Attendance?.nextActionFor?.(EH.Pages?.detect?.()||'desconhecida',context)||'Conferir a etapa atual.'}`;body.appendChild(note);return note; },
         renderRoutes(body) {
-            const routes=EH.QuickRoutes.active();body.classList.remove('eh-route-size-small','eh-route-size-normal','eh-route-size-large','eh-route-size-xlarge');body.classList.add(`eh-route-size-${EH.Config.CONTEXT_BUTTON_SIZE||'normal'}`);if(!routes.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota configurada.';body.appendChild(empty);return;}
+            const hint=EH.RequestFlow?.renderScheduleHint?.(body);const routes=EH.QuickRoutes.active();body.classList.remove('eh-route-size-small','eh-route-size-normal','eh-route-size-large','eh-route-size-xlarge');body.classList.add(`eh-route-size-${EH.Config.CONTEXT_BUTTON_SIZE||'normal'}`);if(!routes.length){if(!hint){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota configurada.';body.appendChild(empty);}return;}
             const selectedId=String(EH.Storage.get('selectedQuickRouteId.v1','')||'');
             routes.forEach(route=>{
                 const card=document.createElement('article');card.className='eh-context-route';
@@ -21653,7 +21990,7 @@
             const stageLabels={new:'Novo atendimento',document_uploaded:'Documento enviado',data_detected:'Dados detectados',data_confirmed:'Dados confirmados',route_defined:'Rota definida',requisition_documents_ready:'Documentos da requisição prontos',protocol_defined:'Protocolo definido',request_filled:'Solicitação preenchida',request_submitted:'Solicitação enviada',awaiting_codes:'Aguardando códigos',codes_captured:'Códigos capturados',outbound_sale_pending:'Venda da ida pendente',outbound_sale_prepared:'Venda da ida preparada',return_sale_pending:'Venda da volta pendente',return_sale_prepared:'Venda da volta preparada',payment_pending:'Pagamento pendente',emission_confirmed:'Emissão confirmada',tickets_lookup_pending:'Localização de bilhetes pendente',tickets_found:'Bilhetes encontrados',tickets_ready:'Bilhetes preparados',completed:'Concluído',canceled:'Cancelado',error:'Atendimento com erro'};
             const codes=context.requisition?.codes||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger),this.cell('Etapa',stageLabels[context.stage]||context.stage),this.cell('Requisição',context.requisition?.logicalNumber||'—'),this.cell('Código da ida',codes.ida?'Disponível':'Pendente'),this.cell('Código da volta',codes.volta?'Disponível':'Pendente'),this.cell('Trecho atual',context.currentLeg==='volta'?'Volta':'Ida'));body.appendChild(grid);this.nextAction(body,context);
             const actions=document.createElement('div');actions.className='eh-context-actions';const hasIda=Boolean(context.trips?.ida?.origin||codes.ida),hasVolta=Boolean(context.trips?.volta?.origin||codes.volta);if(hasIda)actions.append(this.action('Trabalhar na ida',()=>{EH.Attendance?.setCurrentLeg?.('ida');this.refresh('attendance');},context.currentLeg==='ida'?'primary':''));if(hasVolta)actions.append(this.action('Trabalhar na volta',()=>{EH.Attendance?.setCurrentLeg?.('volta');this.refresh('attendance');},context.currentLeg==='volta'?'primary':''));body.appendChild(actions);
-            const more=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Mais opções';const secondary=document.createElement('div');secondary.className='eh-context-actions';secondary.append(this.action('Arquivar como concluído',()=>{if(!window.confirm('Arquivar este atendimento como concluído?'))return;EH.Attendance?.clear?.({status:'completed'});this.close('attendance');}),this.action('Cancelar atendimento',()=>{if(!window.confirm('Cancelar este atendimento? Os registros já salvos não serão apagados.'))return;EH.Attendance?.clear?.({status:'canceled'});this.close('attendance');}));more.append(summary,secondary);body.appendChild(more);
+            const more=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Mais opções';const secondary=document.createElement('div');secondary.className='eh-context-actions';secondary.append(this.action('Arquivar como concluído',()=>{if(!window.confirm('Arquivar este atendimento como concluído?'))return;const flow=EH.RequestFlow?.current?.();if(flow)EH.RequestFlow?.upsert?.({...flow,status:'completed',active:false,completedAt:Date.now()});EH.Attendance?.clear?.({status:'completed'});this.close('attendance');}),this.action('Cancelar atendimento',()=>{if(!window.confirm('Cancelar este atendimento? Os registros já salvos não serão apagados.'))return;const flow=EH.RequestFlow?.current?.();if(flow)EH.RequestFlow?.cancel?.(flow.id);EH.Attendance?.clear?.({status:'canceled'});this.close('attendance');}));more.append(summary,secondary);body.appendChild(more);
         },
         renderMenu(body) {
             const actions=document.createElement('div');actions.className='eh-context-actions';[['Rotas','routes'],['Poltronas','seats'],['Passageiro / Document AI','passenger'],['Pagamento / PIX','payment'],['Confirmação','confirmation'],['Lembretes','reminders'],['Passagens','tickets'],['Caixa / Financeiro','finance'],['Requisição da Prefeitura','prefeitura'],['Mapa / Fila','operation']].forEach(([label,id])=>actions.append(this.action(label,()=>this.open(id))));body.appendChild(actions);
@@ -21666,14 +22003,15 @@
             if(id==='confirmation')return this.renderConfirmation(body);
             if(id==='passenger'){
                 const page=EH.Pages?.detect?.()||'desconhecida';const request=EH.RequisitionManager?.requestForContext?.();const activeCpf=EH.SaleContext?.getActivePassenger?.()?.cpf||'';const passenger=request?.passengers?.find(item=>item.cpf===EH.RequisitionManager.normalizeCpf(activeCpf))||(request?.passengers?.length===1?request.passengers[0]:null);const note=document.createElement('div');note.className='eh-context-empty';note.textContent=passenger?`${passenger.nome} • dados confirmados disponíveis`:'Envie ou confirme o documento uma única vez.';const actions=document.createElement('div');actions.className='eh-context-actions';
-                if(passenger&&EH.RequisitionManager?.findEmissionCards?.().length)actions.append(this.action('Preencher passageiro',()=>EH.RequisitionManager.usePassenger(request.id,passenger.cpf),'primary'));
-                else if(passenger&&page==='passagens')actions.append(this.action('Buscar bilhetes',()=>EH.SaleContext?.searchTicket?.({cpf:passenger.cpf,name:passenger.nome}),'primary'));
+                const validPassenger=Boolean(passenger&&EH.RequestFlow?.validPassenger?.(passenger));
+                if(validPassenger&&EH.RequisitionManager?.findEmissionCards?.().length)actions.append(this.action('Preencher passageiro da solicitação',()=>EH.RequisitionManager.usePassenger(request.id,passenger.cpf),'primary'));
+                else if(validPassenger&&page==='passagens')actions.append(this.action('Buscar bilhetes',()=>EH.SaleContext?.searchTicket?.({cpf:passenger.cpf,name:passenger.nome}),'primary'));
                 else actions.append(this.action('Abrir dados e Document AI',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));
                 body.append(note,actions);if(passenger){const more=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Mais opções';const extra=document.createElement('div');extra.className='eh-context-actions';extra.append(this.action('Conferir documento e dados',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();}));more.append(summary,extra);body.appendChild(more);}return;
             }
             if(id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent='Use o documento oficial, confira os dados e prepare o anexo.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir Requisição da Prefeitura',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));body.append(note,actions);EH.RequisitionManager?.renderContext?.(body,{page:'requisicao'});return;}
             if(id==='reminders'){const groups=EH.Reminders?.queueGroups?.()||{board:[],alight:[],review:[],history:[]};const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${groups.board.length} embarque(s) • ${groups.alight.length} desembarque(s) • ${groups.review.length} para conferência.`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir fila operacional',()=>EH.Reminders?.openModal?.('active'),'primary'),this.action('Ver pendências',()=>EH.Reminders?.openModal?.('review')));body.append(note,actions);return;}
-            if(id==='tickets'){const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Selecionar passagem',()=>EH.Tickets?.activateSelection?.(),'primary'));body.appendChild(actions);return;}
+            if(id==='tickets'){EH.EmissionMemory?.renderShareQueue?.(body);return;}
             if(id==='finance')return this.renderFinance(body);
             if(id==='operation'){EH.OperationCars?.renderContext?.(body);return;}
             if(id==='attendance')return this.renderAttendance(body);
@@ -21705,10 +22043,31 @@
             `);this.render(EH.Pages?.detect?.()||'desconhecida');
         },
         button(icon,label,title,action){const button=document.createElement('button');button.type='button';button.title=title;button.setAttribute('aria-label',title);const i=document.createElement('span');i.className='eh-context-shortcut-icon';i.textContent=icon;button.appendChild(i);if(EH.Config.CONTEXT_BUTTON_SHOW_TEXT){const text=document.createElement('span');text.textContent=label;button.appendChild(text);}button.addEventListener('click',event=>{event.stopPropagation();action();});return button;},
-        definitions(page){const open=id=>()=>EH.ContextualPanels.open(id);if(page==='pesquisa')return[['🧭','Rotas','Rotas e horários rápidos',open('routes')],['🗓️','Horários','Capturar horários encontrados',()=>EH.UI?.captureAction?.('pesquisa')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];if(page==='reserva')return[['💺','Poltronas','Poltronas e passageiro atual',open('seats')],['👤','Dados','Dados do passageiro e Document AI',open('passenger')]];if(page==='confirmacao')return[['✅','Conferir','Resumo e confirmação consciente',open('confirmation')]];if(page==='pagamento')return[['💳','Pagamento','Pagamento e código da requisição',open('payment')]];if(page==='passagens')return[['🎫','Bilhetes','Passagens emitidas',open('tickets')],['👤','Passageiro','Dados confirmados do passageiro',open('passenger')]];if(page==='caixa'||page==='comissoes')return[['📊','Financeiro','Caixa e financeiro',open('finance')]];if(page==='requisicao')return[['📄','Requisição','Requisição da Prefeitura e códigos',open('prefeitura')],['👤','Preencher','Preencher somente campos reais compatíveis',async()=>{try{await EH.PassengerIdentity?.fillSolicitation?.();EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.');}catch(error){EH.Toast?.warning?.(error.message||'A tela atual não possui campos compatíveis para preenchimento.');}}]];return[];},
+        definitions(page){
+            const open=id=>()=>EH.ContextualPanels.open(id);
+            if(page==='pesquisa')return[['🧭','Rotas','Rotas e horários rápidos',open('routes')],['🗓️','Horários','Capturar horários encontrados',()=>EH.UI?.captureAction?.('pesquisa')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];
+            if(page==='reserva')return[['💺','Poltronas','Poltronas e passageiro atual',open('seats')],['👤','Dados','Dados do passageiro e Document AI',open('passenger')]];
+            if(page==='confirmacao')return[['✅','Conferir','Resumo e confirmação consciente',open('confirmation')]];
+            if(page==='pagamento')return[['💳','Pagamento','Pagamento e código da requisição',open('payment')]];
+            if(page==='passagens')return EH.EmissionMemory?.shareQueue?.().length||EH.Tickets?.findCards?.().length?[['🎫','Bilhetes','Bilhetes emitidos para localizar e compartilhar',open('tickets')]]:[];
+            if(page==='caixa'||page==='comissoes')return[['📊','Financeiro','Caixa e financeiro',open('finance')]];
+            if(page==='requisicao'){
+                const actions=[['📄','Requisição','Requisição da Prefeitura e códigos',open('prefeitura')]];
+                const confirmed=EH.PassengerIdentity?.currentConfirmed?.();
+                if(confirmed?.name&&confirmed?.birthDate&&(confirmed.cpfValid||confirmed.invalidCpfOverride))actions.push(['👤','Preencher','Preencher somente campos reais compatíveis',async()=>{try{await EH.PassengerIdentity?.fillSolicitation?.();EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.');}catch(error){EH.Toast?.warning?.(error.message||'A tela atual não possui campos compatíveis para preenchimento.');}}]);
+                return actions;
+            }
+            return[];
+        },
         applyPreferences(){if(!this.root)return;const sizes={small:[32,32],normal:[38,36],large:[46,42],xlarge:[56,50]};const [min,height]=sizes[EH.Config.CONTEXT_BUTTON_SIZE]||sizes.normal;this.root.style.setProperty('--eh-context-min',`${min}px`);this.root.style.setProperty('--eh-context-height',`${height}px`);this.root.style.setProperty('--eh-context-font',`${EH.Config.CONTEXT_BUTTON_FONT_SIZE}px`);this.root.style.setProperty('--eh-context-icon',`${EH.Config.CONTEXT_BUTTON_ICON_SIZE}px`);this.root.style.setProperty('--eh-context-gap',`${EH.Config.CONTEXT_BUTTON_GAP}px`);this.root.style.setProperty('--eh-context-opacity',String(EH.Config.CONTEXT_BUTTON_OPACITY));},
         activePassengerName(context){const active=EH.SaleContext?.getActivePassenger?.();if(active?.name)return active.name;const ids=new Set(context?.passengerIds||[]);const remembered=(EH.PassengerMemory?.load?.()||[]).find(item=>ids.has(item.id));if(remembered?.name)return remembered.name;const refs=new Set(context?.requisitionRefs||[]);const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>refs.has(item.id));return request?.passengers?.[0]?.nome||'';},
-        render(page=EH.Pages?.detect?.()||'desconhecida'){if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);const context=EH.Attendance?.load?.();const next=document.createElement('div');next.className='eh-context-next-pill';next.setAttribute('role','button');next.tabIndex=0;next.title='Abrir resumo do atendimento ativo';const openAttendance=()=>EH.ContextualPanels?.open?.('attendance');next.addEventListener('click',openAttendance);next.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openAttendance();}});const passenger=this.activePassengerName(context);if(passenger){const name=document.createElement('strong');name.textContent=passenger;next.appendChild(name);}const action=document.createElement('small');action.textContent=`Próxima: ${context?.nextAction||EH.Attendance?.nextActionFor?.(page,context)||'conferir a etapa atual'}`;next.appendChild(action);this.root.replaceChildren(next,...definitions.map(args=>this.button(...args)));this.root.hidden=false;EH.ContextualPanels?.sync?.(page);}
+        render(page=EH.Pages?.detect?.()||'desconhecida'){
+            if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);const context=EH.Attendance?.load?.();const activeRequest=EH.RequestFlow?.current?.();const nodes=[];
+            if(activeRequest&&!EH.RequestFlow.terminal(activeRequest.status)){
+                const next=document.createElement('div');next.className='eh-context-next-pill';next.setAttribute('role','button');next.tabIndex=0;next.title='Abrir resumo do atendimento ativo';const openAttendance=()=>EH.ContextualPanels?.open?.('attendance');next.addEventListener('click',openAttendance);next.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openAttendance();}});const passenger=activeRequest.passengers?.[0]?.nome||this.activePassengerName(context);if(passenger){const name=document.createElement('strong');name.textContent=passenger;next.appendChild(name);}const action=document.createElement('small');action.textContent=`Próxima: ${context?.nextAction||EH.Attendance?.nextActionFor?.(page,context)||'conferir a etapa atual'}`;next.appendChild(action);nodes.push(next);
+            }
+            nodes.push(...definitions.map(args=>this.button(...args)));this.root.replaceChildren(...nodes);this.root.hidden=!nodes.length;EH.ContextualPanels?.sync?.(page);
+        }
     };
 
     // ============================================================
@@ -21786,6 +22145,7 @@
             safeInit('Contexto operacional', () => EH.Attendance?.init?.());
             safeInit('Identidade do passageiro', () => EH.PassengerIdentity.init());
             safeInit('Requisições', () => EH.RequisitionManager.init());
+            safeInit('Memória da solicitação', () => EH.RequestFlow?.init?.());
             safeInit('Requisição Prefeitura', () => EH.PrefeituraRequisition.init());
             // O WhatsApp Bridge continua ativo; sua interface só é acionada quando necessária.
             safeInit('Layout', () => EH.Layout.sync());
