@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.71.0
-// @description  Atendimento E-Pass com overlays profissionais de Atendimento e Conversa Atual
+// @version      5.72.0
+// @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
 // @downloadURL  https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.71.0',
+        VERSION: '5.72.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 13,
+        STORAGE_SCHEMA_VERSION: 14,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -163,6 +163,10 @@
     // Mantenha alternativas para suportar pequenas mudanças no site.
     // ============================================================
     EH.Selectors = {
+        // Adaptadores confirmados no pacote de evidências de 18/08/2026.
+        SEARCH_ROOT: ['app-pesquisa-venda'],
+        SEARCH_RESULTS_TABLE: ['app-pesquisa-venda table.table-hover', 'app-pesquisa-venda table.table-striped'],
+        SEARCH_RESERVE_BUTTON: 'button[title="Reservar"]',
         ORIGEM: [
             '.ng-select[formcontrolname="id_localidade_origem"] .ng-value-label',
             '[formcontrolname="id_localidade_origem"] .ng-value-label'
@@ -199,6 +203,8 @@
             'app-onibus .onibus-poltronas'
         ],
         POLTRONA_BUTTON: 'app-poltrona button, button.poltrona',
+        RESERVATION_ROOT: ['app-reserva-poltronas'],
+        RESERVATION_CONFIRM_BUTTON: ['button.confirmar-reserva'],
         DADOS_RESERVA: [
             '.dados_reserva',
             '.dados-reserva'
@@ -210,6 +216,9 @@
         PASSAGENS_ROOT: [
             'app-passagens'
         ],
+        CART_ROOT: ['app-carrinho'],
+        CART_PASSENGER_CARD: '.card.cadastro-passageiro',
+        CART_CONTINUE_BUTTON: ['button.confirmar-dados'],
         PASSAGENS_CPF_INPUT: [
             'input[formcontrolname="cpf_passageiro"]',
             'input[placeholder*="CPF DO PASSAGEIRO"]'
@@ -251,24 +260,65 @@
     };
 
     // ============================================================
+    // PRIVACIDADE E REDAÇÃO DE DIAGNÓSTICO
+    // ============================================================
+    EH.Privacy = {
+        sensitiveKey(value) {
+            return /cpf|documento|nascimento|birth|passageiro|passenger|nome|name|pix|token|authorization|apikey|senha|password|secret|imagem|image|base64/i.test(String(value || ''));
+        },
+        redactText(value) {
+            return String(value == null ? '' : value)
+                .replace(/\b\d{3}[.\s-]?\d{3}[.\s-]?\d{3}[-.\s]?\d{2}\b/g, '***.***.***-**')
+                .replace(/\b000201[A-Za-z0-9._:/+-]{20,}\b/g, '[PIX REDIGIDO]')
+                .replace(/([?&](?:token|key|apikey|access_token|authorization)=)[^&#\s]+/gi, '$1[REDIGIDO]')
+                .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi, '$1[REDIGIDO]');
+        },
+        safeUrl(value) {
+            try {
+                const url = new URL(String(value || ''), location.origin || undefined);
+                return `${url.origin}${url.pathname}`;
+            } catch (_error) {
+                return this.redactText(String(value || '').split(/[?#]/)[0]);
+            }
+        },
+        safeLogArg(value, depth = 0) {
+            if (value instanceof Error) return { name:value.name, message:this.redactText(value.message) };
+            if (typeof value === 'string') return this.redactText(value);
+            if (!value || typeof value !== 'object') return value;
+            if (depth >= 2) return '[OBJETO OMITIDO]';
+            if (Array.isArray(value)) return value.slice(0, 20).map(item => this.safeLogArg(item, depth + 1));
+            const safe = {};
+            Object.entries(value).slice(0, 30).forEach(([key, item]) => {
+                safe[key] = this.sensitiveKey(key) ? '[REDIGIDO]' : this.safeLogArg(item, depth + 1);
+            });
+            return safe;
+        },
+        redactHtml(value) {
+            return this.redactText(value)
+                .replace(/(value\s*=\s*["'])[^"']*(["'])/gi, '$1[REDIGIDO]$2')
+                .replace(/(src\s*=\s*["']data:)[^"']+(["'])/gi, '$1[IMAGEM REDIGIDA]$2');
+        }
+    };
+
+    // ============================================================
     // LOGGER
     // ============================================================
     EH.Logger = {
         debug(...args) {
-            if (EH.Config.DEBUG) console.debug('[EPass Helper]', ...args);
+            if (EH.Config.DEBUG) console.debug('[EPass Helper]', ...args.map(arg => EH.Privacy.safeLogArg(arg)));
         },
         trace(scope, ...args) {
-            if (EH.Config.DEBUG) console.debug(`[EH][${String(scope || 'Diagnóstico')}]`, ...args);
+            if (EH.Config.DEBUG) console.debug(`[EH][${String(scope || 'Diagnóstico')}]`, ...args.map(arg => EH.Privacy.safeLogArg(arg)));
         },
         info(...args) {
             // Log normal permanece enxuto: somente mensagens de ciclo de vida realmente úteis.
-            console.info('[EPass Helper]', ...args);
+            console.info('[EPass Helper]', ...args.map(arg => EH.Privacy.safeLogArg(arg)));
         },
         warn(...args) {
-            console.warn('[EPass Helper]', ...args);
+            console.warn('[EPass Helper]', ...args.map(arg => EH.Privacy.safeLogArg(arg)));
         },
         error(...args) {
-            console.error('[EPass Helper]', ...args);
+            console.error('[EPass Helper]', ...args.map(arg => EH.Privacy.safeLogArg(arg)));
         }
     };
 
@@ -679,6 +729,38 @@
             if (EH.Storage.get('operationQueueGraceMinutes', undefined) === undefined) EH.Storage.set('operationQueueGraceMinutes', 180);
         },
 
+        migrateConfirmedEmissionV14() {
+            // Versões anteriores podiam promover uma venda a `issued` apenas por
+            // navegar para /vendas/passagens. O registro é preservado, mas volta
+            // a aguardar uma evidência real e explícita de bilhete.
+            const key = 'emissionMemory.v1';
+            const rows = EH.Storage.get(key, []);
+            if (!Array.isArray(rows)) return;
+            let changed = false;
+            const now = Date.now();
+            const next = rows.map(item => {
+                if (!item || typeof item !== 'object') return item;
+                const issueStatus = String(item.issueStatus || item.status || '').toLowerCase();
+                const hasEvidence = Boolean(
+                    EH.Utils.clean(item.ticketNumber || item.ticket || '')
+                    || item.confirmedEvidence
+                    || Number(item.issuedAt || 0)
+                );
+                if (issueStatus !== 'issued' || hasEvidence) return item;
+                changed = true;
+                return {
+                    ...item,
+                    issueStatus: 'payment',
+                    ticketStatus: item.ticketStatus === 'issued' ? 'pending' : (item.ticketStatus || 'pending'),
+                    saleFinalized: false,
+                    requiresConfirmation: true,
+                    migratedFalseIssueAt: now,
+                    updatedAt: Math.max(Number(item.updatedAt || 0), now)
+                };
+            });
+            if (changed) EH.Storage.set(key, next);
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -694,6 +776,7 @@
             this.migrateContextualWorkspace();
             this.migrateContextualMapWorkflow();
             this.migrateOperationalQueueV13();
+            this.migrateConfirmedEmissionV14();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -5580,6 +5663,7 @@
                 }
             };
             safe('Contexto de vendas', () => EH.SaleCpfs?.captureFromDom?.());
+            safe('Contexto operacional', () => EH.Attendance?.onPageUpdate?.(page));
             safe('Requisições', () => EH.RequisitionManager?.scanDom?.());
             safe('Requisição Prefeitura', () => EH.PrefeituraRequisition?.onPageUpdate?.(page));
             safe('Atendimento', () => EH.UI?.updateState?.(page));
@@ -5936,7 +6020,7 @@
             return (Array.isArray(records)?records:[]).map(record=>[
                 record.id,record.category,record.status,record.timestamp,record.originalValue,
                 record.caixaAdjustment,record.commissionEpass,record.commissionEstimated,
-                record.deleted,record.mergedInto,record.shadowedByCommission
+                record.deleted,record.mergedInto,record.shadowedByCommission,record.provisional
             ].join('|')).sort().join('||');
         },
 
@@ -5989,7 +6073,7 @@
         },
 
         isCountableMovement(record) {
-            if (!record || record.deleted || record.mergedInto) return false;
+            if (!record || record.deleted || record.mergedInto || record.provisional) return false;
             const status = EH.Utils.normalize(record.status || '');
             if (status.includes('SAQUE') || status.includes('SALDO ANTERIOR')) return false;
             if (record.category === 'PASSAGEM') return status === 'VENDA' || !status;
@@ -5997,7 +6081,7 @@
         },
 
         isCommissionEffect(record) {
-            if (!record || record.deleted || record.mergedInto) return false;
+            if (!record || record.deleted || record.mergedInto || record.provisional) return false;
             const status = EH.Utils.normalize(record.status || '');
             if (status.includes('SAQUE') || status.includes('SALDO ANTERIOR')) return false;
             return record.category === 'PASSAGEM' || record.category === 'MERCADORIA_RECEBIDA' || record.category === 'MERCADORIA_ENVIADA' || status.includes('CANCELAMENTO') || status.includes('ESTORNO');
@@ -6098,6 +6182,48 @@
             };
         },
 
+        recordIssuedTickets(candidates = [], context = null) {
+            const rows = this.load();
+            let changed = 0;
+            const list = Array.isArray(candidates) ? candidates : [];
+            list.forEach(candidate => {
+                const ticketNumber = EH.Utils.clean(candidate?.ticketNumber || candidate?.ticket || '');
+                const stableReference = ticketNumber || EH.Utils.clean(candidate?.locator || candidate?.id || '');
+                if (!stableReference) return;
+                const sourceKey = `ticket-confirmed|${stableReference}`;
+                const issuedAt = Number(candidate?.issuedAt || Date.now());
+                const rawValue = EH.Utils.parseMoney(candidate?.value || 0);
+                const fallbackValue = list.length === 1 ? Number(context?.payment?.value || context?.journey?.value || 0) : 0;
+                const value = this.money(rawValue || fallbackValue);
+                const company = this.normalizeCompany(candidate?.company || context?.journey?.company || candidate?.line || 'NÃO INFORMADA');
+                const record = {
+                    id:sourceKey, sourceKey, source:'epass_ticket_confirmed', sourceOrigin:'emissao-confirmada',
+                    category:'PASSAGEM', status:'PENDENTE_CONCILIACAO', operationStatus:'AGUARDANDO CAIXA',
+                    provisional:true, countable:false,
+                    dateTime:this.formatDateTime(new Date(issuedAt)), timestamp:issuedAt,
+                    dayKey:this.dayKey(new Date(issuedAt)), monthKey:this.monthKey(new Date(issuedAt)),
+                    company, companyCode:'', passenger:EH.Utils.clean(candidate?.name || ''),
+                    cpfMasked:EH.SaleContext?.maskCpfPublic?.(candidate?.cpf || '') || '',
+                    identifier:ticketNumber || stableReference, ticketNumber,
+                    saleId:EH.Utils.clean(candidate?.saleReference || ''),
+                    originalValue:value, caixaValue:null, caixaAdjustment:0,
+                    commissionPercent:this.commissionPercentFor(company), commissionEpass:null,
+                    commissionEstimated:0, nature:'neutro',
+                    paymentMethod:EH.Utils.clean(candidate?.paymentMethod || context?.payment?.method || ''),
+                    description:'Emissão confirmada; aguardando conciliação com o Caixa.',
+                    rawReference:'', createdAt:issuedAt, updatedAt:Date.now(), deviceId:EH.Device.id()
+                };
+                const result = this.upsert(record, rows);
+                if (result.added || JSON.stringify(result.record) !== JSON.stringify(record)) changed += 1;
+            });
+            if (list.length) this.save(this.reconcile(rows));
+            return changed;
+        },
+
+        pendingReconciliation() {
+            return this.load().filter(record => record?.provisional && !record.deleted && !record.mergedInto);
+        },
+
         upsert(record, records = null) {
             const list = records || this.load();
             const index = list.findIndex(item => item.sourceKey === record.sourceKey || item.id === record.id);
@@ -6132,6 +6258,20 @@
             });
             const sales = list.filter(record => record.source === 'epass_caixa' && record.status === 'VENDA' && !record.deleted);
             const commissions = list.filter(record => record.source === 'epass_comissoes' && record.category === 'PASSAGEM' && record.status === 'VENDA' && !record.deleted);
+
+            // Conciliação provisória somente por ID real idêntico. Horário, nome,
+            // CPF ou valor isolados não são suficientes para fundir operações.
+            list.filter(record => record.source === 'epass_ticket_confirmed' && record.provisional && !record.deleted).forEach(record => {
+                delete record.mergedInto;
+                const reference = EH.Utils.clean(record.saleId || '');
+                const official = reference ? sales.find(sale => EH.Utils.clean(sale.saleId || '') === reference) : null;
+                if (official) {
+                    record.mergedInto = official.sourceKey;
+                    record.operationStatus = 'CONCILIADO POR ID';
+                } else {
+                    record.operationStatus = 'AGUARDANDO CAIXA';
+                }
+            });
 
             sales.forEach(sale => {
                 const saleTime = Number(sale.timestamp || 0);
@@ -6700,10 +6840,11 @@
 
             const dados = {
                 origemDestino: this.findRoute(panel),
+                servico: this.findValueByLabel(panel, [/\bSERVICO\b/]),
                 linha: this.findValueByLabel(panel, [/\bLINHA\b/, /EMPRESA/]),
                 tarifa: this.findValueByLabel(panel, [/TARIFA/, /PASSAGEM/]),
                 taxa: this.findValueByLabel(panel, [/TAXA DE EMBARQUE/, /\bTAXA\b/]),
-                tipo: this.findValueByLabel(panel, [/\bTIPO\b/, /VEICULO/, /SERVICO/]),
+                tipo: this.findValueByLabel(panel, [/\bTIPO\b/, /VEICULO/]),
                 horaSaida: this.findValueByLabel(panel, [/HORA DE SAIDA/, /HORARIO DE SAIDA/, /\bSAIDA\b/]),
                 valorParcial: EH.Utils.text(EH.Utils.first(EH.Selectors.VALOR_PARCIAL)),
                 poltronasCount: this.findValueByLabel(panel, [/POLTRONAS?/, /OCUPACOES?/]),
@@ -8498,6 +8639,7 @@
                 fieldMeta: passenger.fieldMeta,
                 updatedAt: passenger.updatedAt || Date.now()
             });
+            EH.Attendance?.linkPassenger?.(passenger);
             return passenger;
         },
 
@@ -8547,6 +8689,7 @@
                 if (saleBeforeClear?.passengers?.length) EH.EmissionMemory?.finalizeSale?.(saleBeforeClear.id);
                 sessionStorage.removeItem(this.KEY);
                 sessionStorage.removeItem(this.LEGACY_KEY);
+                EH.Attendance?.clear?.();
             } catch (error) {
                 EH.Logger.debug('Não foi possível limpar o contexto temporário da venda:', error);
             }
@@ -8775,6 +8918,331 @@
             EH.Runtime.on('sale-context-change', document, 'change', capture, true);
             EH.Runtime.on('sale-context-blur', document, 'blur', capture, true);
             this.captureFromDom();
+        }
+    };
+
+    // ============================================================
+    // EVENTOS DE DOMÍNIO — barramento local e idempotente
+    // ============================================================
+    EH.DomainEvents = {
+        handlers: new Map(),
+        seen: new Map(),
+        LIMIT: 600,
+        on(type, callback) {
+            const key = String(type || '');
+            if (!key || typeof callback !== 'function') return () => {};
+            const list = this.handlers.get(key) || new Set();
+            list.add(callback); this.handlers.set(key, list);
+            return () => list.delete(callback);
+        },
+        emit(type, payload = {}, { idempotencyKey = '' } = {}) {
+            const eventType = String(type || '');
+            if (!eventType) return false;
+            const key = String(idempotencyKey || '');
+            if (key && this.seen.has(`${eventType}|${key}`)) return false;
+            if (key) {
+                this.seen.set(`${eventType}|${key}`, Date.now());
+                while (this.seen.size > this.LIMIT) this.seen.delete(this.seen.keys().next().value);
+            }
+            const event = Object.freeze({ type:eventType, at:Date.now(), payload });
+            (this.handlers.get(eventType) || []).forEach(callback => {
+                try { callback(event); }
+                catch (error) { EH.Logger.error(`Evento ${eventType} falhou de forma isolada.`, error); }
+            });
+            return true;
+        }
+    };
+
+    // ============================================================
+    // CONTEXTO OPERACIONAL ÚNICO — sessão de atendimento corrente
+    // Liga venda, passageiros, viagem, pagamento, bilhetes e requisições.
+    // Não persiste imagens e não transforma CPF em identificador de viagem.
+    // ============================================================
+    EH.Attendance = {
+        KEY: 'epassHelper.attendance.v1',
+        started: false,
+        normalizeText(value) { return EH.Utils.clean(value || ''); },
+        makeId(prefix = 'att') { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`; },
+        empty(sale = null) {
+            const now = Date.now();
+            return {
+                id: this.makeId(),
+                saleId: String(sale?.id || ''),
+                status: 'active',
+                stage: 'route_search',
+                page: 'desconhecida',
+                nextAction: 'Abrir a pesquisa de horários.',
+                passengerIds: [],
+                journey: { origin:'', destination:'', date:'', service:'', line:'', company:'', departure:'', arrival:'', seat:'', value:0 },
+                payment: { method:'', value:0, installments:'', state:'not_defined', observedAt:0 },
+                ticketRefs: [],
+                requisitionRefs: [],
+                evidence: {},
+                createdAt: now,
+                updatedAt: now
+            };
+        },
+        normalize(raw = {}) {
+            const sale = EH.SaleContext?.loadSale?.() || null;
+            const base = this.empty(sale);
+            const journey = raw.journey && typeof raw.journey === 'object' ? raw.journey : {};
+            const payment = raw.payment && typeof raw.payment === 'object' ? raw.payment : {};
+            return {
+                ...base, ...raw,
+                id: String(raw.id || base.id),
+                saleId: String(raw.saleId || sale?.id || ''),
+                status: String(raw.status || 'active'),
+                stage: String(raw.stage || 'route_search'),
+                page: String(raw.page || 'desconhecida'),
+                nextAction: this.normalizeText(raw.nextAction || ''),
+                passengerIds: Array.from(new Set(Array.isArray(raw.passengerIds) ? raw.passengerIds.map(String).filter(Boolean) : [])),
+                journey: {
+                    ...base.journey, ...journey,
+                    origin:this.normalizeText(journey.origin), destination:this.normalizeText(journey.destination),
+                    date:this.normalizeText(journey.date), service:String(journey.service || '').replace(/\D/g, ''),
+                    line:this.normalizeText(journey.line), company:this.normalizeText(journey.company),
+                    departure:EH.Utils.extractTime(journey.departure) || this.normalizeText(journey.departure),
+                    arrival:EH.Utils.extractTime(journey.arrival) || this.normalizeText(journey.arrival),
+                    seat:this.normalizeText(journey.seat), value:Math.max(0, Number(journey.value || 0) || 0)
+                },
+                payment: {
+                    ...base.payment, ...payment,
+                    method:this.normalizeText(payment.method), value:Math.max(0, Number(payment.value || 0) || 0),
+                    installments:this.normalizeText(payment.installments), state:String(payment.state || 'not_defined'),
+                    observedAt:Number(payment.observedAt || 0)
+                },
+                ticketRefs: Array.from(new Set(Array.isArray(raw.ticketRefs) ? raw.ticketRefs.map(String).filter(Boolean) : [])),
+                requisitionRefs: Array.from(new Set(Array.isArray(raw.requisitionRefs) ? raw.requisitionRefs.map(String).filter(Boolean) : [])),
+                evidence: raw.evidence && typeof raw.evidence === 'object' ? { ...raw.evidence } : {},
+                createdAt: Number(raw.createdAt || base.createdAt),
+                updatedAt: Number(raw.updatedAt || base.updatedAt)
+            };
+        },
+        load() {
+            try {
+                const parsed = JSON.parse(sessionStorage.getItem(this.KEY) || 'null');
+                if (!parsed) return this.empty(EH.SaleContext?.loadSale?.());
+                if (Date.now() - Number(parsed.updatedAt || parsed.createdAt || 0) > EH.Config.SALE_CPF_TTL_MS) {
+                    sessionStorage.removeItem(this.KEY);
+                    return this.empty(EH.SaleContext?.loadSale?.());
+                }
+                return this.normalize(parsed);
+            } catch (error) {
+                EH.Logger.warn('Não foi possível ler o contexto operacional.', error);
+                return this.empty(EH.SaleContext?.loadSale?.());
+            }
+        },
+        same(left, right) {
+            const clean = item => { const copy = this.normalize(item); delete copy.updatedAt; return copy; };
+            try { return JSON.stringify(clean(left)) === JSON.stringify(clean(right)); }
+            catch (_error) { return false; }
+        },
+        save(raw, { emit = true } = {}) {
+            const previous = this.load();
+            const next = this.normalize({ ...raw, updatedAt:Date.now() });
+            if (this.same(previous, next)) return previous;
+            try { sessionStorage.setItem(this.KEY, JSON.stringify(next)); }
+            catch (error) { EH.Logger.warn('Não foi possível salvar o contexto operacional.', error); }
+            if (emit) EH.DomainEvents.emit('attendance:changed', { attendanceId:next.id, stage:next.stage, page:next.page }, { idempotencyKey:`${next.id}|${next.updatedAt}` });
+            EH.ContextualPanels?.refresh?.('seats');
+            EH.ContextualPanels?.refresh?.('confirmation');
+            EH.ContextualPanels?.refresh?.('payment');
+            return next;
+        },
+        routeParts(value) {
+            const text = this.normalizeText(value);
+            const parts = text.split(/\s+(?:[xX×]|→)\s+/).map(item => this.normalizeText(item)).filter(Boolean);
+            return { origin:parts[0] || '', destination:parts[1] || '' };
+        },
+        summaryRouteDate(value) {
+            const text = this.normalizeText(value);
+            const match = text.match(/^(.*?)\s*-\s*(\d{2}\/\d{2}\/\d{4})(?:\s+(\d{1,2}:\d{2}))?$/);
+            const route = this.routeParts(match?.[1] || text);
+            return { ...route, date:match?.[2] || '', departure:match?.[3] || '' };
+        },
+        currentSearchSelection() {
+            const origin = EH.Utils.text(EH.Utils.first(EH.Selectors.ORIGEM));
+            const destination = EH.Utils.text(EH.Utils.first(EH.Selectors.DESTINO));
+            const dateInput = EH.Utils.first(EH.Selectors.DATA);
+            return { origem:origin, destino:destination, data:EH.Utils.formatDate(dateInput?.value || '') };
+        },
+        nextActionFor(page, context = this.load()) {
+            const journey = context.journey || {};
+            const hasSeat = Boolean(journey.seat);
+            const hasPassengers = Boolean(context.passengerIds?.length || EH.SaleContext?.loadSale?.()?.passengers?.length);
+            if (page === 'pesquisa') return journey.service ? 'Continuar com o horário selecionado no E-Pass.' : 'Escolher um horário real nos resultados.';
+            if (page === 'reserva') return hasSeat ? 'Confirmar a poltrona no E-Pass.' : 'Selecionar uma poltrona disponível.';
+            if (page === 'confirmacao') return hasPassengers ? 'Conferir os dados e avançar conscientemente para pagamento.' : 'Preencher e confirmar os dados do passageiro.';
+            if (page === 'pagamento') return context.payment?.state === 'pix_generated' ? 'Consultar o pagamento no E-Pass; cobrança gerada ainda não é quitação.' : 'Definir a forma de pagamento no E-Pass.';
+            if (page === 'passagens') return context.ticketRefs?.length ? 'Conferir ou imprimir o bilhete emitido.' : 'Pesquisar e conferir o bilhete; esta página não confirma emissão.';
+            if (page === 'requisicao') return 'Conferir os dados e concluir a solicitação manualmente.';
+            if (page === 'caixa' || page === 'comissoes') return 'Conciliar os movimentos oficiais do E-Pass.';
+            return 'Abrir a ferramenta relacionada à tarefa atual.';
+        },
+        resultFromRow(row) {
+            if (!row) return null;
+            const table = row.closest?.('table');
+            const headers = Array.from(table?.querySelectorAll?.('thead th') || []).map(th => EH.Utils.normalize(th.textContent));
+            const cells = Array.from(row.children || []).filter(cell => cell.tagName === 'TD');
+            const index = pattern => headers.findIndex(header => pattern.test(header));
+            const textAt = pattern => EH.Utils.clean(cells[index(pattern)]?.textContent || '');
+            const search = this.currentSearchSelection();
+            const service = (textAt(/^SERVICO$/).match(/\d+/) || [])[0] || '';
+            const lineText = textAt(/^LINHA$/);
+            return {
+                origin:search.origem || '', destination:search.destino || '', date:search.data || '', service,
+                line:lineText, company:EH.Utils.mapLine(lineText),
+                departure:EH.Utils.extractTime(textAt(/HORARIO DE SAIDA/)),
+                arrival:EH.Utils.extractTime(textAt(/HORARIO DE CHEGADA/)),
+                value:EH.Utils.parseMoney(textAt(/^VALOR$/))
+            };
+        },
+        setJourney(journey = {}, evidenceType = 'dom') {
+            const current = this.load();
+            current.journey = { ...current.journey, ...journey };
+            current.stage = current.journey.service ? 'journey_selected' : 'route_search';
+            current.evidence.journey = { type:evidenceType, at:Date.now() };
+            current.nextAction = this.nextActionFor(current.page, current);
+            const saved = this.save(current);
+            EH.DomainEvents.emit('journey:selected', { attendanceId:saved.id, service:saved.journey.service }, { idempotencyKey:`${saved.id}|${saved.journey.service}|${saved.journey.date}|${saved.journey.departure}` });
+            return saved;
+        },
+        captureSearch(context) {
+            // Não percorre a tabela em cada MutationObserver: somente lê os três
+            // controles estáveis. A linha completa é analisada uma vez no clique.
+            const data = this.currentSearchSelection();
+            if (!data.origem && !data.destino && !data.data) return;
+            const oldSignature = [context.journey.origin,context.journey.destination,context.journey.date].join('|');
+            const signature = [data.origem,data.destino,data.data].join('|');
+            const hasOld=Boolean(context.journey.origin||context.journey.destination||context.journey.date);
+            if (signature !== oldSignature && hasOld) {
+                context.journey = { ...this.empty().journey, origin:data.origem || '', destination:data.destino || '', date:data.data || '' };
+            } else {
+                Object.assign(context.journey, { origin:data.origem || context.journey.origin, destination:data.destino || context.journey.destination, date:data.data || context.journey.date });
+            }
+            context.stage = context.journey.service ? 'journey_selected' : 'route_search';
+            context.evidence.search = { type:'real-search-dom', at:Date.now() };
+        },
+        captureReservation(context) {
+            if (!EH.Utils.first(EH.Selectors.RESERVATION_ROOT) && !EH.Utils.first(EH.Selectors.DADOS_RESERVA) && !EH.Utils.first(EH.Selectors.MAPA_POLTRONAS)) return;
+            const data = EH.Parser?.parseReserva?.() || {};
+            const route = this.routeParts(data.origemDestino);
+            Object.assign(context.journey, {
+                origin:route.origin || context.journey.origin, destination:route.destination || context.journey.destination,
+                service:String(data.servico || context.journey.service || '').replace(/\D/g, ''),
+                line:data.linha || context.journey.line, departure:data.horaSaida || context.journey.departure,
+                seat:(data.poltronasSelecionadas || []).join(', '), value:Number(data.valorTotalNum || context.journey.value || 0)
+            });
+            context.stage = context.journey.seat ? 'seat_selected' : 'seat_selection';
+            context.evidence.seat = { type:'real-seat-dom', at:Date.now() };
+        },
+        captureSummary(context) {
+            const summary = EH.Payment?.parseSummary?.();
+            const first = summary?.cards?.[0];
+            if (!first) return;
+            const route = this.summaryRouteDate(first.routeDate);
+            Object.assign(context.journey, {
+                origin:route.origin || context.journey.origin, destination:route.destination || context.journey.destination,
+                date:route.date || context.journey.date, departure:route.departure || context.journey.departure,
+                seat:first.seat || context.journey.seat,
+                value:Math.max(Number(context.journey.value || 0), EH.Utils.parseMoney(first.total))
+            });
+            context.evidence.summary = { type:'real-summary-dom', at:Date.now() };
+        },
+        capturePayment(context) {
+            const root = EH.Utils.first(EH.Selectors.PAGAMENTO_ROOT);
+            if (!root) return;
+            this.captureSummary(context);
+            const valueOf = selector => Array.from(root?.querySelectorAll?.(selector) || []).map(control => String(('value' in control ? control.value : control.querySelector?.('.ng-value-label')?.textContent) || '').trim()).find(Boolean) || '';
+            const method = valueOf('[formcontrolname="nome"]');
+            const value = EH.Utils.parseMoney(valueOf('[formcontrolname="valor"]'));
+            const installments = valueOf('[formcontrolname="parcelas"]');
+            const pix = EH.Payment?.parsePix?.();
+            context.payment = {
+                ...context.payment, method:method || context.payment.method,
+                value:value || context.payment.value || context.journey.value,
+                installments:installments || context.payment.installments,
+                state:pix ? 'pix_generated' : (method || value ? 'defined' : context.payment.state),
+                observedAt:Date.now()
+            };
+            context.stage = pix ? 'pix_generated' : 'payment';
+            context.evidence.payment = { type:pix ? 'real-pix-charge-dom' : 'real-payment-dom', at:Date.now() };
+            EH.DomainEvents.emit('payment:observed', { attendanceId:context.id, state:context.payment.state }, { idempotencyKey:`${context.id}|${context.payment.state}|${context.payment.value}` });
+        },
+        syncLegacy(context) {
+            const sale = EH.SaleContext?.loadSale?.();
+            if (!sale?.passengers?.length) return;
+            const passengerIds = sale.passengers.map(item => item.id).filter(Boolean);
+            context.passengerIds = Array.from(new Set([...(context.passengerIds || []), ...passengerIds]));
+            context.saleId = String(sale.id || context.saleId || '');
+            const journey = context.journey || {};
+            const next = {
+                ...sale, attendanceId:context.id,
+                origem:journey.origin, destino:journey.destination, data:journey.date,
+                horario:journey.departure, service:journey.service, line:journey.line,
+                seat:journey.seat, valorFinal:journey.value,
+                paymentMethod:context.payment?.method || '', paymentState:context.payment?.state || 'not_defined'
+            };
+            const comparable = item => JSON.stringify({ origem:item.origem||'',destino:item.destino||'',data:item.data||'',horario:item.horario||'',service:item.service||'',line:item.line||'',seat:item.seat||'',valorFinal:Number(item.valorFinal||0),paymentMethod:item.paymentMethod||'',paymentState:item.paymentState||'',attendanceId:item.attendanceId||'' });
+            if (comparable(sale) !== comparable(next)) EH.SaleContext.saveSale(next);
+        },
+        linkPassenger(passenger = {}) {
+            const id=String(passenger.id||'');if(!id)return null;
+            const context=this.load();context.passengerIds=Array.from(new Set([...(context.passengerIds||[]),id]));
+            const sale=EH.SaleContext?.loadSale?.();if(sale?.id)context.saleId=String(sale.id);
+            context.evidence.passenger={type:passenger.confirmed?'confirmed-passenger':'real-passenger-dom',at:Date.now()};
+            context.nextAction=this.nextActionFor(context.page,context);
+            const saved=this.save(context);EH.DomainEvents.emit('passenger:confirmed',{attendanceId:saved.id,passengerId:id},{idempotencyKey:`${saved.id}|${id}|${passenger.confirmedAt||passenger.updatedAt||''}`});return saved;
+        },
+        linkRequisition(request = {}) {
+            const id=String(request.id||'');if(!id)return null;
+            const context=this.load();context.requisitionRefs=Array.from(new Set([...(context.requisitionRefs||[]),id]));
+            context.evidence.requisition={type:'persisted-requisition',at:Date.now()};
+            context.nextAction=this.nextActionFor(context.page,context);
+            const saved=this.save(context);EH.DomainEvents.emit('requisition:linked',{attendanceId:saved.id,requisitionId:id},{idempotencyKey:`${saved.id}|${id}|${request.updatedAt||''}`});return saved;
+        },
+        onPageUpdate(page) {
+            let context = this.load();
+            context.page = page || 'desconhecida';
+            if (page === 'pesquisa') this.captureSearch(context);
+            else if (page === 'reserva') this.captureReservation(context);
+            else if (page === 'confirmacao') { this.captureSummary(context); context.stage='passenger_confirmation'; }
+            else if (page === 'pagamento') this.capturePayment(context);
+            else if (page === 'passagens') context.stage = context.ticketRefs.length ? 'ticket_issued' : 'ticket_lookup';
+            else if (page === 'requisicao') context.stage='requisition';
+            else if (page === 'caixa' || page === 'comissoes') context.stage='finance_reconciliation';
+            this.syncLegacy(context);
+            context.nextAction = this.nextActionFor(page, context);
+            return this.save(context);
+        },
+        confirmIssuedTickets(items = []) {
+            const candidates = EH.Reminders?.candidateItems?.(items) || [];
+            if (!candidates.length) return 0;
+            const context = this.load();
+            const refs = new Set(context.ticketRefs || []);
+            candidates.forEach(item => refs.add(String(item.ticketNumber ? `ticket:${item.ticketNumber}` : item.id || '')));
+            context.ticketRefs = Array.from(refs).filter(Boolean);
+            context.status = 'issued'; context.stage = 'ticket_issued';
+            context.evidence.issue = { type:'qualified-ticket-card', at:Date.now(), count:candidates.length };
+            context.nextAction = 'Conferir, imprimir e acompanhar o bilhete emitido.';
+            this.save(context);
+            EH.FinanceLedger?.recordIssuedTickets?.(candidates, context);
+            candidates.forEach(item => EH.DomainEvents.emit('ticket:confirmed', { attendanceId:context.id, ticketNumber:item.ticketNumber || '' }, { idempotencyKey:item.ticketNumber || item.id }));
+            return candidates.length;
+        },
+        clear() {
+            try { sessionStorage.removeItem(this.KEY); }
+            catch (error) { EH.Logger.debug('Não foi possível limpar o contexto operacional.', error); }
+        },
+        init() {
+            if (this.started || EH.WhatsAppBridge?.isWhatsAppHost?.()) return;
+            this.started = true;
+            EH.Runtime.on('attendance-result-choice', document, 'click', event => {
+                const button = event.target?.closest?.(EH.Selectors.SEARCH_RESERVE_BUTTON);
+                if (!button || !button.closest?.('app-pesquisa-venda')) return;
+                const journey = this.resultFromRow(button.closest('tr'));
+                if (journey) this.setJourney(journey, 'real-reserve-button');
+            }, true);
         }
     };
 
@@ -11454,6 +11922,7 @@
                     <div class="eh-pref-preview">
                         <section class="eh-pref-card eh-pref-document-card eh-pref-workflow eh-pref-document-workflow">
                             <h3>Documento para conferência</h3>
+                            <div class="eh-pref-help">Esta foto é preservada para leitura e conferência dos dados do passageiro. Ela não substitui a requisição oficial gerada pelo DOCX. No final, escolha explicitamente qual dos dois arquivos anexar.</div>
                             <div class="eh-pref-document-toolbar">
                                 <button type="button" class="eh-pref-btn eh-pref-doc-corrected" aria-pressed="false">Imagem corrigida</button>
                                 <button type="button" class="eh-pref-btn eh-pref-doc-original" aria-pressed="false">Original</button>
@@ -11478,7 +11947,7 @@
                         <section class="eh-pref-ready eh-pref-workflow" hidden>
                             <strong>✓ REQUISIÇÃO PRONTA</strong>
                             <code class="eh-pref-ready-name"></code>
-                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-download">Baixar PNG</button><button type="button" class="eh-pref-btn eh-pref-fill-request">Preencher solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach">Usar na solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach-doc">Usar documentação</button><button type="button" class="eh-pref-btn eh-pref-again">Gerar novamente</button></div>
+                            <div class="eh-pref-actions"><button type="button" class="eh-pref-btn eh-pref-download">Baixar PNG</button><button type="button" class="eh-pref-btn eh-pref-fill-request">Preencher solicitação</button><button type="button" class="eh-pref-btn eh-pref-attach">Anexar requisição oficial</button><button type="button" class="eh-pref-btn eh-pref-attach-doc">Anexar foto do documento</button><button type="button" class="eh-pref-btn eh-pref-again">Gerar novamente</button></div>
                             <small>O Helper não clica em “Enviar solicitação”. Confira os anexos e envie manualmente.</small>
                         </section>
                     </div>
@@ -11958,12 +12427,14 @@
                 existing.passengers = this.mergePassengerData(existing.passengers, next.passengers);
                 existing.updatedAt = now;
                 this.saveStore(items);
+                EH.Attendance?.linkRequisition?.(existing);
                 return existing;
             }
             next.createdAt = now;
             next.updatedAt = now;
             items.unshift(next);
             this.saveStore(items);
+            EH.Attendance?.linkRequisition?.(next);
             return next;
         },
 
@@ -14253,6 +14724,8 @@
             add('WhatsApp Bridge', Boolean(EH.WhatsAppBridge?.makeCommand && EH.WhatsAppBridge?.send));
             add('Financeiro', Boolean(EH.FinanceLedger?.summary && EH.FinanceReader?.snapshot));
             add('Mapa 287', Boolean(EH.OperationCars?.agencySummary && EH.OperationCars?.readVehicleMap));
+            add('Contexto operacional', Boolean(EH.Attendance?.load && EH.DomainEvents?.emit));
+            add('Emissão exige evidência', EH.EmissionMemory?.issueStatusForPage?.('passagens') !== 'issued');
             return {
                 success: checks.every(item => item.ok),
                 checks,
@@ -14271,7 +14744,7 @@
                     date: new Date().toISOString()
                 },
                 page: {
-                    url: location.href,
+                    url: EH.Privacy.safeUrl(location.href),
                     title: document.title,
                     detected: EH.Pages.detect(),
                     secureContext: window.isSecureContext,
@@ -14302,7 +14775,8 @@
                 interface: {
                     state: EH.State?.snapshot?.() || null,
                     layout: EH.Layout?.lastMetrics || null,
-                    whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null
+                    whatsapp: EH.WhatsAppBridge?.getConnectionStatus?.() || null,
+                    attendance: (() => { const item=EH.Attendance?.load?.();return item?{id:item.id,stage:item.stage,page:item.page,nextAction:item.nextAction,passengers:item.passengerIds?.length||0,tickets:item.ticketRefs?.length||0,requisitions:item.requisitionRefs?.length||0,service:item.journey?.service||''}:null; })()
                 },
                 financeReadOnly: (() => {
                     const snapshot = EH.FinanceReader?.snapshot?.();
@@ -14338,11 +14812,11 @@
             const panel = EH.Utils.first(EH.Selectors.DADOS_RESERVA);
 
             return JSON.stringify({
-                warning: 'Não envie dados pessoais de passageiros.',
-                url: location.href,
-                table: table?.outerHTML || 'NÃO ENCONTRADA',
-                seatMap: map?.outerHTML || 'NÃO ENCONTRADO',
-                reservationPanel: panel?.outerHTML || 'NÃO ENCONTRADO'
+                warning: 'Dados pessoais, PIX, imagens e parâmetros sensíveis foram redigidos automaticamente.',
+                url: EH.Privacy.safeUrl(location.href),
+                table: table ? EH.Privacy.redactHtml(table.outerHTML) : 'NÃO ENCONTRADA',
+                seatMap: map ? EH.Privacy.redactHtml(map.outerHTML) : 'NÃO ENCONTRADO',
+                reservationPanel: panel ? EH.Privacy.redactHtml(panel.outerHTML) : 'NÃO ENCONTRADO'
             }, null, 2);
         }
     };
@@ -14368,14 +14842,15 @@
             ['poltronas', '2', 'Poltronas'],
             ['confirmacao', '3', 'Confirmar'],
             ['pix', '4', 'PIX'],
-            ['bilhete', '5', 'Bilhete']
+            ['passagens', '5', 'Consultar'],
+            ['bilhete', '6', 'Bilhete']
         ],
         infer(page) {
             if (page === 'pesquisa') return 'consulta';
             if (page === 'reserva') return 'poltronas';
             if (page === 'confirmacao') return 'confirmacao';
             if (page === 'pagamento') return EH.Payment?.parsePix?.() ? 'pix' : 'confirmacao';
-            if (page === 'passagens') return 'bilhete';
+            if (page === 'passagens') return EH.Attendance?.load?.()?.ticketRefs?.length ? 'bilhete' : 'passagens';
             return this.stage || 'consulta';
         }
     };
@@ -15228,10 +15703,13 @@
             return result;
         },
         captureItems(items=[], options={}) {
-            EH.EmissionMemory?.captureItems?.(items);
-            if (!EH.Config.REMINDER_CREATE_AFTER_TICKET) return 0;
             const candidates=this.candidateItems(items);
             if (!candidates.length) return 0;
+            if (options.confirmedEvidence) {
+                EH.EmissionMemory?.captureItems?.(items);
+                EH.Attendance?.confirmIssuedTickets?.(items);
+            }
+            if (!EH.Config.REMINDER_CREATE_AFTER_TICKET) return 0;
             const existing=this.loadAll();
             const fresh=[];const changedIds=[];
             candidates.forEach(candidate=>{
@@ -15260,6 +15738,10 @@
             if (fresh.length&&EH.Config.REMINDER_ASK_AFTER_TICKET && !options.confirmedEvidence) {
                 const ok=window.confirm(`Criar lembrete de impressão/embarque para ${fresh.length} passagem(ns)?`);
                 if (!ok) return 0;
+            }
+            if (!options.confirmedEvidence) {
+                EH.EmissionMemory?.captureItems?.(items);
+                EH.Attendance?.confirmIssuedTickets?.(items);
             }
             this.save([...existing,...fresh],{changedIds:[...changedIds,...fresh.map(item=>item.id)]});
             EH.Sync?.syncReminders?.({ quiet: true });
@@ -15781,6 +16263,11 @@
             const travelDate = EH.Utils.clean(item.travelDate || '');
             const saleId=EH.Utils.clean(item.saleId||'');
             const salePassengerId=EH.Utils.clean(item.salePassengerId||'');
+            const confirmedEvidence=Boolean(item.confirmedEvidence);
+            const issuedAt=Math.max(0,Number(item.issuedAt||0));
+            const rawIssueStatus=EH.Utils.clean(item.issueStatus||item.status||'draft').toLowerCase()||'draft';
+            const falseRouteIssue=rawIssueStatus==='issued'&&!ticketNumber&&!confirmedEvidence&&!issuedAt;
+            const issueStatus=falseRouteIssue?'payment':rawIssueStatus;
             const fallbackId = saleId && salePassengerId
                 ? `sale:${saleId}:${salePassengerId}`
                 : (ticketNumber ? `ticket:${ticketNumber}` : `trip:${cpf}|${travelDate}|${EH.Utils.normalize(origin)}|${EH.Utils.normalize(destination)}`);
@@ -15802,10 +16289,16 @@
                 saleReference: EH.Utils.clean(item.saleReference || item.saleIdReal || ''),
                 requestCodes: item.requestCodes && typeof item.requestCodes==='object' ? { ...item.requestCodes } : {},
                 benefit: EH.Utils.clean(item.benefit || ''),
-                issueStatus: EH.Utils.clean(item.issueStatus || item.status || 'draft').toLowerCase() || 'draft',
+                issueStatus,
                 ticketStatus: EH.Utils.clean(item.ticketStatus || 'pending').toLowerCase() || 'pending',
                 printStatus: EH.Utils.clean(item.printStatus || 'pending').toLowerCase() || 'pending',
                 checkStatus: EH.Utils.clean(item.checkStatus || 'pending').toLowerCase() || 'pending',
+                confirmedEvidence,
+                evidenceType: EH.Utils.clean(item.evidenceType || ''),
+                issuedAt,
+                requiresConfirmation: Boolean(item.requiresConfirmation || falseRouteIssue),
+                paymentMethod: EH.Utils.clean(item.paymentMethod || ''),
+                paymentValue: Math.max(0, EH.Utils.parseMoney(item.paymentValue ?? item.value ?? 0)),
                 saleFinalized: Boolean(item.saleFinalized),
                 createdAt: Number(item.createdAt || Date.now()),
                 updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
@@ -15850,6 +16343,12 @@
                 ticketStatus: this.issueRank(next.ticketStatus)>=this.issueRank(old.ticketStatus)?next.ticketStatus:old.ticketStatus,
                 printStatus,
                 checkStatus,
+                confirmedEvidence: Boolean(old.confirmedEvidence || next.confirmedEvidence),
+                evidenceType: preferred.evidenceType || secondary.evidenceType,
+                issuedAt: Math.max(Number(old.issuedAt || 0), Number(next.issuedAt || 0)),
+                requiresConfirmation: Boolean((old.requiresConfirmation || next.requiresConfirmation) && !(old.confirmedEvidence || next.confirmedEvidence || old.issuedAt || next.issuedAt)),
+                paymentMethod: preferred.paymentMethod || secondary.paymentMethod,
+                paymentValue: Math.max(Number(old.paymentValue || 0), Number(next.paymentValue || 0)),
                 saleFinalized: Boolean(old.saleFinalized||next.saleFinalized),
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
                 updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
@@ -15910,7 +16409,8 @@
             return merged;
         },
         issueStatusForPage(page='') {
-            return page==='passagens'?'issued':page==='pagamento'?'payment':page==='confirmacao'?'confirmed':'draft';
+            // Rota é contexto de interface, nunca comprovante de negócio.
+            return page==='pagamento'?'payment':page==='confirmacao'?'confirmed':'draft';
         },
         captureSale(sale, { page = '' } = {}) {
             if(!sale?.id||!Array.isArray(sale.passengers)||!sale.passengers.length)return 0;
@@ -15923,6 +16423,11 @@
                     id:`sale:${sale.id}:${passenger.id||`p-${cpf}`}`,
                     saleId:String(sale.id),salePassengerId:String(passenger.id||`p-${cpf}`),
                     cpf,name:passenger.name,birthDate:passenger.birthDate,
+                    origin:sale.origem||sale.origin||'',destination:sale.destino||sale.destination||'',
+                    travelDate:sale.data||sale.travelDate||'',travelTime:sale.horario||sale.time||'',
+                    service:sale.service||'',line:sale.line||'',seat:passenger.seat||sale.seat||'',
+                    paymentMethod:sale.paymentMethod||sale.formaPagamento||'',
+                    paymentValue:Number(sale.valorFinal||sale.total||0),
                     ticketStatus:passenger.ticketStatus||'pending',
                     issueStatus,printStatus:'pending',checkStatus:'pending',
                     createdAt:Number(passenger.createdAt||sale.createdAt||Date.now()),
@@ -15936,7 +16441,7 @@
         finalizeSale(saleId) {
             const id=String(saleId||'');if(!id)return 0;
             const rows=this.load();let changed=0;
-            rows.forEach((row,index)=>{if(String(row.saleId||'')!==id)return;const next=this.normalize(row);if(next.saleFinalized)return;next.saleFinalized=true;next.updatedAt=Date.now();next.deviceId=EH.Device.id();next.syncState=EH.Sync?.configured?.()?'pending':'local';rows[index]=next;EH.Sync?.markPendingRecord?.('emission',next.id);changed+=1;});
+            rows.forEach((row,index)=>{if(String(row.saleId||'')!==id)return;const next=this.normalize(row);if(next.saleFinalized||!this.isIssued(next))return;next.saleFinalized=true;next.updatedAt=Date.now();next.deviceId=EH.Device.id();next.syncState=EH.Sync?.configured?.()?'pending':'local';rows[index]=next;EH.Sync?.markPendingRecord?.('emission',next.id);changed+=1;});
             if(changed)EH.Storage.set(this.KEY,rows);
             return changed;
         },
@@ -15953,7 +16458,7 @@
             const candidates = EH.Reminders?.candidateItems?.(items) || [];
             let count = 0;
             candidates.forEach(candidate => {
-                const saved = this.upsert({ ...candidate, issueStatus:'captured', ticketStatus:'captured', printStatus:'pending' });
+                const saved = this.upsert({ ...candidate, issueStatus:'captured', ticketStatus:'captured', printStatus:'pending', confirmedEvidence:true, evidenceType:'qualified-ticket-card', issuedAt:Number(candidate.issuedAt||Date.now()), requiresConfirmation:false });
                 if (saved) count += 1;
             });
             return count;
@@ -15971,7 +16476,7 @@
             EH.UI?.renderAutomation?.(EH.Pages?.detect?.()||'desconhecida');EH.UI?.renderSaleSummary?.(EH.Pages?.detect?.()||'desconhecida');
             return current;
         },
-        isIssued(row) { const item=this.normalize(row);return this.issueRank(item.issueStatus)>=this.issueRank('issued')||Boolean(item.ticketNumber); },
+        isIssued(row) { const item=this.normalize(row);return Boolean(item.confirmedEvidence||item.issuedAt||this.issueRank(item.issueStatus)>=this.issueRank('captured')||(item.issueStatus==='issued'&&item.ticketNumber)); },
         isPending(row) { const item=this.normalize(row);return this.isIssued(item)&&this.statusRank(item.printStatus)<this.statusRank('printed'); },
         pending({ excludeSaleId = '' } = {}) {
             const excluded=String(excludeSaleId||'');
@@ -16025,7 +16530,15 @@
             if(['confirmacao','pagamento','passagens'].includes(page))this.captureSale(EH.SaleContext?.loadSale?.(),{page});
             if(page==='passagens')this.runPendingSearch();
         },
-        applyRemote(item = {}) { return this.upsert(item, { fromSync:true }); }
+        applyRemote(item = {}) {
+            const saved=this.upsert(item, { fromSync:true });
+            if(saved&&this.isIssued(saved))EH.FinanceLedger?.recordIssuedTickets?.([{
+                id:saved.id,ticketNumber:saved.ticketNumber,locator:saved.locator,saleReference:saved.saleReference,
+                cpf:saved.cpf,name:saved.name,line:saved.line,paymentMethod:saved.paymentMethod,
+                value:saved.paymentValue,issuedAt:saved.issuedAt
+            }],null);
+            return saved;
+        }
     };
 
 
@@ -18354,7 +18867,7 @@
                     const statusLines = [];
                     if (pix.value) statusLines.push(`💰 Valor: ${pix.value}`);
                     if (pix.expires) statusLines.push(`⏳ Expira: ${pix.expires}`);
-                    statusLines.push(validation.valid ? '🟢 Código válido' : '🔴 PIX aparentemente incompleto ou inválido');
+                    statusLines.push(validation.valid ? '🟢 Cobrança gerada; pagamento ainda não confirmado' : '🔴 PIX aparentemente incompleto ou inválido');
                     if (!validation.valid && validation.reason) statusLines.push(validation.reason);
                     info.textContent = statusLines.join('\n');
 
@@ -20700,6 +21213,7 @@
         },
         cell(label,value) { const cell=document.createElement('div');const span=document.createElement('span');span.textContent=label;const strong=document.createElement('b');strong.textContent=value||'—';cell.append(span,strong);return cell; },
         action(label,callback,className='') { const button=document.createElement('button');button.type='button';button.textContent=label;button.className=className;button.addEventListener('click',callback);return button; },
+        nextAction(body, context=EH.Attendance?.load?.()) { const note=document.createElement('div');note.className='eh-context-empty eh-context-next-action';note.textContent=`Próxima ação: ${context?.nextAction||EH.Attendance?.nextActionFor?.(EH.Pages?.detect?.()||'desconhecida',context)||'Conferir a etapa atual.'}`;body.appendChild(note);return note; },
         renderRoutes(body) {
             const routes=EH.QuickRoutes.active();body.classList.remove('eh-route-size-small','eh-route-size-normal','eh-route-size-large','eh-route-size-xlarge');body.classList.add(`eh-route-size-${EH.Config.CONTEXT_BUTTON_SIZE||'normal'}`);if(!routes.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota configurada.';body.appendChild(empty);return;}
             const selectedId=String(EH.Storage.get('selectedQuickRouteId.v1','')||'');
@@ -20710,13 +21224,13 @@
             });
         },
         renderSeats(body) {
-            const data=EH.Parser?.parseReserva?.()||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',EH.SaleContext?.getActivePassenger?.()?.name||''),this.cell('Rota',data.origemDestino),this.cell('Horário',data.horaSaida),this.cell('Poltrona',data.poltronasSelecionadas?.join(', ')),this.cell('Disponíveis',data.poltronasLivres?.length?String(data.poltronasLivres.length):''),this.cell('Valor',data.valorTotalNum>0?EH.Utils.formatMoney(data.valorTotalNum):''));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Gerar poltronas',()=>EH.UI?.captureAction?.('reserva'),'primary'),this.action('Copiar dados',async()=>{await EH.Clipboard.copyText(EH.Parser.formatReservaResumo(data));EH.Toast.success('Dados das poltronas copiados.');}));body.append(grid,actions);
+            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{};const data=EH.Parser?.parseReserva?.()||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',EH.SaleContext?.getActivePassenger?.()?.name||''),this.cell('Rota',data.origemDestino||[journey.origin,journey.destination].filter(Boolean).join(' → ')),this.cell('Serviço',data.servico||journey.service),this.cell('Horário',data.horaSaida||journey.departure),this.cell('Poltrona',data.poltronasSelecionadas?.join(', ')||journey.seat),this.cell('Disponíveis',data.poltronasLivres?.length?String(data.poltronasLivres.length):''),this.cell('Valor',data.valorTotalNum>0?EH.Utils.formatMoney(data.valorTotalNum):(journey.value?EH.Utils.formatMoney(journey.value):'')));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Gerar poltronas',()=>EH.UI?.captureAction?.('reserva'),'primary'),this.action('Copiar dados',async()=>{await EH.Clipboard.copyText(EH.Parser.formatReservaResumo(data));EH.Toast.success('Dados das poltronas copiados.');}));body.append(grid);this.nextAction(body,context);body.append(actions);
         },
         renderPayment(body) {
-            const sale=EH.SaleContext?.loadSale?.()||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const pix=EH.Payment?.parsePix?.();const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name),this.cell('Rota',[sale.origem,sale.destino].filter(Boolean).join(' → ')),this.cell('Data',sale.data||sale.travelDate),this.cell('Horário',sale.horario||sale.time),this.cell('Poltrona',passenger.seat||passenger.poltrona),this.cell('Status PIX',pix?.validation?.valid?'Código disponível':'Aguardando E-Pass'));const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid)actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));body.append(grid,actions);
+            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const pix=EH.Payment?.parsePix?.();const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name),this.cell('Rota',[journey.origin,journey.destination].filter(Boolean).join(' → ')),this.cell('Data',journey.date),this.cell('Horário',journey.departure),this.cell('Poltrona',journey.seat),this.cell('Forma',payment.method),this.cell('Valor',payment.value?EH.Utils.formatMoney(payment.value):''),this.cell('Status PIX',pix?.validation?.valid?'Cobrança gerada — pagamento não confirmado':'Aguardando E-Pass'));const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid)actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));body.append(grid);this.nextAction(body,context);body.append(actions);
         },
         renderConfirmation(body) {
-            const sale=EH.SaleContext?.loadSale?.()||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const cpf=EH.SaleContext?.maskCpfPublic?.(passenger.cpf||'')||'';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Nome',passenger.name),this.cell('CPF',cpf),this.cell('Origem',sale.origem),this.cell('Destino',sale.destino),this.cell('Horário',sale.horario||sale.time),this.cell('Poltrona',passenger.seat||passenger.poltrona),this.cell('Pagamento',sale.paymentMethod||sale.formaPagamento),this.cell('Valor final',sale.valorFinal||sale.total));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Copiar resumo',()=>EH.UI?.copyCurrentSummary?.(),'primary'));body.append(grid,actions);
+            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const cpf=EH.SaleContext?.maskCpfPublic?.(passenger.cpf||'')||'';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Nome',passenger.name),this.cell('CPF',cpf),this.cell('Origem',journey.origin),this.cell('Destino',journey.destination),this.cell('Serviço',journey.service),this.cell('Horário',journey.departure),this.cell('Poltrona',journey.seat),this.cell('Pagamento',payment.method),this.cell('Valor final',payment.value?EH.Utils.formatMoney(payment.value):(journey.value?EH.Utils.formatMoney(journey.value):'')));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Copiar resumo',()=>EH.UI?.copyCurrentSummary?.(),'primary'));body.append(grid);this.nextAction(body,context);body.append(actions);
         },
         renderFinance(body) {
             const today=EH.FinanceLedger?.todaySummary?.()||{};const stats=EH.FinanceLedger?.monthStats?.();const month=stats?.summary||EH.FinanceLedger?.monthSummary?.()||{};
@@ -20731,7 +21245,7 @@
                 this.cell(`Mercadorias recebidas • ${month.merchandiseReceivedCount||0}`,money(month.merchandiseReceivedValue)),
                 this.cell(`Mercadorias enviadas • ${month.merchandiseSentCount||0}`,money(month.merchandiseSentValue))
             );
-            const note=document.createElement('div');note.className='eh-context-empty';note.textContent=stats?`Realizado em ${stats.elapsedDays} dia(s) corrido(s). A projeção usa ${stats.daysInMonth} dias e não é valor realizado.`:'Sem período mensal válido.';
+            const pending=EH.FinanceLedger?.pendingReconciliation?.()?.length||0;const note=document.createElement('div');note.className='eh-context-empty';note.textContent=stats?`Realizado em ${stats.elapsedDays} dia(s) corrido(s). A projeção usa ${stats.daysInMonth} dias e não é valor realizado. ${pending} emissão(ões) aguarda(m) conciliação e não entra(m) nos totais.`:'Sem período mensal válido.';
             const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Ver detalhes',()=>EH.UI?.showFinanceModal?.('resumo'),'primary'),this.action('Atualizar dados',()=>EH.FinanceLedger?.syncFromCurrentPage?.()));
             body.append(grid,note,actions);
         },
@@ -20771,7 +21285,7 @@
             EH.ContextualPanels.init();
             const root=document.createElement('nav');root.id='eh-context-shortcuts';root.setAttribute('aria-label','Atalhos contextuais do E-Pass Helper');document.body.appendChild(root);this.root=root;
             GM_addStyle(`
-                #eh-context-shortcuts{position:fixed;right:8px;top:142px;z-index:2147482950;display:flex;flex-direction:column;gap:var(--eh-context-gap,6px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}
+                #eh-context-shortcuts{position:fixed;right:8px;top:142px;z-index:2147482950;display:flex;flex-direction:column;gap:var(--eh-context-gap,6px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}.eh-context-next-pill{box-sizing:border-box;max-width:230px;padding:7px 9px;border:1px solid #d7e2ec;border-radius:9px;background:rgba(248,251,254,.97);color:#526579;box-shadow:0 4px 12px rgba(31,48,70,.09);font:750 9px/1.3 Inter,"Segoe UI",Arial,sans-serif}
                 #eh-context-shortcuts button{pointer-events:auto;display:flex;align-items:center;gap:6px;min-width:var(--eh-context-min,38px);min-height:var(--eh-context-height,36px);padding:7px 9px;border:1px solid #cbd5e1;border-radius:10px;background:rgba(255,255,255,var(--eh-context-opacity,.96));color:#28415e;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:800 var(--eh-context-font,10px)/1.15 Inter,"Segoe UI",Arial,sans-serif;text-align:left}.eh-context-shortcut-icon{font-size:var(--eh-context-icon,15px)}#eh-context-shortcuts button:hover,#eh-context-shortcuts button:focus-visible{border-color:#6b9ed8;background:#fff;outline:2px solid rgba(59,130,246,.18)}
                 html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:auto}@media(max-width:760px){#eh-context-shortcuts{top:auto;right:8px;bottom:10px;flex-direction:row;max-width:calc(100vw - 16px);overflow-x:auto}html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:8px}}
             `);this.render(EH.Pages?.detect?.()||'desconhecida');
@@ -20779,7 +21293,7 @@
         button(icon,label,title,action){const button=document.createElement('button');button.type='button';button.title=title;button.setAttribute('aria-label',title);const i=document.createElement('span');i.className='eh-context-shortcut-icon';i.textContent=icon;button.appendChild(i);if(EH.Config.CONTEXT_BUTTON_SHOW_TEXT){const text=document.createElement('span');text.textContent=label;button.appendChild(text);}button.addEventListener('click',event=>{event.stopPropagation();action();});return button;},
         definitions(page){const open=id=>()=>EH.ContextualPanels.open(id);if(page==='pesquisa')return[['🧭','Rotas','Rotas e horários rápidos',open('routes')],['🗓️','Horários','Capturar horários encontrados',()=>EH.UI?.captureAction?.('pesquisa')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];if(page==='reserva')return[['💺','Poltronas','Poltronas e passageiro atual',open('seats')],['👤','Dados','Dados do passageiro e Document AI',open('passenger')]];if(page==='confirmacao')return[['✅','Conferir','Resumo e confirmação consciente',open('confirmation')]];if(page==='pagamento')return[['💳','Pagamento','Pagamento e PIX',open('payment')]];if(page==='passagens')return[['🎫','Bilhetes','Passagens emitidas',open('tickets')],['🔔','Lembretes','Lembretes de impressão',open('reminders')],['👤','Passageiro','Dados confirmados do passageiro',open('passenger')]];if(page==='caixa'||page==='comissoes')return[['📊','Financeiro','Caixa e financeiro',open('finance')]];if(page==='requisicao')return[['📄','Requisição','Requisição da Prefeitura',open('prefeitura')],['👤','Preencher','Preencher somente campos reais compatíveis',async()=>{try{await EH.PassengerIdentity?.fillSolicitation?.();EH.Toast?.success?.('Solicitação preenchida. O envio continua manual.');}catch(error){EH.Toast?.warning?.(error.message||'A tela atual não possui campos compatíveis para preenchimento.');}}]];return[['☰','Ferramentas','Abrir menu compacto de ferramentas',open('menu')]];},
         applyPreferences(){if(!this.root)return;const sizes={small:[32,32],normal:[38,36],large:[46,42],xlarge:[56,50]};const [min,height]=sizes[EH.Config.CONTEXT_BUTTON_SIZE]||sizes.normal;this.root.style.setProperty('--eh-context-min',`${min}px`);this.root.style.setProperty('--eh-context-height',`${height}px`);this.root.style.setProperty('--eh-context-font',`${EH.Config.CONTEXT_BUTTON_FONT_SIZE}px`);this.root.style.setProperty('--eh-context-icon',`${EH.Config.CONTEXT_BUTTON_ICON_SIZE}px`);this.root.style.setProperty('--eh-context-gap',`${EH.Config.CONTEXT_BUTTON_GAP}px`);this.root.style.setProperty('--eh-context-opacity',String(EH.Config.CONTEXT_BUTTON_OPACITY));},
-        render(page=EH.Pages?.detect?.()||'desconhecida'){if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);this.root.replaceChildren(...definitions.map(args=>this.button(...args)));this.root.hidden=!definitions.length;EH.ContextualPanels?.sync?.(page);}
+        render(page=EH.Pages?.detect?.()||'desconhecida'){if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);const context=EH.Attendance?.load?.();const next=document.createElement('div');next.className='eh-context-next-pill';next.setAttribute('role','status');next.textContent=`Próxima: ${context?.nextAction||EH.Attendance?.nextActionFor?.(page,context)||'conferir a etapa atual'}`;this.root.replaceChildren(next,...definitions.map(args=>this.button(...args)));this.root.hidden=!definitions.length;EH.ContextualPanels?.sync?.(page);}
     };
 
     // ============================================================
@@ -20854,6 +21368,7 @@
             // Docks operacionais permanentes foram substituídos por painéis contextuais.
             safeInit('Mapa dos carros', () => EH.OperationCars.init());
             safeInit('Contexto de vendas', () => EH.SaleCpfs.init());
+            safeInit('Contexto operacional', () => EH.Attendance?.init?.());
             safeInit('Identidade do passageiro', () => EH.PassengerIdentity.init());
             safeInit('Requisições', () => EH.RequisitionManager.init());
             safeInit('Requisição Prefeitura', () => EH.PrefeituraRequisition.init());
