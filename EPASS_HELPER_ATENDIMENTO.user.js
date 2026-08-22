@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.83.0
+// @version      5.84.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.83.0',
+        VERSION: '5.84.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 23,
+        STORAGE_SCHEMA_VERSION: 24,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -90,6 +90,15 @@
         OPERATION_AGENCY_CODE: '287',
         OPERATION_SORT_BY_SEAT: true,
         OPERATION_DOCK_ENABLED: true,
+        OPERATION_PANEL_X: 0,
+        OPERATION_PANEL_Y: 0,
+        OPERATION_PANEL_WIDTH: 360,
+        OPERATION_PANEL_HEIGHT: 420,
+        OPERATION_PANEL_BUTTON_HEIGHT: 28,
+        OPERATION_PANEL_FONT_SIZE: 10,
+        OPERATION_PANEL_PASSENGER_GAP: 4,
+        OPERATION_PANEL_COMPACT: true,
+        OPERATION_PANEL_KEEP_VISIBLE: true,
         REMINDER_CREATE_AFTER_TICKET: true,
         REMINDER_ASK_AFTER_TICKET: true,
         REMINDER_MASK_CPF: true,
@@ -111,7 +120,7 @@
         CONTEXT_BUTTON_GAP: 6,
         CONTEXT_BUTTON_OPACITY: 0.96,
         CONTEXT_BUTTON_SHOW_TEXT: true,
-        CONTEXT_BUTTON_POSITION: 'auto',
+        CONTEXT_BUTTON_POSITION: 'top',
         QUICK_ROUTE_GREETING: '',
         QUICK_ROUTE_FOOTER: 'Consulte disponibilidade.',
         QUICK_ROUTE_SUMMARY_TEMPLATE: '',
@@ -461,6 +470,15 @@
             EH.Config.OPERATION_AGENCY_CODE = String(this.get('operationAgencyCode', EH.Config.OPERATION_AGENCY_CODE) || '287').replace(/\D/g, '') || '287';
             EH.Config.OPERATION_SORT_BY_SEAT = EH.Utils.parseBoolean(this.get('operationSortBySeat', EH.Config.OPERATION_SORT_BY_SEAT), EH.Config.OPERATION_SORT_BY_SEAT);
             EH.Config.OPERATION_DOCK_ENABLED = EH.Utils.parseBoolean(this.get('operationDockEnabled', EH.Config.OPERATION_DOCK_ENABLED), EH.Config.OPERATION_DOCK_ENABLED);
+            EH.Config.OPERATION_PANEL_X = Math.max(0, Number(this.get('operationPanelX', EH.Config.OPERATION_PANEL_X)) || 0);
+            EH.Config.OPERATION_PANEL_Y = Math.max(0, Number(this.get('operationPanelY', EH.Config.OPERATION_PANEL_Y)) || 0);
+            EH.Config.OPERATION_PANEL_WIDTH = Math.min(720, Math.max(300, Number(this.get('operationPanelWidth', EH.Config.OPERATION_PANEL_WIDTH)) || 360));
+            EH.Config.OPERATION_PANEL_HEIGHT = Math.min(900, Math.max(220, Number(this.get('operationPanelHeight', EH.Config.OPERATION_PANEL_HEIGHT)) || 420));
+            EH.Config.OPERATION_PANEL_BUTTON_HEIGHT = Math.min(40, Math.max(24, Number(this.get('operationPanelButtonHeight', EH.Config.OPERATION_PANEL_BUTTON_HEIGHT)) || 28));
+            EH.Config.OPERATION_PANEL_FONT_SIZE = Math.min(14, Math.max(9, Number(this.get('operationPanelFontSize', EH.Config.OPERATION_PANEL_FONT_SIZE)) || 10));
+            EH.Config.OPERATION_PANEL_PASSENGER_GAP = Math.min(14, Math.max(2, Number(this.get('operationPanelPassengerGap', EH.Config.OPERATION_PANEL_PASSENGER_GAP)) || 4));
+            EH.Config.OPERATION_PANEL_COMPACT = EH.Utils.parseBoolean(this.get('operationPanelCompact', EH.Config.OPERATION_PANEL_COMPACT), EH.Config.OPERATION_PANEL_COMPACT);
+            EH.Config.OPERATION_PANEL_KEEP_VISIBLE = EH.Utils.parseBoolean(this.get('operationPanelKeepVisible', EH.Config.OPERATION_PANEL_KEEP_VISIBLE), EH.Config.OPERATION_PANEL_KEEP_VISIBLE);
             {
                 const value = EH.Utils.parseFiniteNumber(this.get('operationTimeToleranceMinutes', EH.Config.OPERATION_TIME_TOLERANCE_MINUTES), EH.Config.OPERATION_TIME_TOLERANCE_MINUTES);
                 EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = Math.min(90, Math.max(0, value));
@@ -490,8 +508,8 @@
             EH.Config.CONTEXT_BUTTON_GAP = Math.min(18, Math.max(2, Number(this.get('contextButtonGap', EH.Config.CONTEXT_BUTTON_GAP)) || 6));
             EH.Config.CONTEXT_BUTTON_OPACITY = Math.min(1, Math.max(0.65, Number(this.get('contextButtonOpacity', EH.Config.CONTEXT_BUTTON_OPACITY)) || 0.96));
             EH.Config.CONTEXT_BUTTON_SHOW_TEXT = EH.Utils.parseBoolean(this.get('contextButtonShowText', EH.Config.CONTEXT_BUTTON_SHOW_TEXT), EH.Config.CONTEXT_BUTTON_SHOW_TEXT);
-            EH.Config.CONTEXT_BUTTON_POSITION = ['auto','right','left','bottom'].includes(String(this.get('contextButtonPosition', EH.Config.CONTEXT_BUTTON_POSITION)))
-                ? String(this.get('contextButtonPosition', EH.Config.CONTEXT_BUTTON_POSITION)) : 'auto';
+            EH.Config.CONTEXT_BUTTON_POSITION = ['top','auto','right','left','bottom'].includes(String(this.get('contextButtonPosition', EH.Config.CONTEXT_BUTTON_POSITION)))
+                ? String(this.get('contextButtonPosition', EH.Config.CONTEXT_BUTTON_POSITION)) : 'top';
             EH.Config.QUICK_ROUTE_GREETING = String(this.get('quickRouteGreeting', EH.Config.QUICK_ROUTE_GREETING) || '').trim();
             EH.Config.QUICK_ROUTE_FOOTER = String(this.get('quickRouteFooter', EH.Config.QUICK_ROUTE_FOOTER) || '').trim();
             EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE = String(this.get('quickRouteSummaryTemplate', EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE) || '');
@@ -603,13 +621,22 @@
             operationRoutines:{section:'carros',shared:true,default:()=>JSON.parse(JSON.stringify(EH.ConfigDefaults.OPERATION_ROUTINES))},
             operationTimeToleranceMinutes:{section:'carros',shared:true,default:20},
             operationQueueGraceMinutes:{section:'carros',shared:true,default:180},
+            operationPanelX:{section:'carros',device:true,default:0},
+            operationPanelY:{section:'carros',device:true,default:0},
+            operationPanelWidth:{section:'carros',device:true,default:360},
+            operationPanelHeight:{section:'carros',device:true,default:420},
+            operationPanelButtonHeight:{section:'carros',shared:true,default:28},
+            operationPanelFontSize:{section:'carros',shared:true,default:10},
+            operationPanelPassengerGap:{section:'carros',shared:true,default:4},
+            operationPanelCompact:{section:'carros',shared:true,default:true},
+            operationPanelKeepVisible:{section:'carros',shared:true,default:true},
 
             contextButtonSize:{section:'atalhos',shared:true,default:'normal'},
             contextButtonFontSize:{section:'atalhos',shared:true,default:10},
             contextButtonIconSize:{section:'atalhos',shared:true,default:15},
             contextButtonGap:{section:'atalhos',shared:true,default:6},
             contextButtonShowText:{section:'atalhos',shared:true,default:true},
-            contextButtonPosition:{section:'atalhos',device:true,default:'auto'},
+            contextButtonPosition:{section:'atalhos',device:true,default:'top'},
 
             'quickRoutes.v1':{section:'rotas',shared:true,default:[]},
 
@@ -656,7 +683,7 @@
             if(typeof fallback==='string'){
                 if(typeof value!=='string'||value.length>200000)throw new Error(`Texto inválido em ${key}.`);
                 if(/^visual(?:Primary|Panel|Surface|Text|Muted|Border)Color$/.test(key)&&!/^#[0-9a-f]{6}$/i.test(value))throw new Error(`Cor inválida em ${key}.`);
-                const enums={visualTheme:['claro','alto-contraste'],visualFontFamily:['sistema','arial','verdana'],visualContrast:['normal','forte'],uiDensity:['compacto','padrao','confortavel'],shadowLevel:['none','suave','normal'],contextButtonSize:['small','normal','large','xlarge'],contextButtonPosition:['auto','right','left','bottom'],quickRouteEmojiLevel:['none','low','normal','high']};
+                const enums={visualTheme:['claro','alto-contraste'],visualFontFamily:['sistema','arial','verdana'],visualContrast:['normal','forte'],uiDensity:['compacto','padrao','confortavel'],shadowLevel:['none','suave','normal'],contextButtonSize:['small','normal','large','xlarge'],contextButtonPosition:['top','auto','right','left','bottom'],quickRouteEmojiLevel:['none','low','normal','high']};
                 if(enums[key]&&!enums[key].includes(value))throw new Error(`Opção inválida em ${key}.`);
                 return value;
             }
@@ -1230,6 +1257,23 @@
             if(changed)EH.Storage.set(key,next);
         },
 
+        migrateOperationWorkspaceV24() {
+            // Liga o layout já persistido do painel `operation` aos controles
+            // de Carros / Operação e move os atalhos para a barra superior.
+            const panels=EH.Storage.get('contextualPanels.v1',{}),operation=panels&&typeof panels==='object'?panels.operation||{}:{};
+            const defaults={
+                operationPanelX:Math.max(0,Number(operation.x||0)),
+                operationPanelY:Math.max(0,Number(operation.y||0)),
+                operationPanelWidth:Math.min(720,Math.max(300,Number(operation.width||360))),
+                operationPanelHeight:Math.min(900,Math.max(220,Number(operation.height||420))),
+                operationPanelButtonHeight:28,operationPanelFontSize:10,operationPanelPassengerGap:4,
+                operationPanelCompact:true,operationPanelKeepVisible:true,contextButtonPosition:'top'
+            };
+            Object.entries(defaults).forEach(([key,value])=>{if(EH.Storage.get(key,undefined)===undefined)EH.Storage.set(key,value);});
+            if(['', 'auto'].includes(String(EH.Storage.get('contextButtonPosition','')||'')))EH.Storage.set('contextButtonPosition','top');
+            EH.SettingsCatalog?.touch?.(Object.keys(defaults),1);
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -1255,6 +1299,7 @@
             this.migratePassengerJourneyV21();
             this.migrateRecentEmissionsV22();
             this.migrateFinancialOperationsV23();
+            this.migrateOperationWorkspaceV24();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -1416,6 +1461,7 @@
                 source,
                 fieldMeta,
                 manualCorrections:{...(item.manualCorrections&&typeof item.manualCorrections==='object'?item.manualCorrections:{}),...Object.fromEntries(Object.entries(fieldMeta).filter(([,meta])=>meta.source==='manual').map(([field])=>[field,true]))},
+                deletedAt: Math.max(0,Number(item.deletedAt||0)),
                 createdAt: Number(item.createdAt || Date.now()),
                 updatedAt,
                 deviceId: String(item.deviceId || EH.Device.id())
@@ -1456,6 +1502,7 @@
                 return Number(nextMeta.updatedAt||0)>=Number(oldMeta.updatedAt||0)?{value:nextCode,meta:nextMeta}:{value:oldCode,meta:oldMeta};
             };
             const idaCode=chooseCode('ida'),voltaCode=journey.hasReturn?chooseCode('volta'):{value:'',meta:{source:'',manual:false,updatedAt:Number(journey.journeyUpdatedAt||0)}};
+            const deletedAt=Math.max(Number(old.deletedAt||0),Number(next.deletedAt||0));
             return {
                 ...old,
                 ...next,
@@ -1469,7 +1516,7 @@
                 protocol: next.protocol || old.protocol || '',
                 origin:journey.origin||'',destination:journey.destination||'',returnOrigin:journey.hasReturn?(journey.returnOrigin||''):'',returnDestination:journey.hasReturn?(journey.returnDestination||''):'',
                 marketIda:this.normalizeMarket(journey.marketIda||{}),marketVolta:this.normalizeMarket(journey.marketVolta||{}),hasReturn:Boolean(journey.hasReturn),temVolta:Boolean(journey.hasReturn),journeyKnown:Boolean(journey.journeyKnown),journeyUpdatedAt:Number(journey.journeyUpdatedAt||0),
-                status:(nextJourneyIsNewer?next.status:old.status)||next.status||old.status||'',
+                status:deletedAt?'deleted':((nextJourneyIsNewer?next.status:old.status)||next.status||old.status||''),
                 codes:{ida:idaCode.value,volta:voltaCode.value},
                 codeMeta:{ida:idaCode.meta,volta:voltaCode.meta},
                 manualCorrections: { ...(old.manualCorrections || {}), ...(next.manualCorrections || {}) },
@@ -1479,6 +1526,7 @@
                 invalidCpfOverride: Boolean(next.invalidCpfOverride || old.invalidCpfOverride),
                 source: Number(this.SOURCE_RANK[next.source] ?? 0) >= Number(this.SOURCE_RANK[old.source] ?? 0) ? next.source : old.source,
                 fieldMeta: { name: name.meta, cpf: cpf.meta, birthDate: birthDate.meta },
+                deletedAt,
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
                 updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
                 deviceId: next.deviceId || old.deviceId || EH.Device.id()
@@ -1505,7 +1553,7 @@
             if (changed && !fromSync) merged.updatedAt = Date.now();
             if (!changed && current) return rows[index];
             if (index >= 0) rows[index] = merged; else rows.push(merged);
-            EH.Storage.set(this.KEY, rows.slice(-1500));
+            const ordered=rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));EH.Storage.set(this.KEY,[...ordered.filter(item=>!item.deletedAt).slice(0,1500),...ordered.filter(item=>item.deletedAt).slice(0,5000)]);
             if (!fromSync) EH.Sync?.markPendingRecord?.('passenger', merged.id);
             if (!quiet) EH.Toast?.success?.('Dados do passageiro memorizados.');
             return merged;
@@ -1513,12 +1561,12 @@
         findByCpf(cpf) {
             const digits = this.normalizeCpf(cpf);
             const requestId=String(EH.Storage.get('requestFlow.activeRequestId.v1','')||'');
-            const rows=this.load().filter(row=>this.normalizeCpf(row.cpf)===digits);
+            const rows=this.load().filter(row=>!row.deletedAt&&this.normalizeCpf(row.cpf)===digits);
             return rows.find(row=>requestId&&row.requestId===requestId)||rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0))[0]||null;
         },
         findForRequest(requestId, cpf='') {
             const id=String(requestId||''),digits=this.normalizeCpf(cpf);
-            return this.load().find(row=>row.requestId===id&&(!digits||row.cpf===digits))||null;
+            return this.load().find(row=>!row.deletedAt&&row.requestId===id&&(!digits||row.cpf===digits))||null;
         },
         migrateV18() {
             const raw=EH.Storage.get(this.KEY,[]);if(!Array.isArray(raw))return false;
@@ -12332,6 +12380,7 @@
                 @media (max-width:700px) { .eh-pref-steps { grid-template-columns:repeat(3,minmax(0,1fr)); } }
                 @media (max-width:520px) { .eh-pref-grid, .eh-pref-route-list, .eh-pref-confirm-grid { grid-template-columns:1fr; } .eh-pref-steps { grid-template-columns:repeat(2,minmax(0,1fr)); } }
             `);
+            EH.Runtime?.on?.('context-panels-window-resize',window,'resize',EH.Utils.debounce(()=>{for(const [id,entry] of this.panels){if(id==='operation'&&EH.Config.OPERATION_PANEL_KEEP_VISIBLE)this.ensureVisible(entry.panel);else this.ensureVisible(entry.panel);}},120));
         },
 
         mount(host, button) {
@@ -13593,6 +13642,7 @@
         normalizeRequest(item = {}) {
             const now = Date.now();
             const id = item.id || item.requestId || `req-${now}-${Math.random().toString(36).slice(2, 8)}`;
+            const deletedAt=Math.max(0,Number(item.deletedAt||0));
             return {
                 id,
                 requestId: String(item.requestId || id),
@@ -13602,12 +13652,13 @@
                 prefeitura: EH.Utils.clean(item.prefeitura || ''),
                 secretaria: EH.Utils.clean(item.secretaria || ''),
                 contrato: EH.Utils.clean(item.contrato || ''),
-                status: EH.Utils.clean(item.status || 'pending'),
+                status: deletedAt?'deleted':EH.Utils.clean(item.status || 'pending'),
                 source: EH.Utils.clean(item.source || 'epass-request'),
                 manualFields: item.manualFields && typeof item.manualFields === 'object' ? { ...item.manualFields } : {},
-                active: item.active !== false,
+                active: deletedAt?false:item.active !== false,
                 canceledAt: Number(item.canceledAt || 0),
                 completedAt: Number(item.completedAt || 0),
+                deletedAt,
                 passengers: (Array.isArray(item.passengers) ? item.passengers : [])
                     .map((passenger,index) => this.normalizePassenger(passenger,index,id))
                     .filter(passenger => passenger.cpf.length === 11),
@@ -13694,12 +13745,12 @@
                     legs:this.mergeLegCollections(current.legs,passenger.legs)
                 }));
             });
-            const ranks={pending:0,prepared:1,submitted:2,analyzed:3,approved:4};
+            const deletedAt=Math.max(Number(a.deletedAt||0),Number(b.deletedAt||0));const ranks={pending:0,prepared:1,submitted:2,analyzed:3,approved:4,deleted:99};
             const status=(ranks[b.status]??0)>(ranks[a.status]??0)?b.status:a.status;
             return this.normalizeRequest({
                 ...secondary,...primary,id:primary.id,numeroLogico:a.numeroLogico||b.numeroLogico,protocolo:a.protocolo||b.protocolo,
                 prefeitura:primary.prefeitura||secondary.prefeitura,secretaria:primary.secretaria||secondary.secretaria,contrato:primary.contrato||secondary.contrato,
-                status,passengers:Array.from(byCpf.values()),createdAt:Math.min(Number(a.createdAt||Date.now()),Number(b.createdAt||Date.now())),
+                status:deletedAt?'deleted':status,active:deletedAt?false:(a.active||b.active),deletedAt,passengers:Array.from(byCpf.values()),createdAt:Math.min(Number(a.createdAt||Date.now()),Number(b.createdAt||Date.now())),
                 submittedAt:Math.max(Number(a.submittedAt||0),Number(b.submittedAt||0)),updatedAt:Math.max(Number(a.updatedAt||0),Number(b.updatedAt||0))
             });
         },
@@ -13718,10 +13769,9 @@
         loadStore() {
             const raw = EH.Storage.get(this.STORAGE_KEY, { version: 1, items: [] });
             const limit = Date.now() - EH.Config.REQUISITION_TTL_MS;
-            const loaded = (Array.isArray(raw?.items) ? raw.items : [])
-                .map(item => this.normalizeRequest(item))
-                .filter(item => item.passengers.length && item.updatedAt >= limit);
-            const deduped=this.deduplicateRequests(loaded);const items=deduped.items;
+            const all=(Array.isArray(raw?.items)?raw.items:[]).map(item=>this.normalizeRequest(item));
+            const tombstones=all.filter(item=>item.deletedAt);const loaded=all.filter(item=>!item.deletedAt&&item.passengers.length&&item.updatedAt>=limit);
+            const deduped=this.deduplicateRequests(loaded);const byId=new Map(deduped.items.map(item=>[item.id,item]));tombstones.forEach(item=>{const old=byId.get(item.id);if(!old||Number(item.deletedAt||0)>=Number(old.updatedAt||0))byId.set(item.id,item);});const items=Array.from(byId.values());
             if ((raw?.items || []).length !== items.length||deduped.changed) this.saveStore(items);
             return items;
         },
@@ -13729,16 +13779,17 @@
         saveStore(items) {
             const previousRaw = EH.Storage.get(this.STORAGE_KEY, { version: 1, items: [] });
             const previousById = new Map((Array.isArray(previousRaw?.items) ? previousRaw.items : []).map(item => [String(item?.id || ''), item]));
-            const normalized = (items || [])
+            const prepared = (items || [])
                 .map(item => this.normalizeRequest(item))
-                .filter(item => item.passengers.length)
-                .sort((a, b) => b.updatedAt - a.updatedAt)
-                .slice(0, 80);
+                .filter(item => item.deletedAt || item.passengers.length)
+                .sort((a, b) => b.updatedAt - a.updatedAt);
+            const normalized=[...prepared.filter(item=>!item.deletedAt).slice(0,80),...prepared.filter(item=>item.deletedAt).slice(0,5000)];
             EH.Storage.set(this.STORAGE_KEY, { version: 1, updatedAt: Date.now(), items: normalized });
             normalized.forEach(request => {
+                if(request.deletedAt){if(!EH.Sync?.applyingRemote)EH.Sync?.markPendingRecord?.('requisition',request.id);return;}
                 (request.passengers || []).forEach(passenger => {
                     const linked=EH.PassengerMemory?.findForRequest?.(request.id,passenger.cpf);
-                    const neutral=(EH.PassengerMemory?.load?.()||[]).filter(item=>item.cpf===passenger.cpf&&!item.requestId);
+                    const neutral=(EH.PassengerMemory?.load?.()||[]).filter(item=>!item.deletedAt&&item.cpf===passenger.cpf&&!item.requestId);
                     const passengerId=linked?.passengerId||(neutral.length===1?neutral[0].passengerId:passenger.id);
                     EH.PassengerMemory?.upsert?.(this.passengerMemoryRecord(request,passenger,passengerId), { fromSync:Boolean(EH.Sync?.applyingRemote) });
                 });
@@ -13759,7 +13810,7 @@
             const digits = this.normalizeCpf(cpf);
             if (digits.length !== 11) return [];
             const rows = [];
-            this.loadStore().forEach(request => {
+            this.loadStore().filter(request=>!request.deletedAt).forEach(request => {
                 (request.passengers || []).forEach(passenger => {
                     if (this.normalizeCpf(passenger.cpf) !== digits) return;
                     (passenger.legs || []).forEach(leg => {
@@ -13811,7 +13862,7 @@
         upsertRequest(request) {
             const next = this.normalizeRequest(request);
             if (!next.passengers.length) return null;
-            const items = this.loadStore();
+            const allItems=this.loadStore(),items=allItems.filter(item=>!item.deletedAt),tombstones=allItems.filter(item=>item.deletedAt);
             const fingerprint = this.requestFingerprint(next);
             const now = Date.now();
             let existing = items.find(item=>String(item.id||'')===String(next.id||'')) || (next.numeroLogico?items.find(item=>item.numeroLogico===next.numeroLogico):null);
@@ -13832,7 +13883,7 @@
                 if((statusRank[next.status]??0)>(statusRank[existing.status]??0))existing.status=next.status;
                 existing.passengers = this.mergePassengerData(existing.passengers, next.passengers);
                 existing.updatedAt = now;
-                this.saveStore(items);
+                this.saveStore([...items,...tombstones]);
                 EH.RequestFlow?.linkRequest?.(existing, { evidence:'request-upsert' });
                 EH.Attendance?.linkRequisition?.(existing);
                 return existing;
@@ -13840,7 +13891,7 @@
             next.createdAt = now;
             next.updatedAt = now;
             items.unshift(next);
-            this.saveStore(items);
+            this.saveStore([...items,...tombstones]);
             EH.RequestFlow?.linkRequest?.(next, { evidence:'request-created' });
             EH.Attendance?.linkRequisition?.(next);
             return next;
@@ -13892,7 +13943,7 @@
             if (!app) return 0;
             const cards = Array.from(app.querySelectorAll('.dados-passagem')).filter(card => /REQUISICAO\s+PREFEITURA|REQUISIÇÃO\s+PREFEITURA/i.test(card.textContent || ''));
             if (!cards.length) return 0;
-            const items = this.loadStore();
+            const allItems=this.loadStore(),items=allItems.filter(item=>!item.deletedAt),tombstones=allItems.filter(item=>item.deletedAt);
             let changed = 0;
             cards.forEach(card => {
                 const numeroLogico = this.numeroLogicoFromCard(card);
@@ -13915,7 +13966,7 @@
                 }
             });
             if (changed){
-                this.saveStore(items);
+                this.saveStore([...items,...tombstones]);
                 items.filter(item=>item.numeroLogico).forEach(item=>{
                     EH.RequestFlow?.linkRequest?.(item, { evidence:'real-request-card' });
                     EH.Attendance?.linkRequisition?.(item);
@@ -13955,7 +14006,7 @@
 
         resolvePendingCapture(block, requestId, legType) {
             const rows=this.pendingCodeCaptures();let changed=false;const logical=this.pendingCodeContext?.numeroLogico||this.pendingNumeroLogico||'';
-            const request=this.loadStore().find(item=>item.id===requestId),passenger=request?.passengers?.find(item=>this.normalizeName(item.nome)===this.normalizeName(block.nome)&&item.dataNascimento===block.dataNascimento);
+            const request=this.loadStore().find(item=>!item.deletedAt&&item.id===requestId),passenger=request?.passengers?.find(item=>this.normalizeName(item.nome)===this.normalizeName(block.nome)&&item.dataNascimento===block.dataNascimento);
             rows.forEach(item=>{if(item.status!=='pending')return;const sameLogical=!logical||!item.numeroLogico||item.numeroLogico===logical;const sameCode=item.codigo===block.codigo;const sameRoute=this.sameRoute(item.origem,item.destino,block.origem,block.destino);if(sameLogical&&sameCode&&sameRoute){Object.assign(item,{status:'assigned',requestId,protocolo:request?.protocolo||request?.numeroLogico||'',passengerId:passenger?.id||'',cpf:passenger?.cpf||'',legType,linhaReal:block.linhaReal||block.mercadoCompleto,updatedAt:Date.now()});changed=true;}});if(changed)EH.Storage.set(this.CODE_CAPTURE_KEY,rows);return changed;
         },
 
@@ -13995,7 +14046,7 @@
             if (fingerprint === this.lastModalFingerprint) return 0;
             this.lastModalFingerprint = fingerprint;
 
-            const items = this.loadStore();
+            const allItems=this.loadStore(),items=allItems.filter(item=>!item.deletedAt),tombstones=allItems.filter(item=>item.deletedAt);
             let updated = 0;
             let ambiguous = 0;
             let statusChanged = 0;
@@ -14041,7 +14092,7 @@
                 if (legs.length && legs.every(leg => leg.codigo)&&request.status!=='approved'){request.status='approved';request.updatedAt=Date.now();statusChanged+=1;}
             });
             if (updated||statusChanged) {
-                this.saveStore(items);
+                this.saveStore([...items,...tombstones]);
                 items.filter(request=>linked.has(request.id)).forEach(request=>{EH.RequestFlow?.linkRequest?.(request,{evidence:'real-code-modal'});EH.Attendance?.linkRequisition?.(request);});
                 if(updated)EH.Toast.success(`${updated} código${updated === 1 ? '' : 's'} de requisição associado${updated === 1 ? '' : 's'} ao trecho correto.`);
             }
@@ -14058,7 +14109,7 @@
         setManualCode({requestId='',cpf='',tipo='ida',codigo='',confirmed=false}={}) {
             if(!confirmed)throw new Error('A correção manual precisa de confirmação explícita.');
             const code=this.sanitizeRequestCode(codigo);if(!code)throw new Error('Informe um código de requisição válido.');
-            const rows=this.loadStore(),request=rows.find(item=>item.id===String(requestId||''));if(!request)throw new Error('Não foi possível localizar esta solicitação.');
+            const rows=this.loadStore(),request=rows.find(item=>!item.deletedAt&&item.id===String(requestId||''));if(!request)throw new Error('Não foi possível localizar esta solicitação.');
             const digits=this.normalizeCpf(cpf);const passengers=digits?request.passengers.filter(item=>item.cpf===digits):request.passengers;
             if(passengers.length!==1)throw new Error('Selecione um único passageiro antes de corrigir o código.');
             const legs=passengers[0].legs.filter(leg=>(tipo==='volta'?'volta':'ida')===leg.tipo);if(legs.length!==1)throw new Error('O trecho não pôde ser identificado com segurança.');
@@ -14068,7 +14119,7 @@
         },
 
         requestForContext() {
-            const rows=this.loadStore();
+            const rows=this.loadStore().filter(item=>!item.deletedAt&&item.active!==false);
             const selected=EH.RequestFlow?.requestForContext?.(rows);
             if(selected)return this.normalizeRequest(selected);
             if(!rows.length)return null;
@@ -14092,7 +14143,7 @@
             if(page==='pagamento'&&!hasCode)return null;
             if(!request&&!pending.length){
                 const activeDraft=EH.RequestFlow?.current?.();if(!activeDraft)return EH.RequestFlow?.renderSelector?.(body,{page})||null;
-                const draftWrap=document.createElement('section');draftWrap.className='eh-requisition-context';EH.RequestFlow?.renderSelector?.(draftWrap,{page});const draftHeading=document.createElement('strong');draftHeading.textContent='Solicitação em preenchimento';draftWrap.appendChild(draftHeading);EH.RequestFlow?.renderSummary?.(draftWrap);body.appendChild(draftWrap);return draftWrap;
+                const draftWrap=document.createElement('section');draftWrap.className='eh-requisition-context';EH.RequestFlow?.renderSelector?.(draftWrap,{page});const draftHeading=document.createElement('strong');draftHeading.textContent='Solicitação em preenchimento';draftWrap.appendChild(draftHeading);EH.RequestFlow?.renderSummary?.(draftWrap);const clean=document.createElement('div');clean.className='eh-context-actions';clean.append(EH.ContextualPanels.action('Limpar',()=>EH.Cleanup?.clearRequest?.(activeDraft.id)));draftWrap.appendChild(clean);body.appendChild(draftWrap);return draftWrap;
             }
             const wrap=document.createElement('section');wrap.className='eh-requisition-context';
             EH.RequestFlow?.renderSelector?.(wrap,{page});
@@ -14115,6 +14166,7 @@
                 }
             }
             if(pending.length){const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${pending.length} código${pending.length===1?' preservado aguarda':'s preservados aguardam'} associação manual. Nenhum foi descartado.`;wrap.appendChild(note);}
+            if(request){const clean=document.createElement('div');clean.className='eh-context-actions';clean.append(EH.ContextualPanels.action('Limpar',()=>EH.Cleanup?.clearRequest?.(request.id)));wrap.appendChild(clean);}
             body.appendChild(wrap);return wrap;
         },
 
@@ -14182,7 +14234,7 @@
         codeCandidates(cpf, origem, destino) {
             const digits = this.normalizeCpf(cpf);
             const candidates = [];
-            this.loadStore().forEach(request => {
+            this.loadStore().filter(request=>!request.deletedAt).forEach(request => {
                 request.passengers.forEach(passenger => {
                     if (passenger.cpf !== digits) return;
                     passenger.legs.forEach(leg => {
@@ -14201,11 +14253,11 @@
         },
 
         passengerForSale(requestId,cpf,passengerId=''){
-            const stored=this.loadStore().find(item=>item.id===requestId),draft=EH.RequestFlow?.loadAll?.().find(item=>item.id===requestId);
+            const stored=this.loadStore().find(item=>!item.deletedAt&&item.id===requestId),draft=EH.RequestFlow?.loadAll?.().find(item=>!item.deletedAt&&item.id===requestId);
             const request=stored||(draft?EH.RequestFlow.asRequest(draft):null);
             const passenger = request?.passengers?.find(item => item.cpf === this.normalizeCpf(cpf));
             if(request&&passenger)return{request,passenger};
-            const digits=this.normalizeCpf(cpf),memory=(EH.PassengerMemory?.load?.()||[]).find(item=>(!passengerId||item.passengerId===passengerId)&&item.cpf===digits);
+            const digits=this.normalizeCpf(cpf),memory=(EH.PassengerMemory?.load?.()||[]).find(item=>!item.deletedAt&&(!passengerId||item.passengerId===passengerId)&&item.cpf===digits);
             if(!memory)return null;
             return{request:{id:memory.requestId||'',numeroLogico:memory.protocol||'',protocolo:memory.protocol||''},passenger:{id:memory.passengerId,cpf:memory.cpf,nome:memory.name,dataNascimento:memory.birthDate,legs:[],manualFields:memory.manualCorrections||{}}};
         },
@@ -14383,7 +14435,7 @@
         },
 
         renderCard() {
-            const requests = this.loadStore();
+            const requests = this.loadStore().filter(item=>!item.deletedAt);
             if (!requests.length) return null;
             const block = document.createElement('div');
             block.className = 'eh-sale-cpfs';
@@ -14517,7 +14569,7 @@
         lastInvalidCpfNotice:'',
 
         makeId(){return `request-${Date.now()}-${Math.random().toString(36).slice(2,9)}`;},
-        terminal(status){return new Set(['canceled','cancelled','completed','concluded','shared','archived']).has(String(status||'').toLowerCase());},
+        terminal(status){return new Set(['canceled','cancelled','completed','concluded','shared','archived','deleted']).has(String(status||'').toLowerCase());},
         statusRank(status){const value=String(status||'draft').toLowerCase();const order=['draft','incomplete','ready','prepared','submitted','awaiting_codes','analyzed','approved','sale','issued','tickets_pending','tickets_found','shared','completed'];if(value==='canceled'||value==='cancelled')return order.length+1;return Math.max(0,order.indexOf(value));},
         validBirth(value){const parsed=EH.PassengerIdentity?.parseDate?.(value);return Boolean(parsed?.valid&&parsed?.plausible);},
         validPassenger(passenger={}){
@@ -14561,16 +14613,16 @@
         normalize(item={}){
             const now=Date.now(),id=String(item.id||item.requestId||this.makeId());
             const passengers=(Array.isArray(item.passengers)?item.passengers:[]).map((passenger,index)=>this.normalizePassenger(passenger,index,id));
-            return {
+            const deletedAt=Math.max(0,Number(item.deletedAt||0));return {
                 version:this.VERSION,id,requestId:id,requisitionId:String(item.requisitionId||''),attendanceId:String(item.attendanceId||''),
                 prefeitura:EH.Utils.clean(item.prefeitura||''),secretaria:EH.Utils.clean(item.secretaria||''),contrato:EH.Utils.clean(item.contrato||''),
                 protocolo:EH.Utils.clean(item.protocolo||''),numeroLogico:EH.Utils.clean(item.numeroLogico||''),
                 codes:{ida:EH.Utils.clean(item.codes?.ida||item.codigoIda||''),volta:EH.Utils.clean(item.codes?.volta||item.codigoVolta||'')},
-                status:String(item.status||'draft').toLowerCase(),active:item.active!==false,passengers,
+                status:deletedAt?'deleted':String(item.status||'draft').toLowerCase(),active:deletedAt?false:item.active!==false,passengers,
                 source:EH.Utils.clean(item.source||'real-requisition-form'),
                 manualFields:item.manualFields&&typeof item.manualFields==='object'?{...item.manualFields}:{},
                 submittedIntentAt:Number(item.submittedIntentAt||0),submittedAt:Number(item.submittedAt||0),promotedAt:Number(item.promotedAt||0),
-                canceledAt:Number(item.canceledAt||0),completedAt:Number(item.completedAt||0),
+                canceledAt:Number(item.canceledAt||0),completedAt:Number(item.completedAt||0),deletedAt,
                 createdAt:Number(item.createdAt||now),updatedAt:Number(item.updatedAt||now),deviceId:String(item.deviceId||EH.Device.id()),
                 syncState:EH.Utils.clean(item.syncState||'local')||'local'
             };
@@ -14582,9 +14634,9 @@
         same(left={},right={}){const clean=value=>{const copy=this.normalize(value);delete copy.updatedAt;delete copy.deviceId;delete copy.syncState;return copy;};try{return JSON.stringify(clean(left))===JSON.stringify(clean(right));}catch(_error){return false;}},
         saveAll(rows,{changedIds=[],fromSync=false}={}){
             const unique=new Map();(Array.isArray(rows)?rows:[]).forEach(row=>{const next=this.normalize(row),old=unique.get(next.id);if(!old||Number(next.updatedAt||0)>=Number(old.updatedAt||0))unique.set(next.id,next);});
-            const items=Array.from(unique.values()).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0,this.MAX_RECORDS);
+            const prepared=Array.from(unique.values()).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));const items=[...prepared.filter(item=>!item.deletedAt).slice(0,this.MAX_RECORDS),...prepared.filter(item=>item.deletedAt).slice(0,5000)];
             EH.Storage.set(this.KEY,{version:this.VERSION,updatedAt:Date.now(),items});
-            items.forEach(record=>(record.passengers||[]).filter(passenger=>passenger.cpf.length===11).forEach(passenger=>EH.PassengerMemory?.upsert?.({
+            items.filter(record=>!record.deletedAt).forEach(record=>(record.passengers||[]).filter(passenger=>passenger.cpf.length===11).forEach(passenger=>EH.PassengerMemory?.upsert?.({
                 passengerId:passenger.id,requestId:record.id,protocol:record.protocolo||record.numeroLogico||'',cpf:passenger.cpf,name:passenger.nome,birthDate:passenger.dataNascimento,
                 origin:passenger.trechoIda?.origem||'',destination:passenger.trechoIda?.destino||'',returnOrigin:passenger.temVolta?(passenger.trechoVolta?.origem||''):'',returnDestination:passenger.temVolta?(passenger.trechoVolta?.destino||''):'',
                 marketIda:passenger.mercadoIda||{},marketVolta:passenger.mercadoVolta||{},hasReturn:Boolean(passenger.temVolta),journeyUpdatedAt:Math.max(Number(record.updatedAt||0),Number(passenger.updatedAt||0)),status:record.status,
@@ -14605,7 +14657,8 @@
             const a=this.normalize(local),b=this.normalize(remote),remoteNewer=Number(b.updatedAt||0)>=Number(a.updatedAt||0),preferred=remoteNewer?b:a,secondary=remoteNewer?a:b;
             const merged=EH.Sync?.smartMerge?.(secondary,preferred)||{...secondary,...preferred};
             const rankA=this.statusRank(a.status),rankB=this.statusRank(b.status);merged.status=rankB>rankA?b.status:rankA>rankB?a.status:preferred.status;
-            merged.id=a.id||b.id;merged.requestId=merged.id;merged.active=this.terminal(merged.status)?false:Boolean(preferred.active||secondary.active);
+            merged.deletedAt=Math.max(Number(a.deletedAt||0),Number(b.deletedAt||0));if(merged.deletedAt)merged.status='deleted';
+            merged.id=a.id||b.id;merged.requestId=merged.id;merged.active=merged.deletedAt||this.terminal(merged.status)?false:Boolean(preferred.active||secondary.active);
             merged.createdAt=Math.min(Number(a.createdAt||Date.now()),Number(b.createdAt||Date.now()));merged.updatedAt=Math.max(Number(a.updatedAt||0),Number(b.updatedAt||0));
             return this.normalize(merged);
         },
@@ -14772,7 +14825,7 @@
         fromRequest(request,passenger){
             if(!request||!passenger)return null;
             const ida=(passenger.legs||[]).find(leg=>leg.tipo!=='volta'),volta=(passenger.legs||[]).find(leg=>leg.tipo==='volta');
-            const linked=EH.PassengerMemory?.findForRequest?.(request.id,passenger.cpf),neutral=(EH.PassengerMemory?.load?.()||[]).filter(item=>item.cpf===passenger.cpf&&!item.requestId);
+            const linked=EH.PassengerMemory?.findForRequest?.(request.id,passenger.cpf),neutral=(EH.PassengerMemory?.load?.()||[]).filter(item=>!item.deletedAt&&item.cpf===passenger.cpf&&!item.requestId);
             const memory=linked||(neutral.length===1?neutral[0]:{});
             return EH.PassengerMemory?.normalize?.({
                 ...memory,passengerId:memory.passengerId||passenger.id,requestId:request.id,protocol:request.protocolo||request.numeroLogico||memory.protocol||'',
@@ -14803,7 +14856,7 @@
                 }
             }
             const context=EH.Attendance?.load?.()||{},ids=new Set(context.passengerIds||[]);
-            const linked=(EH.PassengerMemory?.load?.()||[]).filter(item=>ids.has(item.passengerId)||ids.has(item.id));
+            const linked=(EH.PassengerMemory?.load?.()||[]).filter(item=>!item.deletedAt&&(ids.has(item.passengerId)||ids.has(item.id)));
             if(linked.length===1)return linked[0];
             const confirmed=EH.PassengerIdentity?.currentConfirmed?.();
             return confirmed?.cpf?EH.PassengerMemory?.findByCpf?.(confirmed.cpf):null;
@@ -17221,7 +17274,7 @@
         },
         requestStatusRank(status) {
             const value=String(status||'').toLowerCase();
-            return value==='pending'?0:value==='prepared'?1:value==='submitted'?2:(value==='analyzed'||value==='analysed')?3:value==='approved'?4:0;
+            return value==='deleted'?99:value==='pending'?0:value==='prepared'?1:value==='submitted'?2:(value==='analyzed'||value==='analysed')?3:value==='approved'?4:0;
         },
         mergeReminderData(localData={},remoteData={},localTs=0,remoteTs=0) {
             const remoteNewer=Number(remoteTs||0)>=Number(localTs||0);
@@ -17290,11 +17343,12 @@
             merged.passengers=Array.from(passengers.values());
             const lStatus=String(localData.status||'pending'),rStatus=String(remoteData.status||'pending');
             merged.status=this.requestStatusRank(rStatus)>this.requestStatusRank(lStatus)?rStatus:lStatus;
+            merged.deletedAt=Math.max(Number(localData.deletedAt||0),Number(remoteData.deletedAt||0));if(merged.deletedAt){merged.status='deleted';merged.active=false;}
             merged.numeroLogico=this.usefulText(preferred.numeroLogico,secondary.numeroLogico);
             merged.protocolo=this.usefulText(preferred.protocolo,secondary.protocolo);
             merged.submittedAt=Math.max(Number(localData.submittedAt||0),Number(remoteData.submittedAt||0));
             merged.createdAt=Math.min(Number(localData.createdAt||Date.now()),Number(remoteData.createdAt||Date.now()));
-            merged.updatedAt=Math.max(Number(localTs||localData.updatedAt||0),Number(remoteTs||remoteData.updatedAt||0));
+            merged.updatedAt=Math.max(Number(localTs||localData.updatedAt||0),Number(remoteTs||remoteData.updatedAt||0),merged.deletedAt);
             merged.deviceId=remoteNewer?(remoteData.deviceId||localData.deviceId||EH.Device.id()):(localData.deviceId||remoteData.deviceId||EH.Device.id());
             return merged;
         },
@@ -17326,6 +17380,7 @@
             if(type==='reminder')return this.mergeReminderData(localData,remoteData,localTs,remoteTs);
             if(type==='requisition')return this.mergeRequisitionData(localData,remoteData,localTs,remoteTs);
             if(type==='request-draft')return EH.RequestFlow?.merge?.({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs})||this.smartMerge(localData,remoteData);
+            if(type==='passenger')return EH.PassengerMemory?.merge?.({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs})||this.smartMerge(localData,remoteData);
             if(type==='attendance')return this.mergeAttendanceData(localData,remoteData,localTs,remoteTs);
             if(type==='emission'){
                 if(EH.EmissionMemory?.merge)return EH.EmissionMemory.merge({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs});
@@ -18239,6 +18294,7 @@
                 documentDeviceId: String(item.documentDeviceId || ''),
                 downloadedAt: Math.max(0,Number(item.downloadedAt || 0)),
                 printedAt: Math.max(0,Number(item.printedAt || 0)),
+                deletedAt: Math.max(0,Number(item.deletedAt || 0)),
                 createdAt: Number(item.createdAt || Date.now()),
                 updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
                 deviceId: String(item.deviceId || EH.Device.id()),
@@ -18255,6 +18311,7 @@
             const issueStatus=this.issueRank(next.issueStatus)>=this.issueRank(old.issueStatus)?next.issueStatus:old.issueStatus;
             const printStatus=this.statusRank(next.printStatus)>=this.statusRank(old.printStatus)?next.printStatus:old.printStatus;
             const checkStatus=this.statusRank(next.checkStatus)>=this.statusRank(old.checkStatus)?next.checkStatus:old.checkStatus;
+            const deletedAt=Math.max(Number(old.deletedAt||0),Number(next.deletedAt||0));
             return {
                 ...secondary, ...preferred,
                 id: old.id || next.id,
@@ -18308,6 +18365,7 @@
                 documentDeviceId:preferred.documentDeviceId||secondary.documentDeviceId||'',
                 downloadedAt:Math.max(Number(old.downloadedAt||0),Number(next.downloadedAt||0)),
                 printedAt:Math.max(Number(old.printedAt||0),Number(next.printedAt||0)),
+                deletedAt,
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
                 updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
                 deviceId: preferred.deviceId || secondary.deviceId || EH.Device.id(),
@@ -18360,7 +18418,7 @@
             else merged.syncState='synced';
             if (index >= 0) rows[index] = merged; else rows.push(merged);
             if (index < 0 || before !== JSON.stringify(merged)) {
-                EH.Storage.set(this.KEY, rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0)).slice(0, 3000));
+                const ordered=rows.sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));EH.Storage.set(this.KEY,[...ordered.filter(item=>!item.deletedAt).slice(0,3000),...ordered.filter(item=>item.deletedAt).slice(0,5000)]);
                 if (!fromSync) EH.Sync?.markPendingRecord?.('emission', merged.id);
             }
             if (merged.cpf) EH.PassengerMemory?.upsert?.({ cpf:merged.cpf, name:merged.name, birthDate:merged.birthDate, updatedAt:merged.updatedAt }, { fromSync });
@@ -18376,7 +18434,7 @@
         postStatus(item={}){
             const row=this.normalize(item);if(this.statusRank(row.printStatus)>=this.statusRank('completed'))return'Concluída';if(row.shareStatus==='shared')return'Compartilhada';if(row.documentState==='official-url'||(row.documentState==='captured-local'&&row.documentDeviceId===EH.Device.id()))return'Documento oficial disponível';if(row.documentState==='captured-local')return'Localizar documento neste computador';if(row.shareStatus==='found'||row.ticketNumber)return'Bilhete localizado';return'Aguardando localização';
         },
-        recent({limit=300}={}){return this.load().map(row=>this.normalize(row)).filter(row=>this.isIssued(row)).sort((a,b)=>Number(b.issuedAt||b.updatedAt||0)-Number(a.issuedAt||a.updatedAt||0)).slice(0,Math.max(1,limit));},
+        recent({limit=300}={}){return this.load().map(row=>this.normalize(row)).filter(row=>!row.deletedAt&&this.isIssued(row)).sort((a,b)=>Number(b.issuedAt||b.updatedAt||0)-Number(a.issuedAt||a.updatedAt||0)).slice(0,Math.max(1,limit));},
         destinationLabel(value){const clean=EH.Utils.clean(value||'').replace(/\s*-\s*\d+\s*$/,'').replace(/\s*-\s*[A-Z]{2}\s*$/i,'').trim();return clean||'DESTINO NÃO IDENTIFICADO';},
         groupsByDestination(items=this.recent()){
             const groups=new Map();items.forEach(item=>{const label=this.destinationLabel(item.destination),key=EH.Utils.normalize(label);if(!groups.has(key))groups.set(key,{key,label,items:[]});groups.get(key).items.push(item);});return Array.from(groups.values()).sort((a,b)=>a.label.localeCompare(b.label,'pt-BR'));
@@ -18460,9 +18518,9 @@
         isPending(row) { const item=this.normalize(row);return this.isIssued(item)&&this.statusRank(item.printStatus)<this.statusRank('printed'); },
         pending({ excludeSaleId = '' } = {}) {
             const excluded=String(excludeSaleId||'');
-            return this.load().map(row=>this.normalize(row)).filter(row=>this.isPending(row)&&(!excluded||row.saleId!==excluded)).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
+            return this.load().map(row=>this.normalize(row)).filter(row=>!row.deletedAt&&this.isPending(row)&&(!excluded||row.saleId!==excluded)).sort((a,b)=>Number(b.updatedAt||0)-Number(a.updatedAt||0));
         },
-        shareQueue(){return this.load().map(row=>this.normalize(row)).filter(row=>this.isIssued(row)&&['pending','found'].includes(row.shareStatus)).sort((a,b)=>Number(a.issuedAt||a.createdAt||0)-Number(b.issuedAt||b.createdAt||0));},
+        shareQueue(){return this.load().map(row=>this.normalize(row)).filter(row=>!row.deletedAt&&this.isIssued(row)&&['pending','found'].includes(row.shareStatus)).sort((a,b)=>Number(a.issuedAt||a.createdAt||0)-Number(b.issuedAt||b.createdAt||0));},
         markShareStatus(id,status,{channel=''}={}){
             const requested=['pending','found','shared'].includes(String(status||'').toLowerCase())?String(status).toLowerCase():'';if(!requested)return null;
             const rows=this.load(),index=rows.findIndex(row=>String(row.id)===String(id||''));if(index<0)return null;const current=this.normalize(rows[index]),rank={not_queued:0,pending:1,found:2,shared:3};if((rank[requested]||0)<(rank[current.shareStatus]||0))return current;
@@ -18526,7 +18584,7 @@
         renderShareQueue(body){
             const items=this.recent();if(!items.length)return null;const groups=this.groupsByDestination(items),activeGroupKey='emissionMemory.activeDestination.v1',activeEmissionKey='emissionMemory.activeShare.v1';let activeGroup=String(EH.Storage.get(activeGroupKey,'')||'');if(!groups.some(group=>group.key===activeGroup))activeGroup=groups[0].key;const wrap=document.createElement('section');wrap.className='eh-emission-recent';const title=document.createElement('strong');title.textContent=`EMISSÕES RECENTES • ${items.length}`;wrap.appendChild(title);
             groups.forEach(group=>{const details=document.createElement('details');details.className='eh-emission-group';details.open=group.key===activeGroup;const summary=document.createElement('summary');summary.textContent=`${group.label.toLocaleUpperCase('pt-BR')} — ${group.items.length}`;details.appendChild(summary);details.addEventListener('toggle',()=>{if(details.open){EH.Storage.set(activeGroupKey,group.key);Array.from(wrap.querySelectorAll('.eh-emission-group')).forEach(other=>{if(other!==details)other.open=false;});EH.PanelAutoFit?.schedule?.(body.closest?.('.eh-context-panel'),'emission-group');}});
-                group.items.forEach((item,index)=>{const card=document.createElement('article');card.className='eh-emission-item';const meta=document.createElement('div');meta.className='eh-context-data';meta.append(EH.ContextualPanels.cell('Número do bilhete',item.ticketNumber||item.locator),EH.ContextualPanels.cell('Nome',item.name),EH.ContextualPanels.cell('Horário',item.travelTime),EH.ContextualPanels.cell('Poltrona',item.seat),EH.ContextualPanels.cell('Status',this.postStatus(item)));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Buscar',()=>{EH.Storage.set(activeEmissionKey,item.id);this.searchTicket(item);},'primary'),EH.ContextualPanels.action('Abrir',()=>EH.TicketDocuments?.open?.(item)),EH.ContextualPanels.action('Baixar',()=>EH.TicketDocuments?.download?.(item)),EH.ContextualPanels.action('Imprimir',()=>EH.TicketDocuments?.print?.(item)),EH.ContextualPanels.action('Preparar para escanear',()=>EH.TicketDocuments?.open?.(item,{scan:true})),EH.ContextualPanels.action('Compartilhar',async()=>{try{await EH.TicketDocuments?.share?.(item);}catch(error){EH.Toast.error(error?.message||'Não foi possível compartilhar o documento oficial.');}},'success'),EH.ContextualPanels.action('Concluir',()=>{if(!window.confirm(`Concluir a operação do bilhete ${item.ticketNumber||item.locator||index+1}?`))return;this.markStatus(item.id,'completed');EH.ContextualPanels?.refresh?.('tickets');}));card.append(meta,actions);details.appendChild(card);});wrap.appendChild(details);});body.appendChild(wrap);return wrap;
+                group.items.forEach((item,index)=>{const card=document.createElement('article');card.className='eh-emission-item';const meta=document.createElement('div');meta.className='eh-context-data';meta.append(EH.ContextualPanels.cell('Número do bilhete',item.ticketNumber||item.locator),EH.ContextualPanels.cell('Nome',item.name),EH.ContextualPanels.cell('Horário',item.travelTime),EH.ContextualPanels.cell('Poltrona',item.seat),EH.ContextualPanels.cell('Status',this.postStatus(item)));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Buscar',()=>{EH.Storage.set(activeEmissionKey,item.id);this.searchTicket(item);},'primary'),EH.ContextualPanels.action('Abrir',()=>EH.TicketDocuments?.open?.(item)),EH.ContextualPanels.action('Baixar',()=>EH.TicketDocuments?.download?.(item)),EH.ContextualPanels.action('Imprimir',()=>EH.TicketDocuments?.print?.(item)),EH.ContextualPanels.action('Preparar para escanear',()=>EH.TicketDocuments?.open?.(item,{scan:true})),EH.ContextualPanels.action('Compartilhar',async()=>{try{await EH.TicketDocuments?.share?.(item);}catch(error){EH.Toast.error(error?.message||'Não foi possível compartilhar o documento oficial.');}},'success'),EH.ContextualPanels.action('Concluir',()=>{if(!window.confirm(`Concluir a operação do bilhete ${item.ticketNumber||item.locator||index+1}?`))return;this.markStatus(item.id,'completed');EH.ContextualPanels?.refresh?.('tickets');}),EH.ContextualPanels.action('Limpar',()=>EH.Cleanup?.clearEmission?.(item.id)));card.append(meta,actions);details.appendChild(card);});wrap.appendChild(details);});const batch=document.createElement('div');batch.className='eh-context-actions';batch.append(EH.ContextualPanels.action('Limpar emissões concluídas',()=>EH.Cleanup?.clearCompletedEmissions?.()));wrap.appendChild(batch);body.appendChild(wrap);return wrap;
         },
         renderPendingBlock({ excludeSaleId = '' } = {}) {
             const items=this.pending({excludeSaleId});if(!items.length)return null;
@@ -18568,13 +18626,40 @@
         },
         applyRemote(item = {}) {
             const saved=this.upsert(item, { fromSync:true });
-            if(saved&&this.isIssued(saved))EH.FinanceLedger?.recordIssuedTickets?.([{
+            if(saved&&!saved.deletedAt&&this.isIssued(saved))EH.FinanceLedger?.recordIssuedTickets?.([{
                 id:saved.id,ticketNumber:saved.ticketNumber,locator:saved.locator,saleId:saved.saleId,saleReference:saved.saleReference,
                 cpf:saved.cpf,name:saved.name,line:saved.line,company:saved.company,destination:saved.destination,paymentMethod:saved.paymentMethod,
                 value:saved.paymentValue,issuedAt:saved.issuedAt
             }],null);
             return saved;
         }
+    };
+
+    // ============================================================
+    // LIMPEZA OPERACIONAL — exclusões por registro com tombstones.
+    // Dados financeiros e configurações nunca participam desta operação.
+    // ============================================================
+    EH.Cleanup = {
+        busy:false,
+        requestRecord(id){const key=String(id||'');return EH.RequestFlow?.loadAll?.().find(item=>item.id===key)||EH.RequisitionManager?.loadStore?.().find(item=>item.id===key)||null;},
+        requestLabel(record={}){const passenger=record.passengers?.[0]||{},leg=passenger.trechoIda||(passenger.legs||[]).find(item=>item.tipo!=='volta')||{};return `${passenger.nome||'Solicitação'}${leg.origem&&leg.destino?` — ${leg.origem} × ${leg.destino}`:''}`;},
+        refresh(){['attendance','prefeitura','payment','tickets','reminders'].forEach(id=>EH.ContextualPanels?.refresh?.(id));EH.Reminders?.render?.();EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');},
+        tombstonePassengerRecords(requestId,now){const rows=EH.PassengerMemory?.load?.()||[];rows.filter(item=>item.requestId===requestId&&!item.deletedAt).forEach(item=>EH.PassengerMemory.upsert({...item,status:'deleted',deletedAt:now,updatedAt:now}));},
+        tombstoneEmissions(predicate,now){const affected=[];(EH.EmissionMemory?.load?.()||[]).map(item=>EH.EmissionMemory.normalize(item)).filter(item=>!item.deletedAt&&predicate(item)).forEach(item=>{const saved=EH.EmissionMemory.upsert({...item,deletedAt:now,updatedAt:now});if(saved)affected.push(saved);});return affected;},
+        tombstoneRelatedReminders(emissions=[],requestId=''){const key=String(requestId||''),tickets=new Set(emissions.map(item=>EH.Utils.clean(item.ticketNumber||'')).filter(Boolean)),sales=new Set(emissions.flatMap(item=>[item.saleId,item.saleReference]).map(String).filter(Boolean)),ids=(EH.Reminders?.load?.()||[]).filter(item=>Boolean(key&&String(item.requestId||'')===key)||tickets.has(EH.Utils.clean(item.ticketNumber||''))||sales.has(String(item.saleId||item.saleReference||''))).map(item=>item.id);if(ids.length)EH.Reminders?.tombstone?.(ids);return ids.length;},
+        async clearRequest(id,{ask=true,includePostEmission=true}={}){
+            if(this.busy)return false;const requestId=String(id||''),record=this.requestRecord(requestId);if(!record)return false;
+            if(ask&&!window.confirm(`Deseja limpar a solicitação de ${this.requestLabel(record)}?\n\nSomente este atendimento, seus códigos, lembretes e tarefas operacionais vinculadas serão retirados. O histórico financeiro será preservado.`))return false;
+            this.busy=true;try{const now=Date.now(),cpfs=new Set((record.passengers||[]).map(item=>EH.RequisitionManager?.normalizeCpf?.(item.cpf||'')).filter(Boolean));const drafts=EH.RequestFlow?.loadAll?.()||[],draftIndex=drafts.findIndex(item=>item.id===requestId);if(draftIndex>=0){drafts[draftIndex]={...drafts[draftIndex],active:false,status:'deleted',deletedAt:now,updatedAt:now};EH.RequestFlow.saveAll(drafts,{changedIds:[requestId]});}
+                const requests=EH.RequisitionManager?.loadStore?.()||[],requestIndex=requests.findIndex(item=>item.id===requestId);if(requestIndex>=0){requests[requestIndex]={...requests[requestIndex],active:false,status:'deleted',deletedAt:now,updatedAt:now};EH.RequisitionManager.saveStore(requests);}
+                this.tombstonePassengerRecords(requestId,now);const emissions=includePostEmission?this.tombstoneEmissions(item=>item.requestId===requestId,now):[];this.tombstoneRelatedReminders(emissions,requestId);const captures=EH.RequisitionManager?.pendingCodeCaptures?.()||[];if(captures.length)EH.Storage.set(EH.RequisitionManager.CODE_CAPTURE_KEY,captures.map(item=>(item.requestId===requestId||item.numeroLogico===record.numeroLogico||item.protocolo===record.protocolo)?{...item,status:'deleted',deletedAt:now,updatedAt:now}:item));
+                (EH.Attendance?.loadAll?.()||[]).filter(item=>(item.requisitionRefs||[]).includes(requestId)&&item.status==='active').forEach(item=>EH.Attendance.save({...item,status:'archived',stage:EH.Attendance.STAGES?.COMPLETED||item.stage,nextAction:'Atendimento limpo pelo usuário.'},{setCurrent:false}));
+                if(String(EH.Storage.get(EH.RequestFlow.ACTIVE_KEY,'')||'')===requestId)EH.Storage.remove(EH.RequestFlow.ACTIVE_KEY);const active=EH.RequisitionManager?.getActiveEmission?.();if(active?.requestId===requestId)EH.RequisitionManager.setActiveEmission(null);const lookup=EH.RequisitionManager?.saleLookup?.();if(lookup?.requestId===requestId)EH.RequisitionManager.saleLookup(null);const activePassenger=EH.SaleContext?.getActivePassenger?.();if(activePassenger&&cpfs.has(EH.RequisitionManager.normalizeCpf(activePassenger.cpf))){const sale=EH.SaleContext.loadSale();sale.activePassengerId=null;try{sessionStorage.setItem(EH.SaleContext.KEY,JSON.stringify({...sale,updatedAt:Date.now()}));}catch(_error){}EH.PassengerIdentity?.startNew?.();}EH.Sync?.syncAll?.({quiet:true});this.refresh();EH.Toast.success('Solicitação limpa sem afetar os demais atendimentos.');return true;
+            }catch(error){EH.Toast.error(error?.message||'Não foi possível limpar a solicitação.');return false;}finally{this.busy=false;}
+        },
+        async clearEmission(id,{ask=true}={}){if(this.busy)return false;const item=(EH.EmissionMemory?.load?.()||[]).map(row=>EH.EmissionMemory.normalize(row)).find(row=>row.id===String(id||'')&&!row.deletedAt);if(!item)return false;if(ask&&!window.confirm(`Deseja limpar a emissão de ${item.name||'Passageiro'}${item.ticketNumber?` — bilhete ${item.ticketNumber}`:''}?\n\nAs outras emissões e os dados financeiros serão preservados.`))return false;this.busy=true;try{const now=Date.now(),removed=this.tombstoneEmissions(row=>row.id===item.id,now);this.tombstoneRelatedReminders(removed,'');const pending=EH.Storage.get('emissionMemory.pendingSearch.v1',null);if(pending?.emissionId===item.id)EH.Storage.remove('emissionMemory.pendingSearch.v1');EH.Sync?.syncAll?.({quiet:true});this.refresh();EH.Toast.success('Emissão limpa.');return true;}catch(error){EH.Toast.error(error?.message||'Não foi possível limpar a emissão.');return false;}finally{this.busy=false;}},
+        async clearCompletedRequests(){const map=new Map();[...(EH.RequestFlow?.loadAll?.()||[]),...(EH.RequisitionManager?.loadStore?.()||[])].filter(item=>!item.deletedAt&&['completed','concluded','shared','archived'].includes(String(item.status||'').toLowerCase())).forEach(item=>map.set(item.id,item));const rows=Array.from(map.values());if(!rows.length)return EH.Toast.info('Não há solicitações concluídas para limpar.');if(!window.confirm(`Limpar ${rows.length} solicitação(ões) concluída(s)?\n\nSolicitações ativas e dados financeiros serão preservados.`))return false;for(const row of rows)await this.clearRequest(row.id,{ask:false});return true;},
+        async clearCompletedEmissions(){const rows=(EH.EmissionMemory?.load?.()||[]).map(item=>EH.EmissionMemory.normalize(item)).filter(item=>!item.deletedAt&&(item.shareStatus==='shared'||EH.EmissionMemory.statusRank(item.printStatus)>=EH.EmissionMemory.statusRank('completed')));if(!rows.length)return EH.Toast.info('Não há emissões concluídas para limpar.');if(!window.confirm(`Limpar ${rows.length} emissão(ões) concluída(s)?\n\nEmissões pendentes e dados financeiros serão preservados.`))return false;for(const row of rows)await this.clearEmission(row.id,{ask:false});return true;}
     };
 
 
@@ -19312,10 +19397,15 @@
             return Array.from(table?.querySelectorAll?.('tbody tr') || []).map((row,rowIndex)=>{
                 const cells=Array.from(row.querySelectorAll('td')).map(td=>EH.Utils.clean(td.textContent));
                 if(!cells.length)return null;
+                const rawTicket=idx.ticket>=0?cells[idx.ticket]||'':'';
+                const ticket=EH.Utils.clean(rawTicket.replace(/^(?:N[º°O]?\.?\s*(?:DO\s+)?BILHETE|BILHETE)\s*[:#-]?\s*/i,''));
                 return {
                     rowIndex,
                     name:idx.name>=0?cells[idx.name]||'':'',
-                    ticket:idx.ticket>=0?cells[idx.ticket]||'':'',
+                    // O número vem exclusivamente da célula cuja coluna real
+                    // contém BILHETE. Nunca é inferido de CPF, poltrona, serviço,
+                    // agência, localizador ou sequência visual.
+                    ticket,
                     cpf:idx.cpf>=0?String(cells[idx.cpf]||'').replace(/\D/g,''):'',
                     locator:idx.locator>=0?cells[idx.locator]||'':'',
                     service:idx.service>=0?String(cells[idx.service]||'').replace(/\D/g,''):'',
@@ -20097,6 +20187,20 @@
             EH.Toast.warning('CPF não disponível neste passageiro do mapa.');return false;
         },
 
+        async locateMapTicket(passenger,record) {
+            const ticket=EH.Utils.clean(passenger?.ticket||'');
+            if(!ticket)return EH.Toast.warning('O mapa não informou o Nº do Bilhete deste passageiro.');
+            const emission=(EH.EmissionMemory?.recent?.()||[]).find(item=>EH.Utils.clean(item.ticketNumber||'')===ticket);
+            if(emission){
+                if(EH.Pages?.detect?.()==='passagens'&&EH.EmissionMemory?.matchTicketCards?.(emission)?.length===1)return EH.EmissionMemory.openTicket(emission);
+                return EH.EmissionMemory.searchTicket(emission);
+            }
+            await EH.Clipboard.copyText(ticket);
+            EH.SaleContext?.navigateToPassagens?.();
+            EH.Toast.info(`Bilhete ${ticket} copiado para localização manual.`);
+            return true;
+        },
+
         markMapPassengerStatus(row,status) {
             if(!row?.reminder?.id)return EH.Toast.warning('Não foi possível relacionar este passageiro ao registro do mapa.');
             const saved=EH.Reminders?.markStatus?.(row.reminder.id,status);if(!saved)return false;
@@ -20106,6 +20210,8 @@
 
         renderContext(body) {
             body.classList.add('eh-map-287-context');
+            body.classList.toggle('is-compact',Boolean(EH.Config.OPERATION_PANEL_COMPACT));
+            const panel=body.closest?.('.eh-context-panel');if(panel){panel.style.setProperty('--eh-map-button-height',`${EH.Config.OPERATION_PANEL_BUTTON_HEIGHT}px`);panel.style.setProperty('--eh-map-font-size',`${EH.Config.OPERATION_PANEL_FONT_SIZE}px`);panel.style.setProperty('--eh-map-passenger-gap',`${EH.Config.OPERATION_PANEL_PASSENGER_GAP}px`);}
             const analysis=this.mapAnalysis||{state:'idle',message:'Aguardando o mapa do E-Pass.',records:[]};
             const message=document.createElement('div');message.className='eh-context-empty';message.textContent=analysis.message;
             if(analysis.state==='idle'||analysis.state==='loading'){
@@ -20127,19 +20233,21 @@
             const list=document.createElement('div');list.className='eh-operation-passenger-list';
             rows.forEach(entry=>{
                 const {passenger,record,movement,reminder,identity}=entry;const row=document.createElement('article');row.className=`eh-operation-passenger${active?.identity===identity?' is-active':''}${EH.Reminders?.isDoneStatus?.(reminder?.status)?' is-completed':''}`;row.dataset.mapPassengerId=identity;
-                const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(passenger.seat);
                 const info=document.createElement('div');info.className='eh-operation-passenger-info';
+                const place=this.shortLocation(movement==='alight'?passenger.destination:passenger.origin).replace(/\s+-\s+[A-Z]{2}$/i,'');
+                const kind=document.createElement('span');kind.className=`eh-map-movement ${movement==='alight'?'alight':'board'}`;kind.textContent=`${movement==='alight'?'Desembarque':'Embarque'}${place?` — ${place}`:''}`;
                 const name=document.createElement('strong');name.textContent=passenger.name||'Passageiro sem nome';
-                const cpf=String(passenger.cpf||reminder?.cpf||'').replace(/\D/g,'').slice(0,11);const meta=document.createElement('small');meta.textContent=`${movement==='alight'?'Desembarque':'Embarque'} • ${cpf.length===11?EH.SaleContext.maskCpf(cpf):'CPF não disponível'}`;
+                const cpf=String(passenger.cpf||reminder?.cpf||'').replace(/\D/g,'').slice(0,11),ticket=EH.Utils.clean(passenger.ticket||reminder?.ticketNumber||'');const meta=document.createElement('small');meta.className='eh-map-passenger-meta';meta.textContent=[cpf.length===11?EH.SaleContext.maskCpf(cpf):'CPF não disponível',`Poltrona ${EH.Utils.clean(passenger.seat||'—')}`,`Nº do Bilhete ${ticket||'não informado'}`].join(' • ');
                 const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders?.isDoneStatus?.(reminder?.status)?'done':'pending'}`;
                 const statusLabels={pending:'Pendente',checked:'Conferido',printed:'Impresso',completed:'Concluído',concluded:'Concluído'};
                 state.textContent=`Status: ${reminder?(statusLabels[String(reminder.status||'pending').toLowerCase()]||'Pendente'):'Pendente'}`;
                 const actions=document.createElement('div');actions.className='eh-operation-detail-actions';
                 const copy=document.createElement('button');copy.type='button';copy.className='eh-modal-btn';copy.textContent='Copiar CPF';copy.disabled=cpf.length!==11;copy.addEventListener('click',()=>this.copyMapCpf({...passenger,cpf}));
-                const search=document.createElement('button');search.type='button';search.className='eh-modal-btn primary';search.textContent='Buscar passagem';search.disabled=cpf.length!==11;search.addEventListener('click',()=>this.openMapPassenger(passenger,record));
+                const search=document.createElement('button');search.type='button';search.className='eh-modal-btn primary';search.textContent='Buscar CPF';search.disabled=cpf.length!==11;search.addEventListener('click',()=>this.openMapPassenger(passenger,record));
+                const locate=document.createElement('button');locate.type='button';locate.className='eh-modal-btn';locate.textContent='Abrir/Localizar bilhete';locate.disabled=!ticket;locate.addEventListener('click',()=>this.locateMapTicket({...passenger,ticket},record));
                 const statusButton=(label,status)=>{const button=document.createElement('button');button.type='button';button.className='eh-modal-btn';button.textContent=label;button.disabled=!reminder||(status==='completed'&&EH.Reminders?.isDoneStatus?.(reminder.status));button.addEventListener('click',()=>this.markMapPassengerStatus(entry,status));return button;};
-                actions.append(copy,search,statusButton('Conferir','checked'),statusButton('Impresso','printed'),statusButton('Concluir','completed'));
-                info.append(name,meta,state,actions);row.append(seat,info);list.appendChild(row);
+                actions.append(search,copy,locate,statusButton('Conferir','checked'),statusButton('Impresso','printed'),statusButton('Concluir','completed'));
+                info.append(kind,name,meta,state,actions);row.append(info);list.appendChild(row);
             });
             body.appendChild(list);
             const actions=document.createElement('div');actions.className='eh-context-actions eh-map-287-footer';actions.append(EH.ContextualPanels.action('Verificar novamente',()=>this.verifyOpenMap()));body.appendChild(actions);EH.PanelAutoFit?.schedule?.(body.closest?.('.eh-context-panel'),'map-287-list');
@@ -20248,7 +20356,7 @@
                 .eh-operation-empty{padding:18px;border:1px dashed #d9e0e7;border-radius:9px;color:#718092;text-align:center;font-size:11px}.eh-operation-warning{padding:9px 10px;border:1px solid #f0cfaa;border-radius:8px;background:#fff8ee;color:#8b561f;font-size:10px}.eh-operation-detail-summary{display:grid;gap:8px}.eh-operation-detail-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.eh-operation-detail-metrics>div{display:grid;gap:3px;padding:9px;border:1px solid #e2e8ee;border-radius:8px;font-size:9px}.eh-operation-detail-metrics strong{font-size:16px}.eh-operation-detail-actions{display:flex;flex-wrap:wrap;gap:7px}
                 .eh-operation-group-title{margin:8px 0 2px;color:#536175;font-size:9px;font-weight:950;letter-spacing:.4px}.eh-operation-day-row{display:grid;grid-template-columns:22px minmax(0,1fr) auto;align-items:center;gap:8px;padding:9px;border:1px solid #e2e7ed;border-radius:9px;background:#fbfcfd}.eh-operation-day-status{font-size:15px;font-weight:900;color:#517064}.eh-operation-day-info{min-width:0;display:grid;gap:3px}.eh-operation-day-info strong{font-size:11px}.eh-operation-day-info small{font-size:9.5px;color:#748091}
                 .eh-operation-reminder-state.pending{color:#a35d24!important}.eh-operation-reminder-state.done{color:#2d785f!important}
-                .eh-context-panel[data-panel="operation"] .eh-map-287-context{overflow:hidden!important;grid-template-rows:auto minmax(0,1fr) auto;align-content:stretch}.eh-map-287-header{display:grid;gap:3px;padding:8px 9px;border:1px solid var(--eh-border,#dbe3ec);border-radius:9px;background:var(--eh-surface-color,#f8fafc)}.eh-map-287-header strong{font-size:11px;color:var(--eh-text,#1f2937);letter-spacing:.05em}.eh-map-287-header span{font-size:9px;color:var(--eh-muted,#64748b);font-weight:750}.eh-map-287-context>.eh-operation-passenger-list{min-height:0;max-height:min(56vh,520px);overflow-y:auto;overscroll-behavior:contain;padding-right:3px}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger{transition:border-color .12s ease,background-color .12s ease}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger.is-active{border-color:var(--eh-primary,#2563eb);background:#eef6ff;box-shadow:0 0 0 2px rgba(37,99,235,.1)}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger.is-completed{opacity:.72;background:#f3faf6}.eh-map-287-context .eh-operation-detail-actions button{flex:1 1 82px;min-height:30px}.eh-map-287-footer{flex:0 0 auto}
+                .eh-context-panel[data-panel="operation"] .eh-map-287-context{overflow:hidden!important;grid-template-rows:auto minmax(0,1fr) auto;align-content:stretch;font-size:var(--eh-map-font-size,10px)}.eh-map-287-header{display:flex;align-items:center;justify-content:space-between;gap:6px;padding:6px 7px;border:1px solid var(--eh-border,#dbe3ec);border-radius:8px;background:var(--eh-surface-color,#f8fafc)}.eh-map-287-header strong{font-size:10px;color:var(--eh-text,#1f2937);letter-spacing:.04em}.eh-map-287-header span{font-size:8px;color:var(--eh-muted,#64748b);font-weight:750}.eh-map-287-context>.eh-operation-passenger-list{display:grid;gap:var(--eh-map-passenger-gap,4px);min-height:0;max-height:min(62vh,620px);overflow-y:auto;overscroll-behavior:contain;padding-right:2px}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger{display:block;padding:7px 8px;transition:border-color .12s ease,background-color .12s ease}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger.is-active{border-color:var(--eh-primary,#2563eb);background:#eef6ff;box-shadow:0 0 0 2px rgba(37,99,235,.1)}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger.is-completed{opacity:.72;background:#f3faf6}.eh-map-287-context .eh-operation-passenger-info{gap:2px}.eh-map-287-context .eh-operation-passenger-info>strong{font-size:var(--eh-map-font-size,10px);line-height:1.25}.eh-map-movement{width:max-content;font-size:8px;font-weight:900;letter-spacing:.025em;color:#24735e}.eh-map-movement.alight{color:#a35a31}.eh-map-passenger-meta{font-size:calc(var(--eh-map-font-size,10px) - 1px)!important;overflow-wrap:anywhere}.eh-map-287-context .eh-operation-reminder-state{font-size:8px!important}.eh-map-287-context .eh-operation-detail-actions{display:flex;flex-wrap:wrap;gap:3px;margin-top:2px}.eh-map-287-context .eh-operation-detail-actions button{flex:0 1 auto;min-height:var(--eh-map-button-height,28px);height:var(--eh-map-button-height,28px);padding:3px 6px;font-size:8px;line-height:1}.eh-map-287-context.is-compact .eh-operation-passenger{padding:5px 6px}.eh-map-287-context.is-compact .eh-operation-detail-actions button{min-width:0}.eh-map-287-footer{flex:0 0 auto}.eh-map-287-footer button{min-height:var(--eh-map-button-height,28px)!important}
                 .eh-operation-settings-list{display:grid;gap:8px;margin-top:8px}.eh-operation-settings-service{display:grid;grid-template-columns:100px minmax(180px,1.5fr) minmax(125px,1fr) minmax(125px,1fr);gap:7px;padding:9px;border:1px solid #e1e6ec;border-radius:9px;background:#fff}.eh-operation-settings-service .eh-check{align-self:end;min-height:36px}.eh-operation-settings-service .eh-remove-routine{align-self:end}.eh-operation-settings-service-note{grid-column:1/-1}
                 @media(max-width:760px){:is(#eh-root,#eh-operation-dock) .eh-operation-metrics{grid-template-columns:1fr 1fr}:is(#eh-root,#eh-operation-dock) .eh-operation-metric.balance{grid-column:1/-1}:is(#eh-root,#eh-operation-dock) .eh-operation-actions{grid-template-columns:1fr}.eh-operation-day-row{grid-template-columns:22px minmax(0,1fr)}.eh-operation-day-row>button,.eh-operation-search-actions{grid-column:1/-1}.eh-operation-detail-metrics{grid-template-columns:1fr}.eh-operation-settings-service{grid-template-columns:1fr}.eh-operation-settings-service-note{grid-column:auto}}
             `);
@@ -22382,7 +22490,7 @@
                 numberField('contextButtonIconSize', 'Ícone (px)', EH.Config.CONTEXT_BUTTON_ICON_SIZE, {min:12,max:26,step:1}),
                 numberField('contextButtonGap', 'Distância (px)', EH.Config.CONTEXT_BUTTON_GAP, {min:2,max:18,step:1}),
                 numberField('contextButtonOpacity','Transparência (%)',Math.round(EH.Config.CONTEXT_BUTTON_OPACITY*100),{min:65,max:100,step:1}),
-                selectField('contextButtonPosition','Posição',EH.Config.CONTEXT_BUTTON_POSITION,[['auto','Automática'],['right','Direita'],['left','Esquerda'],['bottom','Inferior']])
+                selectField('contextButtonPosition','Posição',EH.Config.CONTEXT_BUTTON_POSITION,[['top','Superior segura'],['auto','Automática'],['right','Direita'],['left','Esquerda'],['bottom','Inferior']])
             );
             shortcutCard.append(shortcutGrid,checkField('contextButtonShowText','Exibir texto ao lado do ícone',EH.Config.CONTEXT_BUTTON_SHOW_TEXT,'Quando desativado, o nome continua disponível no tooltip e no rótulo acessível.'));
             const resetContextPanels=document.createElement('button');resetContextPanels.type='button';resetContextPanels.className='eh-modal-btn';resetContextPanels.textContent='Restaurar posições dos painéis contextuais';resetContextPanels.addEventListener('click',()=>{EH.Storage.set('contextualPanels.v1',{});for(const [id] of EH.ContextualPanels?.panels||[])EH.ContextualPanels.close(id);EH.Toast.info('Posições contextuais restauradas.');});
@@ -22654,6 +22762,26 @@
                 note('O número do Serviço NÃO é configuração fixa. O Helper detecta Serviço + Linha + Empresa na pesquisa real daquele dia e usa o código 287 no mapa.')
             );
             sections.carros.pane.appendChild(operationGeneralCard);
+
+            const operationPanelCard=card('Painel do Mapa');
+            const operationPanelGrid=grid();
+            operationPanelGrid.append(
+                numberField('operationPanelX','Posição horizontal (px)',EH.Config.OPERATION_PANEL_X,{min:0,max:5000,step:5,hint:'0 = posição automática segura.'}),
+                numberField('operationPanelY','Posição vertical (px)',EH.Config.OPERATION_PANEL_Y,{min:0,max:3000,step:5,hint:'0 = posição automática segura.'}),
+                numberField('operationPanelWidth','Largura (px)',EH.Config.OPERATION_PANEL_WIDTH,{min:300,max:720,step:10}),
+                numberField('operationPanelHeight','Altura (px)',EH.Config.OPERATION_PANEL_HEIGHT,{min:220,max:900,step:10}),
+                numberField('operationPanelButtonHeight','Altura dos botões (px)',EH.Config.OPERATION_PANEL_BUTTON_HEIGHT,{min:24,max:40,step:1}),
+                numberField('operationPanelFontSize','Tamanho das letras (px)',EH.Config.OPERATION_PANEL_FONT_SIZE,{min:9,max:14,step:1}),
+                numberField('operationPanelPassengerGap','Espaço entre passageiros (px)',EH.Config.OPERATION_PANEL_PASSENGER_GAP,{min:2,max:14,step:1})
+            );
+            const operationPanelCompact=checkField('operationPanelCompact','Modo compacto',EH.Config.OPERATION_PANEL_COMPACT,'Mantém todos os dados e ações, reduzindo apenas espaços e dimensões visuais.');
+            const operationPanelVisible=checkField('operationPanelKeepVisible','Manter o painel dentro da área visível',EH.Config.OPERATION_PANEL_KEEP_VISIBLE,'Reposiciona automaticamente quando a resolução muda.');
+            const restoreOperationPanel=document.createElement('button');restoreOperationPanel.type='button';restoreOperationPanel.className='eh-modal-btn';restoreOperationPanel.textContent='Restaurar o padrão do Painel do Mapa';
+            const previewOperationPanel=()=>EH.ContextualPanels?.previewOperationSettings?.({x:Number(fields.operationPanelX.value||0),y:Number(fields.operationPanelY.value||0),width:Number(fields.operationPanelWidth.value||360),height:Number(fields.operationPanelHeight.value||420),buttonHeight:Number(fields.operationPanelButtonHeight.value||28),fontSize:Number(fields.operationPanelFontSize.value||10),gap:Number(fields.operationPanelPassengerGap.value||4),compact:Boolean(fields.operationPanelCompact.checked),keepVisible:Boolean(fields.operationPanelKeepVisible.checked)});
+            ['operationPanelX','operationPanelY','operationPanelWidth','operationPanelHeight','operationPanelButtonHeight','operationPanelFontSize','operationPanelPassengerGap','operationPanelCompact','operationPanelKeepVisible'].forEach(key=>{fields[key].addEventListener(fields[key].type==='checkbox'?'change':'input',previewOperationPanel);});
+            restoreOperationPanel.addEventListener('click',()=>{fields.operationPanelX.value='0';fields.operationPanelY.value='0';fields.operationPanelWidth.value='360';fields.operationPanelHeight.value='420';fields.operationPanelButtonHeight.value='28';fields.operationPanelFontSize.value='10';fields.operationPanelPassengerGap.value='4';fields.operationPanelCompact.checked=true;fields.operationPanelKeepVisible.checked=true;EH.Storage.set('contextualPanels.v1',{...EH.ContextualPanels.saved(),operation:{autoFit:false}});previewOperationPanel();setDirty(true);});
+            operationPanelCard.append(operationPanelGrid,operationPanelCompact,operationPanelVisible,restoreOperationPanel,note('A pré-visualização é aplicada imediatamente. O arraste manual atualiza a posição sem alterar zoom ou outros painéis.'));
+            sections.carros.pane.appendChild(operationPanelCard);
 
             const operationServicesCard = card('Carros principais / horários');
             operationServicesCard.appendChild(note('Configure somente a rotina. O “Serviço de hoje” é detectado automaticamente. Origem/Destino ajudam a diferenciar sentidos com horários próximos.'));
@@ -22980,6 +23108,15 @@
                 fields.operationDockEnabled.checked = Boolean(d.OPERATION_DOCK_ENABLED);
                 fields.operationAgencyCode.value = String(d.OPERATION_AGENCY_CODE || '287');
                 fields.operationSortBySeat.checked = Boolean(d.OPERATION_SORT_BY_SEAT);
+                fields.operationPanelX.value=String(d.OPERATION_PANEL_X);
+                fields.operationPanelY.value=String(d.OPERATION_PANEL_Y);
+                fields.operationPanelWidth.value=String(d.OPERATION_PANEL_WIDTH);
+                fields.operationPanelHeight.value=String(d.OPERATION_PANEL_HEIGHT);
+                fields.operationPanelButtonHeight.value=String(d.OPERATION_PANEL_BUTTON_HEIGHT);
+                fields.operationPanelFontSize.value=String(d.OPERATION_PANEL_FONT_SIZE);
+                fields.operationPanelPassengerGap.value=String(d.OPERATION_PANEL_PASSENGER_GAP);
+                fields.operationPanelCompact.checked=Boolean(d.OPERATION_PANEL_COMPACT);
+                fields.operationPanelKeepVisible.checked=Boolean(d.OPERATION_PANEL_KEEP_VISIBLE);
                 fields.reminderCreate.checked = Boolean(d.REMINDER_CREATE_AFTER_TICKET);
                 fields.reminderAsk.checked = Boolean(d.REMINDER_ASK_AFTER_TICKET);
                 fields.reminderMaskCpf.checked = Boolean(d.REMINDER_MASK_CPF);
@@ -23177,7 +23314,7 @@
                 EH.Config.CONTEXT_BUTTON_GAP = clamp(fields.contextButtonGap.value,2,18,6);
                 EH.Config.CONTEXT_BUTTON_OPACITY = clamp(Number(fields.contextButtonOpacity.value)/100,.65,1,.96);
                 EH.Config.CONTEXT_BUTTON_SHOW_TEXT = Boolean(fields.contextButtonShowText.checked);
-                EH.Config.CONTEXT_BUTTON_POSITION = ['auto','right','left','bottom'].includes(fields.contextButtonPosition.value)?fields.contextButtonPosition.value:'auto';
+                EH.Config.CONTEXT_BUTTON_POSITION = ['top','auto','right','left','bottom'].includes(fields.contextButtonPosition.value)?fields.contextButtonPosition.value:'top';
                 EH.Config.QUICK_ROUTE_GREETING = String(fields.quickRouteGreeting.value||'').trim();
                 EH.Config.QUICK_ROUTE_FOOTER = String(fields.quickRouteFooter.value||'').trim();
                 EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE = String(fields.quickRouteSummaryTemplate.value||'');
@@ -23190,6 +23327,15 @@
                 EH.Config.OPERATION_SORT_BY_SEAT = fields.operationSortBySeat.checked;
                 EH.Config.OPERATION_TIME_TOLERANCE_MINUTES = clamp(fields.operationTolerance.value, 0, 90, 20);
                 EH.Config.OPERATION_QUEUE_GRACE_MINUTES = clamp(fields.operationQueueGrace.value, 15, 1440, 180);
+                EH.Config.OPERATION_PANEL_X = Math.max(0,Number(fields.operationPanelX.value||0));
+                EH.Config.OPERATION_PANEL_Y = Math.max(0,Number(fields.operationPanelY.value||0));
+                EH.Config.OPERATION_PANEL_WIDTH = clamp(fields.operationPanelWidth.value,300,720,360);
+                EH.Config.OPERATION_PANEL_HEIGHT = clamp(fields.operationPanelHeight.value,220,900,420);
+                EH.Config.OPERATION_PANEL_BUTTON_HEIGHT = clamp(fields.operationPanelButtonHeight.value,24,40,28);
+                EH.Config.OPERATION_PANEL_FONT_SIZE = clamp(fields.operationPanelFontSize.value,9,14,10);
+                EH.Config.OPERATION_PANEL_PASSENGER_GAP = clamp(fields.operationPanelPassengerGap.value,2,14,4);
+                EH.Config.OPERATION_PANEL_COMPACT = Boolean(fields.operationPanelCompact.checked);
+                EH.Config.OPERATION_PANEL_KEEP_VISIBLE = Boolean(fields.operationPanelKeepVisible.checked);
                 EH.Config.OPERATION_ROUTINES = operationRoutines;
                 EH.Storage.set('operationConfig.updatedAt', Date.now());
                 EH.Sync?.markPendingRecord?.('config','operation');
@@ -23253,6 +23399,15 @@
                     operationDockEnabled: EH.Config.OPERATION_DOCK_ENABLED,
                     operationTimeToleranceMinutes: EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,
                     operationQueueGraceMinutes: EH.Config.OPERATION_QUEUE_GRACE_MINUTES,
+                    operationPanelX:EH.Config.OPERATION_PANEL_X,
+                    operationPanelY:EH.Config.OPERATION_PANEL_Y,
+                    operationPanelWidth:EH.Config.OPERATION_PANEL_WIDTH,
+                    operationPanelHeight:EH.Config.OPERATION_PANEL_HEIGHT,
+                    operationPanelButtonHeight:EH.Config.OPERATION_PANEL_BUTTON_HEIGHT,
+                    operationPanelFontSize:EH.Config.OPERATION_PANEL_FONT_SIZE,
+                    operationPanelPassengerGap:EH.Config.OPERATION_PANEL_PASSENGER_GAP,
+                    operationPanelCompact:EH.Config.OPERATION_PANEL_COMPACT,
+                    operationPanelKeepVisible:EH.Config.OPERATION_PANEL_KEEP_VISIBLE,
                     operationRoutines: EH.Config.OPERATION_ROUTINES,
                     reminderCreateAfterTicket: EH.Config.REMINDER_CREATE_AFTER_TICKET,
                     reminderAskAfterTicket: EH.Config.REMINDER_ASK_AFTER_TICKET,
@@ -23462,9 +23617,9 @@
             if (EH.UI?.root) EH.UI.root.hidden = true;
             if (EH.UI?.launcher) EH.UI.launcher.hidden = true;
             const button=document.createElement('button');button.id='eh-general-settings';button.type='button';button.textContent='⚙';button.title='Configurações Gerais';button.setAttribute('aria-label','Configurações Gerais');
-            button.addEventListener('click',()=>EH.UI?.showSettings?.());document.body.appendChild(button);this.settingsButton=button;
+            button.addEventListener('click',()=>EH.UI?.showSettings?.());button.hidden=true;document.body.appendChild(button);this.settingsButton=button;
             GM_addStyle(`
-                #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
+                #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden],#eh-general-settings{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
                 html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:auto;min-width:270px;min-height:110px;overflow:hidden;resize:none;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
                 .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}.eh-request-context-selector{display:grid;gap:4px;color:#607286;font-size:8px;font-weight:800}.eh-request-context-selector select,.eh-share-queue>select{width:100%;min-height:32px;padding:5px 7px;border:1px solid #d3dce6;border-radius:7px;background:#fff;color:#30445a;font-size:9px}.eh-share-queue .eh-context-empty,.eh-request-route-hint .eh-context-empty{padding:6px;text-align:left}
                 #eh-general-settings,.eh-context-panel,.eh-context-panel-head,.eh-context-panel-body,.eh-context-route-choice,.eh-context-actions button,.eh-context-data div,.eh-requisition-context,.eh-request-context-selector select,.eh-share-queue>select{font-family:var(--eh-font-family,Inter,"Segoe UI",Arial,sans-serif);color:var(--eh-text,#1f2937);border-color:var(--eh-border,#dbe3ec);background:var(--eh-panel-color,#fff)}
@@ -23478,7 +23633,27 @@
             const rect=panel.getBoundingClientRect(),all=this.saved(),current=all[id]&&typeof all[id]==='object'?all[id]:{};
             all[id]={...current,x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(patch.width??current.width??rect.width),height:Math.round(patch.height??current.height??rect.height),autoFit:patch.autoFit!==undefined?Boolean(patch.autoFit):(current.autoFit!==false),updatedAt:Date.now()};EH.Storage.set(this.KEY,all);
             EH.SettingsCatalog?.touch?.(this.KEY);
+            if(id==='operation'){
+                EH.Config.OPERATION_PANEL_X=Math.round(rect.left);EH.Config.OPERATION_PANEL_Y=Math.round(rect.top);
+                const values={operationPanelX:EH.Config.OPERATION_PANEL_X,operationPanelY:EH.Config.OPERATION_PANEL_Y};
+                EH.SettingsCatalog?.setMany?.(values,{timestamp:Date.now(),markSync:true});
+            }
             if(EH.Config.SYNC_PANEL_LAYOUT)EH.Sync?.markPendingRecord?.('setting',this.KEY);
+        },
+
+        ensureVisible(panel) {
+            if(!panel?.isConnected)return false;const rect=panel.getBoundingClientRect();
+            const maxLeft=Math.max(0,window.innerWidth-rect.width),maxTop=Math.max(0,window.innerHeight-rect.height);
+            const left=Math.min(maxLeft,Math.max(0,rect.left));
+            const top=Math.min(maxTop,Math.max(0,rect.top));
+            panel.style.left=`${Math.round(left)}px`;panel.style.top=`${Math.round(top)}px`;return true;
+        },
+
+        previewOperationSettings(config={}) {
+            EH.Config.OPERATION_PANEL_X=Math.max(0,Number(config.x||0));EH.Config.OPERATION_PANEL_Y=Math.max(0,Number(config.y||0));
+            EH.Config.OPERATION_PANEL_WIDTH=Math.min(720,Math.max(300,Number(config.width||360)));EH.Config.OPERATION_PANEL_HEIGHT=Math.min(900,Math.max(220,Number(config.height||420)));
+            EH.Config.OPERATION_PANEL_BUTTON_HEIGHT=Math.min(40,Math.max(24,Number(config.buttonHeight||28)));EH.Config.OPERATION_PANEL_FONT_SIZE=Math.min(14,Math.max(9,Number(config.fontSize||10)));EH.Config.OPERATION_PANEL_PASSENGER_GAP=Math.min(14,Math.max(2,Number(config.gap||4)));EH.Config.OPERATION_PANEL_COMPACT=Boolean(config.compact);EH.Config.OPERATION_PANEL_KEEP_VISIBLE=Boolean(config.keepVisible);
+            const panel=this.open('operation'),entry=this.panels.get('operation');if(!panel||!entry)return null;this.position('operation',panel);this.render('operation',entry.body);if(EH.Config.OPERATION_PANEL_KEEP_VISIBLE)this.ensureVisible(panel);return panel;
         },
         setAutoFit(id, value=true) {
             const entry=this.panels.get(id),all=this.saved(),current=all[id]&&typeof all[id]==='object'?all[id]:{};
@@ -23486,9 +23661,10 @@
             if(entry&&value){entry.panel.style.removeProperty('width');entry.panel.style.removeProperty('height');EH.PanelAutoFit?.schedule?.(entry.panel,'context-auto');}
         },
         position(id,panel) {
-            const cfg=this.saved()[id]||{};const compact=id==='attendance';const defaultHeight=id==='operation'?430:(compact?260:360);const automatic=cfg.autoFit!==false;const width=Math.min(window.innerWidth-24,Math.max(270,automatic?(compact?334:390):(Number(cfg.width)||390)));const height=Math.min(window.innerHeight-34,Math.max(110,automatic?defaultHeight:(Number(cfg.height)||defaultHeight)));
-            const fallbackX=EH.Config.OVERLAY_SIDE==='left'?12:Math.max(12,window.innerWidth-width-62);const x=Math.min(window.innerWidth-80,Math.max(0,Number.isFinite(Number(cfg.x))?Number(cfg.x):fallbackX));const y=Math.min(window.innerHeight-48,Math.max(0,Number.isFinite(Number(cfg.y))?Number(cfg.y):92));
+            const cfg=this.saved()[id]||{};const compact=id==='attendance';const operation=id==='operation';const defaultHeight=operation?420:(compact?260:360);const automatic=operation?false:cfg.autoFit!==false;const configuredWidth=operation?EH.Config.OPERATION_PANEL_WIDTH:Number(cfg.width);const configuredHeight=operation?EH.Config.OPERATION_PANEL_HEIGHT:Number(cfg.height);const width=Math.min(window.innerWidth-24,Math.max(270,automatic?(compact?334:390):(configuredWidth||390)));const height=Math.min(window.innerHeight-34,Math.max(110,automatic?defaultHeight:(configuredHeight||defaultHeight)));
+            const fallbackX=EH.Config.OVERLAY_SIDE==='left'?12:Math.max(12,window.innerWidth-width-62);const savedX=operation?(Number(EH.Config.OPERATION_PANEL_X)>0?EH.Config.OPERATION_PANEL_X:fallbackX):cfg.x,savedY=operation?(Number(EH.Config.OPERATION_PANEL_Y)>0?EH.Config.OPERATION_PANEL_Y:92):cfg.y;const x=Math.min(window.innerWidth-80,Math.max(0,Number.isFinite(Number(savedX))?Number(savedX):fallbackX));const y=Math.min(window.innerHeight-48,Math.max(0,Number.isFinite(Number(savedY))?Number(savedY):92));
             Object.assign(panel.style,{width:`${width}px`,height:`${height}px`,left:`${x}px`,top:`${y}px`});
+            if(operation){const all=this.saved();all.operation={...(all.operation||{}),x,y,width,height,autoFit:false,updatedAt:Number(all.operation?.updatedAt||Date.now())};EH.Storage.set(this.KEY,all);if(EH.Config.OPERATION_PANEL_KEEP_VISIBLE)this.ensureVisible(panel);}
         },
         bindMovement(id,panel,head) {
             let start=null,frame=0,pending=null;
@@ -23522,8 +23698,10 @@
             finally{setTimeout(()=>{this.scheduleBusy.delete(original);if(helperButton.isConnected)helperButton.disabled=false;},900);}
         },
         renderSchedules(body) {
-            const rows=this.scheduleRows();if(!rows.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Selecione uma rota e aguarde os resultados reais do E-Pass.';body.appendChild(empty);return;}
-            rows.forEach(row=>{const card=document.createElement('article');card.className='eh-context-schedule';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Horário',row.item.saida),this.cell('Empresa',row.item.empresa||row.item.linha),this.cell('Serviço do dia',row.service),this.cell('Valor',row.item.valorFinal||row.item.preco));const actions=document.createElement('div');actions.className='eh-context-actions';let select;select=this.action('Selecionar',()=>this.selectSchedule(row,select),'primary');actions.appendChild(select);card.append(grid,actions);body.appendChild(card);});
+            const data=EH.Parser?.parsePesquisa?.()||{horarios:[]},rows=this.scheduleRows();if(!rows.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Selecione uma rota e aguarde os resultados reais do E-Pass.';body.appendChild(empty);return;}
+            const summary=EH.Parser?.formatPesquisaResumo?.(data)||'',details=EH.Parser?.formatPesquisaDetalhes?.(data)||summary;
+            const capture=document.createElement('section');capture.className='eh-schedule-capture-summary';Object.assign(capture.style,{display:'grid',gap:'5px',padding:'8px',border:'1px solid var(--eh-border,#dbe3ec)',borderRadius:'9px',background:'var(--eh-surface-color,#f8fafc)'});const title=document.createElement('strong');title.textContent=[data.origem,data.destino].filter(Boolean).join(' → ')||'Horários encontrados';const meta=document.createElement('small');meta.textContent=[data.data,`${data.horarios?.length||rows.length} horário(s)`].filter(Boolean).join(' • ');const preview=document.createElement('pre');preview.textContent=summary;Object.assign(preview.style,{margin:'0',maxHeight:'120px',overflow:'auto',whiteSpace:'pre-wrap',font:'700 9px/1.35 Inter,Segoe UI,Arial,sans-serif',color:'var(--eh-muted,#64748b)'});const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Gerar captura',()=>EH.UI?.captureAction?.('pesquisa'),'primary'),this.action('Copiar resumo',async()=>{await EH.Clipboard.copyText(summary);EH.Toast.success('Resumo dos horários copiado.');}),this.action('Copiar completo',async()=>{await EH.Clipboard.copyText(details);EH.Toast.success('Horários completos copiados.');}));if(EH.UI?.openWhatsApp)actions.append(this.action('Compartilhar',()=>EH.UI.openWhatsApp(details,{allowCurrentChat:true,bridgeOnly:true})));capture.append(title,meta,preview,actions);body.appendChild(capture);
+            rows.forEach(row=>{const card=document.createElement('article');card.className='eh-context-schedule';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Saída',row.item.saida),this.cell('Chegada',row.item.chegada),this.cell('Empresa',row.item.empresa||row.item.linha),this.cell('Serviço do dia',row.service||row.item.linhaReal),this.cell('Disponibilidade',row.item.disponibilidade||row.item.vagas),this.cell('Valor',row.item.valorFinal||row.item.preco));const cardActions=document.createElement('div');cardActions.className='eh-context-actions';let select;select=this.action('Selecionar',()=>this.selectSchedule(row,select),'primary');cardActions.appendChild(select);card.append(grid,cardActions);body.appendChild(card);});
         },
         async confirmSelectedSeat(button) {
             if(this.seatConfirmBusy)return;const data=EH.Parser?.parseReserva?.()||{};
@@ -23536,7 +23714,7 @@
         },
         renderPayment(body) {
             const context=EH.Attendance?.load?.()||{};const payment=context.payment||{};const requestCodes=EH.RequisitionManager?.paymentCodes?.()||{};const ida=requestCodes.ida?.codigo||'',volta=requestCodes.volta?.codigo||'';
-            if(ida||volta){const grid=document.createElement('div');grid.className='eh-context-data';if(ida)grid.append(this.cell('Código da ida',ida));if(volta)grid.append(this.cell('Código da volta',volta));const actions=document.createElement('div');actions.className='eh-context-actions';if(ida)actions.append(this.action('Preencher ida',()=>EH.RequisitionManager.fillPaymentLeg('ida'),'primary'));if(volta)actions.append(this.action('Preencher volta',()=>EH.RequisitionManager.fillPaymentLeg('volta'),'primary'));if(ida&&volta)actions.append(this.action('Preencher ambos',()=>EH.RequisitionManager.fillPaymentBoth()));actions.append(this.action('Copiar',()=>EH.RequisitionManager.copyBothCodes(requestCodes.request)));body.append(grid,actions);return;}
+            if(ida||volta){const grid=document.createElement('div');grid.className='eh-context-data';if(ida)grid.append(this.cell('Código da ida',ida));if(volta)grid.append(this.cell('Código da volta',volta));const actions=document.createElement('div');actions.className='eh-context-actions';if(ida)actions.append(this.action('Preencher ida',()=>EH.RequisitionManager.fillPaymentLeg('ida'),'primary'));if(volta)actions.append(this.action('Preencher volta',()=>EH.RequisitionManager.fillPaymentLeg('volta'),'primary'));if(ida&&volta)actions.append(this.action('Preencher ambos',()=>EH.RequisitionManager.fillPaymentBoth()));actions.append(this.action('Copiar',()=>EH.RequisitionManager.copyBothCodes(requestCodes.request)));if(requestCodes.request?.id)actions.append(this.action('Limpar',()=>EH.Cleanup?.clearRequest?.(requestCodes.request.id)));body.append(grid,actions);return;}
             const pix=EH.Payment?.parsePix?.();const isPix=Boolean(pix||EH.Utils.normalize(payment.method||'').includes('PIX'));if(!isPix){const note=document.createElement('div');note.className='eh-context-empty';note.textContent='Conclua a forma de pagamento no E-Pass.';body.appendChild(note);return;}
             const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid){actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));}else actions.append(this.action('Gerar PIX',()=>EH.Payment.clientConfirmed?.(),'primary'));body.appendChild(actions);
         },
@@ -23582,6 +23760,7 @@
             const ida=data.codes?.ida||'',volta=data.hasReturn?(data.codes?.volta||''):'';
             if(ida||volta){const codeSection=document.createElement('section');codeSection.className='eh-attendance-section';const title=document.createElement('strong');title.textContent='CÓDIGOS';const grid=document.createElement('div');grid.className='eh-context-data';if(ida)grid.append(this.cell('Código da ida',ida));if(volta)grid.append(this.cell('Código da volta',volta));const codeActions=document.createElement('div');codeActions.className='eh-context-actions';if(ida)codeActions.append(this.action('Copiar código da ida',()=>EH.RequisitionManager.copyLegCode(ida)));if(volta)codeActions.append(this.action('Copiar código da volta',()=>EH.RequisitionManager.copyLegCode(volta)));if(EH.Utils.first(EH.Selectors.REQUISITION_CODE_INPUT))codeActions.append(this.action('Preencher códigos no Pagamento',()=>EH.RequisitionManager.fillPaymentCode(),'primary'));codeSection.append(title,grid,codeActions);body.appendChild(codeSection);
             }else if(request&&!EH.RequestFlow?.terminal?.(request.status)){const pending=document.createElement('div');pending.className='eh-context-empty eh-attendance-code-wait';pending.textContent='Aguardando a geração do código da solicitação.';body.appendChild(pending);}
+            if(request?.id){const clean=document.createElement('div');clean.className='eh-context-actions';clean.append(this.action('Limpar',()=>EH.Cleanup?.clearRequest?.(request.id)));body.appendChild(clean);}
             return body;
         },
         renderMenu(body) {
@@ -23602,8 +23781,8 @@
                 else actions.append(this.action('Abrir dados e Document AI',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));
                 body.append(note,actions);if(passenger){const more=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Mais opções';const extra=document.createElement('div');extra.className='eh-context-actions';extra.append(this.action('Conferir documento e dados',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();}));more.append(summary,extra);body.appendChild(more);}return;
             }
-            if(id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent='Use o documento oficial, confira os dados e prepare o anexo.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir Requisição da Prefeitura',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'));body.append(note,actions);EH.RequisitionManager?.renderContext?.(body,{page:'requisicao'});return;}
-            if(id==='reminders'){const groups=EH.Reminders?.queueGroups?.()||{board:[],alight:[],review:[],history:[]};const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${groups.board.length} embarque(s) • ${groups.alight.length} desembarque(s) • ${groups.review.length} para conferência.`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir fila operacional',()=>EH.Reminders?.openModal?.('active'),'primary'),this.action('Ver pendências',()=>EH.Reminders?.openModal?.('review')));body.append(note,actions);return;}
+            if(id==='prefeitura'){const note=document.createElement('div');note.className='eh-context-empty';note.textContent='Use o documento oficial, confira os dados e prepare o anexo.';const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir Requisição da Prefeitura',()=>{this.close(id);EH.PrefeituraRequisition?.open?.();},'primary'),this.action('Limpar concluídas',()=>EH.Cleanup?.clearCompletedRequests?.()));body.append(note,actions);EH.RequisitionManager?.renderContext?.(body,{page:'requisicao'});return;}
+            if(id==='reminders'){const groups=EH.Reminders?.queueGroups?.()||{board:[],alight:[],review:[],history:[]};const note=document.createElement('div');note.className='eh-context-empty';note.textContent=`${groups.board.length} embarque(s) • ${groups.alight.length} desembarque(s) • ${groups.review.length} para conferência.`;const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Abrir fila operacional',()=>EH.Reminders?.openModal?.('active'),'primary'),this.action('Ver pendências',()=>EH.Reminders?.openModal?.('review')),this.action('Limpar todos',()=>EH.Reminders?.deleteAll?.()));body.append(note,actions);return;}
             if(id==='tickets'){EH.EmissionMemory?.renderShareQueue?.(body);return;}
             if(id==='finance')return this.renderFinance(body);
             if(id==='operation'){EH.OperationCars?.renderContext?.(body);return;}
@@ -23625,16 +23804,18 @@
     EH.ContextualShortcuts = {
         root: null,
         currentPage: '',
+        COLLAPSED_KEY: 'contextShortcuts.collapsed.v1',
         init() {
             if (this.root || !document.body) return;
             EH.ContextualPanels.init();
             const root=document.createElement('nav');root.id='eh-context-shortcuts';root.setAttribute('aria-label','Atalhos contextuais do E-Pass Helper');document.body.appendChild(root);this.root=root;
             GM_addStyle(`
-                #eh-context-shortcuts{position:fixed;right:8px;top:142px;z-index:2147482950;display:flex;flex-direction:column;gap:var(--eh-context-gap,6px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}.eh-context-next-pill{pointer-events:auto;cursor:pointer;box-sizing:border-box;display:grid;gap:2px;max-width:230px;padding:7px 9px;border:1px solid #d7e2ec;border-radius:9px;background:rgba(248,251,254,.97);color:#526579;box-shadow:0 4px 12px rgba(31,48,70,.09);font:750 9px/1.3 Inter,"Segoe UI",Arial,sans-serif}.eh-context-next-pill:focus-visible{outline:2px solid rgba(59,130,246,.25)}.eh-context-next-pill strong{color:#2b425b;font-size:10px}.eh-context-next-pill small{font:inherit}
+                #eh-context-shortcuts{position:fixed;left:8px;right:8px;top:6px;z-index:2147482950;display:flex;flex-flow:row wrap;align-items:center;justify-content:flex-end;gap:var(--eh-context-gap,6px);max-width:calc(100vw - 16px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}.eh-context-next-pill{pointer-events:auto;cursor:pointer;box-sizing:border-box;display:grid;gap:1px;max-width:210px;padding:5px 8px;border:1px solid #d7e2ec;border-radius:9px;background:rgba(248,251,254,.97);color:#526579;box-shadow:0 4px 12px rgba(31,48,70,.09);font:750 9px/1.25 Inter,"Segoe UI",Arial,sans-serif}.eh-context-next-pill:focus-visible{outline:2px solid rgba(59,130,246,.25)}.eh-context-next-pill strong{color:#2b425b;font-size:10px}.eh-context-next-pill small{font:inherit}
                 #eh-context-shortcuts button{pointer-events:auto;display:flex;align-items:center;gap:6px;min-width:var(--eh-context-min,38px);min-height:var(--eh-context-height,36px);padding:7px 9px;border:1px solid #cbd5e1;border-radius:10px;background:rgba(255,255,255,var(--eh-context-opacity,.96));color:#28415e;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:800 var(--eh-context-font,10px)/1.15 Inter,"Segoe UI",Arial,sans-serif;text-align:left}.eh-context-shortcut-icon{font-size:var(--eh-context-icon,15px)}#eh-context-shortcuts button:hover,#eh-context-shortcuts button:focus-visible{border-color:#6b9ed8;background:#fff;outline:2px solid rgba(59,130,246,.18)}
-                html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:auto}@media(max-width:760px){#eh-context-shortcuts{top:auto;right:8px;bottom:10px;flex-direction:row;max-width:calc(100vw - 16px);overflow-x:auto}html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:8px}}
+                #eh-context-shortcuts .eh-shortcuts-toggle{min-width:28px;min-height:28px;width:28px;height:28px;padding:3px;justify-content:center;border-radius:8px}#eh-context-shortcuts.is-collapsed>:not(.eh-shortcuts-toggle){display:none!important}
+                @media(max-width:760px){#eh-context-shortcuts{justify-content:flex-start;overflow-x:auto;flex-wrap:nowrap}}
                 #eh-context-shortcuts[data-position="right"]{left:auto!important;right:8px!important;top:142px!important;bottom:auto!important;flex-direction:column!important}#eh-context-shortcuts[data-position="left"]{left:8px!important;right:auto!important;top:142px!important;bottom:auto!important;flex-direction:column!important}#eh-context-shortcuts[data-position="bottom"]{left:8px!important;right:8px!important;top:auto!important;bottom:10px!important;flex-direction:row!important;max-width:calc(100vw - 16px);overflow-x:auto}
-            `);this.render(EH.Pages?.detect?.()||'desconhecida');
+            `);EH.Runtime?.on?.('context-shortcuts-resize',window,'resize',EH.Utils.debounce(()=>this.positionSafely(),120));this.render(EH.Pages?.detect?.()||'desconhecida');
         },
         button(icon,label,title,action){const button=document.createElement('button');button.type='button';button.title=title;button.setAttribute('aria-label',title);const i=document.createElement('span');i.className='eh-context-shortcut-icon';i.textContent=icon;button.appendChild(i);if(EH.Config.CONTEXT_BUTTON_SHOW_TEXT){const text=document.createElement('span');text.textContent=label;button.appendChild(text);}button.addEventListener('click',event=>{event.stopPropagation();action();});return button;},
         definitions(page){
@@ -23654,13 +23835,24 @@
             return[];
         },
         applyPreferences(){if(!this.root)return;const sizes={small:[32,32],normal:[38,36],large:[46,42],xlarge:[56,50]};const [min,height]=sizes[EH.Config.CONTEXT_BUTTON_SIZE]||sizes.normal;this.root.style.setProperty('--eh-context-min',`${min}px`);this.root.style.setProperty('--eh-context-height',`${height}px`);this.root.style.setProperty('--eh-context-font',`${EH.Config.CONTEXT_BUTTON_FONT_SIZE}px`);this.root.style.setProperty('--eh-context-icon',`${EH.Config.CONTEXT_BUTTON_ICON_SIZE}px`);this.root.style.setProperty('--eh-context-gap',`${EH.Config.CONTEXT_BUTTON_GAP}px`);this.root.style.setProperty('--eh-context-opacity',String(EH.Config.CONTEXT_BUTTON_OPACITY));this.root.dataset.position=EH.Config.CONTEXT_BUTTON_POSITION||'auto';},
-        activePassengerName(context){const active=EH.SaleContext?.getActivePassenger?.();if(active?.name)return active.name;const ids=new Set(context?.passengerIds||[]);const remembered=(EH.PassengerMemory?.load?.()||[]).find(item=>ids.has(item.id));if(remembered?.name)return remembered.name;const refs=new Set(context?.requisitionRefs||[]);const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>refs.has(item.id));return request?.passengers?.[0]?.nome||'';},
+        positionSafely(){
+            if(!this.root||this.root.hidden)return;const position=EH.Config.CONTEXT_BUTTON_POSITION||'top';if(!['top','auto'].includes(position)){this.root.style.removeProperty('top');return;}
+            this.root.style.left='8px';this.root.style.right='8px';this.root.style.bottom='auto';this.root.style.top='6px';
+            const own=this.root.getBoundingClientRect();const selectors='button,a[href],input,select,textarea,[role="button"],[role="menuitem"],[role="tab"]';
+            const obstacles=Array.from(document.querySelectorAll(selectors)).filter(node=>!node.closest?.('#eh-context-shortcuts,#eh-root,.eh-context-panel,.eh-overlay,.eh-pref-overlay,#eh-general-settings')).map(node=>node.getBoundingClientRect()).filter(rect=>rect.width>2&&rect.height>2&&rect.bottom>0&&rect.top<280);
+            const intersects=(top)=>{const candidate={left:own.left,top,right:own.right,bottom:top+own.height};return obstacles.some(rect=>candidate.left<rect.right+3&&candidate.right>rect.left-3&&candidate.top<rect.bottom+3&&candidate.bottom>rect.top-3);};
+            let top=6;while(top<280&&intersects(top))top+=Math.max(34,Math.ceil(own.height+4));if(top>=280){const bottom=obstacles.reduce((max,rect)=>Math.max(max,rect.bottom),0);top=Math.min(Math.max(6,bottom+5),Math.max(6,window.innerHeight-own.height-6));}
+            this.root.style.top=`${Math.round(top)}px`;
+        },
+        activePassengerName(context){const active=EH.SaleContext?.getActivePassenger?.();if(active?.name)return active.name;const ids=new Set(context?.passengerIds||[]);const remembered=(EH.PassengerMemory?.load?.()||[]).find(item=>!item.deletedAt&&ids.has(item.id));if(remembered?.name)return remembered.name;const refs=new Set(context?.requisitionRefs||[]);const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>!item.deletedAt&&refs.has(item.id));return request?.passengers?.[0]?.nome||'';},
         render(page=EH.Pages?.detect?.()||'desconhecida'){
             if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);const data=EH.PassengerData?.active?.(),candidates=EH.RequestFlow?.candidates?.()||[];const nodes=[];
             if(data||candidates.length>1){
                 const next=document.createElement('div');next.className='eh-context-next-pill';next.setAttribute('role','button');next.tabIndex=0;next.title='Abrir dados do atendimento ativo';const openAttendance=()=>EH.ContextualPanels?.open?.('attendance');next.addEventListener('click',openAttendance);next.addEventListener('keydown',event=>{if(event.key==='Enter'||event.key===' '){event.preventDefault();openAttendance();}});const name=document.createElement('strong');name.textContent=data?.name||'Selecionar atendimento';const action=document.createElement('small');action.textContent=data?'Atendimento ativo':'Há várias solicitações compatíveis';next.append(name,action);nodes.push(next);
             }
-            nodes.push(...definitions.map(args=>this.button(...args)));this.root.replaceChildren(...nodes);this.root.hidden=!nodes.length;EH.ContextualPanels?.sync?.(page);
+            nodes.push(...definitions.map(args=>this.button(...args)),this.button('⚙','Configurações','Configurações Gerais',()=>EH.UI?.showSettings?.()));
+            if(nodes.length){const toggle=document.createElement('button');toggle.type='button';toggle.className='eh-shortcuts-toggle';const collapsed=Boolean(EH.Storage.get(this.COLLAPSED_KEY,false));toggle.textContent=collapsed?'▣':'−';toggle.title=collapsed?'Expandir atalhos':'Recolher atalhos';toggle.setAttribute('aria-label',toggle.title);toggle.addEventListener('click',()=>{const next=!this.root.classList.contains('is-collapsed');this.root.classList.toggle('is-collapsed',next);EH.Storage.set(this.COLLAPSED_KEY,next);toggle.textContent=next?'▣':'−';toggle.title=next?'Expandir atalhos':'Recolher atalhos';requestAnimationFrame(()=>this.positionSafely());});nodes.push(toggle);this.root.classList.toggle('is-collapsed',collapsed);}
+            this.root.replaceChildren(...nodes);this.root.hidden=!nodes.length;requestAnimationFrame(()=>this.positionSafely());EH.ContextualPanels?.sync?.(page);
         }
     };
 
