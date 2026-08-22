@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.82.0
+// @version      5.83.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.82.0',
+        VERSION: '5.83.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 22,
+        STORAGE_SCHEMA_VERSION: 23,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -1190,6 +1190,46 @@
             if(changed)EH.Storage.set(key,next);
         },
 
+        migrateFinancialOperationsV23() {
+            // A v23 torna a emissão confirmada uma operação financeira efetiva
+            // e acrescenta os nomes canônicos exigidos pela memória financeira.
+            // Os campos antigos permanecem para compatibilidade e nenhum registro
+            // é removido, renumerado ou recriado.
+            const key='financeLedgerV1',rows=EH.Storage.get(key,[]);
+            if(!Array.isArray(rows))return;let changed=false;
+            const next=rows.map(item=>{
+                if(!item||typeof item!=='object')return item;
+                const isConfirmed=item.source==='epass_ticket_confirmed';
+                const originalValue=Number(item.originalValue||item.grossValue||0);
+                const percent=Number.isFinite(Number(item.commissionPercent))?Number(item.commissionPercent):10;
+                const commissionActual=item.commissionEpass!==null&&item.commissionEpass!==undefined&&Number.isFinite(Number(item.commissionEpass))
+                    ?Number(item.commissionEpass):Number(item.commissionEstimated||item.commission||0);
+                const estimated=isConfirmed&&!commissionActual&&originalValue>0?Math.round(originalValue*percent)/100:commissionActual;
+                const normalized={
+                    ...item,
+                    financialOperationId:String(item.financialOperationId||item.id||item.sourceKey||''),
+                    ticket:String(item.ticket||item.ticketNumber||''),
+                    destination:String(item.destination||''),
+                    payment:String(item.payment||item.paymentMethod||''),
+                    grossValue:originalValue,
+                    percentage:percent,
+                    commission:estimated,
+                    date:String(item.date||item.dateTime||''),
+                    ...(isConfirmed?{
+                        status:item.status==='PENDENTE_CONCILIACAO'?'EMISSAO_CONFIRMADA':(item.status||'EMISSAO_CONFIRMADA'),
+                        operationStatus:item.operationStatus==='AGUARDANDO CAIXA'?'EMISSÃO CONFIRMADA':(item.operationStatus||'EMISSÃO CONFIRMADA'),
+                        provisional:false,
+                        countable:true,
+                        nature:item.nature==='neutro'?'entrada':(item.nature||'entrada'),
+                        commissionEstimated:estimated
+                    }:{})
+                };
+                if(JSON.stringify(normalized)!==JSON.stringify(item))changed=true;
+                return normalized;
+            });
+            if(changed)EH.Storage.set(key,next);
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -1214,6 +1254,7 @@
             this.migrateSettingsCategoriesV20();
             this.migratePassengerJourneyV21();
             this.migrateRecentEmissionsV22();
+            this.migrateFinancialOperationsV23();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -5979,7 +6020,17 @@
                 .eh-finance-stat span { display:block; margin-top:3px; color:#667284; font-size:9px; }
                 .eh-finance-toolbar { display:flex; flex-wrap:wrap; gap:6px; margin-bottom:9px; }
                 .eh-finance-toolbar input, .eh-finance-toolbar select { min-height:34px; padding:6px 8px; border:1px solid #d6dce5; border-radius:8px; background:#fff; color:#253142; font-size:10px; }
-                .eh-finance-list { display:grid; gap:6px; max-height:420px; overflow:auto; padding-right:2px; }
+                .eh-finance-modal { width:min(980px,96vw) !important; max-height:min(92vh,900px); overflow:hidden; display:flex; flex-direction:column; }
+                .eh-finance-modal .eh-modal-head, .eh-finance-modal .eh-modal-actions { flex:0 0 auto; }
+                .eh-finance-modal .eh-modal-content { flex:1 1 auto; min-height:0; overflow:hidden; }
+                .eh-finance-modal .eh-settings-shell, .eh-finance-modal .eh-settings-panes { min-height:0; height:100%; }
+                .eh-finance-modal .eh-settings-panes { overflow:hidden; }
+                .eh-finance-modal .eh-settings-pane.active { min-height:0; height:100%; overflow:auto; }
+                .eh-finance-modal .eh-settings-pane[data-finance-pane="historico"].active,
+                .eh-finance-modal .eh-settings-pane[data-finance-pane="mercadorias"].active { display:flex; flex-direction:column; overflow:hidden; }
+                .eh-finance-list { display:grid; align-content:start; gap:6px; min-height:0; max-height:none; overflow-y:auto; overscroll-behavior:contain; padding-right:2px; }
+                .eh-finance-modal [data-finance-pane="historico"] .eh-finance-list,
+                .eh-finance-modal [data-finance-pane="mercadorias"] .eh-finance-list { flex:1 1 auto; }
                 .eh-finance-op { border:1px solid #e3e7ed; border-radius:9px; background:#fff; padding:8px; }
                 .eh-finance-op-head { display:flex; justify-content:space-between; gap:8px; align-items:start; }
                 .eh-finance-op-head strong { color:#26313f; font-size:10px; }
@@ -6787,8 +6838,12 @@
                 const cells = Array.from(row.querySelectorAll('td'));
                 const launchCell = cells[launchIndex] || null;
                 const launch = EH.Utils.clean(launchCell?.textContent || '');
-                const saleMatch = launch.match(/\bVENDA\s*\|\s*(\d+)\s*-\s*(.*)$/i);
-                if (!saleMatch) return null;
+                // A própria coluna Lançamentos informa o tipo real. Limitamos a
+                // captura a operações financeiras conhecidas e nunca procuramos
+                // números soltos no body da página.
+                const operationMatch = launch.match(/\b(VENDA|CANCELAMENTO|ESTORNO|AJUSTE)\b(?:\s*\|\s*(\d+)\s*(?:-\s*(.*))?)?/i);
+                if (!operationMatch) return null;
+                const operation = String(operationMatch[1] || '').toUpperCase();
 
                 const dateCell = EH.Utils.clean(cells[dataIndex]?.textContent || '');
                 const dateMatch = dateCell.match(/(\d{2}\/\d{2}\/\d{4}\s+\d{2}:\d{2}:\d{2})/);
@@ -6807,8 +6862,9 @@
 
                 return {
                     rowIndex,
-                    saleId: saleMatch[1],
-                    passenger: EH.PassengerIdentity?.formatPersonName?.(saleMatch[2] || '') || EH.Utils.clean(saleMatch[2] || ''),
+                    operation,
+                    saleId: operationMatch[2] || '',
+                    passenger: EH.PassengerIdentity?.formatPersonName?.(operationMatch[3] || '') || EH.Utils.clean(operationMatch[3] || ''),
                     companyCode: badge,
                     dateTime,
                     agent,
@@ -7024,11 +7080,51 @@
             return this.money(this.money(value) * this.commissionPercentFor(company) / 100);
         },
 
+        operationKind(value) {
+            const status=EH.Utils.normalize(value||'').replace(/_/g,' ');
+            if(status.includes('CANCEL'))return 'CANCELAMENTO';
+            if(status.includes('ESTORNO')||status.includes('REEMBOLSO'))return 'ESTORNO';
+            if(status.includes('AJUSTE'))return 'AJUSTE';
+            if(status.includes('EMISSAO CONFIRMADA')||status.includes('PENDENTE CONCILIACAO'))return 'VENDA';
+            return status.includes('VENDA')||!status?'VENDA':status;
+        },
+
+        natureForOperation(value, amount=0) {
+            const kind=this.operationKind(value);
+            if(kind==='CANCELAMENTO'||kind==='ESTORNO')return 'saida';
+            if(kind==='AJUSTE')return Number(amount)<0?'saida':'entrada';
+            return 'entrada';
+        },
+
+        decorateRecord(record = {}) {
+            const actual=record.commissionEpass!==null&&record.commissionEpass!==undefined&&Number.isFinite(Number(record.commissionEpass))
+                ?this.money(record.commissionEpass):this.money(record.commissionEstimated||record.commission||0);
+            const percentage=Number.isFinite(Number(record.commissionPercent))?this.money(record.commissionPercent):this.commissionPercentFor(record.company);
+            const financialOperationId=String(record.financialOperationId||record.id||record.sourceKey||'');
+            return {
+                ...record,
+                financialOperationId,
+                ticket:String(record.ticket||record.ticketNumber||''),
+                destination:String(record.destination||''),
+                payment:String(record.payment||record.paymentMethod||''),
+                grossValue:this.money(record.originalValue||record.grossValue||0),
+                percentage,
+                commission:actual,
+                date:String(record.date||record.dateTime||'')
+            };
+        },
+
         effectiveCommission(record) {
+            let value;
             if (record?.commissionEpass !== null && record?.commissionEpass !== undefined && Number.isFinite(Number(record.commissionEpass))) {
-                return this.money(record.commissionEpass);
+                value=this.money(record.commissionEpass);
+            } else {
+                value=this.money(record?.commissionEstimated || record?.commission || 0);
             }
-            return this.money(record?.commissionEstimated || 0);
+            const kind=this.operationKind(record?.status);
+            if((kind==='CANCELAMENTO'||kind==='ESTORNO')&&value>0)value=-value;
+            if(kind==='AJUSTE'&&record?.nature==='saida'&&value>0)value=-value;
+            return this.money(value);
         },
 
         effectiveMovement(record) {
@@ -7038,14 +7134,18 @@
             // (ex.: taxa de embarque). O ajuste é guardado separadamente para não
             // adulterar `originalValue`, mas entra uma única vez no movimento.
             const caixaAdjustment = this.money(record?.caixaAdjustment || 0);
-            return this.money(base + caixaAdjustment);
+            let value=this.money(base + caixaAdjustment);
+            const kind=this.operationKind(record?.status);
+            if((kind==='CANCELAMENTO'||kind==='ESTORNO')&&value>0)value=-value;
+            if(kind==='AJUSTE'&&record?.nature==='saida'&&value>0)value=-value;
+            return this.money(value);
         },
 
         isCountableMovement(record) {
             if (!record || record.deleted || record.mergedInto || record.provisional) return false;
             const status = EH.Utils.normalize(record.status || '');
             if (status.includes('SAQUE') || status.includes('SALDO ANTERIOR')) return false;
-            if (record.category === 'PASSAGEM') return status === 'VENDA' || !status;
+            if (record.category === 'PASSAGEM') return ['VENDA','CANCELAMENTO','ESTORNO','AJUSTE'].includes(this.operationKind(status));
             return record.category === 'MERCADORIA_RECEBIDA' || record.category === 'MERCADORIA_ENVIADA';
         },
 
@@ -7072,14 +7172,14 @@
             const date = this.parseDateTime(row.dateTime);
             const company = this.normalizeCompany(row.company);
             const operation = EH.Utils.clean(row.operation || row.kind || 'MOVIMENTO').toUpperCase();
-            const category = EH.Utils.normalize(row.category).includes('PASSAGEM') || operation === 'CANCELAMENTO'
+            const category = EH.Utils.normalize(row.category).includes('PASSAGEM') || ['CANCELAMENTO','ESTORNO','AJUSTE'].includes(this.operationKind(operation))
                 ? 'PASSAGEM'
                 : 'OUTRO';
             const original = row.originalValue === null || row.originalValue === undefined ? 0 : this.money(row.originalValue);
             const commission = this.money(row.amount);
             const base = this.makeCommissionBaseKey(row);
             const sourceKey = `${base}|${occurrence}`;
-            return {
+            return this.decorateRecord({
                 id: sourceKey,
                 sourceKey,
                 source: 'epass_comissoes',
@@ -7103,27 +7203,29 @@
                 commissionPercent: original ? this.money((commission / original) * 100) : this.commissionPercentFor(company),
                 commissionEpass: commission,
                 commissionEstimated: original ? this.estimateCommission(original, company) : 0,
-                nature: 'neutro',
+                nature: this.natureForOperation(operation, original),
                 description: row.isPriorBalance ? 'Saldo anterior' : '',
                 operator: EH.Utils.clean(row.operator || ''),
                 rawReference: EH.Utils.clean(row.rawText || ''),
                 createdAt: Date.now(),
                 updatedAt: Date.now()
-            };
+            });
         },
 
         recordFromCaixa(sale) {
             const date = this.parseDateTime(sale.dateTime);
             const company = this.normalizeCompany(sale.companyCode);
             const value = this.money(sale.total);
-            const sourceKey = `caixa|${sale.saleId || `${EH.Utils.normalize(sale.dateTime)}|${company}|${value.toFixed(2)}`}`;
-            return {
+            const operation=this.operationKind(sale.operation||'VENDA');
+            const baseReference=sale.saleId||`${EH.Utils.normalize(sale.dateTime)}|${company}|${Math.abs(value).toFixed(2)}`;
+            const sourceKey = operation==='VENDA'?`caixa|${baseReference}`:`caixa|${operation}|${baseReference}|${EH.Utils.normalize(sale.dateTime)}`;
+            return this.decorateRecord({
                 id: sourceKey,
                 sourceKey,
                 source: 'epass_caixa',
                 sourceOrigin: 'epass',
                 category: 'PASSAGEM',
-                status: 'VENDA',
+                status: operation,
                 operationStatus: '',
                 dateTime: this.formatDateTime(date) || EH.Utils.clean(sale.dateTime || ''),
                 timestamp: date?.getTime?.() || 0,
@@ -7141,14 +7243,14 @@
                 commissionPercent: this.commissionPercentFor(company),
                 commissionEpass: null,
                 commissionEstimated: this.estimateCommission(value, company),
-                nature: 'entrada',
+                nature: this.natureForOperation(operation, value),
                 description: '',
                 operator: EH.Utils.clean(sale.agent || ''),
                 breakdown: sale.breakdown || {},
                 rawReference: EH.Utils.clean(sale.rawLaunch || ''),
                 createdAt: Date.now(),
                 updatedAt: Date.now()
-            };
+            });
         },
 
         recordIssuedTickets(candidates = [], context = null) {
@@ -7160,28 +7262,33 @@
                 const stableReference = ticketNumber || EH.Utils.clean(candidate?.locator || candidate?.id || '');
                 if (!stableReference) return;
                 const sourceKey = `ticket-confirmed|${stableReference}`;
+                const saleId=EH.Utils.clean(candidate?.saleId||candidate?.saleReference||context?.saleId||'');
+                const financialOperationId=`finance|${saleId?`${saleId}|`:''}${stableReference}`;
                 const issuedAt = Number(candidate?.issuedAt || Date.now());
                 const rawValue = EH.Utils.parseMoney(candidate?.value || 0);
                 const fallbackValue = list.length === 1 ? Number(context?.payment?.value || context?.journey?.value || 0) : 0;
                 const value = this.money(rawValue || fallbackValue);
                 const company = this.normalizeCompany(candidate?.company || context?.journey?.company || candidate?.line || 'NÃO INFORMADA');
-                const record = {
+                const percent=this.commissionPercentFor(company);
+                const record = this.decorateRecord({
                     id:sourceKey, sourceKey, source:'epass_ticket_confirmed', sourceOrigin:'emissao-confirmada',
-                    category:'PASSAGEM', status:'PENDENTE_CONCILIACAO', operationStatus:'AGUARDANDO CAIXA',
-                    provisional:true, countable:false,
+                    financialOperationId,
+                    category:'PASSAGEM', status:'EMISSAO_CONFIRMADA', operationStatus:'EMISSÃO CONFIRMADA',
+                    provisional:false, countable:true,
                     dateTime:this.formatDateTime(new Date(issuedAt)), timestamp:issuedAt,
                     dayKey:this.dayKey(new Date(issuedAt)), monthKey:this.monthKey(new Date(issuedAt)),
                     company, companyCode:'', passenger:EH.Utils.clean(candidate?.name || ''),
                     cpfMasked:EH.SaleContext?.maskCpfPublic?.(candidate?.cpf || '') || '',
-                    identifier:ticketNumber || stableReference, ticketNumber,
-                    saleId:EH.Utils.clean(candidate?.saleReference || ''),
+                    identifier:ticketNumber || stableReference, ticketNumber, ticket:ticketNumber,
+                    saleId,
+                    destination:EH.Utils.clean(candidate?.destination||context?.journey?.destination||''),
                     originalValue:value, caixaValue:null, caixaAdjustment:0,
-                    commissionPercent:this.commissionPercentFor(company), commissionEpass:null,
-                    commissionEstimated:0, nature:'neutro',
+                    commissionPercent:percent, commissionEpass:null,
+                    commissionEstimated:this.money(value*percent/100), nature:'entrada',
                     paymentMethod:EH.Utils.clean(candidate?.paymentMethod || context?.payment?.method || ''),
-                    description:'Emissão confirmada; aguardando conciliação com o Caixa.',
+                    description:'Emissão confirmada; conciliação posterior com o Caixa preserva uma única operação.',
                     rawReference:'', createdAt:issuedAt, updatedAt:Date.now(), deviceId:EH.Device.id()
-                };
+                });
                 const result = this.upsert(record, rows);
                 if (result.added || JSON.stringify(result.record) !== JSON.stringify(record)) changed += 1;
             });
@@ -7190,19 +7297,19 @@
         },
 
         pendingReconciliation() {
-            return this.load().filter(record => record?.provisional && !record.deleted && !record.mergedInto);
+            return this.load().filter(record => record?.source==='epass_ticket_confirmed' && !record.deleted && !record.mergedInto);
         },
 
         upsert(record, records = null) {
             const list = records || this.load();
-            const index = list.findIndex(item => item.sourceKey === record.sourceKey || item.id === record.id);
+            const index = list.findIndex(item => item.sourceKey === record.sourceKey || item.id === record.id || (record.financialOperationId&&item.financialOperationId===record.financialOperationId));
             if (index >= 0) {
                 const originalCreatedAt = list[index].createdAt || record.createdAt || Date.now();
-                list[index] = { ...list[index], ...record, createdAt: originalCreatedAt, updatedAt: Date.now() };
+                list[index] = this.decorateRecord({ ...list[index], ...record, createdAt: originalCreatedAt, updatedAt: Date.now() });
                 return { list, added: false, record: list[index] };
             }
-            list.push(record);
-            return { list, added: true, record };
+            const normalized=this.decorateRecord(record);list.push(normalized);
+            return { list, added: true, record:normalized };
         },
 
         reconcile(records) {
@@ -7225,29 +7332,30 @@
                     delete record.reconciliationMode;
                 }
             });
-            const sales = list.filter(record => record.source === 'epass_caixa' && record.status === 'VENDA' && !record.deleted);
-            const commissions = list.filter(record => record.source === 'epass_comissoes' && record.category === 'PASSAGEM' && record.status === 'VENDA' && !record.deleted);
+            const sales = list.filter(record => record.source === 'epass_caixa' && record.category === 'PASSAGEM' && !record.deleted);
+            const commissions = list.filter(record => record.source === 'epass_comissoes' && record.category === 'PASSAGEM' && !record.deleted);
 
             // Conciliação provisória somente por ID real idêntico. Horário, nome,
             // CPF ou valor isolados não são suficientes para fundir operações.
-            list.filter(record => record.source === 'epass_ticket_confirmed' && record.provisional && !record.deleted).forEach(record => {
+            list.filter(record => record.source === 'epass_ticket_confirmed' && !record.deleted).forEach(record => {
                 delete record.mergedInto;
                 const reference = EH.Utils.clean(record.saleId || '');
-                const official = reference ? sales.find(sale => EH.Utils.clean(sale.saleId || '') === reference) : null;
+                const official = reference ? sales.find(sale => this.operationKind(sale.status)==='VENDA'&&EH.Utils.clean(sale.saleId || '') === reference) : null;
                 if (official) {
                     record.mergedInto = official.sourceKey;
                     record.operationStatus = 'CONCILIADO POR ID';
                 } else {
-                    record.operationStatus = 'AGUARDANDO CAIXA';
+                    record.operationStatus = 'EMISSÃO CONFIRMADA';
                 }
             });
 
             sales.forEach(sale => {
                 const saleTime = Number(sale.timestamp || 0);
-                const saleValue = this.money(sale.originalValue || sale.caixaValue || 0);
+                const saleValue = Math.abs(this.money(sale.originalValue || sale.caixaValue || 0));
                 if (!(saleValue > 0)) return;
+                const saleKind=this.operationKind(sale.status);
                 const candidates = commissions
-                    .filter(item => !item.linkedToSaleSource && item.company === sale.company && Math.abs(Number(item.timestamp || 0) - saleTime) <= 5000)
+                    .filter(item => !item.linkedToSaleSource && this.operationKind(item.status)===saleKind && item.company === sale.company && Math.abs(Number(item.timestamp || 0) - saleTime) <= 5000)
                     .sort((a, b) => Math.abs(Number(a.timestamp || 0) - saleTime) - Math.abs(Number(b.timestamp || 0) - saleTime));
                 if (!candidates.length) return;
 
@@ -7255,7 +7363,7 @@
                 let sum = 0;
                 let chosen = [];
                 for (const item of candidates) {
-                    const value = this.money(item.originalValue || 0);
+                    const value = Math.abs(this.money(item.originalValue || 0));
                     if (!(value > 0)) continue;
                     if (sum + value > saleValue + 0.02) continue;
                     chosen.push(item);
@@ -7272,9 +7380,9 @@
                 if (!chosen.length || Math.abs(sum - saleValue) > 0.02) {
                     const veryClose = candidates.filter(item =>
                         Math.abs(Number(item.timestamp || 0) - saleTime) <= 2500
-                        && this.money(item.originalValue || 0) > 0
+                        && Math.abs(this.money(item.originalValue || 0)) > 0
                     );
-                    const closeSum = this.money(veryClose.reduce((acc, item) => acc + this.money(item.originalValue || 0), 0));
+                    const closeSum = this.money(veryClose.reduce((acc, item) => acc + Math.abs(this.money(item.originalValue || 0)), 0));
                     const gap = this.money(saleValue - closeSum);
                     const maxGap = this.money(Math.min(15, Math.max(0.50, saleValue * 0.12)));
                     if (veryClose.length && closeSum > 0 && gap > 0.02 && gap <= maxGap) {
@@ -7288,12 +7396,12 @@
                 }
 
                 sale.shadowedByCommission = true;
-                sale.caixaValue = saleValue;
+                sale.caixaValue = this.money(sale.originalValue || saleValue);
                 sale.commissionEpass = this.money(chosen.reduce((acc, item) => acc + this.effectiveCommission(item), 0));
                 // Percentual real continua calculado sobre a BASE comissionável,
                 // nunca sobre a taxa adicional do Caixa.
-                const commissionBase = this.money(chosen.reduce((acc, item) => acc + this.money(item.originalValue || 0), 0));
-                sale.commissionPercent = commissionBase > 0 ? this.money((sale.commissionEpass / commissionBase) * 100) : sale.commissionPercent;
+                const commissionBase = this.money(chosen.reduce((acc, item) => acc + Math.abs(this.money(item.originalValue || 0)), 0));
+                sale.commissionPercent = commissionBase > 0 ? this.money((Math.abs(sale.commissionEpass) / commissionBase) * 100) : sale.commissionPercent;
                 sale.linkedCommissionKeys = chosen.map(item => item.sourceKey);
                 sale.reconciliationMode = reconciliationMode;
                 sale.caixaAdjustment = adjustment;
@@ -7312,7 +7420,7 @@
                     item.linkedToSaleSource = sale.sourceKey;
                 });
             });
-            return list;
+            return list.map(record=>this.decorateRecord(record));
         },
 
         syncFromCurrentPage({ quiet = false } = {}) {
@@ -7374,7 +7482,7 @@
             const date = this.parseDateTime(data.dateTime) || new Date();
             const id = data.id || `manual|${date.getTime()}|${Math.random().toString(36).slice(2,8)}`;
             const percent = Number.isFinite(Number(data.commissionPercent)) ? Number(data.commissionPercent) : this.commissionPercentFor(company);
-            const record = {
+            const record = this.decorateRecord({
                 id,
                 sourceKey: id,
                 source: 'manual',
@@ -7402,7 +7510,7 @@
                 rawReference: '',
                 createdAt: Date.now(),
                 updatedAt: Date.now()
-            };
+            });
             let records = this.load();
             const index = records.findIndex(item => item.id === id);
             if (index >= 0) records[index] = { ...records[index], ...record, createdAt: records[index].createdAt || record.createdAt };
@@ -7457,7 +7565,7 @@
                 const commission = this.isCommissionEffect(record) ? this.effectiveCommission(record) : 0;
                 if (movement || commission) result.operations += 1;
                 if (record.category === 'PASSAGEM' && this.isCountableMovement(record)) {
-                    result.passageCount += 1;
+                    if(this.operationKind(record.status)==='VENDA')result.passageCount += 1;
                     result.passageValue += movement;
                 } else if (record.category === 'MERCADORIA_RECEBIDA' && this.isCountableMovement(record)) {
                     result.merchandiseReceivedCount += 1;
@@ -7469,7 +7577,7 @@
                 result.movement += movement;
                 result.commission += commission;
                 if (record.nature === 'entrada') result.entradas += movement;
-                if (record.nature === 'saida') result.saidas += movement;
+                if (record.nature === 'saida') result.saidas += Math.abs(movement);
 
                 const company = this.normalizeCompany(record.company);
                 if (!result.byCompany[company]) result.byCompany[company] = { company, operations: 0, passageValue: 0, merchandiseValue: 0, movement: 0, commission: 0, percents: [] };
@@ -18461,8 +18569,8 @@
         applyRemote(item = {}) {
             const saved=this.upsert(item, { fromSync:true });
             if(saved&&this.isIssued(saved))EH.FinanceLedger?.recordIssuedTickets?.([{
-                id:saved.id,ticketNumber:saved.ticketNumber,locator:saved.locator,saleReference:saved.saleReference,
-                cpf:saved.cpf,name:saved.name,line:saved.line,paymentMethod:saved.paymentMethod,
+                id:saved.id,ticketNumber:saved.ticketNumber,locator:saved.locator,saleId:saved.saleId,saleReference:saved.saleReference,
+                cpf:saved.cpf,name:saved.name,line:saved.line,company:saved.company,destination:saved.destination,paymentMethod:saved.paymentMethod,
                 value:saved.paymentValue,issuedAt:saved.issuedAt
             }],null);
             return saved;
@@ -20693,12 +20801,12 @@
         showFinanceModal(initialTab='resumo') {
             document.querySelector('#eh-finance-overlay')?.remove();
             const overlay=document.createElement('div');overlay.className='eh-overlay';overlay.id='eh-finance-overlay';
-            const modal=document.createElement('div');modal.className='eh-modal';modal.style.width='min(980px,96vw)';
+            const modal=document.createElement('div');modal.className='eh-modal eh-finance-modal';
             const head=document.createElement('div');head.className='eh-modal-head';const title=document.createElement('div');title.className='eh-modal-title';title.textContent='Caixa / Comissões — Controle do Helper';const closeTop=document.createElement('button');closeTop.type='button';closeTop.className='eh-modal-close';closeTop.textContent='✕';head.append(title,closeTop);
             const content=document.createElement('div');content.className='eh-modal-content';
             const shell=document.createElement('div');shell.className='eh-settings-shell';const tabs=document.createElement('div');tabs.className='eh-settings-tabs';const panes=document.createElement('div');panes.className='eh-settings-panes';shell.append(tabs,panes);content.appendChild(shell);
             const paneMap={};
-            const makePane=(id,label)=>{const tab=document.createElement('button');tab.type='button';tab.className='eh-settings-tab';tab.textContent=label;const pane=document.createElement('section');pane.className='eh-settings-pane';paneMap[id]={tab,pane};tabs.appendChild(tab);panes.appendChild(pane);tab.addEventListener('click',()=>activate(id));return pane;};
+            const makePane=(id,label)=>{const tab=document.createElement('button');tab.type='button';tab.className='eh-settings-tab';tab.textContent=label;const pane=document.createElement('section');pane.className='eh-settings-pane';pane.dataset.financePane=id;paneMap[id]={tab,pane};tabs.appendChild(tab);panes.appendChild(pane);tab.addEventListener('click',()=>activate(id));return pane;};
             const activate=id=>Object.entries(paneMap).forEach(([key,obj])=>{obj.tab.classList.toggle('active',key===id);obj.pane.classList.toggle('active',key===id);});
             const monthState={key:EH.FinanceLedger.monthKey(new Date())};
             const monthLabel=key=>{const [y,m]=key.split('-').map(Number);return new Date(y,m-1,1).toLocaleDateString('pt-BR',{month:'long',year:'numeric'}).replace(/^./,c=>c.toUpperCase());};
@@ -23440,17 +23548,16 @@
             const money=value=>EH.Utils.formatMoney(Number(value||0));const grid=document.createElement('div');grid.className='eh-context-data eh-context-finance';
             grid.append(
                 this.cell('Vendas de hoje',money(today.passageValue)),
-                this.cell('Vendido no mês',money(month.passageValue)),
-                this.cell('Média diária do mês',money(stats?.average?.movement||0)),
-                this.cell('Projeção do mês • estimativa',money(stats?.projection?.movement||0)),
-                this.cell('Comissão acumulada',money(month.commission)),
-                this.cell('Quantidade de operações',String(month.operations||0)),
-                this.cell(`Mercadorias recebidas • ${month.merchandiseReceivedCount||0}`,money(month.merchandiseReceivedValue)),
-                this.cell(`Mercadorias enviadas • ${month.merchandiseSentCount||0}`,money(month.merchandiseSentValue))
+                this.cell('Total do mês',money(month.passageValue)),
+                this.cell('Comissão de hoje',money(today.commission)),
+                this.cell('Comissão do mês',money(month.commission)),
+                this.cell('Média diária',money(stats?.average?.passage||0)),
+                this.cell('Projeção',money(stats?.projection?.passage||month.passageValue||0)),
+                this.cell('Quantidade de vendas',String(month.passageCount||0))
             );
-            const pending=EH.FinanceLedger?.pendingReconciliation?.()?.length||0;const note=document.createElement('div');note.className='eh-context-empty';note.textContent=stats?`Realizado em ${stats.elapsedDays} dia(s) corrido(s). A projeção usa ${stats.daysInMonth} dias e não é valor realizado. ${pending} emissão(ões) aguarda(m) conciliação e não entra(m) nos totais.`:'Sem período mensal válido.';
+            const pending=EH.FinanceLedger?.pendingReconciliation?.()?.length||0;const note=document.createElement('div');note.className='eh-context-empty';note.textContent=stats?`Realizado em ${stats.elapsedDays} dia(s). Projeção estatística para ${stats.daysInMonth} dias. ${pending} emissão(ões) confirmada(s) ainda pode(m) ser conciliada(s) com o Caixa sem duplicar os totais.`:'Sem período mensal válido.';
             const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Ver detalhes',()=>EH.UI?.showFinanceModal?.('resumo'),'primary'),this.action('Atualizar dados',()=>EH.FinanceLedger?.syncFromCurrentPage?.()));
-            body.append(grid,note,actions);
+            body.append(grid,note,actions);EH.PanelAutoFit?.schedule?.(body.closest?.('.eh-context-panel'),'finance-summary');
         },
         renderAttendance(body) {
             const candidates=EH.RequestFlow?.candidates?.()||[],data=EH.PassengerData?.active?.();if(!data){if(candidates.length>1){EH.RequestFlow?.renderSelector?.(body,{page:'attendance'});return body;}this.close('attendance');return null;}
