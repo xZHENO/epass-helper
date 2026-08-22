@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.76.0
+// @version      5.77.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.76.0',
+        VERSION: '5.77.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 18,
+        STORAGE_SCHEMA_VERSION: 19,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -1076,6 +1076,37 @@
             EH.PassengerMemory?.migrateV18?.();
         },
 
+        migratePanelAutoFitV19() {
+            // O autoajuste passa a ser um estado explícito. Dimensões antigas são
+            // preservadas como preferência manual e nenhum posicionamento é apagado.
+            const managerKey = 'panelManager.v1';
+            const manager = EH.Storage.get(managerKey, null);
+            if (manager && typeof manager === 'object' && !Array.isArray(manager)) {
+                let changed = false;
+                const next = { ...manager };
+                ['main', 'whatsapp', 'operation'].forEach(key => {
+                    const current = next[key] && typeof next[key] === 'object' ? next[key] : {};
+                    if (current.dynamic !== undefined) return;
+                    next[key] = { ...current, dynamic: true };
+                    changed = true;
+                });
+                if (changed) EH.Storage.set(managerKey, next);
+            }
+
+            const contextualKey = 'contextualPanels.v1';
+            const contextual = EH.Storage.get(contextualKey, null);
+            if (contextual && typeof contextual === 'object' && !Array.isArray(contextual)) {
+                let changed = false;
+                const next = { ...contextual };
+                Object.entries(next).forEach(([key, value]) => {
+                    if (!value || typeof value !== 'object' || value.autoFit !== undefined) return;
+                    next[key] = { ...value, autoFit: true };
+                    changed = true;
+                });
+                if (changed) EH.Storage.set(contextualKey, next);
+            }
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -1096,6 +1127,7 @@
             this.migrateRequestJourneyV16();
             this.migrateSettingsV17();
             this.migratePassengerDataV18();
+            this.migratePanelAutoFitV19();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -3560,6 +3592,7 @@
                 rightSpace: 0,
                 centralSpace: viewportWidth
             };
+            EH.PanelAutoFit?.fitAll?.('layout');
             return this.lastMetrics;
         },
 
@@ -3804,18 +3837,15 @@
             const vh = Math.max(480, window.innerHeight || 768);
             if (key === 'main') return {
                 width: Math.round(Math.min(430, Math.max(290, vw * (vw < 900 ? .38 : .27)))),
-                height: Math.round(Math.min(720, Math.max(390, vh * (vh < 700 ? .66 : .72)))),
-                zoom: vw < 800 ? 90 : 100
+                height: Math.round(Math.min(720, Math.max(390, vh * (vh < 700 ? .66 : .72))))
             };
             if (key === 'whatsapp') return {
                 width: Math.round(Math.min(420, Math.max(250, vw * (vw < 900 ? .34 : .23)))),
-                height: Math.round(Math.min(690, Math.max(300, vh * (vh < 700 ? .58 : .66)))),
-                zoom: vw < 800 ? 90 : 100
+                height: Math.round(Math.min(690, Math.max(300, vh * (vh < 700 ? .58 : .66))))
             };
             return {
                 width: Math.round(Math.min(360, Math.max(250, vw * .22))),
-                height: Math.round(Math.min(440, Math.max(230, vh * .38))),
-                zoom: vw < 760 ? 90 : 100
+                height: Math.round(Math.min(440, Math.max(230, vh * .38)))
             };
         },
 
@@ -3861,7 +3891,9 @@
             const auto = this.dynamicSize(key);
             const width = cfg.dynamic ? auto.width : cfg.width;
             const height = cfg.dynamic ? auto.height : cfg.height;
-            const zoom = cfg.dynamic ? auto.zoom : cfg.zoom;
+            // O autoajuste altera somente as dimensões. Zoom é sempre a
+            // preferência explícita do painel e nunca depende do viewport.
+            const zoom = cfg.zoom;
 
             this.applyContentZoom(key, zoom);
 
@@ -3895,6 +3927,8 @@
                 }
                 this.ensureResizeGrip(key);
                 this.applyHandle(key);
+                EH.PanelAutoFit?.registerDock?.(key, el);
+                EH.PanelAutoFit?.schedule?.(el, 'panel-apply');
                 return;
             }
 
@@ -3942,6 +3976,8 @@
             this.setImportant(el, 'bottom', 'auto');
             this.ensureResizeGrip(key);
             this.applyHandle(key);
+            EH.PanelAutoFit?.registerDock?.(key, el);
+            EH.PanelAutoFit?.schedule?.(el, 'panel-apply');
         },
 
         validateStored() {
@@ -4259,6 +4295,330 @@
     };
 
     // ============================================================
+    // AUTOAJUSTE CENTRAL DE SUPERFÍCIES — v5.77
+    // Mede apenas o conteúdo pertencente ao Helper. Não observa o body/app-root.
+    // Tamanho automático, tamanho manual, posição e zoom são estados independentes.
+    // ============================================================
+    EH.PanelAutoFit = {
+        entries: new Map(),
+        resizeBound: false,
+        margin() { return (window.innerWidth || 1366) <= 760 ? 8 : 14; },
+        viewport() {
+            const margin = this.margin();
+            return {
+                width: Math.max(320, Number(window.innerWidth) || 1366),
+                height: Math.max(360, Number(window.innerHeight) || 768),
+                margin
+            };
+        },
+        clamp(value, min, max) { return Math.min(max, Math.max(min, Number(value) || min)); },
+        calculate({ naturalWidth, naturalHeight, viewportWidth, viewportHeight, margin = 14, minWidth = 260, minHeight = 140, maxWidth = 960, maxHeight = 900 } = {}) {
+            const safeWidth = Math.max(minWidth, Number(viewportWidth || 1366) - margin * 2);
+            const safeHeight = Math.max(minHeight, Number(viewportHeight || 768) - margin * 2);
+            const widthLimit = Math.max(minWidth, Math.min(Number(maxWidth) || safeWidth, safeWidth));
+            const heightLimit = Math.max(minHeight, Math.min(Number(maxHeight) || safeHeight, safeHeight));
+            const width = Math.round(this.clamp(Math.ceil(Number(naturalWidth) || minWidth), minWidth, widthLimit));
+            const height = Math.round(this.clamp(Math.ceil(Number(naturalHeight) || minHeight), minHeight, heightLimit));
+            return {
+                width,
+                height,
+                maxWidth: Math.round(widthLimit),
+                maxHeight: Math.round(heightLimit),
+                overflowX: Number(naturalWidth || 0) > widthLimit + 1,
+                overflowY: Number(naturalHeight || 0) > heightLimit + 1
+            };
+        },
+        isVisible(surface) {
+            if (!surface?.isConnected || surface.hidden) return false;
+            const style = getComputedStyle(surface);
+            return style.display !== 'none' && style.visibility !== 'hidden';
+        },
+        isAuto(entry) {
+            try { return entry.options.isAuto ? entry.options.isAuto() !== false : true; }
+            catch (error) { EH.Logger.debug('Autoajuste: falha ao consultar o modo:', error); return true; }
+        },
+        register(surface, options = {}) {
+            if (!surface) return null;
+            const previous = this.entries.get(surface);
+            if (previous) {
+                previous.options = { ...previous.options, ...options };
+                if (options.content) previous.content = options.content;
+                this.schedule(surface, 'register-update');
+                return previous;
+            }
+            const entry = {
+                surface,
+                content: options.content || surface,
+                options: { ...options },
+                frame: 0,
+                fitting: false,
+                lastSignature: '',
+                mutationObserver: null,
+                resizeObserver: null,
+                resizeState: null
+            };
+            surface.classList.add('eh-autofit-surface');
+            entry.content?.classList?.add('eh-autofit-scroll');
+            this.entries.set(surface, entry);
+
+            if (typeof ResizeObserver === 'function') {
+                entry.resizeObserver = new ResizeObserver(() => {
+                    if (!entry.fitting && !entry.resizeState) this.schedule(surface, 'content-resize');
+                });
+                entry.resizeObserver.observe(entry.content || surface);
+            }
+            if (typeof MutationObserver === 'function') {
+                entry.mutationObserver = new MutationObserver(() => {
+                    if (!entry.fitting && !entry.resizeState) this.schedule(surface, 'content-mutation');
+                });
+                entry.mutationObserver.observe(entry.content || surface, { childList: true, subtree: true, characterData: true });
+            }
+            this.ensureFitButton(entry);
+            if (options.manualResize) this.ensureResizeGrip(entry);
+            if (!this.resizeBound) {
+                this.resizeBound = true;
+                EH.Runtime?.on?.('panel-autofit-window', window, 'resize', EH.Utils.debounce(() => this.fitAll('viewport'), 100));
+            }
+            this.schedule(surface, 'register');
+            return entry;
+        },
+        unregister(surface) {
+            const entry = this.entries.get(surface);
+            if (!entry) return;
+            if (entry.frame) cancelAnimationFrame(entry.frame);
+            entry.mutationObserver?.disconnect?.();
+            entry.resizeObserver?.disconnect?.();
+            this.entries.delete(surface);
+        },
+        unregisterDetached() {
+            Array.from(this.entries.keys()).forEach(surface => { if (!surface.isConnected) this.unregister(surface); });
+        },
+        schedule(surface, reason = 'content') {
+            const entry = this.entries.get(surface);
+            if (!entry || entry.frame || entry.resizeState) return;
+            entry.frame = requestAnimationFrame(() => {
+                entry.frame = 0;
+                this.fit(surface, { reason });
+            });
+        },
+        fitAll(reason = 'all') {
+            this.unregisterDetached();
+            this.entries.forEach((_entry, surface) => this.schedule(surface, reason));
+        },
+        ensureFitButton(entry) {
+            if (entry.options.fitButton === false) return;
+            const header = entry.options.header;
+            if (!header || header.querySelector(':scope > .eh-autofit-button')) return;
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = 'eh-autofit-button';
+            button.textContent = '↔';
+            button.title = 'Ajustar ao conteúdo';
+            button.setAttribute('aria-label', button.title);
+            button.addEventListener('click', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                try { entry.options.onAutoFit?.(); }
+                catch (error) { EH.Logger.warn('Autoajuste: não foi possível restaurar o modo automático:', error); }
+                entry.lastSignature = '';
+                this.fit(entry.surface, { force: true, reason: 'user' });
+            });
+            const close = Array.from(header.children).find(node => node?.classList?.contains('eh-modal-close') || String(node?.title || '').toLowerCase().includes('fechar'));
+            if (close) header.insertBefore(button, close);
+            else header.appendChild(button);
+        },
+        ensureResizeGrip(entry) {
+            const surface = entry.surface;
+            if (surface.querySelector(':scope > .eh-autofit-resize-grip')) return;
+            const grip = document.createElement('div');
+            grip.className = 'eh-autofit-resize-grip';
+            grip.title = 'Arraste para definir um tamanho manual';
+            surface.appendChild(grip);
+            const threshold = 4;
+            const finish = event => {
+                const state = entry.resizeState;
+                if (!state || state.pointerId !== event.pointerId) return;
+                if (state.frame) cancelAnimationFrame(state.frame);
+                entry.resizeState = null;
+                surface.classList.remove('eh-autofit-resizing');
+                surface.style.removeProperty('will-change');
+                try { grip.releasePointerCapture?.(event.pointerId); } catch (_error) {}
+                if (!state.started) return;
+                try { entry.options.onManualSize?.(Math.round(state.width), Math.round(state.height)); }
+                catch (error) { EH.Logger.warn('Autoajuste: não foi possível salvar o tamanho manual:', error); }
+                entry.lastSignature = '';
+                this.keepRecoverable(entry);
+            };
+            grip.addEventListener('pointerdown', event => {
+                if (event.button !== 0) return;
+                const rect = surface.getBoundingClientRect();
+                entry.resizeState = { pointerId:event.pointerId, startX:event.clientX, startY:event.clientY, startW:rect.width, startH:rect.height, width:rect.width, height:rect.height, started:false, frame:0, currentX:event.clientX, currentY:event.clientY };
+                try { grip.setPointerCapture?.(event.pointerId); } catch (_error) {}
+                event.preventDefault(); event.stopPropagation();
+            });
+            grip.addEventListener('pointermove', event => {
+                const state = entry.resizeState;
+                if (!state || state.pointerId !== event.pointerId) return;
+                state.currentX = event.clientX; state.currentY = event.clientY;
+                const dx = state.currentX - state.startX, dy = state.currentY - state.startY;
+                if (!state.started && Math.hypot(dx, dy) < threshold) return;
+                state.started = true;
+                surface.classList.add('eh-autofit-resizing');
+                surface.style.setProperty('will-change', 'width,height', 'important');
+                if (state.frame) return;
+                state.frame = requestAnimationFrame(() => {
+                    state.frame = 0;
+                    const viewport = this.viewport();
+                    const minWidth = Number(entry.options.minWidth) || 260;
+                    const minHeight = Number(entry.options.minHeight) || 140;
+                    state.width = this.clamp(state.startW + dx, minWidth, viewport.width - viewport.margin * 2);
+                    state.height = this.clamp(state.startH + dy, minHeight, viewport.height - viewport.margin * 2);
+                    surface.style.setProperty('width', `${Math.round(state.width)}px`, 'important');
+                    surface.style.setProperty('height', `${Math.round(state.height)}px`, 'important');
+                });
+                event.preventDefault(); event.stopPropagation();
+            });
+            grip.addEventListener('pointerup', finish);
+            grip.addEventListener('pointercancel', finish);
+        },
+        naturalSize(entry, bounds) {
+            const { surface, content } = entry;
+            const saved = {
+                width: surface.style.getPropertyValue('width'), widthPriority: surface.style.getPropertyPriority('width'),
+                height: surface.style.getPropertyValue('height'), heightPriority: surface.style.getPropertyPriority('height'),
+                maxWidth: surface.style.getPropertyValue('max-width'), maxWidthPriority: surface.style.getPropertyPriority('max-width'),
+                maxHeight: surface.style.getPropertyValue('max-height'), maxHeightPriority: surface.style.getPropertyPriority('max-height'),
+                contentMaxHeight: content?.style?.getPropertyValue?.('max-height') || '',
+                contentOverflowY: content?.style?.getPropertyValue?.('overflow-y') || ''
+            };
+            const restore = (node, prop, value, priority = '') => value ? node.style.setProperty(prop, value, priority) : node.style.removeProperty(prop);
+            surface.classList.add('eh-autofit-measuring');
+            surface.style.setProperty('width', 'max-content', 'important');
+            surface.style.setProperty('height', 'max-content', 'important');
+            surface.style.setProperty('max-width', `${bounds.maxWidth}px`, 'important');
+            surface.style.setProperty('max-height', 'none', 'important');
+            if (content) {
+                content.style.setProperty('max-height', 'none', 'important');
+                content.style.setProperty('overflow-y', 'visible', 'important');
+            }
+            const rect = surface.getBoundingClientRect();
+            const result = {
+                width: Math.max(rect.width, surface.scrollWidth || 0),
+                height: Math.max(rect.height, surface.scrollHeight || 0)
+            };
+            restore(surface, 'width', saved.width, saved.widthPriority);
+            restore(surface, 'height', saved.height, saved.heightPriority);
+            restore(surface, 'max-width', saved.maxWidth, saved.maxWidthPriority);
+            restore(surface, 'max-height', saved.maxHeight, saved.maxHeightPriority);
+            if (content) {
+                restore(content, 'max-height', saved.contentMaxHeight);
+                restore(content, 'overflow-y', saved.contentOverflowY);
+            }
+            surface.classList.remove('eh-autofit-measuring');
+            return result;
+        },
+        fit(surface, { force = false } = {}) {
+            const entry = this.entries.get(surface);
+            if (!entry || entry.fitting || entry.resizeState || !this.isVisible(surface)) return null;
+            const viewport = this.viewport();
+            const options = entry.options;
+            const minWidth = Math.max(180, Number(options.minWidth) || 260);
+            const minHeight = Math.max(80, Number(options.minHeight) || 140);
+            const maxWidth = Math.max(minWidth, Number(options.maxWidth) || 960);
+            const maxHeight = Math.max(minHeight, Number(options.maxHeight) || 900);
+            if (!force && !this.isAuto(entry)) {
+                this.keepRecoverable(entry);
+                return null;
+            }
+            entry.fitting = true;
+            try {
+                const bounds = this.calculate({ naturalWidth:minWidth, naturalHeight:minHeight, viewportWidth:viewport.width, viewportHeight:viewport.height, margin:viewport.margin, minWidth, minHeight, maxWidth, maxHeight });
+                const natural = this.naturalSize(entry, bounds);
+                const result = this.calculate({ naturalWidth:natural.width, naturalHeight:natural.height, viewportWidth:viewport.width, viewportHeight:viewport.height, margin:viewport.margin, minWidth, minHeight, maxWidth, maxHeight });
+                const signature = `${result.width}:${result.height}:${result.overflowX}:${result.overflowY}:${viewport.width}:${viewport.height}`;
+                if (signature !== entry.lastSignature || force) {
+                    entry.lastSignature = signature;
+                    surface.style.setProperty('width', `${result.width}px`, 'important');
+                    surface.style.setProperty('height', `${result.height}px`, 'important');
+                    surface.style.setProperty('max-width', `${result.maxWidth}px`, 'important');
+                    surface.style.setProperty('max-height', `${result.maxHeight}px`, 'important');
+                    surface.classList.toggle('eh-autofit-overflow-y', result.overflowY);
+                    surface.classList.toggle('eh-autofit-overflow-x', result.overflowX);
+                    const headerHeight = Number(options.header?.getBoundingClientRect?.().height || 0);
+                    const footerHeight = Number(options.footer?.getBoundingClientRect?.().height || 0);
+                    if (entry.content) {
+                        const contentMax = Math.max(48, result.height - headerHeight - footerHeight - 2);
+                        entry.content.style.setProperty('max-height', `${Math.round(contentMax)}px`, 'important');
+                        entry.content.style.setProperty('overflow-y', result.overflowY ? 'auto' : 'visible', 'important');
+                        entry.content.style.setProperty('overflow-x', result.overflowX ? 'auto' : 'hidden', 'important');
+                    }
+                    this.keepRecoverable(entry);
+                }
+                return result;
+            } catch (error) {
+                EH.Logger.warn('Não foi possível ajustar o painel ao conteúdo:', error);
+                return null;
+            } finally {
+                entry.fitting = false;
+            }
+        },
+        keepRecoverable(entry) {
+            const surface = entry.surface;
+            if (!surface?.isConnected || entry.options.centered) return;
+            const rect = surface.getBoundingClientRect();
+            const viewport = this.viewport();
+            const visibleX = 56, visibleY = 40;
+            const left = Math.min(viewport.width - visibleX, Math.max(-(rect.width - visibleX), rect.left));
+            const top = Math.min(viewport.height - visibleY, Math.max(0, rect.top));
+            if (Math.abs(left - rect.left) > 1) surface.style.setProperty('left', `${Math.round(left)}px`, 'important');
+            if (Math.abs(top - rect.top) > 1) surface.style.setProperty('top', `${Math.round(top)}px`, 'important');
+        },
+        registerDock(key, surface) {
+            if (!surface) return null;
+            const limits = EH.PanelManager?.limits?.(key) || { minW:260, maxW:600, minH:140, maxH:900 };
+            const content = key === 'main' ? EH.UI?.body : key === 'whatsapp' ? (surface.querySelector(':scope > .eh-wa-scale-body') || surface.querySelector('.eh-wa-conversation')) : EH.OperationDock?.body;
+            return this.register(surface, {
+                key:`dock:${key}`,
+                content:content || surface,
+                header:EH.PanelManager?.header?.(key),
+                minWidth:limits.minW,
+                minHeight:key === 'operation' ? 120 : 150,
+                maxWidth:limits.maxW,
+                maxHeight:limits.maxH,
+                isAuto:() => EH.PanelManager?.get?.(key)?.dynamic !== false,
+                onAutoFit:() => EH.PanelManager?.update?.(key, { dynamic:true })
+            });
+        },
+        registerContext(id, surface, content, header) {
+            const cfg = EH.ContextualPanels?.saved?.()?.[id] || {};
+            return this.register(surface, {
+                key:`context:${id}`, content, header,
+                minWidth:id === 'attendance' ? 270 : 280,
+                minHeight:110, maxWidth:720, maxHeight:900,
+                manualResize:true,
+                isAuto:() => (EH.ContextualPanels?.saved?.()?.[id]?.autoFit !== false),
+                onAutoFit:() => EH.ContextualPanels?.setAutoFit?.(id, true),
+                onManualSize:(width,height) => EH.ContextualPanels?.persist?.(id, surface, { width, height, autoFit:false })
+            });
+        },
+        trackOverlay(overlay, options = {}) {
+            if (!overlay) return null;
+            const surface = options.surface || overlay.querySelector('.eh-modal, .eh-pref-modal');
+            if (!surface) return null;
+            const content = options.content || surface.querySelector('.eh-modal-content, .eh-pref-body, .eh-pref-content') || surface;
+            const header = options.header || surface.querySelector('.eh-modal-head, .eh-pref-head');
+            const footer = options.footer || surface.querySelector('.eh-modal-actions, .eh-pref-actions');
+            const entry = this.register(surface, { key:`overlay:${overlay.id || 'anonymous'}`, content, header, footer, centered:true, fitButton:false, minWidth:280, minHeight:120, maxWidth:1100, maxHeight:960 });
+            if (!overlay.dataset.ehAutoFitRemoveBound) {
+                overlay.dataset.ehAutoFitRemoveBound = '1';
+                const originalRemove = overlay.remove.bind(overlay);
+                overlay.remove = () => { this.unregister(surface); return originalRemove(); };
+            }
+            return entry;
+        }
+    };
+
+    // ============================================================
     // ESTILO
     // ============================================================
     EH.Style = {
@@ -4439,7 +4799,9 @@
                 .eh-modal {
                     width: min(900px, 96vw);
                     max-height: 92vh;
-                    overflow: auto;
+                    overflow: hidden;
+                    display: flex;
+                    flex-direction: column;
                     border: 1px solid #343946;
                     border-radius: 14px;
                     background: #fff;
@@ -4463,6 +4825,47 @@
                 .eh-modal-note { margin-top: 2px; color: #687182; font-size: 11px; }
                 .eh-modal-close { border: 0; background: #eef1f5; border-radius: 8px; width: 30px; height: 30px; cursor: pointer; }
                 .eh-modal-content { padding: 14px; }
+
+                .eh-autofit-surface {
+                    box-sizing: border-box !important;
+                    contain: none;
+                }
+                .eh-autofit-surface.eh-autofit-measuring,
+                .eh-autofit-surface.eh-autofit-resizing {
+                    transition: none !important;
+                }
+                .eh-autofit-scroll {
+                    min-width: 0;
+                    min-height: 0;
+                    overscroll-behavior: contain;
+                    scrollbar-gutter: auto;
+                }
+                .eh-autofit-button {
+                    flex: 0 0 auto;
+                    width: 29px;
+                    height: 29px;
+                    padding: 0;
+                    border: 0;
+                    border-radius: 7px;
+                    background: transparent;
+                    color: inherit;
+                    cursor: pointer;
+                    font: 800 15px/1 Inter, "Segoe UI", Arial, sans-serif;
+                }
+                .eh-autofit-button:hover,
+                .eh-autofit-button:focus-visible { background: rgba(37,99,235,.10); outline: 2px solid rgba(37,99,235,.18); }
+                .eh-autofit-resize-grip {
+                    position: absolute;
+                    z-index: 5;
+                    right: 2px;
+                    bottom: 2px;
+                    width: 18px;
+                    height: 18px;
+                    cursor: nwse-resize;
+                    touch-action: none;
+                    background: linear-gradient(135deg, transparent 0 54%, rgba(76,96,120,.55) 55% 61%, transparent 62% 70%, rgba(76,96,120,.55) 71% 77%, transparent 78%);
+                }
+                .eh-autofit-overflow-y > .eh-autofit-scroll { scrollbar-width: thin; }
 
                 .eh-preview-image {
                     display: block;
@@ -12535,6 +12938,7 @@
                 </div>`;
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
+            EH.PanelAutoFit?.trackOverlay?.(overlay);
             this.modal = overlay;
 
             const q = selector => modal.querySelector(selector);
@@ -17299,7 +17703,7 @@
             const render=()=>{content.innerHTML='';this.renderOperational(content,{mode});Array.from(tabs.children).forEach(button=>button.classList.toggle('active',button.dataset.mode===mode));};
             [['active','Fila atual'],['review','Pendente de conferência'],['history','Histórico']].forEach(([value,label])=>{const button=document.createElement('button');button.type='button';button.dataset.mode=value;button.textContent=label;button.addEventListener('click',()=>{mode=value;render();});tabs.appendChild(button);});
             const foot=document.createElement('div');foot.className='eh-modal-actions';const deleteLatest=document.createElement('button');deleteLatest.type='button';deleteLatest.className='eh-modal-btn danger';deleteLatest.textContent='Excluir último';deleteLatest.addEventListener('click',()=>{this.deleteLatest();render();});const deleteAll=document.createElement('button');deleteAll.type='button';deleteAll.className='eh-modal-btn danger';deleteAll.textContent='Excluir todos';deleteAll.addEventListener('click',()=>{this.deleteAll();render();});const close2=document.createElement('button');close2.type='button';close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(deleteLatest,deleteAll,close2);
-            modal.append(head,tabs,content,foot);overlay.appendChild(modal);document.body.appendChild(overlay);render();
+            modal.append(head,tabs,content,foot);overlay.appendChild(modal);document.body.appendChild(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);render();
             const dismiss=()=>overlay.remove();close.onclick=dismiss;close2.onclick=dismiss;overlay.addEventListener('click',event=>{if(event.target===overlay)dismiss();});
         },
         render() {
@@ -17919,6 +18323,7 @@
             this.collapsed=Boolean(value); EH.Storage.set('operationDockCollapsed',this.collapsed);
             if(this.root){ this.root.classList.toggle('eh-operation-dock-collapsed',this.collapsed); this.root.style.setProperty('display', EH.Config.OPERATION_DOCK_ENABLED && !this.collapsed ? 'flex' : 'none', 'important'); }
             if(this.launcher)this.launcher.hidden=!EH.Config.OPERATION_DOCK_ENABLED || !this.collapsed;
+            if(!this.collapsed&&this.root)EH.PanelAutoFit?.schedule?.(this.root,'operation-reopen');
         },
         injectStyles(){
             GM_addStyle(`
@@ -18947,7 +19352,7 @@
                 row.append(seat,info);content.appendChild(row);
             });
             const foot=document.createElement('div');foot.className='eh-modal-actions';const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(close2);
-            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);
             const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
@@ -18977,7 +19382,7 @@
             }
             content.append(summary);
             const foot=document.createElement('div');foot.className='eh-modal-actions';const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(close2);
-            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);
             const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
@@ -19005,7 +19410,7 @@
         showGroupPassengers(group,kind='board') { if(!group?.maps?.length)return EH.Toast.info('Nenhum mapa deste horário foi lido.'); const records=group.maps.filter(r=>r?.agency?.exists&&!r?.agency?.multiple); const q=EH.TicketVerificationQueue.fromRecords(records,kind,{date:records[0]?.date,operationalTime:group.routine?.operationalTime,name:group.routine?.name,routineId:group.routine?.id}); if(!EH.TicketVerificationQueue.activeList(q).length)return EH.Toast.info(`Nenhum ${kind==='alight'?'desembarque':'embarque'} da agência ${this.agencyCode()} encontrado nos mapas lidos.`); this.showPassengersCombined(records,kind,group); },
         showPassengersCombined(records=[],kind='board',group=null){
             document.querySelector('#eh-operation-passengers-modal')?.remove();const overlay=document.createElement('div');overlay.id='eh-operation-passengers-modal';overlay.className='eh-overlay eh-operation-overlay';const modal=document.createElement('div');modal.className='eh-modal eh-operation-modal';const head=document.createElement('div');head.className='eh-modal-head';const title=document.createElement('div');title.className='eh-modal-title';title.textContent=`${kind==='alight'?'DESEMBARQUES':'EMBARQUES'} — ${group?.routine?.operationalTime||'—'} — AGÊNCIA ${this.agencyCode()}`;const close=document.createElement('button');close.className='eh-modal-close';close.textContent='×';head.append(title,close);const content=document.createElement('div');content.className='eh-modal-content eh-operation-passenger-list';
-            const items=[];records.forEach(record=>(kind==='alight'?(record.agency.alighters||[]):(record.agency.boarders||[])).forEach(item=>items.push({item,record})));items.sort((a,b)=>Number(a.item.seat||999)-Number(b.item.seat||999));items.forEach(({item,record})=>{const row=document.createElement('div');row.className='eh-operation-passenger';const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(item.seat);const info=document.createElement('div');info.className='eh-operation-passenger-info';const name=document.createElement('strong');name.textContent=item.name||'Passageiro';const route=document.createElement('small');route.textContent=`${this.passengerSecondary(item,kind)}${record.floor?` • ${record.floor}`:''} • Serviço ${record.service}`;const reminder=EH.Reminders?.matchPassenger?.(item,record);if(reminder){const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders.isDoneStatus(reminder.status)?'done':'pending'}`;state.textContent=EH.Reminders.isDoneStatus(reminder.status)?'✓ Movimento encerrado':`⚠ ${EH.Reminders.statusLabel(reminder.status)}`;info.append(name,route,state);}else info.append(name,route);const buttons=document.createElement('div');buttons.className='eh-operation-detail-actions';const cpf=document.createElement('button');cpf.className='eh-modal-btn';cpf.textContent='CPF';cpf.addEventListener('click',()=>EH.TicketVerificationQueue.copyCpf(item));const ver=document.createElement('button');ver.className='eh-modal-btn primary';ver.textContent='Ver passagem';ver.addEventListener('click',()=>{const reminder=EH.Reminders?.matchPassenger?.({...item,movement:kind},record);if(reminder)EH.Reminders.searchTicket(reminder);else EH.OperationCars.openMapPassenger({...item,movement:kind},record);});buttons.append(cpf,ver);info.append(buttons);row.append(seat,info);content.append(row);});const foot=document.createElement('div');foot.className='eh-modal-actions';const queueBtn=document.createElement('button');queueBtn.className='eh-modal-btn primary';queueBtn.textContent='Abrir fila operacional';queueBtn.addEventListener('click',()=>EH.Reminders?.openModal?.('active'));const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(queueBtn,close2);modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);const dismiss=()=>overlay.remove();close.onclick=dismiss;close2.onclick=dismiss;overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
+            const items=[];records.forEach(record=>(kind==='alight'?(record.agency.alighters||[]):(record.agency.boarders||[])).forEach(item=>items.push({item,record})));items.sort((a,b)=>Number(a.item.seat||999)-Number(b.item.seat||999));items.forEach(({item,record})=>{const row=document.createElement('div');row.className='eh-operation-passenger';const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(item.seat);const info=document.createElement('div');info.className='eh-operation-passenger-info';const name=document.createElement('strong');name.textContent=item.name||'Passageiro';const route=document.createElement('small');route.textContent=`${this.passengerSecondary(item,kind)}${record.floor?` • ${record.floor}`:''} • Serviço ${record.service}`;const reminder=EH.Reminders?.matchPassenger?.(item,record);if(reminder){const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders.isDoneStatus(reminder.status)?'done':'pending'}`;state.textContent=EH.Reminders.isDoneStatus(reminder.status)?'✓ Movimento encerrado':`⚠ ${EH.Reminders.statusLabel(reminder.status)}`;info.append(name,route,state);}else info.append(name,route);const buttons=document.createElement('div');buttons.className='eh-operation-detail-actions';const cpf=document.createElement('button');cpf.className='eh-modal-btn';cpf.textContent='CPF';cpf.addEventListener('click',()=>EH.TicketVerificationQueue.copyCpf(item));const ver=document.createElement('button');ver.className='eh-modal-btn primary';ver.textContent='Ver passagem';ver.addEventListener('click',()=>{const reminder=EH.Reminders?.matchPassenger?.({...item,movement:kind},record);if(reminder)EH.Reminders.searchTicket(reminder);else EH.OperationCars.openMapPassenger({...item,movement:kind},record);});buttons.append(cpf,ver);info.append(buttons);row.append(seat,info);content.append(row);});const foot=document.createElement('div');foot.className='eh-modal-actions';const queueBtn=document.createElement('button');queueBtn.className='eh-modal-btn primary';queueBtn.textContent='Abrir fila operacional';queueBtn.addEventListener('click',()=>EH.Reminders?.openModal?.('active'));const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(queueBtn,close2);modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);const dismiss=()=>overlay.remove();close.onclick=dismiss;close2.onclick=dismiss;overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
         showCarSearch() {
@@ -19045,7 +19450,7 @@
             input.addEventListener('input',renderRows);input.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();renderRows();}});
             refresh.addEventListener('click',()=>{this.readScheduleResults();renderRows();EH.Toast.info('Resultados relidos.');});
             const foot=document.createElement('div');foot.className='eh-modal-actions';const clear=document.createElement('button');clear.className='eh-modal-btn';clear.textContent='Limpar selecionado';clear.addEventListener('click',()=>this.clearSelectedCar());const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(clear,close2);
-            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);
             const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});renderRows();input.focus();
         },
 
@@ -19123,7 +19528,7 @@
             const refresh=document.createElement('button');refresh.className='eh-modal-btn primary';refresh.textContent='↻ Ler pesquisa atual';refresh.addEventListener('click',()=>{this.readScheduleResults();overlay.remove();this.showCars();});
             const settings=document.createElement('button');settings.className='eh-modal-btn';settings.textContent='⚙ Configurar horários';settings.addEventListener('click',()=>{overlay.remove();EH.Storage.set('settingsTab','carros');EH.UI.showSettings();});
             const close2=document.createElement('button');close2.className='eh-modal-btn';close2.textContent='Fechar';foot.append(refresh,settings,close2);
-            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);
+            modal.append(head,content,foot);overlay.append(modal);document.body.append(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);
             const dismiss=()=>overlay.remove();close.addEventListener('click',dismiss);close2.addEventListener('click',dismiss);overlay.addEventListener('click',e=>{if(e.target===overlay)dismiss();});
         },
 
@@ -19848,7 +20253,7 @@
                     EH.Toast.success(existing?'Mercadoria atualizada.':'Mercadoria registrada.'); close(); this.showFinanceModal?.('mercadorias');
                 } catch(error){EH.Toast.error(error.message||'Não foi possível salvar.');}
             });
-            actions.append(save,cancel);modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);
+            actions.append(save,cancel);modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);
         },
 
         showFinanceModal(initialTab='resumo') {
@@ -19944,7 +20349,7 @@
             const renderMerch=()=>{merchPane.innerHTML='';const actions=document.createElement('div');actions.className='eh-finance-toolbar';const add=document.createElement('button');add.className='eh-modal-btn primary';add.textContent='+ Nova mercadoria';add.addEventListener('click',()=>this.showMerchandiseModal());const filter=document.createElement('select');filter.innerHTML='<option value="all">Todas</option><option value="MERCADORIA_RECEBIDA">Recebidas</option><option value="MERCADORIA_ENVIADA">Enviadas</option>';actions.append(add,filter);merchPane.appendChild(actions);const list=document.createElement('div');list.className='eh-finance-list';merchPane.appendChild(list);const refresh=()=>{let records=EH.FinanceLedger.visibleRecords().filter(r=>r.category==='MERCADORIA_RECEBIDA'||r.category==='MERCADORIA_ENVIADA');if(filter.value!=='all')records=records.filter(r=>r.category===filter.value);records.sort((a,b)=>Number(b.timestamp||0)-Number(a.timestamp||0));const sum=EH.FinanceLedger.summary(records);const info=document.createElement('div');info.className='eh-help-box';info.textContent=`${records.length} operação(ões) • ${EH.Utils.formatMoney(sum.movement)} • Comissão ${EH.Utils.formatMoney(sum.commission)}`;list.innerHTML='';list.appendChild(info);records.forEach(record=>{const op=document.createElement('div');op.className='eh-finance-op';const hd=document.createElement('div');hd.className='eh-finance-op-head';const s=document.createElement('strong');s.textContent=`${record.category==='MERCADORIA_RECEBIDA'?'RECEBIDA':'ENVIADA'} • ${record.company}`;const t=document.createElement('time');t.textContent=record.dateTime;hd.append(s,t);const vals=document.createElement('div');vals.className='eh-finance-op-values';vals.innerHTML=`<span>${EH.Utils.formatMoney(record.originalValue)}</span><b>Comissão ${EH.Utils.formatMoney(EH.FinanceLedger.effectiveCommission(record))}</b>`;const details=document.createElement('details');const sm=document.createElement('summary');sm.textContent='Detalhes / editar';const body=document.createElement('div');body.textContent=`Natureza: ${record.nature}${record.description?` • ${record.description}`:''}`;const btns=document.createElement('div');btns.className='eh-settings-inline-actions';const edit=document.createElement('button');edit.className='eh-modal-btn';edit.textContent='Editar';edit.addEventListener('click',()=>this.showMerchandiseModal(record));const del=document.createElement('button');del.className='eh-modal-btn';del.textContent='Excluir';del.addEventListener('click',()=>{if(EH.Config.FINANCE_CONFIRM_DELETE&&!confirm('Excluir este lançamento manual?'))return;EH.FinanceLedger.deleteManual(record.id);refresh();});btns.append(edit,del);details.append(sm,body,btns);op.append(hd,vals,details);list.appendChild(op);});};filter.addEventListener('change',refresh);refresh();};
 
             renderSummary();renderHistory();renderCompanies();renderMerch();activate(paneMap[initialTab]?initialTab:'resumo');
-            const actions=document.createElement('div');actions.className='eh-modal-actions';const sync=document.createElement('button');sync.className='eh-modal-btn primary';sync.textContent='Atualizar dados';sync.addEventListener('click',()=>{EH.FinanceLedger.syncFromCurrentPage();renderSummary();renderHistory();renderCompanies();renderMerch();});const csv=document.createElement('button');csv.className='eh-modal-btn';csv.textContent='Exportar CSV';csv.addEventListener('click',()=>EH.FinanceLedger.exportCsv());const backup=document.createElement('button');backup.className='eh-modal-btn';backup.textContent='Backup JSON';backup.addEventListener('click',()=>EH.FinanceLedger.exportBackup());const closeBottom=document.createElement('button');closeBottom.className='eh-modal-btn';closeBottom.textContent='Fechar';const close=()=>overlay.remove();closeTop.addEventListener('click',close);closeBottom.addEventListener('click',close);overlay.addEventListener('click',e=>{if(e.target===overlay)close();});actions.append(sync,csv,backup,closeBottom);modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);
+            const actions=document.createElement('div');actions.className='eh-modal-actions';const sync=document.createElement('button');sync.className='eh-modal-btn primary';sync.textContent='Atualizar dados';sync.addEventListener('click',()=>{EH.FinanceLedger.syncFromCurrentPage();renderSummary();renderHistory();renderCompanies();renderMerch();});const csv=document.createElement('button');csv.className='eh-modal-btn';csv.textContent='Exportar CSV';csv.addEventListener('click',()=>EH.FinanceLedger.exportCsv());const backup=document.createElement('button');backup.className='eh-modal-btn';backup.textContent='Backup JSON';backup.addEventListener('click',()=>EH.FinanceLedger.exportBackup());const closeBottom=document.createElement('button');closeBottom.className='eh-modal-btn';closeBottom.textContent='Fechar';const close=()=>overlay.remove();closeTop.addEventListener('click',close);closeBottom.addEventListener('click',close);overlay.addEventListener('click',e=>{if(e.target===overlay)close();});actions.append(sync,csv,backup,closeBottom);modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);
         },
 
         contextButton(label, cls, handler) {
@@ -20765,6 +21170,7 @@
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
+            EH.PanelAutoFit?.trackOverlay?.(overlay);
         },
 
         showHistory() {
@@ -20870,6 +21276,7 @@
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
+            EH.PanelAutoFit?.trackOverlay?.(overlay);
         },
 
         showSend(historyId = '') {
@@ -21005,6 +21412,7 @@
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
+            EH.PanelAutoFit?.trackOverlay?.(overlay);
         },
 
         showPreview({ blob, dataUrl, text, summaryText = '', detailsText = '', message, filename, captureType, historyId, copied, reason }) {
@@ -21161,6 +21569,7 @@
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
+            EH.PanelAutoFit?.trackOverlay?.(overlay);
         },
 
         showSettings() {
@@ -21558,7 +21967,7 @@
                 checkField('managedAllowResize','Permitir redimensionar pela alça inferior',panelDrafts.main.allowResize)
             );
             const panelControlActions=document.createElement('div'); panelControlActions.className='eh-settings-action-row';
-            const fitPanel=document.createElement('button'); fitPanel.type='button'; fitPanel.className='eh-modal-btn'; fitPanel.textContent='Ajustar à tela';
+            const fitPanel=document.createElement('button'); fitPanel.type='button'; fitPanel.className='eh-modal-btn'; fitPanel.textContent='Ajustar ao conteúdo';
             const restorePanel=document.createElement('button'); restorePanel.type='button'; restorePanel.className='eh-modal-btn'; restorePanel.textContent='Restaurar este painel';
             const restoreAllPanels=document.createElement('button'); restoreAllPanels.type='button'; restoreAllPanels.className='eh-modal-btn'; restoreAllPanels.textContent='Restaurar todos';
             panelControlActions.append(fitPanel,restorePanel,restoreAllPanels); controlCard.append(panelControlActions,note('Arraste somente pelo cabeçalho. Botões e campos não iniciam movimento. O modo Livre é salvo após soltar.'));
@@ -21567,7 +21976,7 @@
             const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedHandleY.value=String(cfg.handleY); fields.managedDynamic.checked=Boolean(cfg.dynamic); fields.managedAllowDrag.checked=Boolean(cfg.allowDrag); fields.managedAllowResize.checked=Boolean(cfg.allowResize); };
             let previousManagedPanel='main'; fields.managedPanel.addEventListener('change',()=>{ const next=fields.managedPanel.value; fields.managedPanel.value=previousManagedPanel; capturePanelDraft(); fields.managedPanel.value=next; previousManagedPanel=next; loadPanelDraft(next); });
             ['managedMode','managedWidth','managedHeight','managedHandleY','managedDynamic','managedAllowDrag','managedAllowResize'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
-            fitPanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; const rec=EH.PanelManager.recommended(key); fields.managedWidth.value=String(rec.width); fields.managedHeight.value=String(rec.height); fields.managedDynamic.checked=false; capturePanelDraft(); });
+            fitPanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; const rec=EH.PanelManager.recommended(key); fields.managedWidth.value=String(rec.width); fields.managedHeight.value=String(rec.height); fields.managedDynamic.checked=true; capturePanelDraft(); });
             restorePanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...EH.PanelManager.defaults()[key]}; loadPanelDraft(key); });
             restoreAllPanels.addEventListener('click',()=>{ const defs=EH.PanelManager.defaults(); Object.keys(defs).forEach(k=>panelDrafts[k]={...defs[k]}); loadPanelDraft(fields.managedPanel.value); });
 
@@ -21857,7 +22266,7 @@
                 const replace=document.createElement('button');replace.type='button';replace.className='eh-modal-btn';replace.textContent='Substituir';
                 const cancel=document.createElement('button');cancel.type='button';cancel.className='eh-modal-btn';cancel.textContent='Cancelar';
                 const finish=mode=>{layer.remove();resolve(mode);};merge.onclick=()=>finish('merge');replace.onclick=()=>finish('replace');cancel.onclick=()=>finish('');layer.onclick=event=>{if(event.target===layer)finish('');};
-                actions.append(merge,replace,cancel);box.append(hd,body,actions);layer.appendChild(box);document.body.appendChild(layer);
+                actions.append(merge,replace,cancel);box.append(hd,body,actions);layer.appendChild(box);document.body.appendChild(layer);EH.PanelAutoFit?.trackOverlay?.(layer,{surface:box,content:body,header:hd,footer:actions});
             });
             importInput.addEventListener('change',async()=>{
                 const file=importInput.files?.[0]; if(!file)return;
@@ -22335,6 +22744,7 @@
             modal.append(head, content, actions);
             overlay.appendChild(modal);
             document.body.appendChild(overlay);
+            EH.PanelAutoFit?.trackOverlay?.(overlay);
         }
     };
 
@@ -22448,7 +22858,7 @@
                 const result=await EH.UI?.openWhatsApp?.(textarea.value,{allowCurrentChat:true,bridgeOnly:true});
                 if(result?.connected)dismiss();
             };
-            modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);textarea.focus();
+            modal.append(head,content,actions);overlay.appendChild(modal);document.body.appendChild(overlay);EH.PanelAutoFit?.trackOverlay?.(overlay);textarea.focus();
         }
     };
 
@@ -22477,23 +22887,28 @@
             button.addEventListener('click',()=>EH.UI?.showSettings?.());document.body.appendChild(button);this.settingsButton=button;
             GM_addStyle(`
                 #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
-                html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 34px));min-width:270px;min-height:190px;overflow:hidden;resize:both;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
+                html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:auto;min-width:270px;min-height:110px;overflow:hidden;resize:none;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
                 .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}.eh-request-context-selector{display:grid;gap:4px;color:#607286;font-size:8px;font-weight:800}.eh-request-context-selector select,.eh-share-queue>select{width:100%;min-height:32px;padding:5px 7px;border:1px solid #d3dce6;border-radius:7px;background:#fff;color:#30445a;font-size:9px}.eh-share-queue .eh-context-empty,.eh-request-route-hint .eh-context-empty{padding:6px;text-align:left}
                 #eh-general-settings,.eh-context-panel,.eh-context-panel-head,.eh-context-panel-body,.eh-context-route-choice,.eh-context-actions button,.eh-context-data div,.eh-requisition-context,.eh-request-context-selector select,.eh-share-queue>select{font-family:var(--eh-font-family,Inter,"Segoe UI",Arial,sans-serif);color:var(--eh-text,#1f2937);border-color:var(--eh-border,#dbe3ec);background:var(--eh-panel-color,#fff)}
                 .eh-context-panel-head,.eh-context-data div,.eh-requisition-context{background:var(--eh-surface-color,#f8fafc)}.eh-context-empty,.eh-context-data div,.eh-request-context-selector{color:var(--eh-muted,#64748b)}.eh-context-route-choice.is-selected,.eh-context-actions button.primary{border-color:var(--eh-primary,#2563eb)!important;color:var(--eh-primary,#2563eb)!important}.eh-context-panel{border-radius:var(--eh-panel-radius,15px)}
-                .eh-context-panel[data-panel="attendance"]{width:min(334px,calc(100vw - 24px));height:auto;max-height:min(430px,calc(100vh - 34px));min-height:0;resize:none}.eh-context-panel[data-panel="attendance"] .eh-context-panel-body{max-height:380px;overflow:auto}.eh-attendance-section{display:grid;gap:6px}.eh-attendance-section>strong{font-size:9px;letter-spacing:.08em;color:var(--eh-muted,#64748b)}.eh-attendance-compare{display:grid;gap:4px;padding:7px;border:1px solid var(--eh-border,#dbe3ec);border-radius:8px;background:var(--eh-surface-color,#f8fafc);font-size:9px}.eh-attendance-compare.is-match{border-color:#86c8a8;background:#f0faf5}.eh-attendance-compare.is-mismatch{border-color:#e1b15f;background:#fff9ed}.eh-attendance-compare b{font-size:10px;overflow-wrap:anywhere}
-                @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:auto!important;height:min(72vh,560px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
+                .eh-context-panel[data-panel="attendance"]{width:min(334px,calc(100vw - 24px));height:auto;min-height:0}.eh-attendance-section{display:grid;gap:6px}.eh-attendance-section>strong{font-size:9px;letter-spacing:.08em;color:var(--eh-muted,#64748b)}.eh-attendance-compare{display:grid;gap:4px;padding:7px;border:1px solid var(--eh-border,#dbe3ec);border-radius:8px;background:var(--eh-surface-color,#f8fafc);font-size:9px}.eh-attendance-compare.is-match{border-color:#86c8a8;background:#f0faf5}.eh-attendance-compare.is-mismatch{border-color:#e1b15f;background:#fff9ed}.eh-attendance-compare b{font-size:10px;overflow-wrap:anywhere}
+                @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:calc(100vw - 16px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
         saved() { const value=EH.Storage.get(this.KEY,{});return value&&typeof value==='object'?value:{}; },
-        persist(id, panel) {
-            const rect=panel.getBoundingClientRect(),all=this.saved();
-            all[id]={x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height),updatedAt:Date.now()};EH.Storage.set(this.KEY,all);
+        persist(id, panel, patch={}) {
+            const rect=panel.getBoundingClientRect(),all=this.saved(),current=all[id]&&typeof all[id]==='object'?all[id]:{};
+            all[id]={...current,x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(patch.width??current.width??rect.width),height:Math.round(patch.height??current.height??rect.height),autoFit:patch.autoFit!==undefined?Boolean(patch.autoFit):(current.autoFit!==false),updatedAt:Date.now()};EH.Storage.set(this.KEY,all);
             EH.SettingsCatalog?.touch?.(this.KEY);
             if(EH.Config.SYNC_PANEL_LAYOUT)EH.Sync?.markPendingRecord?.('setting',this.KEY);
         },
+        setAutoFit(id, value=true) {
+            const entry=this.panels.get(id),all=this.saved(),current=all[id]&&typeof all[id]==='object'?all[id]:{};
+            all[id]={...current,autoFit:Boolean(value),updatedAt:Date.now()};EH.Storage.set(this.KEY,all);
+            if(entry&&value){entry.panel.style.removeProperty('width');entry.panel.style.removeProperty('height');EH.PanelAutoFit?.schedule?.(entry.panel,'context-auto');}
+        },
         position(id,panel) {
-            const cfg=this.saved()[id]||{};const compact=id==='attendance';const defaultHeight=id==='operation'?430:(compact?390:520);const width=Math.min(window.innerWidth-24,Math.max(270,compact?334:(Number(cfg.width)||390)));const height=Math.min(window.innerHeight-34,Math.max(compact?260:190,compact?defaultHeight:(Number(cfg.height)||defaultHeight)));
+            const cfg=this.saved()[id]||{};const compact=id==='attendance';const defaultHeight=id==='operation'?430:(compact?260:360);const automatic=cfg.autoFit!==false;const width=Math.min(window.innerWidth-24,Math.max(270,automatic?(compact?334:390):(Number(cfg.width)||390)));const height=Math.min(window.innerHeight-34,Math.max(110,automatic?defaultHeight:(Number(cfg.height)||defaultHeight)));
             const fallbackX=EH.Config.OVERLAY_SIDE==='left'?12:Math.max(12,window.innerWidth-width-62);const x=Math.min(window.innerWidth-80,Math.max(0,Number.isFinite(Number(cfg.x))?Number(cfg.x):fallbackX));const y=Math.min(window.innerHeight-48,Math.max(0,Number.isFinite(Number(cfg.y))?Number(cfg.y):92));
             Object.assign(panel.style,{width:`${width}px`,height:`${height}px`,left:`${x}px`,top:`${y}px`});
         },
@@ -22504,7 +22919,6 @@
             head.addEventListener('pointermove',event=>{if(!start||start.id!==event.pointerId)return;let dx=event.clientX-start.x,dy=event.clientY-start.y;if(!start.dragging&&Math.hypot(dx,dy)<5)return;start.dragging=true;panel.classList.add('is-dragging');const rect=panel.getBoundingClientRect();dx=Math.max(-rect.left+28,Math.min(window.innerWidth-rect.right+rect.width-28,dx));dy=Math.max(-rect.top+24,Math.min(window.innerHeight-rect.bottom+rect.height-24,dy));start.dx=dx;start.dy=dy;pending={dx,dy};if(!frame)frame=requestAnimationFrame(paint);event.preventDefault();});
             const finish=event=>{if(!start||start.id!==event.pointerId)return;if(frame){cancelAnimationFrame(frame);frame=0;}if(start.dragging){const baseLeft=parseFloat(panel.style.left)||panel.getBoundingClientRect().left;const baseTop=parseFloat(panel.style.top)||panel.getBoundingClientRect().top;panel.style.transform='';panel.style.left=`${Math.max(0,Math.min(window.innerWidth-60,baseLeft+start.dx))}px`;panel.style.top=`${Math.max(0,Math.min(window.innerHeight-42,baseTop+start.dy))}px`;panel.classList.remove('is-dragging');this.persist(id,panel);}start=null;pending=null;try{head.releasePointerCapture?.(event.pointerId);}catch(_error){}};
             head.addEventListener('pointerup',finish);head.addEventListener('pointercancel',finish);
-            if(typeof ResizeObserver==='function'){const saveSize=EH.Utils.debounce(()=>{if(panel.isConnected&&!panel.classList.contains('is-dragging'))this.persist(id,panel);},280);new ResizeObserver(saveSize).observe(panel);}
         },
         cell(label,value) { const cell=document.createElement('div');const span=document.createElement('span');span.textContent=label;const strong=document.createElement('b');strong.textContent=value||'—';cell.append(span,strong);return cell; },
         action(label,callback,className='') { const button=document.createElement('button');button.type='button';button.textContent=label;button.className=className;button.addEventListener('click',callback);return button; },
@@ -22595,12 +23009,12 @@
             this.renderMenu(body);
         },
         open(id) {
-            this.init();if(id==='attendance'&&!EH.PassengerData?.active?.()&&(EH.RequestFlow?.candidates?.()||[]).length<2)return null;if(this.panels.has(id)){const existing=this.panels.get(id);this.render(id,existing.body);existing.panel.focus();return existing.panel;}
-            const panel=document.createElement('aside');panel.className='eh-context-panel';panel.dataset.panel=id;panel.tabIndex=-1;panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const head=document.createElement('div');head.className='eh-context-panel-head';const title=document.createElement('strong');title.textContent=this.titles[id]||'E-Pass Helper';const close=document.createElement('button');close.type='button';close.textContent='✕';close.title='Fechar painel';head.append(title,close);const body=document.createElement('div');body.className='eh-context-panel-body';panel.append(head,body);document.body.appendChild(panel);this.panels.set(id,{panel,body});this.position(id,panel);this.bindMovement(id,panel,head);close.onclick=()=>this.close(id);this.render(id,body);panel.focus();return panel;
+            this.init();if(id==='attendance'&&!EH.PassengerData?.active?.()&&(EH.RequestFlow?.candidates?.()||[]).length<2)return null;if(this.panels.has(id)){const existing=this.panels.get(id);this.render(id,existing.body);EH.PanelAutoFit?.schedule?.(existing.panel,'context-open');existing.panel.focus();return existing.panel;}
+            const panel=document.createElement('aside');panel.className='eh-context-panel';panel.dataset.panel=id;panel.tabIndex=-1;panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const head=document.createElement('div');head.className='eh-context-panel-head';const title=document.createElement('strong');title.textContent=this.titles[id]||'E-Pass Helper';const close=document.createElement('button');close.type='button';close.textContent='✕';close.title='Fechar painel';head.append(title,close);const body=document.createElement('div');body.className='eh-context-panel-body';panel.append(head,body);document.body.appendChild(panel);this.panels.set(id,{panel,body});this.position(id,panel);this.bindMovement(id,panel,head);close.onclick=()=>this.close(id);this.render(id,body);EH.PanelAutoFit?.registerContext?.(id,panel,body,head);panel.focus();return panel;
         },
-        close(id){const entry=this.panels.get(id);if(!entry)return;this.persist(id,entry.panel);entry.panel.remove();this.panels.delete(id);},
-        refresh(id){const entry=this.panels.get(id);if(entry)this.render(id,entry.body);},
-        sync(page){for(const [id,entry] of this.panels){entry.panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const allowed=this.contexts[id];if(allowed&&!allowed.includes(page))this.close(id);}}
+        close(id){const entry=this.panels.get(id);if(!entry)return;this.persist(id,entry.panel);EH.PanelAutoFit?.unregister?.(entry.panel);entry.panel.remove();this.panels.delete(id);},
+        refresh(id){const entry=this.panels.get(id);if(entry){this.render(id,entry.body);EH.PanelAutoFit?.schedule?.(entry.panel,'context-refresh');}},
+        sync(page){for(const [id,entry] of this.panels){entry.panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const allowed=this.contexts[id];if(allowed&&!allowed.includes(page))this.close(id);else EH.PanelAutoFit?.schedule?.(entry.panel,'context-sync');}}
     };
 
     // ============================================================
