@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.79.0
+// @version      5.82.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.79.0',
+        VERSION: '5.82.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 21,
+        STORAGE_SCHEMA_VERSION: 22,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -1160,6 +1160,36 @@
             EH.PassengerMemory?.migrateV21?.();
         },
 
+        migrateRecentEmissionsV22() {
+            // A v22 acrescenta somente aliases de identidade da operação e
+            // metadados do documento oficial. O Blob/PDF nunca entra no GM
+            // storage: arquivos ficam no IndexedDB local e podem ser obtidos
+            // novamente no outro dispositivo pela busca segura da emissão.
+            const key='emissionMemory.v1',rows=EH.Storage.get(key,[]);
+            if(!Array.isArray(rows))return;let changed=false;
+            const next=rows.map(item=>{
+                if(!item||typeof item!=='object')return item;
+                const id=String(item.id||item.emissionId||'');
+                const normalized={
+                    ...item,
+                    id,
+                    emissionId:String(item.emissionId||id),
+                    documentKey:String(item.documentKey||''),
+                    documentState:String(item.documentState||'not-captured'),
+                    documentName:String(item.documentName||''),
+                    documentMime:String(item.documentMime||''),
+                    documentSize:Math.max(0,Number(item.documentSize||0)),
+                    documentUrl:String(item.documentUrl||''),
+                    documentSource:String(item.documentSource||''),
+                    documentCapturedAt:Math.max(0,Number(item.documentCapturedAt||0)),
+                    documentDeviceId:String(item.documentDeviceId||'')
+                };
+                if(JSON.stringify(normalized)!==JSON.stringify(item))changed=true;
+                return normalized;
+            });
+            if(changed)EH.Storage.set(key,next);
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -1183,6 +1213,7 @@
             this.migratePanelAutoFitV19();
             this.migrateSettingsCategoriesV20();
             this.migratePassengerJourneyV21();
+            this.migrateRecentEmissionsV22();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -7656,6 +7687,7 @@
                     );
                 }
                 const typeElement = valueCell?.querySelector?.('small') || row.querySelector(EH.Selectors.CELULA_TIPO);
+                const reserveButton = row.querySelector(EH.Selectors.SEARCH_RESERVE_BUTTON);
                 const typeRaw = EH.Utils.extractVehicleType(EH.Utils.text(typeElement), valueText);
                 const typeNormalized = EH.Utils.normalize(typeRaw);
                 let tipo = typeRaw;
@@ -7691,7 +7723,11 @@
                         taxaAplicada,
                         taxaOrigem,
                         tipo,
-                        andares: []
+                        andares: [],
+                        // Vínculo efêmero com a linha real. Não é persistido nem
+                        // usado para inferir serviço: o clique continua no botão
+                        // `button[title="Reservar"]` que pertence a esta linha.
+                        selectionTargets: []
                     });
                 }
 
@@ -7699,6 +7735,7 @@
                 if (servico && !item.servicos.includes(servico)) item.servicos.push(servico);
                 if (!item.linhaReal && linhaReal) item.linhaReal = linhaReal;
                 if (!item.empresa && empresa) item.empresa = empresa;
+                if (reserveButton) item.selectionTargets.push({ button:reserveButton, row, service:servico });
                 if (andar) item.andares.push(andar);
                 if (!item.tipo && tipo) item.tipo = tipo;
             });
@@ -9728,7 +9765,7 @@
                 }
 
                 if (acceptedFound.length) {
-                    if(item?.emissionId)EH.EmissionMemory?.markShareStatus?.(item.emissionId,'found');
+                    if(item?.emissionId){const emission=(EH.EmissionMemory?.load?.()||[]).find(row=>String(row.id||row.emissionId)===String(item.emissionId));if(emission)EH.EmissionMemory?.captureMatchedCards?.(emission,acceptedFound);EH.EmissionMemory?.markShareStatus?.(item.emissionId,'found');}
                     EH.Toast.success(`${acceptedFound.length} passagem(ns) da emissão atual encontrada(s). Selecione até 2 para capturar.`);
                     EH.Tickets.activateSelection();
                 } else {
@@ -14184,6 +14221,52 @@
             return true;
         },
 
+        paymentPassenger(request=this.requestForContext()) {
+            if (!request) return null;
+            const active=EH.PassengerData?.active?.();
+            if (active?.cpfDigits) {
+                const exact=request.passengers?.find(item=>item.cpf===this.normalizeCpf(active.cpfDigits));
+                if (exact) return exact;
+            }
+            return request.passengers?.length===1?request.passengers[0]:null;
+        },
+
+        paymentCodes(request=this.requestForContext()) {
+            const passenger=this.paymentPassenger(request);if(!passenger)return{request,passenger:null,ida:null,volta:null};
+            const ida=passenger.legs?.find(leg=>leg.tipo!=='volta'&&leg.codigo)||null;
+            const volta=passenger.legs?.find(leg=>leg.tipo==='volta'&&leg.codigo)||null;
+            return{request,passenger,ida,volta};
+        },
+
+        async fillPaymentLeg(tipo='ida') {
+            const wanted=tipo==='volta'?'volta':'ida';
+            const {request,passenger,ida,volta}=this.paymentCodes();const leg=wanted==='volta'?volta:ida;
+            if(!request||!passenger||!leg?.codigo)return EH.Toast.warning(`O código da ${wanted} não está disponível para a solicitação ativa.`);
+            const route=this.paymentRoute();
+            if(!route?.origem||!route?.destino)return EH.Toast.warning('A rota atual do Pagamento não pôde ser identificada com segurança.');
+            if(!this.legMatchesRoute(leg,route.origem,route.destino))return EH.Toast.warning(`Abra o Pagamento do trecho de ${wanted} antes de preencher este código.`);
+            const input=EH.Utils.first(EH.Selectors.REQUISITION_CODE_INPUT);
+            if(!input)return EH.Toast.warning('O campo Código da requisição não está disponível nesta forma de pagamento.');
+            input.focus();EH.SaleContext.setNativeValue(input,leg.codigo);await EH.Utils.sleep(120);
+            if(EH.Utils.clean(input.value)!==leg.codigo)return EH.Toast.error('O E-Pass não manteve o código preenchido.');
+            this.setActiveEmission({...(this.getActiveEmission()||{}),requestId:request.id,numeroLogico:request.numeroLogico,cpf:passenger.cpf,nome:passenger.nome,tipo:wanted,codigo:leg.codigo,origem:leg.origem||'',destino:leg.destino||''});
+            EH.Toast.success(`Código da ${wanted} preenchido para a rota atual.`);return true;
+        },
+
+        async fillPaymentBoth() {
+            const {ida,volta}=this.paymentCodes();
+            if(!ida?.codigo||!volta?.codigo)return EH.Toast.warning('Os dois códigos ainda não estão disponíveis.');
+            // O HTML real expõe um único `codigoRequisicao` para o trecho em
+            // pagamento. Sobrescrevê-lo com o segundo código trocaria ida/volta.
+            // Portanto a ação usa somente o código compatível com a rota atual.
+            const route=this.paymentRoute();
+            const compatible=[ida,volta].filter(leg=>route&&this.legMatchesRoute(leg,route.origem,route.destino));
+            if(compatible.length!==1)return EH.Toast.warning('Não foi possível distinguir ida e volta nesta tela. Preencha cada trecho na respectiva etapa de Pagamento.');
+            const ok=await this.fillPaymentLeg(compatible[0].tipo);
+            if(ok)EH.Toast.info('O outro código permanece preservado para o Pagamento do outro trecho.');
+            return ok;
+        },
+
         async copyLegCode(code) {
             const value = EH.Utils.clean(code || '');
             if (!value) return EH.Toast.warning('Este trecho ainda não possui código.');
@@ -14939,7 +15022,12 @@
             const seat = raw.match(/Poltrona\s*:\s*([\w-]+)/i)?.[1] || '';
             const service = raw.match(/Servi[cç]o\s*:\s*([\w-]+)/i)?.[1] || '';
             const ticket = raw.match(/N[º°O]?\s*:\s*(\d+)/i)?.[1] || '';
-            return { raw, status, value, seat, service, ticket };
+            const locator=raw.match(/Localizador\s*:\s*([A-Z0-9-]+)/i)?.[1]||'';
+            const saleReference=(raw.match(/(?:ID|N[º°O]?)\s+da\s+Venda\s*:\s*([A-Z0-9-]+)/i)||raw.match(/Venda\s*(?:ID|N[º°O]?)\s*:\s*([A-Z0-9-]+)/i))?.[1]||'';
+            const boarding=raw.match(/Data\s+de\s+Embarque\s*:\s*([^\n]+)/i)?.[1]||'';
+            const route=raw.match(/Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*([^\n]+)/i);
+            const travel=EH.Reminders?.parseTravel?.(boarding)||{key:'',time:''};
+            return { raw, status, value, seat, service, ticket, locator, saleReference, boarding, travelDate:travel.key||'', travelTime:travel.time||'', origin:EH.Utils.clean(route?.[1]||''), destination:EH.Utils.clean(route?.[2]||'') };
         },
 
         cardsSignature(cards = this.findCards()) {
@@ -14947,7 +15035,8 @@
                 const raw = EH.Utils.clean(card?.innerText || card?.textContent || '');
                 const tickets = Array.from(raw.matchAll(/N[º°O]?\s*:\s*(\d+)/gi)).map(match => match[1]).join(',');
                 const route = raw.match(/Origem\s*:\s*(.*?)\s*-\s*Destino\s*:\s*([^\n]+)/i);
-                return `${tickets}|${route?.[1] || ''}|${route?.[2] || ''}`;
+                const summary=this.summary(card);
+                return `${tickets}|${summary.locator}|${summary.saleReference}|${route?.[1] || ''}|${route?.[2] || ''}|${summary.travelDate}|${summary.travelTime}|${summary.service}|${summary.seat}`;
             }).join('||');
         },
 
@@ -15202,6 +15291,8 @@
                 status: status || summary.status || 'PASSAGEM',
                 seller,
                 soldAt,
+                locator:summary.locator||'',
+                saleReference:summary.saleReference||'',
                 tickets,
                 filename: `bilhete-${tickets[0]?.number || summary.ticket || Date.now()}.png`,
                 text: EH.Utils.clean(card.innerText || card.textContent || '')
@@ -15223,6 +15314,62 @@
             };
         }
 
+    };
+
+    // ============================================================
+    // DOCUMENTO OFICIAL DO BILHETE — arquivos grandes no IndexedDB
+    // ============================================================
+    EH.TicketDocuments = {
+        DB_NAME:'epass-helper-ticket-documents',
+        DB_VERSION:1,
+        STORE:'documents',
+        live:new Map(),
+        dbPromise:null,
+        openDb(){
+            if(this.dbPromise)return this.dbPromise;
+            if(typeof indexedDB==='undefined')return Promise.reject(new Error('IndexedDB não está disponível neste navegador.'));
+            this.dbPromise=new Promise((resolve,reject)=>{const request=indexedDB.open(this.DB_NAME,this.DB_VERSION);request.onupgradeneeded=()=>{const db=request.result;if(!db.objectStoreNames.contains(this.STORE))db.createObjectStore(this.STORE,{keyPath:'emissionId'});};request.onsuccess=()=>resolve(request.result);request.onerror=()=>reject(request.error||new Error('Não foi possível abrir o armazenamento de bilhetes.'));});
+            return this.dbPromise;
+        },
+        async put(emissionId,blob,meta={}){
+            const id=String(emissionId||'');if(!id||!(blob instanceof Blob)||!blob.size)throw new Error('Documento oficial inválido.');
+            const db=await this.openDb();const record={emissionId:id,blob,name:EH.Utils.clean(meta.name||`bilhete-${id}.pdf`),mime:EH.Utils.clean(blob.type||meta.mime||'application/octet-stream'),size:blob.size,source:EH.Utils.clean(meta.source||'epass-official'),capturedAt:Date.now(),deviceId:EH.Device.id()};
+            await new Promise((resolve,reject)=>{const tx=db.transaction(this.STORE,'readwrite');tx.objectStore(this.STORE).put(record);tx.oncomplete=()=>resolve();tx.onerror=()=>reject(tx.error||new Error('Não foi possível armazenar o documento oficial.'));});return record;
+        },
+        async get(emissionId){
+            const id=String(emissionId||'');if(!id)return null;
+            try{const db=await this.openDb();return await new Promise((resolve,reject)=>{const tx=db.transaction(this.STORE,'readonly'),request=tx.objectStore(this.STORE).get(id);request.onsuccess=()=>resolve(request.result||null);request.onerror=()=>reject(request.error);});}catch(error){EH.Logger.debug('Documento oficial local indisponível:',error);return null;}
+        },
+        safeUrl(value){
+            const raw=String(value||'').trim();if(!raw||/^javascript:/i.test(raw))return'';
+            try{return new URL(raw,location.href).href;}catch(_error){return'';}
+        },
+        stableUrl(value){const url=this.safeUrl(value);return /^https?:/i.test(url)?url:'';},
+        discover(card){
+            if(!card)return null;const nodes=Array.from(card.querySelectorAll('a[href],iframe[src],embed[src],object[data]'));let file=null;
+            for(const node of nodes){const raw=node.getAttribute(node.tagName==='OBJECT'?'data':'href')||node.getAttribute('src')||'';const url=this.safeUrl(raw);const label=EH.Utils.normalize(node.textContent||node.getAttribute('title')||node.getAttribute('aria-label')||'');const type=String(node.getAttribute('type')||'').toLowerCase();const download=node.getAttribute('download');const explicit=/^blob:|^data:application\/pdf/i.test(url)||/\.pdf(?:[?#]|$)/i.test(url)||type.includes('pdf')||download!==null||/PDF|BAIXAR|DOWNLOAD|IMPRIMIR BILHETE/.test(label);if(!url||!explicit)continue;file={node,url,name:EH.Utils.clean(download||`bilhete-${Date.now()}.${type.includes('pdf')||/\.pdf/i.test(url)?'pdf':'bin'}`),mime:type||(/\.pdf(?:[?#]|$)/i.test(url)?'application/pdf':''),source:node.tagName.toLowerCase()};break;}
+            const controls=Array.from(card.querySelectorAll('button,a[href]'));const byLabel=pattern=>controls.find(node=>pattern.test(EH.Utils.normalize(node.textContent||node.getAttribute('title')||node.getAttribute('aria-label')||''))&&!node.disabled)||null;
+            const downloadControl=byLabel(/BAIXAR|DOWNLOAD|PDF/),printControl=byLabel(/IMPRIMIR/);
+            return file||downloadControl||printControl?{...(file||{}),downloadControl,printControl}:null;
+        },
+        acceptableBlob(blob){const type=String(blob?.type||'').toLowerCase();return Boolean(blob?.size)&&(type.includes('pdf')||type.startsWith('image/')||type.includes('octet-stream'))&&!type.includes('html');},
+        async fetchBlob(handle){
+            const url=handle?.url||'';if(!url)return null;
+            if(!/^blob:|^data:|^https?:/i.test(url))return null;
+            try{const parsed=/^https?:/i.test(url)?new URL(url):null;if(parsed&&parsed.origin!==location.origin)return null;const response=await fetch(url,{credentials:'include'});if(!response.ok)throw new Error(`HTTP ${response.status}`);const blob=await response.blob();return this.acceptableBlob(blob)?blob:null;}catch(error){EH.Logger.debug('O documento oficial não pôde ser copiado para o armazenamento local:',error);return null;}
+        },
+        async captureForEmission(emission,card){
+            const item=EH.EmissionMemory?.normalize?.(emission)||emission;if(!item?.id||!card)return null;const handle=this.discover(card);if(!handle)return null;this.live.set(item.id,{card,handle});
+            const blob=await this.fetchBlob(handle);if(blob){const record=await this.put(item.id,blob,{name:handle.name,mime:handle.mime,source:handle.source});EH.EmissionMemory?.attachDocument?.(item.id,{documentKey:item.id,documentState:'captured-local',documentName:record.name,documentMime:record.mime,documentSize:record.size,documentUrl:this.stableUrl(handle.url),documentSource:handle.source,documentCapturedAt:record.capturedAt,documentDeviceId:record.deviceId});return record;}
+            const stable=this.stableUrl(handle.url);EH.EmissionMemory?.attachDocument?.(item.id,{documentState:stable?'official-url':'available-on-page',documentName:handle.name||'',documentMime:handle.mime||'',documentUrl:stable,documentSource:handle.source||'real-control'});return stable?{url:stable,name:handle.name||''}:null;
+        },
+        liveHandle(item){const id=String(item?.id||item?.emissionId||'');const remembered=this.live.get(id);if(remembered?.card?.isConnected)return remembered;const matches=EH.EmissionMemory?.matchTicketCards?.(item)||[];if(matches.length!==1)return null;const handle=this.discover(matches[0]);if(!handle)return null;const live={card:matches[0],handle};this.live.set(id,live);return live;},
+        async source(item){const record=await this.get(item?.documentKey||item?.id);if(record?.blob)return{kind:'blob',record};const url=this.stableUrl(item?.documentUrl);if(url)return{kind:'url',url,name:item.documentName||''};const live=this.liveHandle(item);return live?{kind:'live',...live}:null;},
+        objectUrl(blob){const url=URL.createObjectURL(blob);setTimeout(()=>URL.revokeObjectURL(url),60000);return url;},
+        async open(item,{scan=false}={}){const source=await this.source(item);if(!source)return EH.Toast.warning('O documento oficial ainda não foi obtido. Use Buscar e abra o bilhete atual.');let url='';if(source.kind==='blob')url=this.objectUrl(source.record.blob);else if(source.kind==='url')url=source.url;else if(source.handle?.url)url=source.handle.url;if(!url){const control=source.handle?.downloadControl||source.handle?.printControl;if(control){control.click();return true;}return EH.Toast.warning('Não encontrei um documento oficial que possa ser aberto.');}const opened=window.open(url,'_blank','noopener');if(!opened)return EH.Toast.warning('O navegador bloqueou a abertura do bilhete oficial.');EH.Toast.success(scan?'Bilhete oficial aberto em uma nova aba para leitura.':'Bilhete oficial aberto.');return true;},
+        async download(item){const source=await this.source(item);if(!source)return EH.Toast.warning('O documento oficial ainda não está disponível para baixar.');if(source.kind==='live'&&source.handle?.downloadControl){source.handle.downloadControl.click();return true;}const url=source.kind==='blob'?this.objectUrl(source.record.blob):(source.url||source.handle?.url||'');if(!url)return EH.Toast.warning('O E-Pass não expôs um download oficial para este bilhete.');const anchor=document.createElement('a');anchor.href=url;anchor.download=source.record?.name||item.documentName||`bilhete-${item.ticketNumber||item.id}.pdf`;document.body.appendChild(anchor);anchor.click();anchor.remove();EH.EmissionMemory?.markDocumentAction?.(item.id,'downloaded');return true;},
+        async print(item){const source=await this.source(item);if(!source)return EH.Toast.warning('O documento oficial ainda não está disponível para impressão.');if(source.kind==='live'&&source.handle?.printControl){source.handle.printControl.click();EH.EmissionMemory?.markDocumentAction?.(item.id,'printed');return true;}const url=source.kind==='blob'?this.objectUrl(source.record.blob):(source.url||source.handle?.url||'');if(!url)return EH.Toast.warning('O E-Pass não expôs uma impressão oficial para este bilhete.');const popup=window.open(url,'_blank');if(!popup)return EH.Toast.warning('O navegador bloqueou a janela de impressão.');try{popup.addEventListener('load',()=>{try{popup.print();}catch(_error){}},{once:true});}catch(_error){}EH.EmissionMemory?.markDocumentAction?.(item.id,'printed');return true;},
+        async share(item){const source=await this.source(item);if(!source)return EH.Toast.warning('O documento oficial ainda não está disponível para compartilhar.');if(source.kind==='blob'){const file=new File([source.record.blob],source.record.name,{type:source.record.mime||source.record.blob.type});if(navigator.share&&(!navigator.canShare||navigator.canShare({files:[file]}))){await navigator.share({title:`Bilhete ${item.ticketNumber||''}`.trim(),files:[file]});EH.EmissionMemory?.markShareStatus?.(item.id,'shared',{channel:'web-share-file'});return true;}}const url=source.kind==='url'?source.url:this.stableUrl(source.handle?.url);if(url&&navigator.share){await navigator.share({title:`Bilhete ${item.ticketNumber||''}`.trim(),url});EH.EmissionMemory?.markShareStatus?.(item.id,'shared',{channel:'web-share-url'});return true;}if(url){await EH.Clipboard.copyText(url);EH.Toast.success('Link oficial do bilhete copiado.');return true;}return EH.Toast.warning('Este navegador não permite compartilhar diretamente o arquivo oficial. Use Baixar.');}
     };
 
     // ============================================================
@@ -17580,31 +17727,18 @@
         },
         captureConfirmedCards() {
             if(EH.Pages?.detect?.()!=='passagens')return 0;
-            const cards=EH.Tickets?.findCards?.()||[];
+            const cards=(EH.Tickets?.findCards?.()||[]).filter(card=>EH.Tickets.qualifiesAsTicketCard(card));
             if(!cards.length)return 0;
-            const signature=[EH.Tickets?.cardsSignature?.(cards)||'',...cards.map(card=>{const summary=EH.Tickets?.summary?.(card)||{};return[summary.status,summary.service,summary.seat,summary.value].join('|');})].join('||');
+            const pendingSearch=EH.Storage.get('emissionMemory.pendingSearch.v1',null),activeShare=String(EH.Storage.get('emissionMemory.activeShare.v1','')||''),sale=EH.SaleContext?.loadSale?.()||{};
+            const all=(EH.EmissionMemory?.load?.()||[]).map(row=>EH.EmissionMemory.normalize(row));const candidateIds=new Set([pendingSearch?.emissionId,activeShare].filter(value=>value!==undefined&&value!==null&&String(value)!=='').map(String));all.filter(row=>row.saleId&&row.saleId===String(sale.id||'')).forEach(row=>candidateIds.add(row.id));
+            const searchedCpf=this.normalizeCpf(EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT)?.value||'');const candidates=all.filter(row=>candidateIds.has(row.id)||(searchedCpf&&row.cpf===searchedCpf&&EH.EmissionMemory.shareQueue().some(item=>item.id===row.id)));
+            if(!candidates.length)return 0;
+            const signature=[EH.Tickets?.cardsSignature?.(cards)||'',...Array.from(candidateIds)].join('||');
             if(signature&&signature===this.lastIssuedCardsSignature)return 0;
-            const searchedCpf=this.normalizeCpf(EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT)?.value||'');
-            const active=EH.SaleContext?.getActivePassenger?.()||null;
-            const sale=EH.SaleContext?.loadSale?.()||{};
-            const items=[];
-            cards.forEach(card=>{
-                try{
-                    // qualifiesAsTicketCard exige simultaneamente VENDA REALIZADA,
-                    // VALOR PAGO, BILHETE(S) e número real do bilhete.
-                    if(!EH.Tickets.qualifiesAsTicketCard(card))return;
-                    const data=EH.Tickets.extractTicketData(card);
-                    const raw=EH.Utils.clean(card.innerText||card.textContent||'');
-                    const cpf=this.normalizeCpf(raw.match(/CPF\s*:\s*([\d.\/-]+)/i)?.[1]||searchedCpf||active?.cpf||'');
-                    const name=EH.Utils.clean(raw.match(/PASSAGEIR[OA]\s*:\s*([^\n]+)/i)?.[1]||active?.name||'');
-                    const summary=EH.Tickets.summary(card);
-                    items.push({passengerId:active?.id||null,saleId:sale?.id||'',salePassengerId:active?.id||'',cpf,name,data:{...data,summary},tickets:data.tickets,ticket:data.tickets[0],service:summary.service,seat:summary.seat,value:summary.value,paymentMethod:sale?.paymentMethod||EH.Attendance?.load?.()?.payment?.method||'',saleReference:sale?.id||''});
-                }catch(error){EH.Logger.debug('Cartão emitido ainda não pôde ser capturado:',error);}
-            });
-            if(!items.length)return 0;
-            const created=this.captureItems(items,{confirmedEvidence:true,automatic:true,quiet:true});
+            let created=0;candidates.forEach(emission=>{const matches=EH.EmissionMemory.matchTicketCards(emission,cards);if(matches.length===1)created+=EH.EmissionMemory.captureMatchedCards(emission,matches);});
+            if(!created)return 0;
             this.lastIssuedCardsSignature=signature;
-            EH.Toast?.success?.(`Emissão confirmada. ${items.length} bilhete(s) entrou(aram) na fila para compartilhar.`);
+            EH.Toast?.success?.(`Emissão confirmada. ${created} bilhete(s) atual(is) entrou(aram) na fila para compartilhar.`);
             return created;
         },
         onPageUpdate(page) {
@@ -17949,8 +18083,9 @@
             const fallbackId = saleId && salePassengerId
                 ? `sale:${saleId}:${salePassengerId}`
                 : (ticketNumber ? `ticket:${ticketNumber}` : `trip:${cpf}|${travelDate}|${EH.Utils.normalize(origin)}|${EH.Utils.normalize(destination)}`);
+            const id=String(item.id||item.emissionId||fallbackId);
             return {
-                id: String(item.id || fallbackId),
+                id, emissionId:String(item.emissionId||id),
                 saleId, salePassengerId, cpf,
                 attendanceId: EH.Utils.clean(item.attendanceId || ''),
                 requestId: EH.Utils.clean(item.requestId || ''),
@@ -17985,6 +18120,17 @@
                 shareFoundAt: Number(item.shareFoundAt || 0),
                 sharedAt: Number(item.sharedAt || 0),
                 shareChannel: EH.Utils.clean(item.shareChannel || ''),
+                documentKey: String(item.documentKey || ''),
+                documentState: ['not-captured','available-on-page','official-url','captured-local'].includes(String(item.documentState||''))?String(item.documentState):'not-captured',
+                documentName: EH.Utils.clean(item.documentName || ''),
+                documentMime: EH.Utils.clean(item.documentMime || ''),
+                documentSize: Math.max(0,Number(item.documentSize || 0)),
+                documentUrl: /^https?:/i.test(String(item.documentUrl||''))?String(item.documentUrl):'',
+                documentSource: EH.Utils.clean(item.documentSource || ''),
+                documentCapturedAt: Math.max(0,Number(item.documentCapturedAt || 0)),
+                documentDeviceId: String(item.documentDeviceId || ''),
+                downloadedAt: Math.max(0,Number(item.downloadedAt || 0)),
+                printedAt: Math.max(0,Number(item.printedAt || 0)),
                 createdAt: Number(item.createdAt || Date.now()),
                 updatedAt: Number(item.updatedAt || item.createdAt || Date.now()),
                 deviceId: String(item.deviceId || EH.Device.id()),
@@ -18004,6 +18150,7 @@
             return {
                 ...secondary, ...preferred,
                 id: old.id || next.id,
+                emissionId:old.emissionId||next.emissionId||old.id||next.id,
                 saleId: preferred.saleId || secondary.saleId,
                 salePassengerId: preferred.salePassengerId || secondary.salePassengerId,
                 attendanceId: preferred.attendanceId || secondary.attendanceId,
@@ -18042,6 +18189,17 @@
                 shareFoundAt:Math.max(Number(old.shareFoundAt||0),Number(next.shareFoundAt||0)),
                 sharedAt:Math.max(Number(old.sharedAt||0),Number(next.sharedAt||0)),
                 shareChannel:preferred.shareChannel||secondary.shareChannel||'',
+                documentKey:preferred.documentKey||secondary.documentKey||'',
+                documentState:(()=>{const rank={'not-captured':0,'available-on-page':1,'official-url':2,'captured-local':3};return (rank[next.documentState]||0)>(rank[old.documentState]||0)?next.documentState:old.documentState;})(),
+                documentName:preferred.documentName||secondary.documentName||'',
+                documentMime:preferred.documentMime||secondary.documentMime||'',
+                documentSize:Math.max(Number(old.documentSize||0),Number(next.documentSize||0)),
+                documentUrl:preferred.documentUrl||secondary.documentUrl||'',
+                documentSource:preferred.documentSource||secondary.documentSource||'',
+                documentCapturedAt:Math.max(Number(old.documentCapturedAt||0),Number(next.documentCapturedAt||0)),
+                documentDeviceId:preferred.documentDeviceId||secondary.documentDeviceId||'',
+                downloadedAt:Math.max(Number(old.downloadedAt||0),Number(next.downloadedAt||0)),
+                printedAt:Math.max(Number(old.printedAt||0),Number(next.printedAt||0)),
                 createdAt: Math.min(Number(old.createdAt || Date.now()), Number(next.createdAt || Date.now())),
                 updatedAt: Math.max(Number(old.updatedAt || 0), Number(next.updatedAt || 0)),
                 deviceId: preferred.deviceId || secondary.deviceId || EH.Device.id(),
@@ -18100,6 +18258,21 @@
             if (merged.cpf) EH.PassengerMemory?.upsert?.({ cpf:merged.cpf, name:merged.name, birthDate:merged.birthDate, updatedAt:merged.updatedAt }, { fromSync });
             return merged;
         },
+        attachDocument(id,metadata={}){
+            const rows=this.load(),index=rows.findIndex(row=>String(row.id||row.emissionId)===String(id||''));if(index<0)return null;
+            const current=this.normalize(rows[index]),next=this.normalize({...current,...metadata,id:current.id,emissionId:current.emissionId,updatedAt:Date.now(),deviceId:EH.Device.id(),syncState:EH.Sync?.configured?.()?'pending':'local'});rows[index]=next;EH.Storage.set(this.KEY,rows);EH.Sync?.markPendingRecord?.('emission',next.id);EH.ContextualPanels?.refresh?.('tickets');return next;
+        },
+        markDocumentAction(id,action){
+            const patch=action==='printed'?{printedAt:Date.now(),printStatus:'printed'}:action==='downloaded'?{downloadedAt:Date.now()}:{};const saved=this.attachDocument(id,patch);if(saved&&action==='printed')this.markStatus(id,'printed');return saved;
+        },
+        postStatus(item={}){
+            const row=this.normalize(item);if(this.statusRank(row.printStatus)>=this.statusRank('completed'))return'Concluída';if(row.shareStatus==='shared')return'Compartilhada';if(row.documentState==='official-url'||(row.documentState==='captured-local'&&row.documentDeviceId===EH.Device.id()))return'Documento oficial disponível';if(row.documentState==='captured-local')return'Localizar documento neste computador';if(row.shareStatus==='found'||row.ticketNumber)return'Bilhete localizado';return'Aguardando localização';
+        },
+        recent({limit=300}={}){return this.load().map(row=>this.normalize(row)).filter(row=>this.isIssued(row)).sort((a,b)=>Number(b.issuedAt||b.updatedAt||0)-Number(a.issuedAt||a.updatedAt||0)).slice(0,Math.max(1,limit));},
+        destinationLabel(value){const clean=EH.Utils.clean(value||'').replace(/\s*-\s*\d+\s*$/,'').replace(/\s*-\s*[A-Z]{2}\s*$/i,'').trim();return clean||'DESTINO NÃO IDENTIFICADO';},
+        groupsByDestination(items=this.recent()){
+            const groups=new Map();items.forEach(item=>{const label=this.destinationLabel(item.destination),key=EH.Utils.normalize(label);if(!groups.has(key))groups.set(key,{key,label,items:[]});groups.get(key).items.push(item);});return Array.from(groups.values()).sort((a,b)=>a.label.localeCompare(b.label,'pt-BR'));
+        },
         issueStatusForPage(page='') {
             // Rota é contexto de interface, nunca comprovante de negócio.
             return page==='pagamento'?'payment':page==='confirmacao'?'confirmed':'draft';
@@ -18107,6 +18280,7 @@
         captureSale(sale, { page = '' } = {}) {
             if(!sale?.id||!Array.isArray(sale.passengers)||!sale.passengers.length)return 0;
             const issueStatus=this.issueStatusForPage(page||EH.Pages?.detect?.()||'');
+            const attendance=EH.Attendance?.load?.()||{},journey=attendance.journey||attendance.trips?.[attendance.currentLeg||'ida']||{},payment=attendance.payment||{};
             let count=0;
             sale.passengers.forEach(passenger=>{
                 const cpf=this.normalizeCpf(passenger?.cpf||'');
@@ -18115,11 +18289,12 @@
                     id:`sale:${sale.id}:${passenger.id||`p-${cpf}`}`,
                     saleId:String(sale.id),salePassengerId:String(passenger.id||`p-${cpf}`),
                     cpf,name:passenger.name,birthDate:passenger.birthDate,
-                    origin:sale.origem||sale.origin||'',destination:sale.destino||sale.destination||'',
-                    travelDate:sale.data||sale.travelDate||'',travelTime:sale.horario||sale.time||'',
-                    service:sale.service||'',line:sale.line||'',seat:passenger.seat||sale.seat||'',
-                    paymentMethod:sale.paymentMethod||sale.formaPagamento||'',
-                    paymentValue:Number(sale.valorFinal||sale.total||0),
+                    attendanceId:attendance.id||'',requestId:attendance.requisition?.id||attendance.requisitionRefs?.[0]||'',legType:attendance.currentLeg==='volta'?'volta':'ida',
+                    origin:sale.origem||sale.origin||journey.origin||'',destination:sale.destino||sale.destination||journey.destination||'',
+                    travelDate:sale.data||sale.travelDate||journey.date||'',travelTime:sale.horario||sale.time||journey.departure||'',
+                    service:sale.service||journey.service||'',line:sale.line||journey.line||'',seat:passenger.seat||sale.seat||journey.seat||'',
+                    paymentMethod:sale.paymentMethod||sale.formaPagamento||payment.method||'',
+                    paymentValue:Number(sale.valorFinal||sale.total||payment.value||journey.value||0),
                     ticketStatus:passenger.ticketStatus||'pending',
                     issueStatus,printStatus:'pending',checkStatus:'pending',
                     createdAt:Number(passenger.createdAt||sale.createdAt||Date.now()),
@@ -18197,10 +18372,34 @@
         },
         maskCpf(cpf){return EH.SaleContext?.maskCpfPublic?.(cpf)||'CPF não identificado';},
         async copyCpf(item){const cpf=this.normalizeCpf(item?.cpf);if(cpf.length!==11)return EH.Toast.warning('CPF não disponível nesta emissão.');await EH.Clipboard.copyText(cpf);EH.Toast.success('CPF copiado.');return true;},
+        cardIdentity(card){const summary=EH.Tickets?.summary?.(card)||{};return{...summary,rawNormalized:EH.Utils.normalize(summary.raw||card?.innerText||card?.textContent||'')};},
         matchTicketCards(item,cards=EH.Tickets?.findCards?.()||[]){
-            const row=this.normalize(item||{});if(!cards?.length)return[];if(row.ticketNumber)return cards.filter(card=>EH.Utils.clean(EH.Tickets?.summary?.(card)?.ticket||'')===row.ticketNumber);
-            const origin=EH.Utils.normalize(row.origin||''),destination=EH.Utils.normalize(row.destination||''),service=String(row.service||'');
-            return cards.filter(card=>{const raw=EH.Utils.normalize(card?.innerText||card?.textContent||''),summary=EH.Tickets?.summary?.(card)||{};if(origin&&!raw.includes(origin))return false;if(destination&&!raw.includes(destination))return false;if(service&&summary.service&&String(summary.service)!==service)return false;if(row.seat&&summary.seat&&String(summary.seat)!==String(row.seat))return false;return Boolean(origin&&destination);});
+            const row=this.normalize(item||{});if(!cards?.length)return[];
+            const identities=cards.map(card=>({card,identity:this.cardIdentity(card)}));
+            if(row.ticketNumber)return identities.filter(({identity})=>EH.Utils.clean(identity.ticket||'')===row.ticketNumber).map(entry=>entry.card);
+            if(row.locator){const exact=identities.filter(({identity})=>EH.Utils.clean(identity.locator||'')===row.locator).map(entry=>entry.card);if(exact.length)return exact;}
+            if(row.saleReference){const exact=identities.filter(({identity})=>EH.Utils.clean(identity.saleReference||'')===row.saleReference).map(entry=>entry.card);if(exact.length)return exact;}
+            const origin=EH.Utils.normalize(row.origin||''),destination=EH.Utils.normalize(row.destination||''),service=String(row.service||''),seat=EH.Utils.clean(row.seat||''),date=String(row.travelDate||''),time=String(row.travelTime||'');
+            return identities.filter(({identity})=>{
+                let score=0;const raw=identity.rawNormalized;
+                if(origin&&destination){if(!raw.includes(origin)||!raw.includes(destination))return false;score+=2;}
+                if(date&&identity.travelDate){if(date!==identity.travelDate)return false;score+=1;}
+                if(time&&identity.travelTime){if(time!==identity.travelTime)return false;score+=1;}
+                if(service&&identity.service){if(service!==String(identity.service))return false;score+=1;}
+                if(seat&&identity.seat){if(seat!==EH.Utils.clean(identity.seat))return false;score+=1;}
+                return score>=3;
+            }).map(entry=>entry.card);
+        },
+        itemFromCard(emission,card){
+            const row=this.normalize(emission),data=EH.Tickets?.extractTicketData?.(card),summary=EH.Tickets?.summary?.(card)||{};if(!data?.tickets?.length)return null;
+            let tickets=data.tickets;if(row.ticketNumber)tickets=tickets.filter(ticket=>EH.Utils.clean(ticket.number||'')===row.ticketNumber);
+            else tickets=tickets.filter(ticket=>{const travel=EH.Reminders?.parseTravel?.(ticket.date)||{};if(row.travelDate&&travel.key&&row.travelDate!==travel.key)return false;if(row.origin&&EH.Utils.normalize(ticket.origin||'')!==EH.Utils.normalize(row.origin))return false;if(row.destination&&EH.Utils.normalize(ticket.destination||'')!==EH.Utils.normalize(row.destination))return false;return true;});
+            if(tickets.length!==1)return null;const ticket={...tickets[0],locator:data.locator||summary.locator||row.locator||''};
+            return{passengerId:row.salePassengerId||null,saleId:row.saleId,salePassengerId:row.salePassengerId,cpf:row.cpf,name:row.name,data:{...data,tickets:[ticket],summary},tickets:[ticket],ticket,service:summary.service||row.service,seat:summary.seat||row.seat,value:summary.value||row.paymentValue,paymentMethod:row.paymentMethod,saleReference:data.saleReference||summary.saleReference||row.saleReference||row.saleId,locator:ticket.locator};
+        },
+        captureMatchedCards(emission,cards=EH.Tickets?.findCards?.()||[]){
+            const row=this.normalize(emission),matches=this.matchTicketCards(row,cards);if(matches.length!==1)return 0;let payload;try{payload=this.itemFromCard(row,matches[0]);}catch(error){EH.Logger.debug('O cartão correspondente ainda não pôde ser lido:',error);return 0;}if(!payload)return 0;
+            const count=EH.Reminders?.captureItems?.([payload],{confirmedEvidence:true,automatic:true,quiet:true})||this.captureItems([payload]);const saved=this.load().map(item=>this.normalize(item)).find(item=>item.ticketNumber===EH.Utils.clean(payload.ticket?.number||'')||item.id===row.id)||row;EH.TicketDocuments?.captureForEmission?.(saved,matches[0]).catch?.(error=>EH.Logger.debug('Documento oficial ainda não pôde ser armazenado:',error));return count||1;
         },
         openTicket(item){
             const matches=this.matchTicketCards(item);if(matches.length!==1)return EH.Toast.warning(matches.length?'Mais de um bilhete corresponde à emissão. Confira antes de selecionar.':'O bilhete desta emissão ainda não está visível. Use Buscar CPF primeiro.');
@@ -18217,11 +18416,9 @@
             this.searchBusy=true;try{await EH.SaleContext.searchTicket({...item,emissionId:item.id});EH.Storage.remove('emissionMemory.pendingSearch.v1');}finally{this.searchBusy=false;}
         },
         renderShareQueue(body){
-            const items=this.shareQueue();if(!items.length)return null;const activeKey='emissionMemory.activeShare.v1';let selectedId=String(EH.Storage.get(activeKey,'')||'');if(!items.some(item=>item.id===selectedId))selectedId=items[0].id;EH.Storage.set(activeKey,selectedId);const item=items.find(row=>row.id===selectedId)||items[0];
-            const wrap=document.createElement('section');wrap.className='eh-requisition-context eh-share-queue';const title=document.createElement('strong');title.textContent=`BILHETES PARA COMPARTILHAR • ${items.length}`;wrap.appendChild(title);
-            if(items.length>1){const select=document.createElement('select');items.forEach((row,index)=>{const option=document.createElement('option');option.value=row.id;option.selected=row.id===item.id;option.textContent=`${index+1}. ${row.name||'Passageiro'} — ${[row.origin,row.destination].filter(Boolean).join(' × ')}`;select.appendChild(option);});select.addEventListener('change',()=>{EH.Storage.set(activeKey,select.value);EH.ContextualPanels?.refresh?.('tickets');});wrap.appendChild(select);}
-            const meta=document.createElement('div');meta.className='eh-context-data';meta.append(EH.ContextualPanels.cell('Nome',item.name),EH.ContextualPanels.cell('CPF',this.maskCpf(item.cpf)),EH.ContextualPanels.cell('Rota',[item.origin,item.destination].filter(Boolean).join(' → ')),EH.ContextualPanels.cell('Trecho',item.legType==='volta'?'Volta':'Ida'),EH.ContextualPanels.cell('Bilhete',item.ticketNumber||item.locator),EH.ContextualPanels.cell('Status',item.shareStatus==='found'?'Bilhete localizado':'Aguardando localização'));wrap.appendChild(meta);
-            const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Buscar CPF',()=>this.searchTicket(item),'primary'),EH.ContextualPanels.action('Copiar CPF',()=>this.copyCpf(item)),EH.ContextualPanels.action('Abrir bilhete',()=>this.openTicket(item)),EH.ContextualPanels.action('Marcar como enviado',()=>{if(!window.confirm('Confirmar que este bilhete foi compartilhado com o passageiro?'))return;this.markShareStatus(item.id,'shared',{channel:'manual-confirmed'});EH.Toast.success('Bilhete marcado como compartilhado.');},'success'));wrap.appendChild(actions);body.appendChild(wrap);return wrap;
+            const items=this.recent();if(!items.length)return null;const groups=this.groupsByDestination(items),activeGroupKey='emissionMemory.activeDestination.v1',activeEmissionKey='emissionMemory.activeShare.v1';let activeGroup=String(EH.Storage.get(activeGroupKey,'')||'');if(!groups.some(group=>group.key===activeGroup))activeGroup=groups[0].key;const wrap=document.createElement('section');wrap.className='eh-emission-recent';const title=document.createElement('strong');title.textContent=`EMISSÕES RECENTES • ${items.length}`;wrap.appendChild(title);
+            groups.forEach(group=>{const details=document.createElement('details');details.className='eh-emission-group';details.open=group.key===activeGroup;const summary=document.createElement('summary');summary.textContent=`${group.label.toLocaleUpperCase('pt-BR')} — ${group.items.length}`;details.appendChild(summary);details.addEventListener('toggle',()=>{if(details.open){EH.Storage.set(activeGroupKey,group.key);Array.from(wrap.querySelectorAll('.eh-emission-group')).forEach(other=>{if(other!==details)other.open=false;});EH.PanelAutoFit?.schedule?.(body.closest?.('.eh-context-panel'),'emission-group');}});
+                group.items.forEach((item,index)=>{const card=document.createElement('article');card.className='eh-emission-item';const meta=document.createElement('div');meta.className='eh-context-data';meta.append(EH.ContextualPanels.cell('Número do bilhete',item.ticketNumber||item.locator),EH.ContextualPanels.cell('Nome',item.name),EH.ContextualPanels.cell('Horário',item.travelTime),EH.ContextualPanels.cell('Poltrona',item.seat),EH.ContextualPanels.cell('Status',this.postStatus(item)));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Buscar',()=>{EH.Storage.set(activeEmissionKey,item.id);this.searchTicket(item);},'primary'),EH.ContextualPanels.action('Abrir',()=>EH.TicketDocuments?.open?.(item)),EH.ContextualPanels.action('Baixar',()=>EH.TicketDocuments?.download?.(item)),EH.ContextualPanels.action('Imprimir',()=>EH.TicketDocuments?.print?.(item)),EH.ContextualPanels.action('Preparar para escanear',()=>EH.TicketDocuments?.open?.(item,{scan:true})),EH.ContextualPanels.action('Compartilhar',async()=>{try{await EH.TicketDocuments?.share?.(item);}catch(error){EH.Toast.error(error?.message||'Não foi possível compartilhar o documento oficial.');}},'success'),EH.ContextualPanels.action('Concluir',()=>{if(!window.confirm(`Concluir a operação do bilhete ${item.ticketNumber||item.locator||index+1}?`))return;this.markStatus(item.id,'completed');EH.ContextualPanels?.refresh?.('tickets');}));card.append(meta,actions);details.appendChild(card);});wrap.appendChild(details);});body.appendChild(wrap);return wrap;
         },
         renderPendingBlock({ excludeSaleId = '' } = {}) {
             const items=this.pending({excludeSaleId});if(!items.length)return null;
@@ -18498,6 +18695,8 @@
         LAST_KEY: 'operationCars.lastMap.v4',
         SCHEDULE_KEY: 'operationCars.schedule.v2',
         SELECTED_KEY: 'operationCars.selected.v2',
+        ACTIVE_PASSENGER_KEY: 'operationCars.activePassenger.v1',
+        PENDING_SEARCH_KEY: 'operationCars.pendingSearch.v1',
         lastDomSignature: '',
         lastMapKey: '',
         stylesInjected: false,
@@ -18515,6 +18714,8 @@
         mapOpenedAt: 0,
         pendingMapFingerprint: '',
         pendingMapSince: 0,
+        verifyBusy: false,
+        passengerSearchBusy: false,
         mapAnalysis: { state:'idle', message:'Aguardando o mapa do E-Pass.', records:[], signature:'', diagnostic:'' },
 
         normalize(value) {
@@ -19289,6 +19490,11 @@
                 return{state:'error',message:'Não foi possível verificar este mapa.',records:unique,signature,diagnostic:details.join(' • ')};
             }
             const valid=unique.filter(record=>record.agency?.exists&&!record.agency?.multiple);
+            const passengerMismatch=valid.filter(record=>{
+                const agency=record.agency||{};
+                return Number(agency.board||0)!==(agency.boarders?.length||0)||Number(agency.alight||0)!==(agency.alighters?.length||0);
+            });
+            if(passengerMismatch.length)return{state:'error',message:'Não foi possível verificar este mapa.',records:unique,signature,diagnostic:`As contagens da agência ${this.agencyCode()} não conferem com a lista individual de passageiros.`};
             const board=valid.reduce((sum,record)=>sum+Number(record.agency.board||0),0);
             const alight=valid.reduce((sum,record)=>sum+Number(record.agency.alight||0),0);
             const passengers=valid.reduce((sum,record)=>sum+(record.agency.boarders?.length||0)+(record.agency.alighters?.length||0),0);
@@ -19341,7 +19547,7 @@
 
         watchCurrentMap() {
             const modal=EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL);
-            if(!modal){if(this.mapObservedRoot)this.disconnectMapObserver();return;}
+            if(!modal){if(this.mapObservedRoot)this.disconnectMapObserver({reset:!this.activeMapPassenger()});return;}
             const root=modal.querySelector?.('.nsm-body')||modal;
             if(this.mapObservedRoot!==root){
                 this.disconnectMapObserver({reset:false});
@@ -19353,6 +19559,23 @@
             }
             const fingerprint=this.mapDomFingerprint(modal);
             if(fingerprint!==this.pendingMapFingerprint)this.scheduleMapAnalysis('nova versão do mapa');
+        },
+
+        async verifyOpenMap() {
+            if(this.verifyBusy)return;
+            this.verifyBusy=true;
+            this.publishMapAnalysis({state:'loading',message:'Aguardando o carregamento do mapa…',records:this.mapAnalysis?.records||[],signature:this.mapAnalysis?.signature||'',diagnostic:'Verificação manual iniciada.'});
+            try{
+                const modal=await EH.Utils.waitFor(()=>EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL),5200,180);
+                if(!modal){this.publishMapAnalysis({state:'error',message:'Não foi possível verificar este mapa.',records:[],signature:`manual-error:${Date.now()}`,diagnostic:'Abra o Mapa de Viagem do E-Pass e tente novamente.'});return false;}
+                this.watchCurrentMap();
+                this.scheduleMapAnalysis('verificação manual');
+                return true;
+            }catch(error){
+                EH.Logger.debug('Falha ao aguardar o mapa aberto:',error);
+                this.publishMapAnalysis({state:'error',message:'Não foi possível verificar este mapa.',records:[],signature:`manual-error:${Date.now()}`,diagnostic:'O mapa não terminou de carregar no tempo esperado.'});
+                return false;
+            }finally{this.verifyBusy=false;}
         },
 
         loadMaps() {
@@ -19705,63 +19928,113 @@
             await EH.Clipboard.copyText(cpf);EH.Toast.success('CPF copiado.');
         },
 
-        openMapPassenger(passenger,record) {
-            const reminder=EH.Reminders?.matchPassenger?.(passenger,record);
-            const cpf=String(passenger?.cpf||reminder?.cpf||'').replace(/\D/g,'').slice(0,11);
-            if(cpf.length===11)return EH.Reminders?.searchTicket?.(reminder||{...passenger,cpf,id:''});
+        mapPassengerIdentity(passenger={},record={},movement='') {
+            const type=movement||passenger.movement||passenger._movement||'';
+            const document=EH.Utils.clean(passenger.ticket||passenger.locator||'');
+            const cpf=String(passenger.cpf||'').replace(/\D/g,'').slice(0,11);
+            const personal=document||[cpf,EH.Utils.normalize(passenger.name||''),EH.Utils.clean(passenger.seat||'')].join(':');
+            return[record.mapKey||'',record.date||'',record.service||passenger.service||'',type,personal].join('|');
+        },
+
+        analysisRows(records=this.mapAnalysis?.records||[]) {
+            const unique=new Map();
+            (records||[]).filter(record=>record?.agency?.exists&&!record.agency.multiple).forEach(record=>{
+                const add=(passenger,movement)=>{const contextualPassenger={...passenger,movement};const identity=this.mapPassengerIdentity(contextualPassenger,record,movement);if(!identity||unique.has(identity))return;unique.set(identity,{identity,passenger:contextualPassenger,record,movement,reminder:EH.Reminders?.matchPassenger?.(contextualPassenger,record)||null});};
+                (record.agency.boarders||[]).forEach(passenger=>add(passenger,'board'));
+                (record.agency.alighters||[]).forEach(passenger=>add(passenger,'alight'));
+            });
+            return Array.from(unique.values()).sort((a,b)=>{const seatA=Number(String(a.passenger.seat||'').match(/\d+/)?.[0]||9999),seatB=Number(String(b.passenger.seat||'').match(/\d+/)?.[0]||9999);return seatA-seatB||a.movement.localeCompare(b.movement)||String(a.passenger.name||'').localeCompare(String(b.passenger.name||''),'pt-BR');});
+        },
+
+        activeMapPassenger() {
+            const value=EH.Storage.get(this.ACTIVE_PASSENGER_KEY,null);
+            return value&&typeof value==='object'&&value.identity?value:null;
+        },
+
+        setActiveMapPassenger(row) {
+            if(!row?.identity)return null;
+            const cpf=String(row.passenger?.cpf||row.reminder?.cpf||'').replace(/\D/g,'').slice(0,11);
+            const value={identity:row.identity,reminderId:String(row.reminder?.id||''),mapKey:String(row.record?.mapKey||''),movement:row.movement,cpf,name:EH.Utils.clean(row.passenger?.name||row.reminder?.name||''),updatedAt:Date.now()};
+            EH.Storage.set(this.ACTIVE_PASSENGER_KEY,value);EH.ContextualPanels?.refresh?.('operation');EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');return value;
+        },
+
+        clearActiveMapPassenger(identity='') {
+            const active=this.activeMapPassenger();if(identity&&active?.identity!==identity)return false;
+            EH.Storage.remove(this.ACTIVE_PASSENGER_KEY);EH.Storage.remove(this.PENDING_SEARCH_KEY);EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');return true;
+        },
+
+        async runPendingPassengerSearch() {
+            if(this.passengerSearchBusy||EH.Pages?.detect?.()!=='passagens')return false;
+            const pending=EH.Storage.get(this.PENDING_SEARCH_KEY,null);
+            if(!pending?.cpf||Number(pending.expiresAt||0)<Date.now()){if(pending)EH.Storage.remove(this.PENDING_SEARCH_KEY);return false;}
+            const input=EH.Utils.first(EH.Selectors.PASSAGENS_CPF_INPUT);if(!input)return false;
+            this.passengerSearchBusy=true;
+            try{
+                // Limpa o CPF anterior pelos mesmos eventos aceitos pelo Angular.
+                EH.SaleContext.setNativeValue(input,'');await EH.Utils.sleep(45);
+                EH.SaleContext.setNativeValue(input,EH.SaleContext.maskCpf(pending.cpf));input.focus();await EH.Utils.sleep(90);input.blur();
+                const button=EH.SaleContext.findSearchButton(input),form=input.closest('form');
+                if(button)button.click();else if(form?.requestSubmit)form.requestSubmit();else form?.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true}));
+                EH.Storage.remove(this.PENDING_SEARCH_KEY);EH.Toast.success(`CPF de ${pending.name||'passageiro do mapa'} preenchido e busca iniciada.`);return true;
+            }catch(error){EH.Logger.debug('Busca sequencial do Mapa 287 falhou:',error);EH.Toast.warning('Não foi possível buscar a passagem deste passageiro.');return false;}
+            finally{this.passengerSearchBusy=false;}
+        },
+
+        async openMapPassenger(passenger,record) {
+            const movement=passenger?.movement||passenger?._movement||'';const reminder=EH.Reminders?.matchPassenger?.(passenger,record);const row={identity:this.mapPassengerIdentity(passenger,record,movement),passenger:{...passenger,movement},record,movement,reminder};
+            const active=this.setActiveMapPassenger(row);const cpf=String(passenger?.cpf||reminder?.cpf||'').replace(/\D/g,'').slice(0,11);
+            if(cpf.length===11){EH.Storage.set(this.PENDING_SEARCH_KEY,{cpf,identity:active.identity,reminderId:active.reminderId,mapKey:active.mapKey,name:active.name,expiresAt:Date.now()+300000});if(EH.Pages?.detect?.()==='passagens')return this.runPendingPassengerSearch();EH.SaleContext?.navigateToPassagens?.();return true;}
             const ticket=EH.Utils.clean(passenger?.ticket||passenger?.locator||'');
-            if(ticket){EH.Clipboard.copyText(ticket);EH.SaleContext?.navigateToPassagens?.();EH.Toast.info('Bilhete/localizador copiado. Consulte a passagem no E-Pass para obter o CPF.');return;}
-            EH.SaleContext?.navigateToPassagens?.();EH.Toast.warning('CPF não disponível no mapa. A consulta foi aberta para conferência manual.');
+            if(ticket){await EH.Clipboard.copyText(ticket);EH.SaleContext?.navigateToPassagens?.();EH.Toast.info('Bilhete/localizador copiado. O CPF não está disponível no mapa para busca automática.');return true;}
+            EH.Toast.warning('CPF não disponível neste passageiro do mapa.');return false;
+        },
+
+        markMapPassengerStatus(row,status) {
+            if(!row?.reminder?.id)return EH.Toast.warning('Não foi possível relacionar este passageiro ao registro do mapa.');
+            const saved=EH.Reminders?.markStatus?.(row.reminder.id,status);if(!saved)return false;
+            if(EH.Reminders?.isDoneStatus?.(saved.status))this.clearActiveMapPassenger(row.identity);
+            EH.ContextualPanels?.refresh?.('operation');return true;
         },
 
         renderContext(body) {
-            const queue=document.createElement('div');queue.className='eh-context-operational-queue';
-            EH.Reminders?.renderOperational?.(queue,{mode:'active',compact:true});body.appendChild(queue);
-            const queueActions=document.createElement('div');queueActions.className='eh-context-actions';
-            queueActions.append(EH.ContextualPanels.action('Fila completa',()=>EH.Reminders?.openModal?.('active'),'primary'),EH.ContextualPanels.action('Pendente de conferência',()=>EH.Reminders?.openModal?.('review')));body.appendChild(queueActions);
+            body.classList.add('eh-map-287-context');
             const analysis=this.mapAnalysis||{state:'idle',message:'Aguardando o mapa do E-Pass.',records:[]};
             const message=document.createElement('div');message.className='eh-context-empty';message.textContent=analysis.message;
             if(analysis.state==='idle'||analysis.state==='loading'){
                 const actions=document.createElement('div');actions.className='eh-context-actions';
-                if(analysis.state==='idle')actions.append(EH.ContextualPanels.action('Verificar mapa aberto',()=>this.watchCurrentMap(),'primary'));
+                if(analysis.state==='idle')actions.append(EH.ContextualPanels.action('Verificar mapa aberto',()=>this.verifyOpenMap(),'primary'));
                 body.append(message,actions);return;
             }
             if(analysis.state==='empty'){
-                const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Verificar novamente',()=>this.scheduleMapAnalysis('verificação manual')));
+                const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Verificar novamente',()=>this.verifyOpenMap()));
                 body.append(message,actions);return;
             }
             if(analysis.state==='error'){
                 const details=document.createElement('details');const summary=document.createElement('summary');summary.textContent='Ver detalhes';const text=document.createElement('div');text.className='eh-pref-error-details';text.textContent=analysis.diagnostic||'A estrutura real do mapa não pôde ser confirmada.';details.append(summary,text);
-                const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Tentar novamente',()=>this.scheduleMapAnalysis('nova tentativa'),'primary'));
+                const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Tentar novamente',()=>this.verifyOpenMap(),'primary'));
                 body.append(message,details,actions);return;
             }
-            const records=(analysis.records||[]).filter(record=>record?.agency?.exists&&!record.agency.multiple);
-            const metrics=document.createElement('div');metrics.className='eh-context-data';metrics.append(EH.ContextualPanels.cell('Embarques',String(analysis.board||0)),EH.ContextualPanels.cell('Desembarques',String(analysis.alight||0)));body.appendChild(metrics);
+            const rows=this.analysisRows(analysis.records||[]),active=this.activeMapPassenger(),remaining=rows.filter(row=>!EH.Reminders?.isDoneStatus?.(row.reminder?.status)).length;
+            const header=document.createElement('header');header.className='eh-map-287-header';const title=document.createElement('strong');title.textContent=`AGÊNCIA ${this.agencyCode()}`;const counters=document.createElement('span');counters.textContent=`Embarques: ${analysis.board||0} | Desembarques: ${analysis.alight||0} | Restantes: ${remaining}`;header.append(title,counters);body.appendChild(header);
             const list=document.createElement('div');list.className='eh-operation-passenger-list';
-            const rows=[];records.forEach(record=>{
-                (record.agency.boarders||[]).forEach(passenger=>rows.push({passenger,record,movement:'board'}));
-                (record.agency.alighters||[]).forEach(passenger=>rows.push({passenger,record,movement:'alight'}));
-            });
-            rows.sort((a,b)=>Number(String(a.passenger.seat||'').match(/\d+/)?.[0]||9999)-Number(String(b.passenger.seat||'').match(/\d+/)?.[0]||9999));
-            rows.forEach(({passenger,record,movement})=>{
-                const contextualPassenger={...passenger,movement};
-                const row=document.createElement('article');row.className='eh-operation-passenger';
+            rows.forEach(entry=>{
+                const {passenger,record,movement,reminder,identity}=entry;const row=document.createElement('article');row.className=`eh-operation-passenger${active?.identity===identity?' is-active':''}${EH.Reminders?.isDoneStatus?.(reminder?.status)?' is-completed':''}`;row.dataset.mapPassengerId=identity;
                 const seat=document.createElement('strong');seat.className='eh-operation-seat';seat.textContent=this.seatLabel(passenger.seat);
                 const info=document.createElement('div');info.className='eh-operation-passenger-info';
                 const name=document.createElement('strong');name.textContent=passenger.name||'Passageiro sem nome';
-                const cpf=String(passenger.cpf||'').replace(/\D/g,'').slice(0,11);const meta=document.createElement('small');meta.textContent=`${movement==='alight'?'Desembarque':'Embarque'} • ${cpf.length===11?EH.SaleContext.maskCpf(cpf):'CPF precisa ser consultado'}`;
-                const reminder=EH.Reminders?.matchPassenger?.(contextualPassenger,record);const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders?.isDoneStatus?.(reminder?.status)?'done':'pending'}`;
+                const cpf=String(passenger.cpf||reminder?.cpf||'').replace(/\D/g,'').slice(0,11);const meta=document.createElement('small');meta.textContent=`${movement==='alight'?'Desembarque':'Embarque'} • ${cpf.length===11?EH.SaleContext.maskCpf(cpf):'CPF não disponível'}`;
+                const state=document.createElement('small');state.className=`eh-operation-reminder-state ${EH.Reminders?.isDoneStatus?.(reminder?.status)?'done':'pending'}`;
                 const statusLabels={pending:'Pendente',checked:'Conferido',printed:'Impresso',completed:'Concluído',concluded:'Concluído'};
-                state.textContent=reminder?`Lembrete: ${statusLabels[String(reminder.status||'pending').toLowerCase()]||'Pendente'}`:'Lembrete pendente de criação';
+                state.textContent=`Status: ${reminder?(statusLabels[String(reminder.status||'pending').toLowerCase()]||'Pendente'):'Pendente'}`;
                 const actions=document.createElement('div');actions.className='eh-operation-detail-actions';
-                const copy=document.createElement('button');copy.type='button';copy.className='eh-modal-btn';copy.textContent='Copiar CPF';copy.disabled=cpf.length!==11;copy.addEventListener('click',()=>this.copyMapCpf(passenger));
-                const search=document.createElement('button');search.type='button';search.className='eh-modal-btn primary';search.textContent='Buscar passagem';search.addEventListener('click',()=>this.openMapPassenger(contextualPassenger,record));
-                const statusButton=(label,status)=>{const button=document.createElement('button');button.type='button';button.className='eh-modal-btn';button.textContent=label;button.disabled=!reminder;button.addEventListener('click',()=>{if(reminder)EH.Reminders.markStatus(reminder.id,status);EH.ContextualPanels.refresh('operation');});return button;};
-                actions.append(copy,search,statusButton('Conferido','checked'),statusButton('Impresso','printed'),statusButton('Concluir','completed'));
+                const copy=document.createElement('button');copy.type='button';copy.className='eh-modal-btn';copy.textContent='Copiar CPF';copy.disabled=cpf.length!==11;copy.addEventListener('click',()=>this.copyMapCpf({...passenger,cpf}));
+                const search=document.createElement('button');search.type='button';search.className='eh-modal-btn primary';search.textContent='Buscar passagem';search.disabled=cpf.length!==11;search.addEventListener('click',()=>this.openMapPassenger(passenger,record));
+                const statusButton=(label,status)=>{const button=document.createElement('button');button.type='button';button.className='eh-modal-btn';button.textContent=label;button.disabled=!reminder||(status==='completed'&&EH.Reminders?.isDoneStatus?.(reminder.status));button.addEventListener('click',()=>this.markMapPassengerStatus(entry,status));return button;};
+                actions.append(copy,search,statusButton('Conferir','checked'),statusButton('Impresso','printed'),statusButton('Concluir','completed'));
                 info.append(name,meta,state,actions);row.append(seat,info);list.appendChild(row);
             });
             body.appendChild(list);
-            const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(EH.ContextualPanels.action('Ver detalhes',()=>records.length===1?this.showDetails(records[0]):this.showCars()),EH.ContextualPanels.action('Verificar novamente',()=>this.scheduleMapAnalysis('verificação manual')));body.appendChild(actions);
+            const actions=document.createElement('div');actions.className='eh-context-actions eh-map-287-footer';actions.append(EH.ContextualPanels.action('Verificar novamente',()=>this.verifyOpenMap()));body.appendChild(actions);EH.PanelAutoFit?.schedule?.(body.closest?.('.eh-context-panel'),'map-287-list');
         },
 
         render() {
@@ -19867,6 +20140,7 @@
                 .eh-operation-empty{padding:18px;border:1px dashed #d9e0e7;border-radius:9px;color:#718092;text-align:center;font-size:11px}.eh-operation-warning{padding:9px 10px;border:1px solid #f0cfaa;border-radius:8px;background:#fff8ee;color:#8b561f;font-size:10px}.eh-operation-detail-summary{display:grid;gap:8px}.eh-operation-detail-metrics{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px}.eh-operation-detail-metrics>div{display:grid;gap:3px;padding:9px;border:1px solid #e2e8ee;border-radius:8px;font-size:9px}.eh-operation-detail-metrics strong{font-size:16px}.eh-operation-detail-actions{display:flex;flex-wrap:wrap;gap:7px}
                 .eh-operation-group-title{margin:8px 0 2px;color:#536175;font-size:9px;font-weight:950;letter-spacing:.4px}.eh-operation-day-row{display:grid;grid-template-columns:22px minmax(0,1fr) auto;align-items:center;gap:8px;padding:9px;border:1px solid #e2e7ed;border-radius:9px;background:#fbfcfd}.eh-operation-day-status{font-size:15px;font-weight:900;color:#517064}.eh-operation-day-info{min-width:0;display:grid;gap:3px}.eh-operation-day-info strong{font-size:11px}.eh-operation-day-info small{font-size:9.5px;color:#748091}
                 .eh-operation-reminder-state.pending{color:#a35d24!important}.eh-operation-reminder-state.done{color:#2d785f!important}
+                .eh-context-panel[data-panel="operation"] .eh-map-287-context{overflow:hidden!important;grid-template-rows:auto minmax(0,1fr) auto;align-content:stretch}.eh-map-287-header{display:grid;gap:3px;padding:8px 9px;border:1px solid var(--eh-border,#dbe3ec);border-radius:9px;background:var(--eh-surface-color,#f8fafc)}.eh-map-287-header strong{font-size:11px;color:var(--eh-text,#1f2937);letter-spacing:.05em}.eh-map-287-header span{font-size:9px;color:var(--eh-muted,#64748b);font-weight:750}.eh-map-287-context>.eh-operation-passenger-list{min-height:0;max-height:min(56vh,520px);overflow-y:auto;overscroll-behavior:contain;padding-right:3px}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger{transition:border-color .12s ease,background-color .12s ease}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger.is-active{border-color:var(--eh-primary,#2563eb);background:#eef6ff;box-shadow:0 0 0 2px rgba(37,99,235,.1)}.eh-map-287-context>.eh-operation-passenger-list .eh-operation-passenger.is-completed{opacity:.72;background:#f3faf6}.eh-map-287-context .eh-operation-detail-actions button{flex:1 1 82px;min-height:30px}.eh-map-287-footer{flex:0 0 auto}
                 .eh-operation-settings-list{display:grid;gap:8px;margin-top:8px}.eh-operation-settings-service{display:grid;grid-template-columns:100px minmax(180px,1.5fr) minmax(125px,1fr) minmax(125px,1fr);gap:7px;padding:9px;border:1px solid #e1e6ec;border-radius:9px;background:#fff}.eh-operation-settings-service .eh-check{align-self:end;min-height:36px}.eh-operation-settings-service .eh-remove-routine{align-self:end}.eh-operation-settings-service-note{grid-column:1/-1}
                 @media(max-width:760px){:is(#eh-root,#eh-operation-dock) .eh-operation-metrics{grid-template-columns:1fr 1fr}:is(#eh-root,#eh-operation-dock) .eh-operation-metric.balance{grid-column:1/-1}:is(#eh-root,#eh-operation-dock) .eh-operation-actions{grid-template-columns:1fr}.eh-operation-day-row{grid-template-columns:22px minmax(0,1fr)}.eh-operation-day-row>button,.eh-operation-search-actions{grid-column:1/-1}.eh-operation-detail-metrics{grid-template-columns:1fr}.eh-operation-settings-service{grid-template-columns:1fr}.eh-operation-settings-service-note{grid-column:auto}}
             `);
@@ -19876,12 +20150,13 @@
             if(page==='pesquisa')this.readScheduleResults();
             else if(!EH.Utils.first(EH.Selectors.MAPA_VIAGEM_MODAL))this.visibleScheduleRecords=[];
             this.watchCurrentMap();
+            if(page==='passagens')EH.Runtime.timeout('operation-map-passenger-search',()=>this.runPendingPassengerSearch(),420);
             this.render();
         },
 
         init() {
             if(this.started||EH.WhatsAppBridge.isWhatsAppHost())return;
-            this.started=true;this.injectStyles();this.watchCurrentMap();this.render();
+            this.started=true;this.injectStyles();this.watchCurrentMap();this.render();if(EH.Pages?.detect?.()==='passagens')EH.Runtime.timeout('operation-map-passenger-search-init',()=>this.runPendingPassengerSearch(),500);
         }
     };
 
@@ -23064,12 +23339,14 @@
         panels: new Map(),
         settingsButton: null,
         routeBusy: false,
+        scheduleBusy: new WeakSet(),
+        seatConfirmBusy: false,
         contexts: {
-            routes:['pesquisa'], seats:['reserva'], passenger:['reserva','passagens','requisicao'],
+            routes:['pesquisa'], schedules:['pesquisa'], seats:['reserva'], passenger:['reserva','passagens','requisicao'],
             payment:['pagamento'], confirmation:['confirmacao'], tickets:['passagens'], reminders:[],
             finance:['caixa','comissoes'], prefeitura:['requisicao'], operation:null, attendance:null
         },
-        titles: { routes:'Rotas', seats:'Poltronas', passenger:'Dados do passageiro', payment:'Pagamento e PIX', confirmation:'Resumo da compra', tickets:'Passagens emitidas', reminders:'Lembretes', finance:'Caixa', prefeitura:'Requisição da Prefeitura', operation:'Mapa do carro', attendance:'Atendimento ativo', menu:'Ferramentas' },
+        titles: { routes:'Rotas', schedules:'Horários', seats:'Poltronas', passenger:'Dados do passageiro', payment:'Pagamento', confirmation:'Resumo da compra', tickets:'Passagens emitidas', reminders:'Lembretes', finance:'Caixa', prefeitura:'Requisição da Prefeitura', operation:'Mapa do carro', attendance:'Atendimento ativo', menu:'Ferramentas' },
         init() {
             if (this.settingsButton || !document.body) return;
             // A UI antiga continua montada para reutilizar captura/configuração, mas deixa
@@ -23083,8 +23360,8 @@
                 html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:auto;min-width:270px;min-height:110px;overflow:hidden;resize:none;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
                 .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}.eh-request-context-selector{display:grid;gap:4px;color:#607286;font-size:8px;font-weight:800}.eh-request-context-selector select,.eh-share-queue>select{width:100%;min-height:32px;padding:5px 7px;border:1px solid #d3dce6;border-radius:7px;background:#fff;color:#30445a;font-size:9px}.eh-share-queue .eh-context-empty,.eh-request-route-hint .eh-context-empty{padding:6px;text-align:left}
                 #eh-general-settings,.eh-context-panel,.eh-context-panel-head,.eh-context-panel-body,.eh-context-route-choice,.eh-context-actions button,.eh-context-data div,.eh-requisition-context,.eh-request-context-selector select,.eh-share-queue>select{font-family:var(--eh-font-family,Inter,"Segoe UI",Arial,sans-serif);color:var(--eh-text,#1f2937);border-color:var(--eh-border,#dbe3ec);background:var(--eh-panel-color,#fff)}
-                .eh-context-panel-head,.eh-context-data div,.eh-requisition-context{background:var(--eh-surface-color,#f8fafc)}.eh-context-empty,.eh-context-data div,.eh-request-context-selector{color:var(--eh-muted,#64748b)}.eh-context-route-choice.is-selected,.eh-context-actions button.primary{border-color:var(--eh-primary,#2563eb)!important;color:var(--eh-primary,#2563eb)!important}.eh-context-panel{border-radius:var(--eh-panel-radius,15px)}
-                .eh-context-panel[data-panel="attendance"]{width:min(334px,calc(100vw - 24px));height:auto;min-height:0}.eh-attendance-section{display:grid;gap:6px}.eh-attendance-section>strong{font-size:9px;letter-spacing:.08em;color:var(--eh-muted,#64748b)}.eh-attendance-passenger-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.eh-attendance-passenger-grid>div:first-child{grid-column:1/-1}.eh-attendance-code-wait{padding:6px 7px!important;text-align:left!important;border-left:3px solid #d8a442;background:#fff9ed}.eh-attendance-compare{display:grid;gap:4px;padding:7px;border:1px solid var(--eh-border,#dbe3ec);border-radius:8px;background:var(--eh-surface-color,#f8fafc);font-size:9px}.eh-attendance-compare.is-match{border-color:#86c8a8;background:#f0faf5}.eh-attendance-compare.is-mismatch{border-color:#e1b15f;background:#fff9ed}.eh-attendance-compare b{font-size:10px;overflow-wrap:anywhere}
+                .eh-context-panel-head,.eh-context-data div,.eh-requisition-context{background:var(--eh-surface-color,#f8fafc)}.eh-context-empty,.eh-context-data div,.eh-request-context-selector{color:var(--eh-muted,#64748b)}.eh-context-route-choice.is-selected,.eh-context-actions button.primary{border-color:var(--eh-primary,#2563eb)!important;color:var(--eh-primary,#2563eb)!important}.eh-context-panel{border-radius:var(--eh-panel-radius,15px)}.eh-context-schedule{display:grid;gap:6px;padding:8px;border:1px solid var(--eh-border,#dbe3ec);border-radius:9px;background:var(--eh-panel-color,#fff)}.eh-context-schedule .eh-context-data{grid-template-columns:repeat(2,minmax(0,1fr))}.eh-context-schedule .eh-context-actions button{width:100%}
+                .eh-context-panel[data-panel="attendance"]{width:min(334px,calc(100vw - 24px));height:auto;min-height:0}.eh-attendance-section{display:grid;gap:6px}.eh-attendance-section>strong{font-size:9px;letter-spacing:.08em;color:var(--eh-muted,#64748b)}.eh-attendance-passenger-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.eh-attendance-passenger-grid>div:first-child{grid-column:1/-1}.eh-attendance-code-wait{padding:6px 7px!important;text-align:left!important;border-left:3px solid #d8a442;background:#fff9ed}.eh-attendance-compare{display:grid;gap:4px;padding:7px;border:1px solid var(--eh-border,#dbe3ec);border-radius:8px;background:var(--eh-surface-color,#f8fafc);font-size:9px}.eh-attendance-compare.is-match{border-color:#86c8a8;background:#f0faf5}.eh-attendance-compare.is-mismatch{border-color:#e1b15f;background:#fff9ed}.eh-attendance-compare b{font-size:10px;overflow-wrap:anywhere}.eh-emission-recent{display:grid;gap:7px}.eh-emission-recent>strong{font-size:10px;letter-spacing:.05em;color:var(--eh-muted,#64748b)}.eh-emission-group{border:1px solid var(--eh-border,#dbe3ec);border-radius:9px;background:var(--eh-panel-color,#fff);overflow:hidden}.eh-emission-group>summary{cursor:pointer;padding:9px 10px;font-size:10px;font-weight:900;color:var(--eh-text,#1f2937);background:var(--eh-surface-color,#f8fafc)}.eh-emission-item{display:grid;gap:6px;padding:8px;border-top:1px solid var(--eh-border,#dbe3ec)}.eh-emission-item .eh-context-actions button{flex:1 1 92px}
                 @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:calc(100vw - 16px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
@@ -23117,22 +23394,46 @@
         action(label,callback,className='') { const button=document.createElement('button');button.type='button';button.textContent=label;button.className=className;button.addEventListener('click',callback);return button; },
         nextAction(body, context=EH.Attendance?.load?.()) { const note=document.createElement('div');note.className='eh-context-empty eh-context-next-action';note.textContent=`Próxima ação: ${context?.nextAction||EH.Attendance?.nextActionFor?.(EH.Pages?.detect?.()||'desconhecida',context)||'Conferir a etapa atual.'}`;body.appendChild(note);return note; },
         renderRoutes(body) {
-            const hint=EH.RequestFlow?.renderScheduleHint?.(body);const routes=EH.QuickRoutes.active();body.classList.remove('eh-route-size-small','eh-route-size-normal','eh-route-size-large','eh-route-size-xlarge');body.classList.add(`eh-route-size-${EH.Config.CONTEXT_BUTTON_SIZE||'normal'}`);if(!routes.length){if(!hint){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota configurada.';body.appendChild(empty);}return;}
+            const routes=EH.QuickRoutes.active();body.classList.remove('eh-route-size-small','eh-route-size-normal','eh-route-size-large','eh-route-size-xlarge');body.classList.add(`eh-route-size-${EH.Config.CONTEXT_BUTTON_SIZE||'normal'}`);if(!routes.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Nenhuma rota configurada.';body.appendChild(empty);return;}
             const selectedId=String(EH.Storage.get('selectedQuickRouteId.v1','')||'');
             routes.forEach(route=>{
                 const card=document.createElement('article');card.className='eh-context-route';
-                const choose=this.action(EH.QuickRoutes.title(route),async()=>{if(this.routeBusy)return;this.routeBusy=true;body.querySelectorAll('.eh-context-route-choice').forEach(button=>{button.disabled=true;button.classList.remove('is-selected');button.setAttribute('aria-pressed','false');});choose.classList.add('is-selected');choose.setAttribute('aria-pressed','true');EH.Storage.set('selectedQuickRouteId.v1',route.id);try{await EH.QuickRoutes.search(route);}catch(error){EH.Toast?.error?.(error?.message||'Não foi possível pesquisar esta rota.');}finally{this.routeBusy=false;if(body.isConnected)body.querySelectorAll('.eh-context-route-choice').forEach(button=>{button.disabled=false;});}});choose.className='eh-context-route-choice';choose.classList.toggle('is-selected',String(route.id)===selectedId);choose.dataset.routeId=route.id;choose.setAttribute('aria-pressed',String(route.id===selectedId));
+                const choose=this.action(EH.QuickRoutes.title(route),async()=>{if(this.routeBusy)return;this.routeBusy=true;body.querySelectorAll('.eh-context-route-choice').forEach(button=>{button.disabled=true;button.classList.remove('is-selected');button.setAttribute('aria-pressed','false');});choose.classList.add('is-selected');choose.setAttribute('aria-pressed','true');EH.Storage.set('selectedQuickRouteId.v1',route.id);try{await EH.QuickRoutes.search(route);this.close('routes');this.open('schedules');}catch(error){EH.Toast?.error?.(error?.message||'Não foi possível pesquisar esta rota.');}finally{this.routeBusy=false;if(body.isConnected)body.querySelectorAll('.eh-context-route-choice').forEach(button=>{button.disabled=false;});}});choose.className='eh-context-route-choice';choose.classList.toggle('is-selected',String(route.id)===selectedId);choose.dataset.routeId=route.id;choose.setAttribute('aria-pressed',String(route.id===selectedId));
                 card.appendChild(choose);body.appendChild(card);
             });
         },
+        scheduleRows() {
+            const data=EH.Parser?.parsePesquisa?.()||{horarios:[]};const rows=[];const seen=new Set();
+            (data.horarios||[]).forEach(item=>(item.selectionTargets||[]).forEach(target=>{const service=String(target.service||item.servicos?.[0]||'');const key=[item.saida,item.empresa||item.linha,service,item.valorFinal||item.preco].join('|');if(seen.has(key))return;seen.add(key);rows.push({data,item,target,service});}));return rows;
+        },
+        async selectSchedule(row, helperButton) {
+            const original=row?.target?.button;if(!original?.isConnected)return EH.Toast.warning('Este horário não está mais disponível nos resultados atuais.');
+            if(original.disabled||this.scheduleBusy.has(original))return;
+            this.scheduleBusy.add(original);helperButton.disabled=true;
+            try{original.scrollIntoView?.({block:'center',behavior:'smooth'});original.click();}
+            finally{setTimeout(()=>{this.scheduleBusy.delete(original);if(helperButton.isConnected)helperButton.disabled=false;},900);}
+        },
+        renderSchedules(body) {
+            const rows=this.scheduleRows();if(!rows.length){const empty=document.createElement('div');empty.className='eh-context-empty';empty.textContent='Selecione uma rota e aguarde os resultados reais do E-Pass.';body.appendChild(empty);return;}
+            rows.forEach(row=>{const card=document.createElement('article');card.className='eh-context-schedule';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Horário',row.item.saida),this.cell('Empresa',row.item.empresa||row.item.linha),this.cell('Serviço do dia',row.service),this.cell('Valor',row.item.valorFinal||row.item.preco));const actions=document.createElement('div');actions.className='eh-context-actions';let select;select=this.action('Selecionar',()=>this.selectSchedule(row,select),'primary');actions.appendChild(select);card.append(grid,actions);body.appendChild(card);});
+        },
+        async confirmSelectedSeat(button) {
+            if(this.seatConfirmBusy)return;const data=EH.Parser?.parseReserva?.()||{};
+            if(!data.poltronasSelecionadas?.length)return EH.Toast.warning('Selecione uma poltrona no mapa original do E-Pass.');
+            const original=EH.Utils.first(EH.Selectors.RESERVATION_CONFIRM_BUTTON);if(!original||original.disabled)return EH.Toast.warning('O botão real de confirmação da poltrona não está disponível.');
+            this.seatConfirmBusy=true;button.disabled=true;try{original.click();}finally{setTimeout(()=>{this.seatConfirmBusy=false;if(button.isConnected)button.disabled=false;},1000);}
+        },
         renderSeats(body) {
-            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{};const data=EH.Parser?.parseReserva?.()||{};const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',EH.SaleContext?.getActivePassenger?.()?.name||''),this.cell('Rota',data.origemDestino||[journey.origin,journey.destination].filter(Boolean).join(' → ')),this.cell('Serviço',data.servico||journey.service),this.cell('Horário',data.horaSaida||journey.departure),this.cell('Poltrona',data.poltronasSelecionadas?.join(', ')||journey.seat),this.cell('Disponíveis',data.poltronasLivres?.length?String(data.poltronasLivres.length):''),this.cell('Valor',data.valorTotalNum>0?EH.Utils.formatMoney(data.valorTotalNum):(journey.value?EH.Utils.formatMoney(journey.value):'')));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Gerar poltronas',()=>EH.UI?.captureAction?.('reserva'),'primary'),this.action('Copiar dados',async()=>{await EH.Clipboard.copyText(EH.Parser.formatReservaResumo(data));EH.Toast.success('Dados das poltronas copiados.');}));body.append(grid);this.nextAction(body,context);body.append(actions);
+            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{};const data=EH.Parser?.parseReserva?.()||{};const passenger=EH.PassengerData?.active?.()||EH.SaleContext?.getActivePassenger?.()||{};const seat=data.poltronasSelecionadas?.join(', ')||journey.seat;const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name||passenger.nome),this.cell('Trecho',context.currentLeg==='volta'?'Volta':'Ida'),this.cell('Horário',data.horaSaida||journey.departure),this.cell('Poltrona',seat));const actions=document.createElement('div');actions.className='eh-context-actions';if(seat&&EH.Utils.first(EH.Selectors.RESERVATION_CONFIRM_BUTTON)){let confirm;confirm=this.action('Confirmar',()=>this.confirmSelectedSeat(confirm),'primary');actions.appendChild(confirm);}body.append(grid);if(!seat){const note=document.createElement('div');note.className='eh-context-empty';note.textContent='Selecione a poltrona no mapa original do E-Pass.';body.appendChild(note);}if(actions.childElementCount)body.appendChild(actions);
         },
         renderPayment(body) {
-            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const pix=EH.Payment?.parsePix?.();const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name),this.cell('Rota',[journey.origin,journey.destination].filter(Boolean).join(' → ')),this.cell('Data',journey.date),this.cell('Horário',journey.departure),this.cell('Poltrona',journey.seat),this.cell('Forma',payment.method),this.cell('Valor',payment.value?EH.Utils.formatMoney(payment.value):''),this.cell('Status PIX',pix?.validation?.valid?'Cobrança gerada — pagamento não confirmado':'Aguardando E-Pass'));const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid)actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));body.append(grid);this.nextAction(body,context);body.append(actions);EH.RequisitionManager?.renderContext?.(body,{page:'pagamento'});
+            const context=EH.Attendance?.load?.()||{};const payment=context.payment||{};const requestCodes=EH.RequisitionManager?.paymentCodes?.()||{};const ida=requestCodes.ida?.codigo||'',volta=requestCodes.volta?.codigo||'';
+            if(ida||volta){const grid=document.createElement('div');grid.className='eh-context-data';if(ida)grid.append(this.cell('Código da ida',ida));if(volta)grid.append(this.cell('Código da volta',volta));const actions=document.createElement('div');actions.className='eh-context-actions';if(ida)actions.append(this.action('Preencher ida',()=>EH.RequisitionManager.fillPaymentLeg('ida'),'primary'));if(volta)actions.append(this.action('Preencher volta',()=>EH.RequisitionManager.fillPaymentLeg('volta'),'primary'));if(ida&&volta)actions.append(this.action('Preencher ambos',()=>EH.RequisitionManager.fillPaymentBoth()));actions.append(this.action('Copiar',()=>EH.RequisitionManager.copyBothCodes(requestCodes.request)));body.append(grid,actions);return;}
+            const pix=EH.Payment?.parsePix?.();const isPix=Boolean(pix||EH.Utils.normalize(payment.method||'').includes('PIX'));if(!isPix){const note=document.createElement('div');note.className='eh-context-empty';note.textContent='Conclua a forma de pagamento no E-Pass.';body.appendChild(note);return;}
+            const actions=document.createElement('div');actions.className='eh-context-actions';if(pix?.validation?.valid){actions.append(this.action('Copiar PIX',()=>EH.Payment.copyPixCode(pix),'primary'),this.action('Enviar PIX',()=>EH.UI?.sendPixPairToWhatsApp?.(),'success'));}else actions.append(this.action('Gerar PIX',()=>EH.Payment.clientConfirmed?.(),'primary'));body.appendChild(actions);
         },
         renderConfirmation(body) {
-            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.SaleContext?.getActivePassenger?.()||{};const cpf=EH.SaleContext?.maskCpfPublic?.(passenger.cpf||'')||'';const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Nome',passenger.name),this.cell('CPF',cpf),this.cell('Origem',journey.origin),this.cell('Destino',journey.destination),this.cell('Serviço',journey.service),this.cell('Horário',journey.departure),this.cell('Poltrona',journey.seat),this.cell('Pagamento',payment.method),this.cell('Valor final',payment.value?EH.Utils.formatMoney(payment.value):(journey.value?EH.Utils.formatMoney(journey.value):'')));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Copiar resumo',()=>EH.UI?.copyCurrentSummary?.(),'primary'));body.append(grid);this.nextAction(body,context);body.append(actions);
+            const context=EH.Attendance?.load?.()||{};const journey=context.journey||{},payment=context.payment||{};const passenger=EH.PassengerData?.active?.()||EH.SaleContext?.getActivePassenger?.()||{};const summary=EH.Payment?.parseSummary?.();const card=summary?.cards?.[0]||{};const routeRaw=EH.Utils.clean(card.routeDate||'');const when=routeRaw.match(/^(.*?)\s*-\s*(\d{2}\/\d{2}\/\d{4})(?:\s+(\d{1,2}:\d{2}))?$/);const route=[journey.origin,journey.destination].filter(Boolean).join(' → ')||(when?.[1]||'').replace(/\s+[xX×]\s+/g,' → ');const codeData=EH.RequisitionManager?.paymentCodes?.()||{};const code=(context.currentLeg==='volta'?codeData.volta:codeData.ida)?.codigo||'';const value=payment.value?EH.Utils.formatMoney(payment.value):(card.total||(journey.value?EH.Utils.formatMoney(journey.value):''));const grid=document.createElement('div');grid.className='eh-context-data';grid.append(this.cell('Passageiro',passenger.name||passenger.nome||card.passenger),this.cell('CPF',EH.SaleContext?.maskCpf?.(passenger.cpfDigits||passenger.cpf)),this.cell('Data de nascimento',EH.RequisitionManager?.displayBirthDate?.(passenger.birthDate||passenger.dataNascimento)),this.cell('Rota',route),this.cell('Data',journey.date||when?.[2]),this.cell('Horário',journey.departure||when?.[3]),this.cell('Poltrona',journey.seat||card.seat),this.cell('Código',code),this.cell('Pagamento',payment.method),this.cell('Valor',value));const actions=document.createElement('div');actions.className='eh-context-actions';actions.append(this.action('Copiar resumo',()=>EH.UI?.copyCurrentSummary?.(),'primary'));body.append(grid,actions);
         },
         renderFinance(body) {
             const today=EH.FinanceLedger?.todaySummary?.()||{};const stats=EH.FinanceLedger?.monthStats?.();const month=stats?.summary||EH.FinanceLedger?.monthSummary?.()||{};
@@ -23177,11 +23478,12 @@
             return body;
         },
         renderMenu(body) {
-            const actions=document.createElement('div');actions.className='eh-context-actions';[['Rotas','routes'],['Poltronas','seats'],['Passageiro / Document AI','passenger'],['Pagamento / PIX','payment'],['Confirmação','confirmation'],['Lembretes','reminders'],['Passagens','tickets'],['Caixa / Financeiro','finance'],['Requisição da Prefeitura','prefeitura'],['Mapa / Fila','operation']].forEach(([label,id])=>actions.append(this.action(label,()=>this.open(id))));body.appendChild(actions);
+            const actions=document.createElement('div');actions.className='eh-context-actions';[['Rotas','routes'],['Horários','schedules'],['Poltronas','seats'],['Passageiro / Document AI','passenger'],['Pagamento / PIX','payment'],['Confirmação','confirmation'],['Lembretes','reminders'],['Passagens','tickets'],['Caixa / Financeiro','finance'],['Requisição da Prefeitura','prefeitura'],['Mapa / Fila','operation']].forEach(([label,id])=>actions.append(this.action(label,()=>this.open(id))));body.appendChild(actions);
         },
         render(id,body) {
             body.innerHTML='';
             if(id==='routes')return this.renderRoutes(body);
+            if(id==='schedules')return this.renderSchedules(body);
             if(id==='seats')return this.renderSeats(body);
             if(id==='payment')return this.renderPayment(body);
             if(id==='confirmation')return this.renderConfirmation(body);
@@ -23207,7 +23509,7 @@
         },
         close(id){const entry=this.panels.get(id);if(!entry)return;this.persist(id,entry.panel);EH.PanelAutoFit?.unregister?.(entry.panel);entry.panel.remove();this.panels.delete(id);},
         refresh(id){const entry=this.panels.get(id);if(entry){this.render(id,entry.body);EH.PanelAutoFit?.schedule?.(entry.panel,'context-refresh');}},
-        sync(page){for(const [id,entry] of this.panels){entry.panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const allowed=this.contexts[id];if(allowed&&!allowed.includes(page))this.close(id);else EH.PanelAutoFit?.schedule?.(entry.panel,'context-sync');}}
+        sync(page){for(const [id,entry] of this.panels){entry.panel.style.setProperty('--eh-context-panel-zoom',String(Math.min(1.5,Math.max(.75,Number(EH.Config.PANEL_ZOOM)||1))));const allowed=this.contexts[id];if(allowed&&!allowed.includes(page))this.close(id);else{if(['schedules','seats','payment','confirmation'].includes(id))this.render(id,entry.body);EH.PanelAutoFit?.schedule?.(entry.panel,'context-sync');}}}
     };
 
     // ============================================================
@@ -23230,11 +23532,11 @@
         button(icon,label,title,action){const button=document.createElement('button');button.type='button';button.title=title;button.setAttribute('aria-label',title);const i=document.createElement('span');i.className='eh-context-shortcut-icon';i.textContent=icon;button.appendChild(i);if(EH.Config.CONTEXT_BUTTON_SHOW_TEXT){const text=document.createElement('span');text.textContent=label;button.appendChild(text);}button.addEventListener('click',event=>{event.stopPropagation();action();});return button;},
         definitions(page){
             const open=id=>()=>EH.ContextualPanels.open(id);
-            if(page==='pesquisa')return[['🧭','Rotas','Rotas e horários rápidos',open('routes')],['🗓️','Horários','Capturar horários encontrados',()=>EH.UI?.captureAction?.('pesquisa')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];
+            if(page==='pesquisa')return[['🧭','Rotas','Rotas configuradas',open('routes')],['🗓️','Horários','Horários reais encontrados',open('schedules')],['🚌','Mapa','Mapa do carro e serviços do dia',open('operation')]];
             if(page==='reserva')return[['💺','Poltronas','Poltronas e passageiro atual',open('seats')],['👤','Dados','Dados do passageiro e Document AI',open('passenger')]];
             if(page==='confirmacao')return[['✅','Conferir','Resumo e confirmação consciente',open('confirmation')]];
             if(page==='pagamento')return[['💳','Pagamento','Pagamento e código da requisição',open('payment')]];
-            if(page==='passagens')return EH.EmissionMemory?.shareQueue?.().length||EH.Tickets?.findCards?.().length?[['🎫','Bilhetes','Bilhetes emitidos para localizar e compartilhar',open('tickets')]]:[];
+            if(page==='passagens'){const actions=[];if(EH.EmissionMemory?.recent?.().length||EH.Tickets?.findCards?.().length)actions.push(['🎫','Bilhetes','Emissões recentes e documentos oficiais',open('tickets')]);if(EH.OperationCars?.activeMapPassenger?.())actions.push(['🚌','Mapa 287','Passageiro destacado no Mapa do Carro',open('operation')]);return actions;}
             if(page==='caixa'||page==='comissoes')return[['📊','Financeiro','Caixa e financeiro',open('finance')]];
             if(page==='requisicao'){
                 const actions=[['📄','Requisição','Requisição da Prefeitura e códigos',open('prefeitura')]];
