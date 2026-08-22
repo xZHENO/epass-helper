@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.78.0
+// @version      5.79.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.78.0',
+        VERSION: '5.79.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 20,
+        STORAGE_SCHEMA_VERSION: 21,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -1153,6 +1153,13 @@
             EH.SettingsCatalog?.touch?.(['contextButtonPosition','syncPanelLayout'], 1);
         },
 
+        migratePassengerJourneyV21() {
+            // Acrescenta rota, Mercados, estado de volta e metadados dos códigos
+            // à mesma memória PassengerData. A normalização é aditiva e mantém
+            // passengerId/requestId, identidade e códigos já armazenados.
+            EH.PassengerMemory?.migrateV21?.();
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -1175,6 +1182,7 @@
             this.migratePassengerDataV18();
             this.migratePanelAutoFitV19();
             this.migrateSettingsCategoriesV20();
+            this.migratePassengerJourneyV21();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -1255,6 +1263,29 @@
             if (/[*Xx•]{2,}/.test(next) && old && !/[*Xx•]{2,}/.test(old)) return old;
             return next.length >= old.length ? next : old;
         },
+        normalizeMarket(value = {}) {
+            const raw=value&&typeof value==='object'?value:{text:String(value||'')};
+            const text=EH.Utils.clean(raw.text||raw.label||raw.mercadoTexto||raw.mercadoCompleto||'');
+            return {
+                id:EH.Utils.clean(raw.id||raw.marketId||raw.mercadoId||''),
+                value:EH.Utils.clean(raw.value||raw.marketValue||raw.mercadoValor||''),
+                text,
+                origin:EH.Utils.clean(raw.origin||raw.origem||''),
+                destination:EH.Utils.clean(raw.destination||raw.destino||'')
+            };
+        },
+        normalizeCodeMeta(value = {}, codes = {}, updatedAt = 0) {
+            const raw=value&&typeof value==='object'?value:{};
+            const leg=tipo=>{
+                const meta=raw[tipo]&&typeof raw[tipo]==='object'?raw[tipo]:{};
+                return {
+                    source:EH.Utils.clean(meta.source||''),
+                    manual:Boolean(meta.manual||meta.confirmedManually),
+                    updatedAt:Number(meta.updatedAt||(codes?.[tipo]?updatedAt:0)||0)
+                };
+            };
+            return {ida:leg('ida'),volta:leg('volta')};
+        },
         normalize(item = {}) {
             const cpf = this.normalizeCpf(item.cpf);
             const updatedAt = Number(item.updatedAt || Date.now());
@@ -1272,6 +1303,18 @@
             });
             const passengerId=String(item.passengerId||item.id||'');
             const rawCodes=item.codes&&typeof item.codes==='object'?item.codes:{};
+            const marketIda=this.normalizeMarket(item.marketIda||item.mercadoIda||{});
+            const marketVolta=this.normalizeMarket(item.marketVolta||item.mercadoVolta||{});
+            const legacyReturnFlag=item.journeyKnown===undefined&&Object.prototype.hasOwnProperty.call(item,'temVolta');
+            const hasJourney=Boolean(item.journeyKnown||item.journeyUpdatedAt||marketIda.id||marketIda.value||marketIda.text||marketIda.origin||marketIda.destination||marketVolta.id||marketVolta.value||marketVolta.text||marketVolta.origin||marketVolta.destination||item.origin||item.origem||item.destination||item.destino||item.returnOrigin||item.origemVolta||item.returnDestination||item.destinoVolta||legacyReturnFlag);
+            const hasReturn=Boolean(item.hasReturn??item.temVolta??false);
+            const origin=EH.Utils.clean(item.origin||item.origem||marketIda.origin||'');
+            const destination=EH.Utils.clean(item.destination||item.destino||marketIda.destination||'');
+            const returnOrigin=hasReturn?EH.Utils.clean(item.returnOrigin||item.origemVolta||marketVolta.origin||''):'';
+            const returnDestination=hasReturn?EH.Utils.clean(item.returnDestination||item.destinoVolta||marketVolta.destination||''):'';
+            marketIda.origin=origin;marketIda.destination=destination;
+            if(hasReturn){marketVolta.origin=returnOrigin;marketVolta.destination=returnDestination;}
+            const codes={ida:EH.Utils.clean(rawCodes.ida||item.codigoIda||''),volta:hasReturn===false&&hasJourney?'':EH.Utils.clean(rawCodes.volta||item.codigoVolta||'')};
             return {
                 id: passengerId,
                 passengerId,
@@ -1281,7 +1324,19 @@
                 birthDate: EH.Utils.clean(item.birthDate || item.dataNascimento || ''),
                 requestId: String(item.requestId || ''),
                 protocol: EH.Utils.clean(item.protocol || item.protocolo || ''),
-                codes: { ida: EH.Utils.clean(rawCodes.ida || item.codigoIda || ''), volta: EH.Utils.clean(rawCodes.volta || item.codigoVolta || '') },
+                origin,
+                destination,
+                returnOrigin,
+                returnDestination,
+                marketIda,
+                marketVolta,
+                hasReturn,
+                temVolta:hasReturn,
+                journeyKnown:hasJourney,
+                journeyUpdatedAt:Number(item.journeyUpdatedAt!==undefined?item.journeyUpdatedAt:(hasJourney?updatedAt:0)),
+                status:EH.Utils.clean(item.status||''),
+                codes,
+                codeMeta:this.normalizeCodeMeta(item.codeMeta,codes,updatedAt),
                 confirmed,
                 confirmedAt: Number(item.confirmedAt || 0),
                 cpfValid: item.cpfValid !== undefined ? Boolean(item.cpfValid) : Boolean(cpf && EH.PassengerIdentity?.validCpf?.(cpf)),
@@ -1316,6 +1371,19 @@
             const birthDate = this.chooseField('birthDate', old, next);
             const cpf = this.chooseField('cpf', old, next);
             const confirmedAt = Math.max(Number(old.confirmedAt || 0), Number(next.confirmedAt || 0));
+            const nextJourneyIsNewer=Number(next.journeyUpdatedAt||0)>0&&Number(next.journeyUpdatedAt||0)>=Number(old.journeyUpdatedAt||0);
+            const journey=nextJourneyIsNewer?next:old;
+            const chooseCode=tipo=>{
+                const oldCode=EH.Utils.clean(old.codes?.[tipo]||''),nextCode=EH.Utils.clean(next.codes?.[tipo]||'');
+                const oldMeta=old.codeMeta?.[tipo]||{},nextMeta=next.codeMeta?.[tipo]||{};
+                if(oldMeta.manual&&!nextMeta.manual)return{value:oldCode,meta:oldMeta};
+                if(nextMeta.manual&&!oldMeta.manual)return{value:nextCode,meta:nextMeta};
+                if(oldMeta.manual&&nextMeta.manual)return Number(nextMeta.updatedAt||0)>=Number(oldMeta.updatedAt||0)?{value:nextCode||oldCode,meta:nextMeta}:{value:oldCode||nextCode,meta:oldMeta};
+                if(!nextCode)return{value:oldCode,meta:oldMeta};
+                if(!oldCode)return{value:nextCode,meta:nextMeta};
+                return Number(nextMeta.updatedAt||0)>=Number(oldMeta.updatedAt||0)?{value:nextCode,meta:nextMeta}:{value:oldCode,meta:oldMeta};
+            };
+            const idaCode=chooseCode('ida'),voltaCode=journey.hasReturn?chooseCode('volta'):{value:'',meta:{source:'',manual:false,updatedAt:Number(journey.journeyUpdatedAt||0)}};
             return {
                 ...old,
                 ...next,
@@ -1327,10 +1395,11 @@
                 birthDate: birthDate.value,
                 requestId: next.requestId || old.requestId || '',
                 protocol: next.protocol || old.protocol || '',
-                codes: {
-                    ida: next.codes?.ida || old.codes?.ida || '',
-                    volta: next.codes?.volta || old.codes?.volta || ''
-                },
+                origin:journey.origin||'',destination:journey.destination||'',returnOrigin:journey.hasReturn?(journey.returnOrigin||''):'',returnDestination:journey.hasReturn?(journey.returnDestination||''):'',
+                marketIda:this.normalizeMarket(journey.marketIda||{}),marketVolta:this.normalizeMarket(journey.marketVolta||{}),hasReturn:Boolean(journey.hasReturn),temVolta:Boolean(journey.hasReturn),journeyKnown:Boolean(journey.journeyKnown),journeyUpdatedAt:Number(journey.journeyUpdatedAt||0),
+                status:(nextJourneyIsNewer?next.status:old.status)||next.status||old.status||'',
+                codes:{ida:idaCode.value,volta:voltaCode.value},
+                codeMeta:{ida:idaCode.meta,volta:voltaCode.meta},
                 manualCorrections: { ...(old.manualCorrections || {}), ...(next.manualCorrections || {}) },
                 confirmed: Boolean(confirmedAt || old.confirmed || next.confirmed),
                 confirmedAt,
@@ -1396,6 +1465,25 @@
                 const attendanceKey='attendances.v2',attendance=EH.Storage.get(attendanceKey,[]);
                 if(Array.isArray(attendance))EH.Storage.set(attendanceKey,attendance.map(item=>({...item,passengerIds:(item.passengerIds||[]).map(id=>idMap.get(String(id))||id)})));
             }
+            return changed;
+        },
+        migrateV21() {
+            const raw=EH.Storage.get(this.KEY,[]);if(!Array.isArray(raw))return false;
+            let changed=false;
+            const next=raw.map(item=>{
+                if(!item||typeof item!=='object')return item;
+                const normalized=this.normalize(item);
+                if(JSON.stringify(normalized)!==JSON.stringify(item))changed=true;
+                return normalized;
+            });
+            if(changed)EH.Storage.set(this.KEY,next);
+            const requests=EH.RequisitionManager?.loadStore?.()||[];
+            requests.forEach(request=>(request.passengers||[]).forEach(passenger=>{
+                const linked=this.findForRequest(request.id,passenger.cpf),neutral=this.load().filter(item=>item.cpf===passenger.cpf&&!item.requestId);
+                const passengerId=linked?.passengerId||(neutral.length===1?neutral[0].passengerId:passenger.id);
+                const record=EH.RequisitionManager?.passengerMemoryRecord?.(request,passenger,passengerId);
+                if(record)this.upsert(record,{fromSync:true});
+            }));
             return changed;
         },
         applyRemote(item = {}) {
@@ -13338,6 +13426,8 @@
         normalizePassenger(item = {}, index=0, requestId='') {
             const cpf = this.normalizeCpf(item.cpf);
             const dataNascimento = this.normalizeBirthDate(item.dataNascimento || item.birthDate || '');
+            const normalizedLegs=(Array.isArray(item.legs) ? item.legs : Array.isArray(item.mercados) ? item.mercados : []).map(leg => this.normalizeLeg(leg)).filter(leg => leg.mercadoCompleto || (leg.origem && leg.destino));
+            const temVolta=item.temVolta!==undefined?Boolean(item.temVolta):normalizedLegs.some(leg=>leg?.tipo==='volta');
             return {
                 id: String(item.id || item.passengerId || `${requestId||'request'}:passenger:${index}`),
                 cpf,
@@ -13346,13 +13436,11 @@
                 nome: EH.Utils.clean(item.nome || item.name || '').replace(/\s+/g, ' '),
                 dataNascimento,
                 nascimentoValido: item.nascimentoValido !== undefined ? Boolean(item.nascimentoValido) : Boolean(EH.RequestFlow?.validBirth?.(dataNascimento)),
-                temVolta: Boolean(item.temVolta || (Array.isArray(item.legs) && item.legs.some(leg => leg?.tipo === 'volta'))),
+                temVolta,
                 mercadoIda: item.mercadoIda && typeof item.mercadoIda === 'object' ? { ...item.mercadoIda } : null,
                 mercadoVolta: item.mercadoVolta && typeof item.mercadoVolta === 'object' ? { ...item.mercadoVolta } : null,
                 manualFields: item.manualFields && typeof item.manualFields === 'object' ? { ...item.manualFields } : {},
-                legs: (Array.isArray(item.legs) ? item.legs : Array.isArray(item.mercados) ? item.mercados : [])
-                    .map(leg => this.normalizeLeg(leg))
-                    .filter(leg => leg.mercadoCompleto || (leg.origem && leg.destino)),
+                legs: normalizedLegs.filter(leg=>temVolta||leg.tipo!=='volta'),
                 updatedAt:Number(item.updatedAt||Date.now())
             };
         },
@@ -13382,6 +13470,20 @@
                 submittedAt: Number(item.submittedAt || 0),
                 updatedAt: Number(item.updatedAt || now),
                 deviceId: String(item.deviceId || EH.Device.id())
+            };
+        },
+
+        passengerMemoryRecord(request = {}, passenger = {}, passengerId = '') {
+            const ida=(passenger.legs||[]).find(leg=>leg.tipo!=='volta'),volta=(passenger.legs||[]).find(leg=>leg.tipo==='volta');
+            return {
+                passengerId:passengerId||passenger.id||'',requestId:request.id||'',protocol:request.protocolo||request.numeroLogico||'',cpf:passenger.cpf||'',name:passenger.nome||'',birthDate:passenger.dataNascimento||'',
+                origin:ida?.origem||'',destination:ida?.destino||'',returnOrigin:passenger.temVolta?(volta?.origem||''):'',returnDestination:passenger.temVolta?(volta?.destino||''):'',
+                marketIda:passenger.mercadoIda||{id:ida?.mercadoId||'',value:ida?.mercadoValor||'',text:ida?.mercadoTexto||ida?.mercadoCompleto||'',origin:ida?.origem||'',destination:ida?.destino||''},
+                marketVolta:passenger.mercadoVolta||{id:volta?.mercadoId||'',value:volta?.mercadoValor||'',text:volta?.mercadoTexto||volta?.mercadoCompleto||'',origin:volta?.origem||'',destination:volta?.destino||''},
+                hasReturn:Boolean(passenger.temVolta),journeyUpdatedAt:Number(request.updatedAt||passenger.updatedAt||0),status:request.status||'',
+                codes:{ida:ida?.codigo||'',volta:passenger.temVolta?(volta?.codigo||''):''},
+                codeMeta:{ida:{source:ida?.codigoOrigem||'',manual:Boolean(ida?.codigoConfirmadoManualmente),updatedAt:Number(ida?.codigoConfirmadoAt||ida?.updatedAt||0)},volta:{source:volta?.codigoOrigem||'',manual:Boolean(volta?.codigoConfirmadoManualmente),updatedAt:Number(volta?.codigoConfirmadoAt||volta?.updatedAt||0)}},
+                manualCorrections:passenger.manualFields||{},source:request.source||'requisition-memory',updatedAt:Number(request.updatedAt||passenger.updatedAt||Date.now())
             };
         },
 
@@ -13490,16 +13592,10 @@
             EH.Storage.set(this.STORAGE_KEY, { version: 1, updatedAt: Date.now(), items: normalized });
             normalized.forEach(request => {
                 (request.passengers || []).forEach(passenger => {
-                    const ida=(passenger.legs||[]).find(leg=>leg.tipo!=='volta'),volta=(passenger.legs||[]).find(leg=>leg.tipo==='volta');
                     const linked=EH.PassengerMemory?.findForRequest?.(request.id,passenger.cpf);
                     const neutral=(EH.PassengerMemory?.load?.()||[]).filter(item=>item.cpf===passenger.cpf&&!item.requestId);
                     const passengerId=linked?.passengerId||(neutral.length===1?neutral[0].passengerId:passenger.id);
-                    EH.PassengerMemory?.upsert?.({
-                        passengerId,requestId:request.id,protocol:request.protocolo||request.numeroLogico||'',
-                        cpf:passenger.cpf,name:passenger.nome,birthDate:passenger.dataNascimento,
-                        codes:{ida:ida?.codigo||'',volta:volta?.codigo||''},manualCorrections:passenger.manualFields||{},
-                        source:request.source||'requisition-memory',updatedAt:request.updatedAt
-                    }, { fromSync:Boolean(EH.Sync?.applyingRemote) });
+                    EH.PassengerMemory?.upsert?.(this.passengerMemoryRecord(request,passenger,passengerId), { fromSync:Boolean(EH.Sync?.applyingRemote) });
                 });
                 if(EH.Sync?.applyingRemote)EH.RequestFlow?.linkRequest?.(request,{evidence:'synced-requisition',fromSync:true});
                 if (!EH.Sync?.applyingRemote) {
@@ -13696,7 +13792,7 @@
             const mercadoCompleto = this.cleanMarket(block.querySelector('[id="nome_mercado"]')?.textContent || '');
             const nome = EH.Utils.clean(block.querySelector('[id="passageiro"]')?.textContent || '');
             const dataNascimento = this.normalizeBirthDate(block.querySelector('[id="data_nascimento"]')?.textContent || '');
-            const codigo = EH.Utils.clean(codeElement.textContent || '');
+            const codigo = this.sanitizeRequestCode(codeElement.textContent || '');
             if (!mercadoCompleto || !nome || !dataNascimento || !codigo) return null;
             return { nome, dataNascimento, codigo, linhaReal:mercadoCompleto, ...this.parseMarket(mercadoCompleto) };
         },
@@ -13767,6 +13863,9 @@
                     return;
                 }
                 const { request, passenger, leg } = targets[0];
+                if(block.codigo===EH.Utils.clean(request.numeroLogico||'').toUpperCase()||block.codigo===EH.Utils.clean(request.protocolo||'').toUpperCase()){
+                    ambiguous+=1;this.preservePendingCode(block,'protocol-code-conflict');return;
+                }
                 if(leg.codigoConfirmadoManualmente&&leg.codigo&&leg.codigo!==block.codigo){ambiguous+=1;this.preservePendingCode(block,'manual-code-locked');return;}
                 if (logical && !request.numeroLogico) request.numeroLogico = logical;
                 if (leg.codigo !== block.codigo || leg.mercadoCompleto !== block.mercadoCompleto) {
@@ -13966,8 +14065,12 @@
             return{request:{id:memory.requestId||'',numeroLogico:memory.protocol||'',protocolo:memory.protocol||''},passenger:{id:memory.passengerId,cpf:memory.cpf,nome:memory.name,dataNascimento:memory.birthDate,legs:[],manualFields:memory.manualCorrections||{}}};
         },
 
-        cardForSaleLookup(cpf){
-            const digits=this.normalizeCpf(cpf);return this.findEmissionCards().find(card=>this.normalizeCpf(card.querySelector('input[formcontrolname="cpf"]')?.value||'')===digits)||null;
+        cardForSaleLookup(cpf,lookup=this.saleLookup()){
+            const digits=this.normalizeCpf(cpf),cards=this.findEmissionCards();
+            const bound=Number.isInteger(Number(lookup?.cardIndex))?cards[Number(lookup.cardIndex)]:null;
+            if(bound&&this.normalizeCpf(bound.querySelector('input[formcontrolname="cpf"]')?.value||'')===digits)return bound;
+            const matches=cards.filter(card=>this.normalizeCpf(card.querySelector('input[formcontrolname="cpf"]')?.value||'')===digits);
+            return matches.length===1?matches[0]:null;
         },
 
         inspectSaleLookup({render=true}={}){
@@ -14001,7 +14104,8 @@
             EH.SaleContext.setNativeValue(cpfInput, EH.SaleContext.maskCpf(passenger.cpf));
             await EH.Utils.sleep(120);
             if(this.normalizeCpf(cpfInput.value)!==passenger.cpf)return EH.Toast.error('O E-Pass não manteve o CPF preenchido.');
-            this.saleLookup({requestId:request.id,passengerId:passenger.id||'',cpf:passenger.cpf,expectedName:passenger.nome,birthDate:passenger.dataNascimento,state:'awaiting-search',returnedName:''});
+            const cardIndex=this.findEmissionCards().indexOf(initialCard);
+            this.saleLookup({requestId:request.id,passengerId:passenger.id||'',cpf:passenger.cpf,cardIndex,expectedName:passenger.nome,birthDate:passenger.dataNascimento,state:'awaiting-search',returnedName:''});
             this.setActiveEmission({
                 requestId:request.id,numeroLogico:request.numeroLogico,cpf:passenger.cpf,nome:passenger.nome,origem:'',destino:'',tipo:'',codigo:''
             });
@@ -14291,6 +14395,8 @@
             EH.Storage.set(this.KEY,{version:this.VERSION,updatedAt:Date.now(),items});
             items.forEach(record=>(record.passengers||[]).filter(passenger=>passenger.cpf.length===11).forEach(passenger=>EH.PassengerMemory?.upsert?.({
                 passengerId:passenger.id,requestId:record.id,protocol:record.protocolo||record.numeroLogico||'',cpf:passenger.cpf,name:passenger.nome,birthDate:passenger.dataNascimento,
+                origin:passenger.trechoIda?.origem||'',destination:passenger.trechoIda?.destino||'',returnOrigin:passenger.temVolta?(passenger.trechoVolta?.origem||''):'',returnDestination:passenger.temVolta?(passenger.trechoVolta?.destino||''):'',
+                marketIda:passenger.mercadoIda||{},marketVolta:passenger.mercadoVolta||{},hasReturn:Boolean(passenger.temVolta),journeyUpdatedAt:Math.max(Number(record.updatedAt||0),Number(passenger.updatedAt||0)),status:record.status,
                 codes:record.codes||{},manualCorrections:passenger.manualFields||{},source:record.source||'real-requisition-form',updatedAt:Math.max(Number(record.updatedAt||0),Number(passenger.updatedAt||0))
             },{fromSync})));
             if(!fromSync)Array.from(new Set(changedIds.map(String).filter(Boolean))).forEach(id=>EH.Sync?.markPendingRecord?.('request-draft',id));
@@ -14480,7 +14586,12 @@
             return EH.PassengerMemory?.normalize?.({
                 ...memory,passengerId:memory.passengerId||passenger.id,requestId:request.id,protocol:request.protocolo||request.numeroLogico||memory.protocol||'',
                 cpf:passenger.cpf,name:passenger.nome||memory.name,birthDate:passenger.dataNascimento||memory.birthDate,
+                origin:ida?.origem||memory.origin||'',destination:ida?.destino||memory.destination||'',returnOrigin:passenger.temVolta?(volta?.origem||memory.returnOrigin||''):'',returnDestination:passenger.temVolta?(volta?.destino||memory.returnDestination||''):'',
+                marketIda:passenger.mercadoIda||{id:ida?.mercadoId||'',value:ida?.mercadoValor||'',text:ida?.mercadoTexto||ida?.mercadoCompleto||'',origin:ida?.origem||'',destination:ida?.destino||''},
+                marketVolta:passenger.mercadoVolta||{id:volta?.mercadoId||'',value:volta?.mercadoValor||'',text:volta?.mercadoTexto||volta?.mercadoCompleto||'',origin:volta?.origem||'',destination:volta?.destino||''},
+                hasReturn:Boolean(passenger.temVolta),journeyUpdatedAt:Number(request.updatedAt||memory.journeyUpdatedAt||0),status:request.status||memory.status||'',
                 codes:{ida:ida?.codigo||memory.codes?.ida||'',volta:passenger.temVolta===false?'':(volta?.codigo||memory.codes?.volta||'')},
+                codeMeta:{ida:{source:ida?.codigoOrigem||memory.codeMeta?.ida?.source||'',manual:Boolean(ida?.codigoConfirmadoManualmente||memory.codeMeta?.ida?.manual),updatedAt:Number(ida?.codigoConfirmadoAt||ida?.updatedAt||memory.codeMeta?.ida?.updatedAt||0)},volta:{source:volta?.codigoOrigem||memory.codeMeta?.volta?.source||'',manual:Boolean(volta?.codigoConfirmadoManualmente||memory.codeMeta?.volta?.manual),updatedAt:Number(volta?.codigoConfirmadoAt||volta?.updatedAt||memory.codeMeta?.volta?.updatedAt||0)}},
                 manualCorrections:{...(memory.manualCorrections||{}),...(passenger.manualFields||{})},updatedAt:Math.max(Number(memory.updatedAt||0),Number(request.updatedAt||0))
             })||null;
         },
@@ -14497,7 +14608,7 @@
                 const passenger=draft.passengers?.find(item=>saleCpf&&item.cpf===saleCpf)||(draft.passengers?.length===1?draft.passengers[0]:null);
                 if(passenger?.cpf?.length===11){
                     const memory=EH.PassengerMemory?.findForRequest?.(draft.id,passenger.cpf)||{};
-                    return EH.PassengerMemory?.normalize?.({...memory,passengerId:memory.passengerId||passenger.id,requestId:draft.id,protocol:draft.protocolo||draft.numeroLogico||'',cpf:passenger.cpf,name:passenger.nome,birthDate:passenger.dataNascimento,codes:draft.codes||memory.codes||{},manualCorrections:passenger.manualFields||{},updatedAt:draft.updatedAt})||null;
+                    return EH.PassengerMemory?.normalize?.({...memory,passengerId:memory.passengerId||passenger.id,requestId:draft.id,protocol:draft.protocolo||draft.numeroLogico||'',cpf:passenger.cpf,name:passenger.nome,birthDate:passenger.dataNascimento,origin:passenger.trechoIda?.origem||'',destination:passenger.trechoIda?.destino||'',returnOrigin:passenger.temVolta?(passenger.trechoVolta?.origem||''):'',returnDestination:passenger.temVolta?(passenger.trechoVolta?.destino||''):'',marketIda:passenger.mercadoIda||{},marketVolta:passenger.mercadoVolta||{},hasReturn:Boolean(passenger.temVolta),journeyUpdatedAt:draft.updatedAt,status:draft.status,codes:draft.codes||memory.codes||{},codeMeta:memory.codeMeta||{},manualCorrections:passenger.manualFields||{},updatedAt:draft.updatedAt})||null;
                 }
             }
             const context=EH.Attendance?.load?.()||{},ids=new Set(context.passengerIds||[]);
@@ -22973,7 +23084,7 @@
                 .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}.eh-request-context-selector{display:grid;gap:4px;color:#607286;font-size:8px;font-weight:800}.eh-request-context-selector select,.eh-share-queue>select{width:100%;min-height:32px;padding:5px 7px;border:1px solid #d3dce6;border-radius:7px;background:#fff;color:#30445a;font-size:9px}.eh-share-queue .eh-context-empty,.eh-request-route-hint .eh-context-empty{padding:6px;text-align:left}
                 #eh-general-settings,.eh-context-panel,.eh-context-panel-head,.eh-context-panel-body,.eh-context-route-choice,.eh-context-actions button,.eh-context-data div,.eh-requisition-context,.eh-request-context-selector select,.eh-share-queue>select{font-family:var(--eh-font-family,Inter,"Segoe UI",Arial,sans-serif);color:var(--eh-text,#1f2937);border-color:var(--eh-border,#dbe3ec);background:var(--eh-panel-color,#fff)}
                 .eh-context-panel-head,.eh-context-data div,.eh-requisition-context{background:var(--eh-surface-color,#f8fafc)}.eh-context-empty,.eh-context-data div,.eh-request-context-selector{color:var(--eh-muted,#64748b)}.eh-context-route-choice.is-selected,.eh-context-actions button.primary{border-color:var(--eh-primary,#2563eb)!important;color:var(--eh-primary,#2563eb)!important}.eh-context-panel{border-radius:var(--eh-panel-radius,15px)}
-                .eh-context-panel[data-panel="attendance"]{width:min(334px,calc(100vw - 24px));height:auto;min-height:0}.eh-attendance-section{display:grid;gap:6px}.eh-attendance-section>strong{font-size:9px;letter-spacing:.08em;color:var(--eh-muted,#64748b)}.eh-attendance-compare{display:grid;gap:4px;padding:7px;border:1px solid var(--eh-border,#dbe3ec);border-radius:8px;background:var(--eh-surface-color,#f8fafc);font-size:9px}.eh-attendance-compare.is-match{border-color:#86c8a8;background:#f0faf5}.eh-attendance-compare.is-mismatch{border-color:#e1b15f;background:#fff9ed}.eh-attendance-compare b{font-size:10px;overflow-wrap:anywhere}
+                .eh-context-panel[data-panel="attendance"]{width:min(334px,calc(100vw - 24px));height:auto;min-height:0}.eh-attendance-section{display:grid;gap:6px}.eh-attendance-section>strong{font-size:9px;letter-spacing:.08em;color:var(--eh-muted,#64748b)}.eh-attendance-passenger-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.eh-attendance-passenger-grid>div:first-child{grid-column:1/-1}.eh-attendance-code-wait{padding:6px 7px!important;text-align:left!important;border-left:3px solid #d8a442;background:#fff9ed}.eh-attendance-compare{display:grid;gap:4px;padding:7px;border:1px solid var(--eh-border,#dbe3ec);border-radius:8px;background:var(--eh-surface-color,#f8fafc);font-size:9px}.eh-attendance-compare.is-match{border-color:#86c8a8;background:#f0faf5}.eh-attendance-compare.is-mismatch{border-color:#e1b15f;background:#fff9ed}.eh-attendance-compare b{font-size:10px;overflow-wrap:anywhere}
                 @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:calc(100vw - 16px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
@@ -23045,7 +23156,7 @@
             const request=EH.RequisitionManager?.requestForContext?.();
             if(candidates.length>1)EH.RequestFlow?.renderSelector?.(body,{page:'attendance'});
             const passengerSection=document.createElement('section');passengerSection.className='eh-attendance-section';const passengerTitle=document.createElement('strong');passengerTitle.textContent='PASSAGEIRO';
-            const passengerGrid=document.createElement('div');passengerGrid.className='eh-context-data';passengerGrid.append(this.cell('Nome',data.name),this.cell('CPF',EH.SaleContext?.maskCpf?.(data.cpfDigits||data.cpf)),this.cell('Data de nascimento',EH.RequisitionManager?.displayBirthDate?.(data.birthDate)||data.birthDate));passengerSection.append(passengerTitle,passengerGrid);body.appendChild(passengerSection);
+            const passengerGrid=document.createElement('div');passengerGrid.className='eh-context-data eh-attendance-passenger-grid';passengerGrid.append(this.cell('Nome',data.name),this.cell('CPF',EH.SaleContext?.maskCpf?.(data.cpfDigits||data.cpf)),this.cell('Data de nascimento',EH.RequisitionManager?.displayBirthDate?.(data.birthDate)||data.birthDate));passengerSection.append(passengerTitle,passengerGrid);body.appendChild(passengerSection);
             const actions=document.createElement('div');actions.className='eh-context-actions';
             if(data.cpfDigits)actions.append(this.action('Copiar CPF',async()=>{await EH.Clipboard.copyText(data.cpfDigits);EH.Toast.success('CPF copiado.');}));
             if(EH.PassengerData.complete(data)&&EH.RequisitionManager?.findEmissionCards?.().length)actions.append(this.action('Preencher CPF na Venda',()=>EH.RequisitionManager.usePassenger(request?.id||data.requestId||'',data.cpfDigits,data.passengerId),'primary'));
@@ -23060,9 +23171,9 @@
                 if(lookup.state==='confirmed'){const status=document.createElement('small');status.textContent='✓ Nomes conferem após normalização segura.';compare.appendChild(status);}else{const fix=this.action('Corrigir nome com o dado salvo',()=>EH.RequisitionManager.correctSaleName(request?.id||data.requestId||'',data.cpfDigits,data.passengerId),'primary');compare.appendChild(fix);}body.appendChild(compare);
             }
 
-            const ida=data.codes?.ida||'',volta=data.codes?.volta||'';
+            const ida=data.codes?.ida||'',volta=data.hasReturn?(data.codes?.volta||''):'';
             if(ida||volta){const codeSection=document.createElement('section');codeSection.className='eh-attendance-section';const title=document.createElement('strong');title.textContent='CÓDIGOS';const grid=document.createElement('div');grid.className='eh-context-data';if(ida)grid.append(this.cell('Código da ida',ida));if(volta)grid.append(this.cell('Código da volta',volta));const codeActions=document.createElement('div');codeActions.className='eh-context-actions';if(ida)codeActions.append(this.action('Copiar código da ida',()=>EH.RequisitionManager.copyLegCode(ida)));if(volta)codeActions.append(this.action('Copiar código da volta',()=>EH.RequisitionManager.copyLegCode(volta)));if(EH.Utils.first(EH.Selectors.REQUISITION_CODE_INPUT))codeActions.append(this.action('Preencher códigos no Pagamento',()=>EH.RequisitionManager.fillPaymentCode(),'primary'));codeSection.append(title,grid,codeActions);body.appendChild(codeSection);
-            }else if(request&&!EH.RequestFlow?.terminal?.(request.status)){const pending=document.createElement('div');pending.className='eh-context-empty';pending.textContent='Solicitação ativa aguardando geração de código.';body.appendChild(pending);}
+            }else if(request&&!EH.RequestFlow?.terminal?.(request.status)){const pending=document.createElement('div');pending.className='eh-context-empty eh-attendance-code-wait';pending.textContent='Aguardando a geração do código da solicitação.';body.appendChild(pending);}
             return body;
         },
         renderMenu(body) {
