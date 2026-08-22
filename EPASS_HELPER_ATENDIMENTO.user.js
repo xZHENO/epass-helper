@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.77.0
+// @version      5.78.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.77.0',
+        VERSION: '5.78.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 19,
+        STORAGE_SCHEMA_VERSION: 20,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -111,6 +111,7 @@
         CONTEXT_BUTTON_GAP: 6,
         CONTEXT_BUTTON_OPACITY: 0.96,
         CONTEXT_BUTTON_SHOW_TEXT: true,
+        CONTEXT_BUTTON_POSITION: 'auto',
         QUICK_ROUTE_GREETING: '',
         QUICK_ROUTE_FOOTER: 'Consulte disponibilidade.',
         QUICK_ROUTE_SUMMARY_TEMPLATE: '',
@@ -489,6 +490,8 @@
             EH.Config.CONTEXT_BUTTON_GAP = Math.min(18, Math.max(2, Number(this.get('contextButtonGap', EH.Config.CONTEXT_BUTTON_GAP)) || 6));
             EH.Config.CONTEXT_BUTTON_OPACITY = Math.min(1, Math.max(0.65, Number(this.get('contextButtonOpacity', EH.Config.CONTEXT_BUTTON_OPACITY)) || 0.96));
             EH.Config.CONTEXT_BUTTON_SHOW_TEXT = EH.Utils.parseBoolean(this.get('contextButtonShowText', EH.Config.CONTEXT_BUTTON_SHOW_TEXT), EH.Config.CONTEXT_BUTTON_SHOW_TEXT);
+            EH.Config.CONTEXT_BUTTON_POSITION = ['auto','right','left','bottom'].includes(String(this.get('contextButtonPosition', EH.Config.CONTEXT_BUTTON_POSITION)))
+                ? String(this.get('contextButtonPosition', EH.Config.CONTEXT_BUTTON_POSITION)) : 'auto';
             EH.Config.QUICK_ROUTE_GREETING = String(this.get('quickRouteGreeting', EH.Config.QUICK_ROUTE_GREETING) || '').trim();
             EH.Config.QUICK_ROUTE_FOOTER = String(this.get('quickRouteFooter', EH.Config.QUICK_ROUTE_FOOTER) || '').trim();
             EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE = String(this.get('quickRouteSummaryTemplate', EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE) || '');
@@ -557,7 +560,7 @@
             panelOpacity:{section:'aparencia',shared:true,default:1},
             panelRadius:{section:'aparencia',shared:true,default:15},
             shadowLevel:{section:'aparencia',shared:true,default:'normal'},
-            contextButtonOpacity:{section:'aparencia',shared:true,default:.96},
+            contextButtonOpacity:{section:'atalhos',shared:true,default:.96},
 
             overlaySide:{section:'paineis',device:true,default:'right'},
             overlayTopOffset:{section:'paineis',device:true,default:0},
@@ -580,12 +583,12 @@
             panelZoom:{section:'zoom',device:true,default:1.5},
             whatsappDockZoom:{section:'zoom',device:true,default:1.1},
 
-            autoRouteCapture:{section:'valores',shared:true,default:true},
-            autoCopyImages:{section:'valores',shared:true,default:true},
-            captureScale:{section:'valores',shared:true,default:2},
-            ticketCaptureWidth:{section:'valores',shared:true,default:430},
-            aplicarTaxasOrigem:{section:'valores',shared:true,default:true},
-            'boardingFees.v2':{section:'valores',shared:true,default:[]},
+            autoRouteCapture:{section:'geral',shared:true,default:true},
+            autoCopyImages:{section:'geral',shared:true,default:true},
+            captureScale:{section:'atendimento',shared:true,default:2},
+            ticketCaptureWidth:{section:'atendimento',shared:true,default:430},
+            aplicarTaxasOrigem:{section:'atendimento',shared:true,default:true},
+            'boardingFees.v2':{section:'atendimento',shared:true,default:[]},
 
             financeCommissionPercent:{section:'financeiro',shared:true,default:10},
             financeAutoRegister:{section:'financeiro',shared:true,default:true},
@@ -606,6 +609,7 @@
             contextButtonIconSize:{section:'atalhos',shared:true,default:15},
             contextButtonGap:{section:'atalhos',shared:true,default:6},
             contextButtonShowText:{section:'atalhos',shared:true,default:true},
+            contextButtonPosition:{section:'atalhos',device:true,default:'auto'},
 
             'quickRoutes.v1':{section:'rotas',shared:true,default:[]},
 
@@ -625,6 +629,38 @@
             syncSupabaseKey:{section:'sincronizacao',secret:true,export:false,default:''},
             syncSupabaseEmail:{section:'sincronizacao',secret:true,export:false,default:''},
             debug:{section:'avancado',default:false}
+        },
+        sectionAliases:{valores:'atendimento'},
+        canonicalSection(section){return this.sectionAliases[String(section||'')]||String(section||'');},
+        validateValue(key,value) {
+            const entry=this.entries[key];
+            if(!entry)throw new Error(`Configuração desconhecida: ${key}.`);
+            const fallback=this.defaultValue(key);
+            if(Array.isArray(fallback)){
+                if(!Array.isArray(value))throw new Error(`Formato inválido em ${key}.`);
+                return this.clone(value);
+            }
+            if(fallback&&typeof fallback==='object'){
+                if(!value||typeof value!=='object'||Array.isArray(value))throw new Error(`Formato inválido em ${key}.`);
+                return this.clone(value);
+            }
+            if(typeof fallback==='boolean'){
+                if(typeof value!=='boolean')throw new Error(`Valor lógico inválido em ${key}.`);
+                return value;
+            }
+            if(typeof fallback==='number'){
+                const number=Number(value);
+                if(!Number.isFinite(number))throw new Error(`Número inválido em ${key}.`);
+                return number;
+            }
+            if(typeof fallback==='string'){
+                if(typeof value!=='string'||value.length>200000)throw new Error(`Texto inválido em ${key}.`);
+                if(/^visual(?:Primary|Panel|Surface|Text|Muted|Border)Color$/.test(key)&&!/^#[0-9a-f]{6}$/i.test(value))throw new Error(`Cor inválida em ${key}.`);
+                const enums={visualTheme:['claro','alto-contraste'],visualFontFamily:['sistema','arial','verdana'],visualContrast:['normal','forte'],uiDensity:['compacto','padrao','confortavel'],shadowLevel:['none','suave','normal'],contextButtonSize:['small','normal','large','xlarge'],contextButtonPosition:['auto','right','left','bottom'],quickRouteEmojiLevel:['none','low','normal','high']};
+                if(enums[key]&&!enums[key].includes(value))throw new Error(`Opção inválida em ${key}.`);
+                return value;
+            }
+            return this.clone(value);
         },
         clone(value) {
             if (value === undefined) return undefined;
@@ -653,7 +689,7 @@
             const changed=[];
             Object.entries(values).forEach(([key,value])=>{
                 if(!this.entries[key]||(this.entries[key].secret&&!allowSecrets))return;
-                EH.Storage.set(key,this.clone(value));changed.push(key);
+                EH.Storage.set(key,this.validateValue(key,value));changed.push(key);
             });
             if(changed.length)this.touch(changed,timestamp);
             if(markSync)changed.forEach(key=>{
@@ -686,10 +722,11 @@
             if(payload.settings&&typeof payload.settings==='object'){
                 Object.entries(payload.settings).forEach(([section,values])=>{
                     if(!values||typeof values!=='object'||Array.isArray(values))return;
-                    Object.entries(values).forEach(([key,value])=>{if(this.entries[key]?.section===section&&!this.entries[key].secret&&this.entries[key].export!==false)flat[key]=value;});
+                    const canonical=this.canonicalSection(section);
+                    Object.entries(values).forEach(([key,value])=>{if(this.entries[key]?.section===canonical&&!this.entries[key].secret&&this.entries[key].export!==false)flat[key]=this.validateValue(key,value);});
                 });
             } else if(payload.values&&typeof payload.values==='object'){
-                Object.entries(payload.values).forEach(([key,value])=>{if(this.entries[key]&&!this.entries[key].secret&&this.entries[key].export!==false)flat[key]=value;});
+                Object.entries(payload.values).forEach(([key,value])=>{if(this.entries[key]&&!this.entries[key].secret&&this.entries[key].export!==false)flat[key]=this.validateValue(key,value);});
             }
             return flat;
         },
@@ -1107,6 +1144,15 @@
             }
         },
 
+        migrateSettingsCategoriesV20() {
+            // A categoria legada `valores` passa a se chamar `atendimento`.
+            // As chaves permanecem idênticas; somente a aba ativa é normalizada.
+            if (EH.Storage.get('settingsTab', '') === 'valores') EH.Storage.set('settingsTab', 'atendimento');
+            if (EH.Storage.get('contextButtonPosition', undefined) === undefined) EH.Storage.set('contextButtonPosition', 'auto');
+            if (EH.Storage.get('syncPanelLayout', undefined) === undefined) EH.Storage.set('syncPanelLayout', false);
+            EH.SettingsCatalog?.touch?.(['contextButtonPosition','syncPanelLayout'], 1);
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -1128,6 +1174,7 @@
             this.migrateSettingsV17();
             this.migratePassengerDataV18();
             this.migratePanelAutoFitV19();
+            this.migrateSettingsCategoriesV20();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -6272,31 +6319,32 @@
                 }
 
                 /* Central de configurações em abas. */
-                #eh-settings-overlay .eh-modal { max-height: min(88vh, 760px); }
-                .eh-settings-shell { display:grid; grid-template-columns: 158px minmax(0,1fr); gap:14px; min-height:420px; }
+                #eh-settings-overlay .eh-modal { max-height:min(92vh,900px);border-color:#d8e1eb!important;background:#fff!important;box-shadow:0 24px 70px rgba(26,45,72,.22); }
+                #eh-settings-overlay .eh-modal-head{min-height:58px;padding:13px 16px;background:#f8fafc!important}.eh-settings-mobile-nav{display:none}
+                .eh-settings-shell { display:grid; grid-template-columns: 210px minmax(0,1fr); gap:18px; min-height:480px; }
                 .eh-settings-tabs {
-                    display:flex; flex-direction:column; gap:5px; padding:4px;
+                    position:sticky;top:0;align-self:start;display:flex; flex-direction:column; gap:5px; padding:4px 14px 4px 2px;
                     border-right:1px solid #e1e6ec;
                 }
                 .eh-settings-tab {
-                    width:100%; border:1px solid transparent; border-radius:9px; padding:9px 10px;
+                    width:100%; min-height:40px!important;border:1px solid transparent; border-radius:9px; padding:10px 12px;
                     background:transparent; color:#5a6678; text-align:left; cursor:pointer;
-                    font:800 10px/1.2 Inter,"Segoe UI",Arial,sans-serif;
+                    font:800 12px/1.25 Inter,"Segoe UI",Arial,sans-serif;
                 }
                 .eh-settings-tab:hover { background:#f4f7fa; color:#2a3a4f; }
-                .eh-settings-tab.active { background:#edf5ff; border-color:#c7ddf8; color:#2167b5; }
-                .eh-settings-panes { min-width:0; }
+                .eh-settings-tab.active { background:#edf5ff; border-color:#bfd8f5; color:#1e63ad;box-shadow:inset 3px 0 #2563eb; }
+                .eh-settings-panes { min-width:0;padding-right:2px; }
                 .eh-settings-pane { display:none; }
                 .eh-settings-pane.active { display:block; }
-                .eh-settings-pane h3 { margin:2px 0 4px; font-size:14px; color:#253448; }
-                .eh-settings-pane > p { margin:0 0 12px; color:#718096; font-size:10px; line-height:1.45; }
+                .eh-settings-pane h3 { margin:2px 0 5px; font-size:17px; color:#253448; }
+                .eh-settings-pane > p { margin:0 0 14px; color:#64748b; font-size:12px; line-height:1.5; }
                 .eh-settings-card {
-                    margin:0 0 10px; padding:11px; border:1px solid #e0e6ed; border-radius:11px;
-                    background:#fafbfd;
+                    margin:0 0 12px; padding:14px; border:1px solid #e0e6ed; border-radius:12px;
+                    background:#fff;
                 }
-                .eh-settings-card-title { margin:0 0 8px; color:#46556a; font-size:9px; font-weight:900; text-transform:uppercase; letter-spacing:.45px; }
-                .eh-settings-grid-compact { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:9px; }
-                .eh-settings-note { margin-top:7px; color:#7d8999; font-size:9px; line-height:1.4; }
+                .eh-settings-card-title { margin:0 0 10px; color:#46556a; font-size:11px; font-weight:900; text-transform:uppercase; letter-spacing:.45px; }
+                .eh-settings-grid-compact { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:11px; }
+                .eh-settings-note { margin-top:8px; color:#69778a; font-size:11px; line-height:1.45; }
                 .eh-preset-row { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; }
                 .eh-preset-btn {
                     border:1px solid #d6dee8; border-radius:9px; padding:9px 7px; background:#fff;
@@ -6358,9 +6406,9 @@
 
 
                 @media (max-width: 760px) {
+                    #eh-settings-overlay{padding:8px}.eh-settings-mobile-nav{position:sticky;top:0;z-index:3;display:grid;gap:5px;margin:0 0 12px;padding:9px;border:1px solid #dbe3ec;border-radius:10px;background:#fff}.eh-settings-mobile-nav span{font-size:10px;font-weight:850;color:#64748b}.eh-settings-mobile-nav select{width:100%;min-height:42px;padding:8px 10px;border:1px solid #cbd5e1;border-radius:8px;background:#fff;color:#263548;font:750 12px Inter,"Segoe UI",Arial,sans-serif}
                     .eh-settings-shell { grid-template-columns:1fr; min-height:0; }
-                    .eh-settings-tabs { flex-direction:row; overflow-x:auto; border-right:0; border-bottom:1px solid #e1e6ec; padding-bottom:8px; }
-                    .eh-settings-tab { width:auto; flex:0 0 auto; }
+                    .eh-settings-tabs { display:none; }
                     .eh-settings-grid-compact { grid-template-columns:1fr; }
                     #eh-root,
                     #eh-wa-dock {
@@ -21581,18 +21629,22 @@
 
             const modal = document.createElement('div');
             modal.className = 'eh-modal';
-            modal.style.width = 'min(900px, 96vw)';
+            modal.style.width = 'min(1040px, 96vw)';
 
             const head = document.createElement('div');
             head.className = 'eh-modal-head';
             const title = document.createElement('div');
             title.className = 'eh-modal-title';
             title.textContent = 'Configurações Gerais';
+            const unsavedIndicator=document.createElement('span');
+            unsavedIndicator.className='eh-unsaved-indicator';
+            unsavedIndicator.textContent='Alterações não salvas';
+            unsavedIndicator.hidden=true;
             const closeTop = document.createElement('button');
             closeTop.type = 'button';
             closeTop.className = 'eh-modal-close';
             closeTop.textContent = '✕';
-            head.append(title, closeTop);
+            head.append(title, unsavedIndicator, closeTop);
 
             const content = document.createElement('div');
             content.className = 'eh-modal-content';
@@ -21601,10 +21653,19 @@
             shell.className = 'eh-settings-shell';
             const tabs = document.createElement('div');
             tabs.className = 'eh-settings-tabs';
+            tabs.setAttribute('role','tablist');
+            tabs.setAttribute('aria-label','Categorias das configurações');
             const panes = document.createElement('div');
             panes.className = 'eh-settings-panes';
+            const mobileNavigation=document.createElement('label');
+            mobileNavigation.className='eh-settings-mobile-nav';
+            const mobileNavigationText=document.createElement('span');
+            mobileNavigationText.textContent='Categoria';
+            const mobileSelect=document.createElement('select');
+            mobileSelect.setAttribute('aria-label','Selecionar categoria das configurações');
+            mobileNavigation.append(mobileNavigationText,mobileSelect);
             shell.append(tabs, panes);
-            content.appendChild(shell);
+            content.append(mobileNavigation,shell);
 
             const fields = {};
             let dirty=false;
@@ -21620,9 +21681,16 @@
                 tab.className = 'eh-settings-tab';
                 tab.textContent = label;
                 tab.dataset.tab = id;
+                tab.id=`eh-settings-tab-${id}`;
+                tab.setAttribute('role','tab');
+                tab.setAttribute('aria-controls',`eh-settings-pane-${id}`);
                 const pane = document.createElement('section');
                 pane.className = 'eh-settings-pane';
                 pane.dataset.pane = id;
+                pane.id=`eh-settings-pane-${id}`;
+                pane.setAttribute('role','tabpanel');
+                pane.setAttribute('aria-labelledby',tab.id);
+                const option=document.createElement('option');option.value=id;option.textContent=label;mobileSelect.appendChild(option);
                 const h = document.createElement('h3');
                 h.textContent = label;
                 const p = document.createElement('p');
@@ -21649,6 +21717,7 @@
             const numberField = (key, labelText, value, { min = 0, max = 9999, step = 1, hint = '' } = {}) => {
                 const field = document.createElement('div');
                 field.className = 'eh-field';
+                field.dataset.settingKey=key;
                 const label = document.createElement('label');
                 label.textContent = labelText;
                 const input = document.createElement('input');
@@ -21670,6 +21739,7 @@
             const moneyField = (key, labelText, value, hint = '') => {
                 const field = document.createElement('div');
                 field.className = 'eh-field';
+                field.dataset.settingKey=key;
                 const label = document.createElement('label');
                 label.textContent = labelText;
                 const input = document.createElement('input');
@@ -21692,6 +21762,7 @@
             const selectField = (key, labelText, value, options, hint = '') => {
                 const field = document.createElement('div');
                 field.className = 'eh-field';
+                field.dataset.settingKey=key;
                 const label = document.createElement('label');
                 label.textContent = labelText;
                 const select = document.createElement('select');
@@ -21714,6 +21785,7 @@
             };
             const checkField = (key, textLabel, checked, hint = '') => {
                 const wrap = document.createElement('div');
+                wrap.dataset.settingKey=key;
                 const label = document.createElement('label');
                 label.className = 'eh-check';
                 const input = document.createElement('input');
@@ -21735,6 +21807,7 @@
             const textareaField = (key, labelText, value) => {
                 const field = document.createElement('div');
                 field.className = 'eh-field';
+                field.dataset.settingKey=key;
                 const label = document.createElement('label');
                 label.textContent = labelText;
                 const textarea = document.createElement('textarea');
@@ -21747,6 +21820,7 @@
             const textField = (key, labelText, value, hint = '') => {
                 const field = document.createElement('div');
                 field.className = 'eh-field';
+                field.dataset.settingKey=key;
                 const label = document.createElement('label');
                 label.textContent = labelText;
                 const input = document.createElement('input');
@@ -21764,6 +21838,7 @@
             };
             const colorField = (key, labelText, value) => {
                 const field=document.createElement('div');field.className='eh-field';
+                field.dataset.settingKey=key;
                 const label=document.createElement('label');label.textContent=labelText;
                 const input=document.createElement('input');input.type='color';input.value=/^#[0-9a-f]{6}$/i.test(String(value||''))?String(value):'#2563eb';
                 field.append(label,input);fields[key]=input;return field;
@@ -21781,7 +21856,7 @@
                 paineis: makePane('paineis', 'Painéis', 'Posição e dimensões dos overlays. O E-Pass original permanece intacto.'),
                 whatsapp: makePane('whatsapp', 'WhatsApp', 'Visualização do painel integrado e mensagens automáticas do atendimento.'),
                 zoom: makePane('zoom', 'Tela e Zoom', 'Escala dos overlays e posição vertical. Nenhum zoom é aplicado ao E-Pass.'),
-                valores: makePane('valores', 'Atendimento', 'Taxas de embarque por origem e qualidade das capturas usadas no atendimento.'),
+                atendimento: makePane('atendimento', 'Atendimento', 'Preenchimento, conservação dos dados, taxas e capturas usadas durante o atendimento.'),
                 financeiro: makePane('financeiro', 'Financeiro', 'Comissão e comportamento do controle local de Caixa e Comissões.'),
                 carros: makePane('carros', 'Carros / Operação', 'Agência 287 e serviços usados na consulta rápida do Mapa de Viagem.'),
                 atalhos: makePane('atalhos', 'Botões contextuais', 'Tamanho e aparência apenas dos botões que abrem as ferramentas.'),
@@ -21792,12 +21867,12 @@
             };
 
             // GERAL
-            const generalAutomation = card('Automação');
+            const generalAutomation = card('Inicialização e comportamento geral');
             generalAutomation.append(
                 checkField('autoRoute', 'Rota rápida: pesquisar e gerar horários automaticamente', EH.Config.AUTO_ROUTE_CAPTURE),
                 checkField('autoCopy', 'Tentar copiar automaticamente o PNG quando o navegador permitir', EH.Config.AUTO_COPY_IMAGES)
             );
-            sections.valores.pane.appendChild(generalAutomation);
+            sections.geral.pane.appendChild(generalAutomation);
             const generalInfo=card('Organização');
             generalInfo.append(note('As preferências estão organizadas por responsabilidade. Aparência, layout, zoom e dados operacionais são salvos de forma independente e sem alterar o E-Pass.'));
             sections.geral.pane.appendChild(generalInfo);
@@ -21811,10 +21886,12 @@
                 ]),
                 numberField('contextButtonFontSize', 'Fonte (px)', EH.Config.CONTEXT_BUTTON_FONT_SIZE, {min:8,max:18,step:1}),
                 numberField('contextButtonIconSize', 'Ícone (px)', EH.Config.CONTEXT_BUTTON_ICON_SIZE, {min:12,max:26,step:1}),
-                numberField('contextButtonGap', 'Distância (px)', EH.Config.CONTEXT_BUTTON_GAP, {min:2,max:18,step:1})
+                numberField('contextButtonGap', 'Distância (px)', EH.Config.CONTEXT_BUTTON_GAP, {min:2,max:18,step:1}),
+                numberField('contextButtonOpacity','Transparência (%)',Math.round(EH.Config.CONTEXT_BUTTON_OPACITY*100),{min:65,max:100,step:1}),
+                selectField('contextButtonPosition','Posição',EH.Config.CONTEXT_BUTTON_POSITION,[['auto','Automática'],['right','Direita'],['left','Esquerda'],['bottom','Inferior']])
             );
             shortcutCard.append(shortcutGrid,checkField('contextButtonShowText','Exibir texto ao lado do ícone',EH.Config.CONTEXT_BUTTON_SHOW_TEXT,'Quando desativado, o nome continua disponível no tooltip e no rótulo acessível.'));
-            const resetContextPanels=document.createElement('button');resetContextPanels.type='button';resetContextPanels.className='eh-modal-btn';resetContextPanels.textContent='Restaurar posições dos painéis contextuais';resetContextPanels.addEventListener('click',()=>{EH.Storage.set('contextualPanels.v1',{});for(const [id] of EH.ContextualPanels?.panels||[])EH.ContextualPanels.close(id);EH.Toast.info('Posições contextuais restauradas.');});shortcutCard.appendChild(resetContextPanels);
+            const resetContextPanels=document.createElement('button');resetContextPanels.type='button';resetContextPanels.className='eh-modal-btn';resetContextPanels.textContent='Restaurar posições dos painéis contextuais';resetContextPanels.addEventListener('click',()=>{EH.Storage.set('contextualPanels.v1',{});for(const [id] of EH.ContextualPanels?.panels||[])EH.ContextualPanels.close(id);EH.Toast.info('Posições contextuais restauradas.');});
             sections.atalhos.pane.appendChild(shortcutCard);
 
             // ROTAS RÁPIDAS
@@ -21898,7 +21975,6 @@
                 numberField('visualSpacing','Espaçamento',EH.Config.VISUAL_SPACING,{min:.8,max:1.35,step:.05}),
                 numberField('visualBorderWidth','Bordas (px)',EH.Config.VISUAL_BORDER_WIDTH,{min:0,max:2,step:1}),
                 numberField('visualButtonHeight','Altura dos botões (px)',EH.Config.VISUAL_BUTTON_HEIGHT,{min:34,max:48,step:1}),
-                numberField('contextButtonOpacity','Opacidade dos atalhos (%)',Math.round(EH.Config.CONTEXT_BUTTON_OPACITY*100),{min:65,max:100,step:1}),
                 selectField('shadow', 'Sombra', EH.Config.SHADOW_LEVEL, [
                     ['none', 'Sem sombra'],
                     ['suave', 'Suave'],
@@ -21928,7 +22004,7 @@
                 numberField('topOffset', 'Distância do topo (px)', EH.Config.OVERLAY_TOP_OFFSET, { min: 0, max: 240, step: 2, hint: '0 = automático conforme o tamanho da tela.' })
             );
             const legacyMainOpen=checkField('mainOpen','Painel legado',false);legacyMainOpen.hidden=true;
-            positionCard.append(legacyMainOpen,positionGrid,note('Os painéis operacionais agora são independentes e aparecem somente no contexto correspondente.'));
+            positionCard.append(legacyMainOpen,positionGrid,resetContextPanels,note('Os painéis operacionais agora são independentes e aparecem somente no contexto correspondente.'));
             sections.paineis.pane.appendChild(positionCard);
 
             const dimensionsCard = card('Dimensões');
@@ -21940,12 +22016,12 @@
                 numberField('waHeight', 'Conversa atual — altura (%)', EH.Config.WHATSAPP_HEIGHT_PERCENT, { min: 0, max: 80, step: 5, hint: '0 = altura automática atual.' })
             );
             dimensionsCard.appendChild(dimensionsGrid);
+            dimensionsCard.hidden=true;
             sections.paineis.pane.appendChild(dimensionsCard);
 
             const managedPanels = EH.PanelManager.load();
             const panelDrafts = JSON.parse(JSON.stringify(managedPanels));
             const controlCard = card('Mover, fixar e dimensionar');
-            controlCard.hidden = true;
             const controlGrid = grid();
             controlGrid.append(
                 selectField('managedPanel', 'Painel', 'main', [
@@ -21970,13 +22046,17 @@
             const fitPanel=document.createElement('button'); fitPanel.type='button'; fitPanel.className='eh-modal-btn'; fitPanel.textContent='Ajustar ao conteúdo';
             const restorePanel=document.createElement('button'); restorePanel.type='button'; restorePanel.className='eh-modal-btn'; restorePanel.textContent='Restaurar este painel';
             const restoreAllPanels=document.createElement('button'); restoreAllPanels.type='button'; restoreAllPanels.className='eh-modal-btn'; restoreAllPanels.textContent='Restaurar todos';
-            panelControlActions.append(fitPanel,restorePanel,restoreAllPanels); controlCard.append(panelControlActions,note('Arraste somente pelo cabeçalho. Botões e campos não iniciam movimento. O modo Livre é salvo após soltar.'));
+            const minimizePanel=document.createElement('button');minimizePanel.type='button';minimizePanel.className='eh-modal-btn';minimizePanel.textContent='Minimizar agora';
+            const panelLimits=note('');
+            panelControlActions.append(fitPanel,minimizePanel,restorePanel,restoreAllPanels); controlCard.append(panelControlActions,panelLimits,note('Arraste somente pelo cabeçalho. Botões e campos não iniciam movimento. O modo Livre é salvo após soltar.'));
             sections.paineis.pane.appendChild(controlCard);
             const capturePanelDraft=()=>{ const key=fields.managedPanel.value; const rawHandleY=Number(fields.managedHandleY.value); panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,handleY:Number.isFinite(rawHandleY)?Math.max(0,Math.min(100,rawHandleY)):50,dynamic:fields.managedDynamic.checked,allowDrag:fields.managedAllowDrag.checked,allowResize:fields.managedAllowResize.checked}; };
-            const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedHandleY.value=String(cfg.handleY); fields.managedDynamic.checked=Boolean(cfg.dynamic); fields.managedAllowDrag.checked=Boolean(cfg.allowDrag); fields.managedAllowResize.checked=Boolean(cfg.allowResize); };
+            const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key],limits=EH.PanelManager.limits(key); fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedHandleY.value=String(cfg.handleY); fields.managedDynamic.checked=Boolean(cfg.dynamic); fields.managedAllowDrag.checked=Boolean(cfg.allowDrag); fields.managedAllowResize.checked=Boolean(cfg.allowResize); panelLimits.textContent=`Limites seguros: largura ${limits.minW}–${limits.maxW}px • altura ${limits.minH}–${limits.maxH}px. Autoajuste é o padrão.`; };
             let previousManagedPanel='main'; fields.managedPanel.addEventListener('change',()=>{ const next=fields.managedPanel.value; fields.managedPanel.value=previousManagedPanel; capturePanelDraft(); fields.managedPanel.value=next; previousManagedPanel=next; loadPanelDraft(next); });
+            loadPanelDraft(previousManagedPanel);
             ['managedMode','managedWidth','managedHeight','managedHandleY','managedDynamic','managedAllowDrag','managedAllowResize'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
             fitPanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; const rec=EH.PanelManager.recommended(key); fields.managedWidth.value=String(rec.width); fields.managedHeight.value=String(rec.height); fields.managedDynamic.checked=true; capturePanelDraft(); });
+            minimizePanel.addEventListener('click',()=>{const key=fields.managedPanel.value;if(key==='main')EH.State?.setPanel?.('left',false);else if(key==='whatsapp')EH.State?.setPanel?.('right',false);else EH.OperationDock?.setCollapsed?.(true);EH.Toast.info(`${EH.PanelManager.label(key)} minimizado sem perder posição, tamanho ou zoom.`);});
             restorePanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...EH.PanelManager.defaults()[key]}; loadPanelDraft(key); });
             restoreAllPanels.addEventListener('click',()=>{ const defs=EH.PanelManager.defaults(); Object.keys(defs).forEach(k=>panelDrafts[k]={...defs[k]}); loadPanelDraft(fields.managedPanel.value); });
 
@@ -22036,7 +22116,7 @@
             EH.BoardingFeeManager.load().forEach(addFeeRow);
             const addFee=document.createElement('button');addFee.type='button';addFee.className='eh-modal-btn';addFee.textContent='+ Adicionar cidade';addFee.addEventListener('click',()=>addFeeRow({}));
             feesCard.append(checkField('autoFees','Adicionar automaticamente a taxa conforme a origem configurada',EH.Config.APLICAR_TAXAS_ORIGEM),feesList,addFee,note('A taxa é vinculada à ORIGEM (cidade + UF). Se não houver taxa cadastrada, o valor-base do E-Pass é preservado.'));
-            sections.valores.pane.appendChild(feesCard);
+            sections.atendimento.pane.appendChild(feesCard);
 
             const captureCard = card('Captura');
             const captureGrid = grid();
@@ -22045,7 +22125,7 @@
                 numberField('ticketWidth', 'Largura do print da passagem (px)', EH.Config.TICKET_CAPTURE_WIDTH, { min: 360, max: 520, step: 10 })
             );
             captureCard.appendChild(captureGrid);
-            sections.valores.pane.appendChild(captureCard);
+            sections.atendimento.pane.appendChild(captureCard);
 
             // FINANCEIRO
             const financeCard = card('Caixa e Comissões');
@@ -22288,7 +22368,6 @@
             sections.avancado.pane.appendChild(advancedCard);
 
             Object.entries(sections).forEach(([id,section])=>{
-                if(id==='geral')return;
                 const row=document.createElement('div');row.className='eh-settings-inline-actions';
                 const restoreSection=document.createElement('button');restoreSection.type='button';restoreSection.className='eh-modal-btn';restoreSection.textContent='Restaurar somente esta seção';
                 restoreSection.addEventListener('click',()=>{
@@ -22303,13 +22382,19 @@
                 Object.values(sections).forEach(section => {
                     const active = section.tab.dataset.tab === id;
                     section.tab.classList.toggle('active', active);
+                    section.tab.setAttribute('aria-selected',String(active));
+                    section.tab.tabIndex=active?0:-1;
                     section.pane.classList.toggle('active', active);
+                    section.pane.hidden=!active;
                 });
+                mobileSelect.value=id;
                 EH.Storage.set('settingsTab', id);
+                EH.PanelAutoFit?.schedule?.(modal,'settings-category');
             };
             Object.values(sections).forEach(section => {
                 section.tab.addEventListener('click', () => setActiveTab(section.tab.dataset.tab));
             });
+            mobileSelect.addEventListener('change',()=>setActiveTab(mobileSelect.value));
             const initialTab = String(EH.Storage.get('settingsTab', 'geral') || 'geral');
             setActiveTab(sections[initialTab] ? initialTab : 'geral');
 
@@ -22347,9 +22432,10 @@
             const restoreDefaults = document.createElement('button');
             restoreDefaults.type = 'button';
             restoreDefaults.className = 'eh-modal-btn';
-            restoreDefaults.textContent = 'Restaurar padrão';
+            restoreDefaults.textContent = 'Restaurar tudo';
             restoreDefaults.title = 'Restaura somente preferências. Não apaga requisições, passageiros, histórico ou outros dados.';
             restoreDefaults.addEventListener('click', () => {
+                if(!window.confirm('Restaurar todas as configurações ao padrão? Solicitações, passageiros, códigos, bilhetes e dados financeiros serão preservados.'))return;
                 const d = EH.ConfigDefaults;
                 selectedPreset = 'padrao';
                 fields.autoRoute.checked = Boolean(d.AUTO_ROUTE_CAPTURE);
@@ -22420,6 +22506,7 @@
                 fields.contextButtonGap.value = String(d.CONTEXT_BUTTON_GAP);
                 fields.contextButtonOpacity.value = String(Math.round(d.CONTEXT_BUTTON_OPACITY*100));
                 fields.contextButtonShowText.checked = Boolean(d.CONTEXT_BUTTON_SHOW_TEXT);
+                fields.contextButtonPosition.value = d.CONTEXT_BUTTON_POSITION;
                 fields.quickRouteGreeting.value = d.QUICK_ROUTE_GREETING;
                 fields.quickRouteFooter.value = d.QUICK_ROUTE_FOOTER;
                 fields.quickRouteSummaryTemplate.value = d.QUICK_ROUTE_SUMMARY_TEMPLATE;
@@ -22489,6 +22576,19 @@
                     });
                 } catch (error) { EH.Toast.error(error.message || 'Confira as taxas de embarque.'); return; }
 
+                // Todas as categorias são validadas antes da primeira gravação.
+                // Isso evita aplicar Aparência/Financeiro se Rotas ou Carros falharem.
+                const quickRouteOrder=Array.from(quickRouteList.children);
+                const quickRoutes=quickRouteRows.filter(row=>!row.removed&&row.row.isConnected).sort((a,b)=>quickRouteOrder.indexOf(a.row)-quickRouteOrder.indexOf(b.row)).map((row,index)=>({
+                    id:row.id,time:EH.Utils.clean(row.time.value||''),origin:EH.Utils.clean(row.origin.value||''),destination:EH.Utils.clean(row.destination.value||''),alias:EH.Utils.clean(row.alias.value||''),active:Boolean(row.active.checked),visible:Boolean(row.visible.checked),order:index
+                }));
+                if(quickRoutes.some(item=>!/^([01]\d|2[0-3]):[0-5]\d$/.test(item.time)||!item.origin||!item.destination)){EH.Toast.error('Confira horário, origem e destino das rotas rápidas.');return;}
+                const operationRoutines=operationRoutineFields.filter(row=>!row.removed&&row.row.isConnected).map((row,index)=>{
+                    const time=EH.Utils.clean(row.time.value||''),name=EH.Utils.clean(row.name.value||''),rawId=EH.Utils.clean(row.id||'')||`${time}-${name}-${index}`;
+                    return {id:EH.Utils.normalize(rawId).replace(/[^A-Z0-9]+/g,'-').replace(/^-+|-+$/g,'').toLowerCase()||`rotina-${index+1}`,name,operationalTime:time,active:Boolean(row.active.checked),originHint:EH.Utils.clean(row.origin.value||''),destinationHint:EH.Utils.clean(row.destination.value||''),companyHint:EH.Utils.clean(row.company.value||''),lineHint:EH.Utils.clean(row.line.value||'')};
+                }).filter(item=>item.name||item.operationalTime);
+                if(!operationRoutines.length||operationRoutines.some(item=>!item.name||!/^([01]\d|2[0-3]):[0-5]\d$/.test(item.operationalTime))){EH.Toast.error(!operationRoutines.length?'Cadastre pelo menos um horário operacional.':'Confira nome e horário dos carros principais (HH:MM).');return;}
+
                 const values = {
                     preset: selectedPreset,
                     density: ['compacto', 'padrao', 'confortavel'].includes(fields.density.value) ? fields.density.value : 'padrao',
@@ -22520,6 +22620,7 @@
                     captureScale: clamp(fields.captureScale.value, 1, 3, 2),
                     ticketWidth: clamp(fields.ticketWidth.value, 360, 520, 430)
                 };
+                const settingsBackup=EH.SettingsCatalog.backupCurrent('before-settings-save');
 
                 EH.Config.SETTINGS_PRESET = values.preset;
                 EH.Config.UI_DENSITY = values.density;
@@ -22582,40 +22683,13 @@
                 EH.Config.CONTEXT_BUTTON_GAP = clamp(fields.contextButtonGap.value,2,18,6);
                 EH.Config.CONTEXT_BUTTON_OPACITY = clamp(Number(fields.contextButtonOpacity.value)/100,.65,1,.96);
                 EH.Config.CONTEXT_BUTTON_SHOW_TEXT = Boolean(fields.contextButtonShowText.checked);
+                EH.Config.CONTEXT_BUTTON_POSITION = ['auto','right','left','bottom'].includes(fields.contextButtonPosition.value)?fields.contextButtonPosition.value:'auto';
                 EH.Config.QUICK_ROUTE_GREETING = String(fields.quickRouteGreeting.value||'').trim();
                 EH.Config.QUICK_ROUTE_FOOTER = String(fields.quickRouteFooter.value||'').trim();
                 EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE = String(fields.quickRouteSummaryTemplate.value||'');
                 EH.Config.QUICK_ROUTE_FULL_TEMPLATE = String(fields.quickRouteFullTemplate.value||'');
                 EH.Config.QUICK_ROUTE_EMOJI_LEVEL = fields.quickRouteEmojiLevel.value;
                 EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP = Boolean(fields.quickRouteCopyBeforeWhatsApp.checked);
-                const quickRouteOrder=Array.from(quickRouteList.children);const quickRoutes = quickRouteRows.filter(row=>!row.removed&&row.row.isConnected).sort((a,b)=>quickRouteOrder.indexOf(a.row)-quickRouteOrder.indexOf(b.row)).map((row,index)=>({
-                    id:row.id,time:EH.Utils.clean(row.time.value||''),origin:EH.Utils.clean(row.origin.value||''),destination:EH.Utils.clean(row.destination.value||''),alias:EH.Utils.clean(row.alias.value||''),active:Boolean(row.active.checked),visible:Boolean(row.visible.checked),order:index
-                }));
-                const invalidQuickRoute=quickRoutes.find(item=>!/^\d{2}:\d{2}$/.test(item.time)||!item.origin||!item.destination);
-                if(invalidQuickRoute){EH.Toast.error('Confira horário, origem e destino das rotas rápidas.');return;}
-                const operationRoutines = operationRoutineFields
-                    .filter(row => !row.removed && row.row.isConnected)
-                    .map((row,index) => {
-                        const time=EH.Utils.clean(row.time.value||'');
-                        const name=EH.Utils.clean(row.name.value||'');
-                        const rawId=EH.Utils.clean(row.id||'')||`${time}-${name}-${index}`;
-                        return {
-                            id: EH.Utils.normalize(rawId).replace(/[^A-Z0-9]+/g,'-').replace(/^-+|-+$/g,'').toLowerCase() || `rotina-${index+1}`,
-                            name,
-                            operationalTime:time,
-                            active:Boolean(row.active.checked),
-                            originHint:EH.Utils.clean(row.origin.value||''),
-                            destinationHint:EH.Utils.clean(row.destination.value||''),
-                            companyHint:EH.Utils.clean(row.company.value||''),
-                            lineHint:EH.Utils.clean(row.line.value||'')
-                        };
-                    })
-                    .filter(item => item.name || item.operationalTime);
-                const invalidRoutine=operationRoutines.find(item=>!item.name||!/^\d{1,2}:\d{2}$/.test(item.operationalTime));
-                if(!operationRoutines.length||invalidRoutine){
-                    EH.Toast.error(!operationRoutines.length?'Cadastre pelo menos um horário operacional.':'Confira nome e horário dos carros principais (HH:MM).');
-                    return;
-                }
                 EH.Config.OPERATION_CARS_ENABLED = fields.operationCarsEnabled.checked;
                 EH.Config.OPERATION_DOCK_ENABLED = fields.operationDockEnabled.checked;
                 EH.Config.OPERATION_AGENCY_CODE = String(fields.operationAgencyCode.value || '').replace(/\D/g, '') || '287';
@@ -22706,6 +22780,7 @@
                     contextButtonGap: EH.Config.CONTEXT_BUTTON_GAP,
                     contextButtonOpacity: EH.Config.CONTEXT_BUTTON_OPACITY,
                     contextButtonShowText: EH.Config.CONTEXT_BUTTON_SHOW_TEXT,
+                    contextButtonPosition: EH.Config.CONTEXT_BUTTON_POSITION,
                     quickRouteGreeting: EH.Config.QUICK_ROUTE_GREETING,
                     quickRouteFooter: EH.Config.QUICK_ROUTE_FOOTER,
                     quickRouteSummaryTemplate: EH.Config.QUICK_ROUTE_SUMMARY_TEMPLATE,
@@ -22716,10 +22791,16 @@
                     'panelManager.v1':panelDrafts,
                     debug: fields.debug.checked
                 };
-                EH.SettingsCatalog.setMany(settingsToSave,{timestamp:Date.now(),markSync:true,allowSecrets:true});
-                EH.QuickRoutes.save(quickRoutes);
-                EH.PanelManager.save(panelDrafts);
-                EH.Sync?.start?.();
+                try {
+                    EH.SettingsCatalog.setMany(settingsToSave,{timestamp:Date.now(),markSync:true,allowSecrets:true});
+                    EH.QuickRoutes.save(quickRoutes);
+                    EH.PanelManager.save(panelDrafts);
+                    EH.Sync?.start?.();
+                } catch(error) {
+                    EH.SettingsCatalog.restoreBackup(settingsBackup);EH.Storage.loadSettings();
+                    EH.Toast.error(error.message||'Não foi possível salvar as configurações. O estado anterior foi restaurado.');
+                    return;
+                }
 
                 EH.Layout.sync();
                 EH.PanelManager?.bindAll?.();
@@ -22732,7 +22813,8 @@
                 const ok=failedKeys.length===0;
 
                 if (!ok) {
-                    EH.Toast.error(`Não foi possível confirmar o salvamento de ${failedKeys.length} preferência(s). Tente novamente.`);
+                    EH.SettingsCatalog.restoreBackup(settingsBackup);EH.Storage.loadSettings();EH.Layout?.sync?.();
+                    EH.Toast.error(`Não foi possível confirmar o salvamento de ${failedKeys.length} preferência(s). O estado anterior foi restaurado.`);
                     return;
                 }
                 EH.Toast.success('Configurações salvas neste navegador.');
@@ -23031,6 +23113,7 @@
                 #eh-context-shortcuts{position:fixed;right:8px;top:142px;z-index:2147482950;display:flex;flex-direction:column;gap:var(--eh-context-gap,6px);pointer-events:none;font-family:Inter,"Segoe UI",Arial,sans-serif}#eh-context-shortcuts[hidden]{display:none!important}.eh-context-next-pill{pointer-events:auto;cursor:pointer;box-sizing:border-box;display:grid;gap:2px;max-width:230px;padding:7px 9px;border:1px solid #d7e2ec;border-radius:9px;background:rgba(248,251,254,.97);color:#526579;box-shadow:0 4px 12px rgba(31,48,70,.09);font:750 9px/1.3 Inter,"Segoe UI",Arial,sans-serif}.eh-context-next-pill:focus-visible{outline:2px solid rgba(59,130,246,.25)}.eh-context-next-pill strong{color:#2b425b;font-size:10px}.eh-context-next-pill small{font:inherit}
                 #eh-context-shortcuts button{pointer-events:auto;display:flex;align-items:center;gap:6px;min-width:var(--eh-context-min,38px);min-height:var(--eh-context-height,36px);padding:7px 9px;border:1px solid #cbd5e1;border-radius:10px;background:rgba(255,255,255,var(--eh-context-opacity,.96));color:#28415e;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:800 var(--eh-context-font,10px)/1.15 Inter,"Segoe UI",Arial,sans-serif;text-align:left}.eh-context-shortcut-icon{font-size:var(--eh-context-icon,15px)}#eh-context-shortcuts button:hover,#eh-context-shortcuts button:focus-visible{border-color:#6b9ed8;background:#fff;outline:2px solid rgba(59,130,246,.18)}
                 html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:auto}@media(max-width:760px){#eh-context-shortcuts{top:auto;right:8px;bottom:10px;flex-direction:row;max-width:calc(100vw - 16px);overflow-x:auto}html.eh-overlay-side-left #eh-context-shortcuts{left:8px;right:8px}}
+                #eh-context-shortcuts[data-position="right"]{left:auto!important;right:8px!important;top:142px!important;bottom:auto!important;flex-direction:column!important}#eh-context-shortcuts[data-position="left"]{left:8px!important;right:auto!important;top:142px!important;bottom:auto!important;flex-direction:column!important}#eh-context-shortcuts[data-position="bottom"]{left:8px!important;right:8px!important;top:auto!important;bottom:10px!important;flex-direction:row!important;max-width:calc(100vw - 16px);overflow-x:auto}
             `);this.render(EH.Pages?.detect?.()||'desconhecida');
         },
         button(icon,label,title,action){const button=document.createElement('button');button.type='button';button.title=title;button.setAttribute('aria-label',title);const i=document.createElement('span');i.className='eh-context-shortcut-icon';i.textContent=icon;button.appendChild(i);if(EH.Config.CONTEXT_BUTTON_SHOW_TEXT){const text=document.createElement('span');text.textContent=label;button.appendChild(text);}button.addEventListener('click',event=>{event.stopPropagation();action();});return button;},
@@ -23050,7 +23133,7 @@
             }
             return[];
         },
-        applyPreferences(){if(!this.root)return;const sizes={small:[32,32],normal:[38,36],large:[46,42],xlarge:[56,50]};const [min,height]=sizes[EH.Config.CONTEXT_BUTTON_SIZE]||sizes.normal;this.root.style.setProperty('--eh-context-min',`${min}px`);this.root.style.setProperty('--eh-context-height',`${height}px`);this.root.style.setProperty('--eh-context-font',`${EH.Config.CONTEXT_BUTTON_FONT_SIZE}px`);this.root.style.setProperty('--eh-context-icon',`${EH.Config.CONTEXT_BUTTON_ICON_SIZE}px`);this.root.style.setProperty('--eh-context-gap',`${EH.Config.CONTEXT_BUTTON_GAP}px`);this.root.style.setProperty('--eh-context-opacity',String(EH.Config.CONTEXT_BUTTON_OPACITY));},
+        applyPreferences(){if(!this.root)return;const sizes={small:[32,32],normal:[38,36],large:[46,42],xlarge:[56,50]};const [min,height]=sizes[EH.Config.CONTEXT_BUTTON_SIZE]||sizes.normal;this.root.style.setProperty('--eh-context-min',`${min}px`);this.root.style.setProperty('--eh-context-height',`${height}px`);this.root.style.setProperty('--eh-context-font',`${EH.Config.CONTEXT_BUTTON_FONT_SIZE}px`);this.root.style.setProperty('--eh-context-icon',`${EH.Config.CONTEXT_BUTTON_ICON_SIZE}px`);this.root.style.setProperty('--eh-context-gap',`${EH.Config.CONTEXT_BUTTON_GAP}px`);this.root.style.setProperty('--eh-context-opacity',String(EH.Config.CONTEXT_BUTTON_OPACITY));this.root.dataset.position=EH.Config.CONTEXT_BUTTON_POSITION||'auto';},
         activePassengerName(context){const active=EH.SaleContext?.getActivePassenger?.();if(active?.name)return active.name;const ids=new Set(context?.passengerIds||[]);const remembered=(EH.PassengerMemory?.load?.()||[]).find(item=>ids.has(item.id));if(remembered?.name)return remembered.name;const refs=new Set(context?.requisitionRefs||[]);const request=(EH.RequisitionManager?.loadStore?.()||[]).find(item=>refs.has(item.id));return request?.passengers?.[0]?.nome||'';},
         render(page=EH.Pages?.detect?.()||'desconhecida'){
             if(!this.root)return;this.currentPage=page;this.applyPreferences();const definitions=this.definitions(page);const data=EH.PassengerData?.active?.(),candidates=EH.RequestFlow?.candidates?.()||[];const nodes=[];
