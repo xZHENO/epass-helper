@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         EPass Atendimento
 // @namespace    https://github.com/epass-helper
-// @version      5.74.0
+// @version      5.75.0
 // @description  Helper contextual do E-Pass para atendimento, documentos, operação e conferência
 // @author       EPass Helper
 // @updateURL    https://raw.githubusercontent.com/xZHENO/epass-helper/main/EPASS_HELPER_ATENDIMENTO.user.js
@@ -37,10 +37,10 @@
     // CONFIGURAÇÕES
     // ============================================================
     EH.Config = {
-        VERSION: '5.74.0',
+        VERSION: '5.75.0',
         DEBUG: false,
         STORAGE_PREFIX: 'epassHelperV5.', // namespace de dados estável; não acompanha a versão do script
-        STORAGE_SCHEMA_VERSION: 16,
+        STORAGE_SCHEMA_VERSION: 17,
         TOAST_DURATION: 3400,
         CAPTURE_SCALE: 2,
         TICKET_CAPTURE_WIDTH: 430,
@@ -58,6 +58,20 @@
         WHATSAPP_MIN_BASE: 160,
         SETTINGS_PRESET: 'padrao',
         UI_DENSITY: 'padrao',
+        VISUAL_THEME: 'claro',
+        VISUAL_PRIMARY_COLOR: '#2563eb',
+        VISUAL_PANEL_COLOR: '#ffffff',
+        VISUAL_SURFACE_COLOR: '#f8fafc',
+        VISUAL_TEXT_COLOR: '#1f2937',
+        VISUAL_MUTED_COLOR: '#64748b',
+        VISUAL_BORDER_COLOR: '#dbe3ec',
+        VISUAL_FONT_FAMILY: 'sistema',
+        VISUAL_BASE_FONT_SIZE: 12,
+        VISUAL_CONTRAST: 'normal',
+        VISUAL_SPACING: 1,
+        VISUAL_BORDER_WIDTH: 1,
+        VISUAL_BUTTON_HEIGHT: 36,
+        VISUAL_ANIMATIONS: true,
         PANEL_CUSTOM_WIDTH: 0,
         PANEL_HEIGHT_PERCENT: 0,
         WHATSAPP_CUSTOM_WIDTH: 0,
@@ -90,6 +104,7 @@
         SYNC_REQUISITIONS: true,
         SYNC_EMISSION_DATA: true,
         SYNC_SETTINGS: false,
+        SYNC_PANEL_LAYOUT: false,
         CONTEXT_BUTTON_SIZE: 'normal',
         CONTEXT_BUTTON_FONT_SIZE: 10,
         CONTEXT_BUTTON_ICON_SIZE: 15,
@@ -356,7 +371,11 @@
         },
         loadSettings() {
             const taxasPadrao = { ...EH.Config.TAXAS_ORIGEM };
-            const taxasSalvas = this.get('taxasOrigem', null);
+            let taxasSalvas = this.get('taxasOrigem', null);
+            const boardingFeesV2=this.get('boardingFees.v2',null);
+            if(Array.isArray(boardingFeesV2)&&boardingFeesV2.length){
+                taxasSalvas=Object.fromEntries(boardingFeesV2.filter(item=>item&&item.city).map(item=>[String(item.city),Math.max(0,EH.Utils.parseMoney(item.value))]));
+            }
             const taxaIporaLegada = EH.Utils.parseMoney(this.get('taxaIpora', taxasPadrao.IPORA));
             if (taxasSalvas && typeof taxasSalvas === 'object') {
                 EH.Config.TAXAS_ORIGEM = Object.fromEntries(
@@ -391,6 +410,27 @@
             EH.Config.SETTINGS_PRESET = ['compacto', 'padrao', 'confortavel', 'personalizado'].includes(preset) ? preset : 'padrao';
             const density = String(this.get('uiDensity', EH.Config.UI_DENSITY) || 'padrao');
             EH.Config.UI_DENSITY = ['compacto', 'padrao', 'confortavel'].includes(density) ? density : 'padrao';
+            const safeColor = (key, fallback) => {
+                const value = String(this.get(key, fallback) || '').trim();
+                return /^#[0-9a-f]{6}$/i.test(value) ? value.toLowerCase() : fallback;
+            };
+            EH.Config.VISUAL_THEME = ['claro','alto-contraste'].includes(String(this.get('visualTheme', EH.Config.VISUAL_THEME)))
+                ? String(this.get('visualTheme', EH.Config.VISUAL_THEME)) : 'claro';
+            EH.Config.VISUAL_PRIMARY_COLOR = safeColor('visualPrimaryColor', EH.Config.VISUAL_PRIMARY_COLOR);
+            EH.Config.VISUAL_PANEL_COLOR = safeColor('visualPanelColor', EH.Config.VISUAL_PANEL_COLOR);
+            EH.Config.VISUAL_SURFACE_COLOR = safeColor('visualSurfaceColor', EH.Config.VISUAL_SURFACE_COLOR);
+            EH.Config.VISUAL_TEXT_COLOR = safeColor('visualTextColor', EH.Config.VISUAL_TEXT_COLOR);
+            EH.Config.VISUAL_MUTED_COLOR = safeColor('visualMutedColor', EH.Config.VISUAL_MUTED_COLOR);
+            EH.Config.VISUAL_BORDER_COLOR = safeColor('visualBorderColor', EH.Config.VISUAL_BORDER_COLOR);
+            EH.Config.VISUAL_FONT_FAMILY = ['sistema','arial','verdana'].includes(String(this.get('visualFontFamily', EH.Config.VISUAL_FONT_FAMILY)))
+                ? String(this.get('visualFontFamily', EH.Config.VISUAL_FONT_FAMILY)) : 'sistema';
+            EH.Config.VISUAL_BASE_FONT_SIZE = Math.min(18, Math.max(11, Number(this.get('visualBaseFontSize', EH.Config.VISUAL_BASE_FONT_SIZE)) || 12));
+            EH.Config.VISUAL_CONTRAST = ['normal','forte'].includes(String(this.get('visualContrast', EH.Config.VISUAL_CONTRAST)))
+                ? String(this.get('visualContrast', EH.Config.VISUAL_CONTRAST)) : 'normal';
+            EH.Config.VISUAL_SPACING = Math.min(1.35, Math.max(0.8, Number(this.get('visualSpacing', EH.Config.VISUAL_SPACING)) || 1));
+            EH.Config.VISUAL_BORDER_WIDTH = Math.min(2, Math.max(0, Number(this.get('visualBorderWidth', EH.Config.VISUAL_BORDER_WIDTH)) || 1));
+            EH.Config.VISUAL_BUTTON_HEIGHT = Math.min(48, Math.max(34, Number(this.get('visualButtonHeight', EH.Config.VISUAL_BUTTON_HEIGHT)) || 36));
+            EH.Config.VISUAL_ANIMATIONS = EH.Utils.parseBoolean(this.get('visualAnimations', EH.Config.VISUAL_ANIMATIONS), EH.Config.VISUAL_ANIMATIONS);
             EH.Config.PANEL_CUSTOM_WIDTH = Math.min(440, Math.max(0, Number(this.get('panelCustomWidth', EH.Config.PANEL_CUSTOM_WIDTH)) || 0));
             if (EH.Config.PANEL_CUSTOM_WIDTH && EH.Config.PANEL_CUSTOM_WIDTH < 260) EH.Config.PANEL_CUSTOM_WIDTH = 260;
             EH.Config.PANEL_HEIGHT_PERCENT = Math.min(90, Math.max(0, Number(this.get('panelHeightPercent', EH.Config.PANEL_HEIGHT_PERCENT)) || 0));
@@ -441,6 +481,7 @@
             EH.Config.SYNC_REQUISITIONS = EH.Utils.parseBoolean(this.get('syncRequisitions', EH.Config.SYNC_REQUISITIONS), EH.Config.SYNC_REQUISITIONS);
             EH.Config.SYNC_EMISSION_DATA = EH.Utils.parseBoolean(this.get('syncEmissionData', EH.Config.SYNC_EMISSION_DATA), EH.Config.SYNC_EMISSION_DATA);
             EH.Config.SYNC_SETTINGS = EH.Utils.parseBoolean(this.get('syncSettings', EH.Config.SYNC_SETTINGS), EH.Config.SYNC_SETTINGS);
+            EH.Config.SYNC_PANEL_LAYOUT = EH.Utils.parseBoolean(this.get('syncPanelLayout', EH.Config.SYNC_PANEL_LAYOUT), EH.Config.SYNC_PANEL_LAYOUT);
             EH.Config.CONTEXT_BUTTON_SIZE = ['small','normal','large','xlarge'].includes(String(this.get('contextButtonSize', EH.Config.CONTEXT_BUTTON_SIZE)))
                 ? String(this.get('contextButtonSize', EH.Config.CONTEXT_BUTTON_SIZE)) : 'normal';
             EH.Config.CONTEXT_BUTTON_FONT_SIZE = Math.min(18, Math.max(8, Number(this.get('contextButtonFontSize', EH.Config.CONTEXT_BUTTON_FONT_SIZE)) || 10));
@@ -484,6 +525,234 @@
             }
 
             EH.Config.DEBUG = EH.Utils.parseBoolean(this.get('debug', EH.Config.DEBUG), EH.Config.DEBUG);
+        }
+    };
+
+    // ============================================================
+    // CATÁLOGO ÚNICO DE CONFIGURAÇÕES — v5.75
+    // Cada preferência pertence a uma única seção. O catálogo também define
+    // o que pode ser exportado, o que é local do dispositivo e o que pode ser
+    // sincronizado por registro. Credenciais nunca entram nesse fluxo.
+    // ============================================================
+    EH.SettingsCatalog = {
+        UPDATED_KEY: 'settings.updatedAt.v1',
+        BACKUP_KEY: 'settings.backups.v1',
+        entries: {
+            settingsPreset:{section:'aparencia',shared:true,default:'padrao'},
+            uiDensity:{section:'aparencia',shared:true,default:'padrao'},
+            visualTheme:{section:'aparencia',shared:true,default:'claro'},
+            visualPrimaryColor:{section:'aparencia',shared:true,default:'#2563eb'},
+            visualPanelColor:{section:'aparencia',shared:true,default:'#ffffff'},
+            visualSurfaceColor:{section:'aparencia',shared:true,default:'#f8fafc'},
+            visualTextColor:{section:'aparencia',shared:true,default:'#1f2937'},
+            visualMutedColor:{section:'aparencia',shared:true,default:'#64748b'},
+            visualBorderColor:{section:'aparencia',shared:true,default:'#dbe3ec'},
+            visualFontFamily:{section:'aparencia',shared:true,default:'sistema'},
+            visualBaseFontSize:{section:'aparencia',shared:true,default:12},
+            visualContrast:{section:'aparencia',shared:true,default:'normal'},
+            visualSpacing:{section:'aparencia',shared:true,default:1},
+            visualBorderWidth:{section:'aparencia',shared:true,default:1},
+            visualButtonHeight:{section:'aparencia',shared:true,default:36},
+            visualAnimations:{section:'aparencia',shared:true,default:true},
+            panelOpacity:{section:'aparencia',shared:true,default:1},
+            panelRadius:{section:'aparencia',shared:true,default:15},
+            shadowLevel:{section:'aparencia',shared:true,default:'normal'},
+            contextButtonOpacity:{section:'aparencia',shared:true,default:.96},
+
+            overlaySide:{section:'paineis',device:true,default:'right'},
+            overlayTopOffset:{section:'paineis',device:true,default:0},
+            panelCustomWidth:{section:'paineis',device:true,default:0},
+            panelHeightPercent:{section:'paineis',device:true,default:0},
+            whatsappCustomWidth:{section:'paineis',device:true,default:0},
+            whatsappHeightPercent:{section:'paineis',device:true,default:0},
+            'panelManager.v1':{section:'paineis',device:true,default:()=>EH.PanelManager?.defaults?.()||{}},
+            'contextualPanels.v1':{section:'paineis',device:true,default:{}},
+
+            messages:{section:'whatsapp',shared:true,default:()=>({...EH.ConfigDefaults.MESSAGES})},
+            whatsappMode:{section:'whatsapp',shared:true,default:'web'},
+            quickRouteGreeting:{section:'whatsapp',shared:true,default:''},
+            quickRouteFooter:{section:'whatsapp',shared:true,default:'Consulte disponibilidade.'},
+            quickRouteSummaryTemplate:{section:'whatsapp',shared:true,default:''},
+            quickRouteFullTemplate:{section:'whatsapp',shared:true,default:''},
+            quickRouteEmojiLevel:{section:'whatsapp',shared:true,default:'normal'},
+            quickRouteCopyBeforeWhatsApp:{section:'whatsapp',shared:true,default:true},
+
+            panelZoom:{section:'zoom',device:true,default:1.5},
+            whatsappDockZoom:{section:'zoom',device:true,default:1.1},
+
+            autoRouteCapture:{section:'valores',shared:true,default:true},
+            autoCopyImages:{section:'valores',shared:true,default:true},
+            captureScale:{section:'valores',shared:true,default:2},
+            ticketCaptureWidth:{section:'valores',shared:true,default:430},
+            aplicarTaxasOrigem:{section:'valores',shared:true,default:true},
+            'boardingFees.v2':{section:'valores',shared:true,default:[]},
+
+            financeCommissionPercent:{section:'financeiro',shared:true,default:10},
+            financeAutoRegister:{section:'financeiro',shared:true,default:true},
+            financeShowCaixaSummary:{section:'financeiro',shared:true,default:true},
+            financeAskCompanyMerch:{section:'financeiro',shared:true,default:true},
+            financeConfirmDelete:{section:'financeiro',shared:true,default:true},
+
+            operationCarsEnabled:{section:'carros',shared:true,default:true},
+            operationAgencyCode:{section:'carros',shared:true,default:'287'},
+            operationSortBySeat:{section:'carros',shared:true,default:true},
+            operationDockEnabled:{section:'carros',shared:true,default:true},
+            operationRoutines:{section:'carros',shared:true,default:()=>JSON.parse(JSON.stringify(EH.ConfigDefaults.OPERATION_ROUTINES))},
+            operationTimeToleranceMinutes:{section:'carros',shared:true,default:20},
+            operationQueueGraceMinutes:{section:'carros',shared:true,default:180},
+
+            contextButtonSize:{section:'atalhos',shared:true,default:'normal'},
+            contextButtonFontSize:{section:'atalhos',shared:true,default:10},
+            contextButtonIconSize:{section:'atalhos',shared:true,default:15},
+            contextButtonGap:{section:'atalhos',shared:true,default:6},
+            contextButtonShowText:{section:'atalhos',shared:true,default:true},
+
+            'quickRoutes.v1':{section:'rotas',shared:true,default:[]},
+
+            reminderCreateAfterTicket:{section:'lembretes',shared:true,default:true},
+            reminderAskAfterTicket:{section:'lembretes',shared:true,default:true},
+            reminderMaskCpf:{section:'lembretes',shared:true,default:true},
+            reminderHighlightToday:{section:'lembretes',shared:true,default:true},
+
+            syncProvider:{section:'sincronizacao',default:'none'},
+            syncEnabled:{section:'sincronizacao',default:false},
+            syncReminders:{section:'sincronizacao',default:true},
+            syncRequisitions:{section:'sincronizacao',default:true},
+            syncEmissionData:{section:'sincronizacao',default:true},
+            syncSettings:{section:'sincronizacao',default:false},
+            syncPanelLayout:{section:'sincronizacao',default:false},
+            syncSupabaseUrl:{section:'sincronizacao',secret:true,export:false,default:''},
+            syncSupabaseKey:{section:'sincronizacao',secret:true,export:false,default:''},
+            syncSupabaseEmail:{section:'sincronizacao',secret:true,export:false,default:''},
+            debug:{section:'avancado',default:false}
+        },
+        clone(value) {
+            if (value === undefined) return undefined;
+            return JSON.parse(JSON.stringify(value));
+        },
+        defaultValue(key) {
+            const raw=this.entries[key]?.default;
+            return this.clone(typeof raw==='function'?raw():raw);
+        },
+        value(key) {
+            const stored=EH.Storage.get(key, undefined);
+            return stored===undefined?this.defaultValue(key):stored;
+        },
+        timestampMap() {
+            const value=EH.Storage.get(this.UPDATED_KEY, {});
+            return value&&typeof value==='object'&&!Array.isArray(value)?value:{};
+        },
+        updatedAt(key) { return Number(this.timestampMap()[key]||1); },
+        touch(keys, timestamp=Date.now()) {
+            const map=this.timestampMap();
+            (Array.isArray(keys)?keys:[keys]).filter(key=>this.entries[key]).forEach(key=>{map[key]=Math.max(Number(map[key]||0),Number(timestamp||Date.now()));});
+            EH.Storage.set(this.UPDATED_KEY,map);
+            return map;
+        },
+        setMany(values={}, {timestamp=Date.now(),markSync=true,allowSecrets=false}={}) {
+            const changed=[];
+            Object.entries(values).forEach(([key,value])=>{
+                if(!this.entries[key]||(this.entries[key].secret&&!allowSecrets))return;
+                EH.Storage.set(key,this.clone(value));changed.push(key);
+            });
+            if(changed.length)this.touch(changed,timestamp);
+            if(markSync)changed.forEach(key=>{
+                const entry=this.entries[key];
+                if(entry.shared||(entry.device&&EH.Config.SYNC_PANEL_LAYOUT))EH.Sync?.markPendingRecord?.('setting',key);
+            });
+            return changed;
+        },
+        sections({includeDevice=true}={}) {
+            const result={};
+            Object.entries(this.entries).forEach(([key,entry])=>{
+                if(entry.export===false||entry.secret||(!includeDevice&&entry.device))return;
+                if(!result[entry.section])result[entry.section]={};
+                result[entry.section][key]=this.clone(this.value(key));
+            });
+            return result;
+        },
+        stable(value) {
+            if(Array.isArray(value))return value.map(item=>this.stable(item));
+            if(value&&typeof value==='object')return Object.fromEntries(Object.keys(value).sort().map(key=>[key,this.stable(value[key])]));
+            return value;
+        },
+        checksum(settings) {
+            const text=JSON.stringify(this.stable(settings));let hash=0x811c9dc5;
+            for(let index=0;index<text.length;index+=1){hash^=text.charCodeAt(index);hash=Math.imul(hash,0x01000193)>>>0;}
+            return hash.toString(16).padStart(8,'0');
+        },
+        flattenPayload(payload={}) {
+            const flat={};
+            if(payload.settings&&typeof payload.settings==='object'){
+                Object.entries(payload.settings).forEach(([section,values])=>{
+                    if(!values||typeof values!=='object'||Array.isArray(values))return;
+                    Object.entries(values).forEach(([key,value])=>{if(this.entries[key]?.section===section&&!this.entries[key].secret&&this.entries[key].export!==false)flat[key]=value;});
+                });
+            } else if(payload.values&&typeof payload.values==='object'){
+                Object.entries(payload.values).forEach(([key,value])=>{if(this.entries[key]&&!this.entries[key].secret&&this.entries[key].export!==false)flat[key]=value;});
+            }
+            return flat;
+        },
+        validateImport(payload={}) {
+            if(!payload||payload.kind!=='epass-helper-settings')throw new Error('Arquivo de configurações inválido.');
+            const version=Number(payload.schemaVersion||0);
+            if(version>Number(EH.Config.STORAGE_SCHEMA_VERSION))throw new Error('Este arquivo foi criado por uma versão mais nova do Helper.');
+            const flat=this.flattenPayload(payload);
+            if(!Object.keys(flat).length)throw new Error('O arquivo não contém configurações compatíveis.');
+            if(payload.settings&&payload.integrity?.value){
+                const actual=this.checksum(payload.settings);
+                if(actual!==String(payload.integrity.value))throw new Error('A validação de integridade do arquivo falhou.');
+            }
+            return {version,flat,legacy:!payload.settings};
+        },
+        previewImport(payload={}) {
+            const validated=this.validateImport(payload);
+            const changes=Object.entries(validated.flat).filter(([key,value])=>JSON.stringify(this.value(key))!==JSON.stringify(value)).map(([key,value])=>({key,section:this.entries[key].section,before:this.clone(this.value(key)),after:this.clone(value)}));
+            return {...validated,changes,sections:Array.from(new Set(changes.map(item=>item.section)))};
+        },
+        backupCurrent(reason='import') {
+            const rows=EH.Storage.get(this.BACKUP_KEY,[]);const backups=Array.isArray(rows)?rows:[];
+            const backup={id:`settings-${Date.now()}`,reason,createdAt:Date.now(),schemaVersion:EH.Config.STORAGE_SCHEMA_VERSION,settings:this.sections({includeDevice:true})};
+            backups.push(backup);EH.Storage.set(this.BACKUP_KEY,backups.slice(-5));return backup;
+        },
+        restoreBackup(backup) {
+            if(!backup?.settings)return false;
+            this.setMany(this.flattenPayload({settings:backup.settings}),{markSync:false});
+            return true;
+        },
+        applyImport(payload={}, {mode='merge'}={}) {
+            const preview=this.previewImport(payload);const backup=this.backupCurrent(`import-${mode}`);
+            try{
+                const next={};
+                if(mode==='replace')Object.keys(this.entries).forEach(key=>{const entry=this.entries[key];if(entry.export!==false&&!entry.secret)next[key]=this.defaultValue(key);});
+                Object.assign(next,preview.flat);
+                this.setMany(next,{timestamp:Date.now(),markSync:true});
+                const meta=EH.Storage.get(EH.StorageSchema.META_KEY,{})||{};
+                EH.Storage.set(EH.StorageSchema.META_KEY,{...meta,schemaVersion:EH.StorageSchema.CURRENT_VERSION,importedAt:Date.now(),scriptVersion:EH.Config.VERSION});
+                return {mode,backup,changed:preview.changes.length,sections:preview.sections};
+            }catch(error){this.restoreBackup(backup);throw error;}
+        },
+        restoreSection(section) {
+            const values={};Object.entries(this.entries).forEach(([key,entry])=>{if(entry.section===section&&!entry.secret)values[key]=this.defaultValue(key);});
+            return this.setMany(values,{timestamp:Date.now(),markSync:true});
+        },
+        syncRecords({includeLayout=false}={}) {
+            return Object.entries(this.entries).filter(([,entry])=>entry.shared||(includeLayout&&entry.device)).map(([key])=>({key,value:this.clone(this.value(key)),updatedAt:this.updatedAt(key)}));
+        },
+        applyRemote(key,value,updatedAt=0) {
+            const entry=this.entries[key];if(!entry||entry.secret||(!entry.shared&&!(entry.device&&EH.Config.SYNC_PANEL_LAYOUT)))return false;
+            if(Number(updatedAt||0)<this.updatedAt(key))return false;
+            if(key==='boardingFees.v2'&&Array.isArray(value))EH.BoardingFeeManager?.save?.(value,{fromSync:true});
+            else if(key==='quickRoutes.v1'&&Array.isArray(value))EH.QuickRoutes?.save?.(value,{markPending:false,preserveUpdatedAt:true});
+            else EH.Storage.set(key,this.clone(value));
+            this.touch(key,Number(updatedAt||Date.now()));
+            return true;
+        },
+        migrateV17() {
+            const map=this.timestampMap();let changed=false;
+            Object.keys(this.entries).forEach(key=>{if(map[key])return;const value=EH.Storage.get(key,undefined);if(value!==undefined){map[key]=1;changed=true;}});
+            if(changed)EH.Storage.set(this.UPDATED_KEY,map);
+            if(EH.Storage.get('syncPanelLayout',undefined)===undefined)EH.Storage.set('syncPanelLayout',false);
         }
     };
 
@@ -795,6 +1064,12 @@
             if (changed) EH.Storage.set(key, next);
         },
 
+        migrateSettingsV17() {
+            // O catálogo preserva todas as chaves existentes e apenas acrescenta
+            // metadados por preferência. Layout continua local por padrão.
+            EH.SettingsCatalog?.migrateV17?.();
+        },
+
         migrate() {
             const meta = EH.Storage.get(this.META_KEY, null) || {};
             const fromVersion = Number(meta.schemaVersion || 0);
@@ -813,6 +1088,7 @@
             this.migrateConfirmedEmissionV14();
             this.migrateAttendanceV15();
             this.migrateRequestJourneyV16();
+            this.migrateSettingsV17();
             EH.BoardingFeeManager?.migrateLegacy?.();
             // v8: a memória persistente de emissões reaproveita a venda temporária
             // sem apagar sessionStorage ou formatos antigos. A migração final acontece
@@ -829,36 +1105,17 @@
         },
 
         exportConfiguration() {
-            const keys = [
-                'settingsPreset','uiDensity','panelOpacity','panelRadius','shadowLevel',
-                'overlaySide','overlayTopOffset','panelCustomWidth','panelHeightPercent',
-                'whatsappCustomWidth','whatsappHeightPercent','panelZoom','whatsappDockZoom',
-                'captureScale','ticketCaptureWidth','autoRouteCapture','autoCopyImages',
-                'aplicarTaxasOrigem','taxasOrigem','boardingFees.v2','messages',
-                'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
-                'financeAskCompanyMerch','financeConfirmDelete',
-                'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
-                'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes','operationQueueGraceMinutes',
-                'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
-                'reminderHighlightToday','panelManager.v1',
-                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail',
-                'syncReminders','syncRequisitions','syncEmissionData','syncSettings',
-                'contextButtonSize','contextButtonFontSize','contextButtonIconSize','contextButtonGap',
-                'contextButtonOpacity','contextButtonShowText','quickRouteGreeting','quickRouteFooter','quickRouteSummaryTemplate','quickRouteFullTemplate',
-                'quickRouteEmojiLevel','quickRouteCopyBeforeWhatsApp','quickRoutes.v1','contextualPanels.v1'
-            ];
-            const values = {};
-            keys.forEach(key => {
-                const value = EH.Storage.get(key, undefined);
-                if (value !== undefined) values[key] = value;
-            });
-            return {
+            const settings=EH.SettingsCatalog.sections({includeDevice:true});
+            const payload={
                 kind: 'epass-helper-settings',
                 schemaVersion: this.CURRENT_VERSION,
+                helperVersion: EH.Config.VERSION,
                 scriptVersion: EH.Config.VERSION,
-                exportedAt: Date.now(),
-                values
+                exportedAt: new Date().toISOString(),
+                settings
             };
+            payload.integrity={algorithm:'fnv1a32',value:EH.SettingsCatalog.checksum(settings)};
+            return payload;
         },
 
         downloadJson(filename, payload) {
@@ -873,36 +1130,8 @@
             setTimeout(() => URL.revokeObjectURL(url), 1500);
         },
 
-        importConfiguration(payload) {
-            if (!payload || payload.kind !== 'epass-helper-settings' || typeof payload.values !== 'object') {
-                throw new Error('Arquivo de configurações inválido.');
-            }
-            const allowed = new Set(Object.keys(this.exportConfiguration().values).concat([
-                'settingsPreset','uiDensity','panelOpacity','panelRadius','shadowLevel',
-                'overlaySide','overlayTopOffset','panelCustomWidth','panelHeightPercent',
-                'whatsappCustomWidth','whatsappHeightPercent','panelZoom','whatsappDockZoom',
-                'captureScale','ticketCaptureWidth','autoRouteCapture','autoCopyImages',
-                'aplicarTaxasOrigem','taxasOrigem','boardingFees.v2','messages',
-                'financeCommissionPercent','financeAutoRegister','financeShowCaixaSummary',
-                'financeAskCompanyMerch','financeConfirmDelete',
-                'operationCarsEnabled','operationAgencyCode','operationSortBySeat',
-                'operationDockEnabled','operationRoutines','operationTimeToleranceMinutes',
-                'reminderCreateAfterTicket','reminderAskAfterTicket','reminderMaskCpf',
-                'reminderHighlightToday','panelManager.v1',
-                'syncProvider','syncEnabled','syncSupabaseUrl','syncSupabaseKey','syncSupabaseEmail',
-                'syncReminders','syncRequisitions','syncEmissionData','syncSettings',
-                'contextButtonSize','contextButtonFontSize','contextButtonIconSize','contextButtonGap',
-                'contextButtonOpacity','contextButtonShowText','quickRouteGreeting','quickRouteFooter','quickRouteSummaryTemplate','quickRouteFullTemplate',
-                'quickRouteEmojiLevel','quickRouteCopyBeforeWhatsApp','quickRoutes.v1','contextualPanels.v1'
-            ]));
-            Object.entries(payload.values).forEach(([key, value]) => {
-                if (allowed.has(key)) EH.Storage.set(key, value);
-            });
-            EH.Storage.set(this.META_KEY, {
-                schemaVersion: this.CURRENT_VERSION,
-                importedAt: Date.now(),
-                scriptVersion: EH.Config.VERSION
-            });
+        importConfiguration(payload, options={}) {
+            return EH.SettingsCatalog.applyImport(payload,options);
         }
     };
 
@@ -1223,6 +1452,8 @@
         setAll(messages) {
             EH.Config.MESSAGES = { ...EH.Config.MESSAGES, ...messages };
             EH.Storage.set('messages', EH.Config.MESSAGES);
+            EH.SettingsCatalog?.touch?.('messages');
+            EH.Sync?.markPendingRecord?.('setting','messages');
         }
     };
 
@@ -1809,7 +2040,11 @@
             (Array.isArray(rows)?rows:[]).forEach(item => { const row=this.normalizeEntry(item); if(row.city) map.set(row.id,row); });
             const safe = Array.from(map.values()).sort((a,b)=>a.label.localeCompare(b.label,'pt-BR'));
             EH.Storage.set(this.KEY, safe);
-            if (!fromSync) EH.Storage.set('boardingFees.updatedAt', Date.now());
+            if (!fromSync) {
+                EH.Storage.set('boardingFees.updatedAt', Date.now());
+                EH.SettingsCatalog?.touch?.(this.KEY);
+                EH.Sync?.markPendingRecord?.('setting',this.KEY);
+            }
             // Compatibilidade: módulos antigos que ainda consultem TAXAS_ORIGEM veem os mesmos valores.
             EH.Config.TAXAS_ORIGEM = Object.fromEntries(safe.map(row => [row.city, row.value]));
             EH.Storage.set('taxasOrigem', EH.Config.TAXAS_ORIGEM);
@@ -3207,6 +3442,8 @@
             root.classList.toggle('eh-overlay-side-left', EH.Config.OVERLAY_SIDE === 'left');
             ['compacto', 'padrao', 'confortavel'].forEach(name => root.classList.toggle(`eh-density-${name}`, EH.Config.UI_DENSITY === name));
             ['none', 'suave', 'normal'].forEach(name => root.classList.toggle(`eh-shadow-${name}`, EH.Config.SHADOW_LEVEL === name));
+            root.classList.toggle('eh-high-contrast', EH.Config.VISUAL_THEME==='alto-contraste'||EH.Config.VISUAL_CONTRAST==='forte');
+            root.classList.toggle('eh-reduced-motion', !EH.Config.VISUAL_ANIMATIONS);
 
             const autoTop = viewportWidth <= 760 ? 58 : 72;
             const topOffset = Number(EH.Config.OVERLAY_TOP_OFFSET) || autoTop;
@@ -3231,6 +3468,20 @@
             root.style.setProperty('--eh-panel-radius', `${configuredRadius}px`);
             root.style.setProperty('--eh-wa-radius', `${Math.max(8, configuredRadius - 1)}px`);
             root.style.setProperty('--eh-layout-transition', `${Math.max(0, Number(EH.Config.LAYOUT_TRANSITION_MS) || 180)}ms`);
+            const fonts={sistema:'Inter,"Segoe UI",Arial,sans-serif',arial:'Arial,sans-serif',verdana:'Verdana,Arial,sans-serif'};
+            root.style.setProperty('--eh-font-family',fonts[EH.Config.VISUAL_FONT_FAMILY]||fonts.sistema);
+            root.style.setProperty('--eh-base-font-size',`${Math.min(18,Math.max(11,Number(EH.Config.VISUAL_BASE_FONT_SIZE)||12))}px`);
+            root.style.setProperty('--eh-spacing-scale',String(Math.min(1.35,Math.max(.8,Number(EH.Config.VISUAL_SPACING)||1))));
+            root.style.setProperty('--eh-border-width',`${Math.min(2,Math.max(0,Number(EH.Config.VISUAL_BORDER_WIDTH)||1))}px`);
+            root.style.setProperty('--eh-button-height',`${Math.min(48,Math.max(34,Number(EH.Config.VISUAL_BUTTON_HEIGHT)||36))}px`);
+            root.style.setProperty('--eh-bg',EH.Config.VISUAL_PANEL_COLOR);
+            root.style.setProperty('--eh-bg-2',EH.Config.VISUAL_SURFACE_COLOR);
+            root.style.setProperty('--eh-border',EH.Config.VISUAL_BORDER_COLOR);
+            root.style.setProperty('--eh-text',EH.Config.VISUAL_TEXT_COLOR);
+            root.style.setProperty('--eh-muted',EH.Config.VISUAL_MUTED_COLOR);
+            root.style.setProperty('--eh-primary',EH.Config.VISUAL_PRIMARY_COLOR);
+            root.style.setProperty('--eh-panel-color',EH.Config.VISUAL_PANEL_COLOR);
+            root.style.setProperty('--eh-surface-color',EH.Config.VISUAL_SURFACE_COLOR);
 
             if (EH.UI?.root) {
                 EH.UI.root.classList.toggle('eh-collapsed', !leftOpen);
@@ -3266,14 +3517,17 @@
                 'eh-layout-tight', 'eh-overlay-side-by-side', 'eh-overlay-stacked',
                 'eh-overlay-main-open', 'eh-overlay-conversation-open', 'eh-app-panels-closed',
                 'eh-overlay-side-left', 'eh-density-compact', 'eh-density-padrao', 'eh-density-confortavel',
-                'eh-shadow-none', 'eh-shadow-suave', 'eh-shadow-normal'
+                'eh-shadow-none', 'eh-shadow-suave', 'eh-shadow-normal', 'eh-high-contrast', 'eh-reduced-motion'
             ].forEach(name => root.classList.remove(name));
             [
                 '--eh-panel-width', '--eh-conversation-width', '--eh-overlay-edge', '--eh-overlay-gap',
                 '--eh-overlay-top', '--eh-overlay-main-height', '--eh-overlay-conversation-height',
                 '--eh-panel-opacity', '--eh-panel-radius', '--eh-wa-radius', '--eh-layout-transition',
                 '--eh-left-active-space', '--eh-right-active-space',
-                '--eh-left-logical-height', '--eh-right-logical-height'
+                '--eh-left-logical-height', '--eh-right-logical-height', '--eh-font-family',
+                '--eh-base-font-size', '--eh-spacing-scale', '--eh-border-width', '--eh-button-height',
+                '--eh-bg', '--eh-bg-2', '--eh-border', '--eh-text', '--eh-muted', '--eh-primary',
+                '--eh-panel-color', '--eh-surface-color'
             ].forEach(name => root.style.removeProperty(name));
             this.lastMetrics = null;
         }
@@ -3356,6 +3610,8 @@
             const normalized = {};
             ['main', 'whatsapp', 'operation'].forEach(key => { normalized[key] = this.normalizePanel(key, all?.[key] || {}); });
             EH.Storage.set(this.KEY, normalized);
+            EH.SettingsCatalog?.touch?.(this.KEY);
+            if(EH.Config.SYNC_PANEL_LAYOUT)EH.Sync?.markPendingRecord?.('setting',this.KEY);
             this.applyAll();
             return normalized;
         },
@@ -3956,12 +4212,19 @@
         inject() {
             GM_addStyle(`
                 :root {
-                    --eh-bg: #17191f;
-                    --eh-bg-2: #20232b;
-                    --eh-border: #343946;
-                    --eh-text: #f4f6fa;
-                    --eh-muted: #aeb5c2;
-                    --eh-primary: #3d8bfd;
+                    --eh-bg: #ffffff;
+                    --eh-bg-2: #f8fafc;
+                    --eh-border: #dbe3ec;
+                    --eh-text: #1f2937;
+                    --eh-muted: #64748b;
+                    --eh-primary: #2563eb;
+                    --eh-panel-color: #ffffff;
+                    --eh-surface-color: #f8fafc;
+                    --eh-font-family: Inter,"Segoe UI",Arial,sans-serif;
+                    --eh-base-font-size: 12px;
+                    --eh-spacing-scale: 1;
+                    --eh-border-width: 1px;
+                    --eh-button-height: 36px;
                     --eh-success: #35b879;
                     --eh-warning: #e7a83a;
                     --eh-danger: #e35d6a;
@@ -5590,6 +5853,52 @@
                 }
                 .eh-settings-inline-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
                 .eh-settings-danger-note { color:#8b5a20; background:#fff8eb; border:1px solid #f2d8ad; border-radius:8px; padding:8px; font-size:9px; line-height:1.4; }
+
+                /* Tokens visuais centrais. Os componentes do Helper consomem as
+                   mesmas cores, fonte, bordas, espaçamento e altura de ação. */
+                :is(#eh-root,#eh-wa-dock,#eh-operation-dock,#eh-context-shortcuts,.eh-context-panel,.eh-overlay,#eh-general-settings) {
+                    font-family:var(--eh-font-family,Inter,"Segoe UI",Arial,sans-serif)!important;
+                    font-size:var(--eh-base-font-size,12px);
+                }
+                :is(#eh-root .eh-panel,#eh-wa-dock,#eh-operation-dock,.eh-context-panel,.eh-modal) {
+                    color:var(--eh-text,#1f2937);
+                    border-color:var(--eh-border,#dbe3ec)!important;
+                    background:var(--eh-panel-color,#fff)!important;
+                }
+                .eh-toast { color:var(--eh-text,#1f2937);border-color:var(--eh-border,#dbe3ec);background:var(--eh-panel-color,#fff);box-shadow:0 10px 28px rgba(31,41,55,.16); }
+                .eh-toast-close { color:var(--eh-muted,#64748b); }
+                :is(#eh-root .eh-header,.eh-wa-dock-head,.eh-context-panel-head,.eh-modal-head,.eh-modal-actions,#eh-root .eh-panel-footer) {
+                    color:var(--eh-text,#1f2937);
+                    border-color:var(--eh-border,#dbe3ec)!important;
+                    background:var(--eh-surface-color,#f8fafc)!important;
+                }
+                :is(#eh-root .eh-body,.eh-conversation-organizer,.eh-context-panel-body,.eh-modal-content) { background:var(--eh-panel-color,#fff)!important; }
+                :is(.eh-settings-card,#eh-root .eh-context-card,.eh-context-data div,.eh-requisition-context,.eh-help-box) {
+                    border-width:var(--eh-border-width,1px)!important;
+                    border-color:var(--eh-border,#dbe3ec)!important;
+                    background:var(--eh-surface-color,#f8fafc)!important;
+                    border-radius:var(--eh-panel-radius,15px);
+                }
+                :is(#eh-root button,#eh-wa-dock button,#eh-operation-dock button,.eh-context-panel button,.eh-modal button,#eh-context-shortcuts button) {
+                    min-height:var(--eh-button-height,36px);
+                    border-color:var(--eh-border,#dbe3ec);
+                    font-family:inherit;
+                }
+                :is(#eh-root .eh-btn,.eh-modal-btn,.eh-context-actions button,.eh-context-route-choice) { font-size:max(10px,calc(var(--eh-base-font-size,12px) - 1px))!important; }
+                :is(.eh-settings-pane>p,.eh-settings-note,.eh-wa-status-text,.eh-context-data div) { color:var(--eh-muted,#64748b)!important; font-size:max(10px,calc(var(--eh-base-font-size,12px) - 2px)); }
+                :is(.eh-settings-pane h3,.eh-settings-card-title,#eh-root .eh-panel-brand strong,.eh-context-panel-head strong) { color:var(--eh-text,#1f2937)!important; }
+                :is(.eh-settings-tab.active,.eh-preset-btn.active,#eh-root .eh-btn.eh-primary,.eh-context-actions button.primary) { border-color:var(--eh-primary,#2563eb)!important; color:var(--eh-primary,#2563eb)!important; }
+                .eh-settings-shell { gap:calc(14px * var(--eh-spacing-scale,1)); }
+                .eh-settings-card { padding:calc(11px * var(--eh-spacing-scale,1)); margin-bottom:calc(10px * var(--eh-spacing-scale,1)); }
+                .eh-settings-grid-compact { gap:calc(9px * var(--eh-spacing-scale,1)); }
+                html.eh-high-contrast :is(#eh-root,#eh-wa-dock,#eh-operation-dock,.eh-context-panel,.eh-modal) { font-weight:500; }
+                html.eh-high-contrast :is(.eh-settings-note,.eh-settings-pane>p,.eh-wa-status-text) { color:var(--eh-text,#1f2937)!important; }
+                html.eh-reduced-motion :is(#eh-root,#eh-root *,#eh-wa-dock,#eh-wa-dock *,#eh-operation-dock,#eh-operation-dock *,.eh-context-panel,.eh-context-panel *,.eh-overlay,.eh-overlay *,#eh-context-shortcuts,#eh-context-shortcuts *) {
+                    animation:none!important;transition:none!important;scroll-behavior:auto!important;
+                }
+                .eh-unsaved-indicator { margin-left:auto;padding:5px 8px;border:1px solid #e9c46a;border-radius:999px;background:#fff8df;color:#7a5a00;font-size:10px;font-weight:800; }
+                .eh-import-preview-list { max-height:240px;overflow:auto;display:grid;gap:5px;margin:9px 0;padding:8px;border:1px solid var(--eh-border,#dbe3ec);border-radius:9px;background:var(--eh-surface-color,#f8fafc); }
+                .eh-import-preview-list div { font-size:11px;color:var(--eh-text,#1f2937); }
 
 
                 @media (max-width: 760px) {
@@ -15927,13 +16236,15 @@
         lastServerConfirmedAt: 0,
         failCount: 0,
         nextRetryAt: 0,
+        settingsChanged: false,
 
         config() {
             return {
                 enabled: Boolean(EH.Config.SYNC_ENABLED), provider: String(EH.Config.SYNC_PROVIDER || 'none'),
                 url: String(EH.Config.SYNC_SUPABASE_URL || '').replace(/\/+$/, ''), key: String(EH.Config.SYNC_SUPABASE_KEY || '').trim(),
                 email: String(EH.Config.SYNC_SUPABASE_EMAIL || '').trim(), reminders:Boolean(EH.Config.SYNC_REMINDERS),
-                requisitions:Boolean(EH.Config.SYNC_REQUISITIONS), emission:Boolean(EH.Config.SYNC_EMISSION_DATA), settings:Boolean(EH.Config.SYNC_SETTINGS)
+                requisitions:Boolean(EH.Config.SYNC_REQUISITIONS), emission:Boolean(EH.Config.SYNC_EMISSION_DATA), settings:Boolean(EH.Config.SYNC_SETTINGS),
+                panelLayout:Boolean(EH.Config.SYNC_PANEL_LAYOUT)
             };
         },
         safeKey(key) {
@@ -15955,7 +16266,7 @@
             if(kind==='reminder')return cfg.reminders;
             if(kind==='requisition'||kind==='request-draft')return cfg.requisitions;
             if(kind==='passenger'||kind==='emission'||kind==='attendance')return cfg.emission;
-            if(kind==='config')return cfg.settings;
+            if(kind==='config'||kind==='setting')return cfg.settings;
             return false;
         },
         recordKey(type,id){
@@ -16098,6 +16409,7 @@
             return EH.Attendance?.normalize?.(merged)||merged;
         },
         mergeRecordData(type,localData={},remoteData={},localTs=0,remoteTs=0) {
+            if(type==='setting')return Number(remoteTs||0)>=Number(localTs||0)?remoteData:localData;
             if(type==='reminder')return this.mergeReminderData(localData,remoteData,localTs,remoteTs);
             if(type==='requisition')return this.mergeRequisitionData(localData,remoteData,localTs,remoteTs);
             if(type==='request-draft')return EH.RequestFlow?.merge?.({...localData,updatedAt:localTs},{...remoteData,updatedAt:remoteTs})||this.smartMerge(localData,remoteData);
@@ -16128,7 +16440,7 @@
                 (EH.EmissionMemory?.load?.()||[]).forEach(item=>rows.push(this.envelope('emission',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
                 (EH.Attendance?.loadAll?.()||[]).forEach(item=>rows.push(this.envelope('attendance',item.id,this.syncPayload(item),item.updatedAt||item.createdAt)));
             }
-            if(cfg.settings){const fees=EH.BoardingFeeManager?.load?.()||[];const feeUpdated=Number(EH.Storage.get('boardingFees.updatedAt',1))||1;const opUpdated=Number(EH.Storage.get('operationConfig.updatedAt',1))||1;const quickUpdated=Number(EH.Storage.get('quickRoutes.updatedAt',1))||1;rows.push(this.envelope('config','boarding-fees',{fees,updatedAt:feeUpdated},feeUpdated));rows.push(this.envelope('config','operation',{agencyCode:EH.Config.OPERATION_AGENCY_CODE,routines:EH.Config.OPERATION_ROUTINES,tolerance:EH.Config.OPERATION_TIME_TOLERANCE_MINUTES,queueGraceMinutes:EH.Config.OPERATION_QUEUE_GRACE_MINUTES,updatedAt:opUpdated},opUpdated));rows.push(this.envelope('config','quick-routes',{routes:EH.QuickRoutes?.load?.()||[],updatedAt:quickUpdated},quickUpdated));}
+            if(cfg.settings)(EH.SettingsCatalog?.syncRecords?.({includeLayout:cfg.panelLayout})||[]).forEach(item=>rows.push(this.envelope('setting',item.key,{key:item.key,value:item.value},item.updatedAt)));
             return rows.filter(row=>row.recordId);
         },
         applyEnvelope(env){
@@ -16155,6 +16467,8 @@
                     EH.EmissionMemory?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
                 } else if(env.recordType==='attendance'){
                     EH.Attendance?.applyRemote?.({...env.data,id:env.recordId,updatedAt:env.updatedAt});
+                } else if(env.recordType==='setting'&&this.config().settings){
+                    if(EH.SettingsCatalog?.applyRemote?.(env.recordId,env.data?.value,env.updatedAt))this.settingsChanged=true;
                 } else if(env.recordType==='config'&&this.config().settings){
                     if(env.recordId==='boarding-fees'&&Array.isArray(env.data?.fees))EH.BoardingFeeManager?.save?.(env.data.fees,{fromSync:true});
                     if(env.recordId==='operation'){
@@ -16206,6 +16520,9 @@
                         received+=1;
                     }
                 });
+                if(this.settingsChanged){
+                    this.settingsChanged=false;EH.Storage.loadSettings();EH.Layout?.sync?.();EH.PanelManager?.bindAll?.();EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');
+                }
 
                 // Somente DEPOIS do pull/merge calculamos alterações locais a enviar.
                 const localAfter=this.collectLocalRecords(),push=[];
@@ -20189,7 +20506,11 @@
             closeTop.type = 'button';
             closeTop.className = 'eh-modal-close';
             closeTop.textContent = '✕';
-            head.append(title, closeTop);
+            const unsavedIndicator=document.createElement('span');
+            unsavedIndicator.className='eh-unsaved-indicator';
+            unsavedIndicator.textContent='Alterações não salvas';
+            unsavedIndicator.hidden=true;
+            head.append(title, unsavedIndicator, closeTop);
 
             const content = document.createElement('div');
             content.className = 'eh-modal-content';
@@ -20782,6 +21103,8 @@
             content.appendChild(shell);
 
             const fields = {};
+            let dirty=false;
+            const setDirty=value=>{dirty=Boolean(value);unsavedIndicator.hidden=!dirty;};
             const clamp = (value, min, max, fallback) => {
                 const n = Number(value);
                 if (!Number.isFinite(n)) return fallback;
@@ -20935,6 +21258,12 @@
                 fields[key] = input;
                 return field;
             };
+            const colorField = (key, labelText, value) => {
+                const field=document.createElement('div');field.className='eh-field';
+                const label=document.createElement('label');label.textContent=labelText;
+                const input=document.createElement('input');input.type='color';input.value=/^#[0-9a-f]{6}$/i.test(String(value||''))?String(value):'#2563eb';
+                field.append(label,input);fields[key]=input;return field;
+            };
             const note = textValue => {
                 const el = document.createElement('div');
                 el.className = 'eh-settings-note';
@@ -20964,7 +21293,10 @@
                 checkField('autoRoute', 'Rota rápida: pesquisar e gerar horários automaticamente', EH.Config.AUTO_ROUTE_CAPTURE),
                 checkField('autoCopy', 'Tentar copiar automaticamente o PNG quando o navegador permitir', EH.Config.AUTO_COPY_IMAGES)
             );
-            sections.geral.pane.appendChild(generalAutomation);
+            sections.valores.pane.appendChild(generalAutomation);
+            const generalInfo=card('Organização');
+            generalInfo.append(note('As preferências estão organizadas por responsabilidade. Aparência, layout, zoom e dados operacionais são salvos de forma independente e sem alterar o E-Pass.'));
+            sections.geral.pane.appendChild(generalInfo);
 
             // BOTÕES CONTEXTUAIS
             const shortcutCard = card('Abertura dos painéis');
@@ -20975,8 +21307,7 @@
                 ]),
                 numberField('contextButtonFontSize', 'Fonte (px)', EH.Config.CONTEXT_BUTTON_FONT_SIZE, {min:8,max:18,step:1}),
                 numberField('contextButtonIconSize', 'Ícone (px)', EH.Config.CONTEXT_BUTTON_ICON_SIZE, {min:12,max:26,step:1}),
-                numberField('contextButtonGap', 'Distância (px)', EH.Config.CONTEXT_BUTTON_GAP, {min:2,max:18,step:1}),
-                numberField('contextButtonOpacity', 'Opacidade (%)', Math.round(EH.Config.CONTEXT_BUTTON_OPACITY*100), {min:65,max:100,step:1})
+                numberField('contextButtonGap', 'Distância (px)', EH.Config.CONTEXT_BUTTON_GAP, {min:2,max:18,step:1})
             );
             shortcutCard.append(shortcutGrid,checkField('contextButtonShowText','Exibir texto ao lado do ícone',EH.Config.CONTEXT_BUTTON_SHOW_TEXT,'Quando desativado, o nome continua disponível no tooltip e no rótulo acessível.'));
             const resetContextPanels=document.createElement('button');resetContextPanels.type='button';resetContextPanels.className='eh-modal-btn';resetContextPanels.textContent='Restaurar posições dos painéis contextuais';resetContextPanels.addEventListener('click',()=>{EH.Storage.set('contextualPanels.v1',{});for(const [id] of EH.ContextualPanels?.panels||[])EH.ContextualPanels.close(id);EH.Toast.info('Posições contextuais restauradas.');});shortcutCard.appendChild(resetContextPanels);
@@ -20993,7 +21324,7 @@
                 checkField('quickRouteCopyBeforeWhatsApp','Copiar antes de preparar no WhatsApp',EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP)
             );
             quickMessageCard.append(note('Campos disponíveis: {greeting}, {origin}, {destination}, {date}, {time}, {company}, {line}, {vehicle}, {service}, {base}, {fee}, {final}, {notes}, {footer}. Linhas sem dado são omitidas.'));
-            sections.rotas.pane.appendChild(quickMessageCard);
+            sections.whatsapp.pane.appendChild(quickMessageCard);
             const quickRoutesCard=card('Rotas cadastradas');
             const quickRouteList=document.createElement('div');quickRouteList.className='eh-settings-list';
             const quickRouteRows=[];
@@ -21043,12 +21374,16 @@
                 presetButtons[key] = button;
                 presetRow.appendChild(button);
             });
-            presetCard.append(presetRow, note('Os presets alteram somente densidade e escala dos painéis. Ajustes manuais continuam disponíveis.'));
+            presetCard.append(presetRow, note('Os presets alteram densidade e legibilidade do Helper. Posição e tamanho dos painéis permanecem separados.'));
             sections.aparencia.pane.appendChild(presetCard);
 
             const visualCard = card('Visual');
             const visualGrid = grid();
             visualGrid.append(
+                selectField('visualTheme','Tema',EH.Config.VISUAL_THEME,[['claro','Claro e neutro'],['alto-contraste','Alto contraste']]),
+                selectField('visualFontFamily','Fonte',EH.Config.VISUAL_FONT_FAMILY,[['sistema','Sistema / Segoe UI'],['arial','Arial'],['verdana','Verdana']]),
+                numberField('visualBaseFontSize','Fonte base (px)',EH.Config.VISUAL_BASE_FONT_SIZE,{min:11,max:18,step:1}),
+                selectField('visualContrast','Contraste',EH.Config.VISUAL_CONTRAST,[['normal','Normal'],['forte','Forte']]),
                 selectField('density', 'Densidade', EH.Config.UI_DENSITY, [
                     ['compacto', 'Compacta'],
                     ['padrao', 'Padrão'],
@@ -21056,13 +21391,26 @@
                 ]),
                 numberField('opacity', 'Opacidade (%)', Math.round(EH.Config.PANEL_OPACITY * 100), { min: 86, max: 100, step: 1 }),
                 numberField('radius', 'Cantos (px)', EH.Config.PANEL_RADIUS, { min: 8, max: 22, step: 1 }),
+                numberField('visualSpacing','Espaçamento',EH.Config.VISUAL_SPACING,{min:.8,max:1.35,step:.05}),
+                numberField('visualBorderWidth','Bordas (px)',EH.Config.VISUAL_BORDER_WIDTH,{min:0,max:2,step:1}),
+                numberField('visualButtonHeight','Altura dos botões (px)',EH.Config.VISUAL_BUTTON_HEIGHT,{min:34,max:48,step:1}),
+                numberField('contextButtonOpacity','Opacidade dos atalhos (%)',Math.round(EH.Config.CONTEXT_BUTTON_OPACITY*100),{min:65,max:100,step:1}),
                 selectField('shadow', 'Sombra', EH.Config.SHADOW_LEVEL, [
                     ['none', 'Sem sombra'],
                     ['suave', 'Suave'],
                     ['normal', 'Padrão']
                 ])
             );
-            visualCard.appendChild(visualGrid);
+            const colorGrid=grid();
+            colorGrid.append(
+                colorField('visualPrimaryColor','Cor principal',EH.Config.VISUAL_PRIMARY_COLOR),
+                colorField('visualPanelColor','Fundo dos painéis',EH.Config.VISUAL_PANEL_COLOR),
+                colorField('visualSurfaceColor','Fundo dos cartões',EH.Config.VISUAL_SURFACE_COLOR),
+                colorField('visualTextColor','Texto principal',EH.Config.VISUAL_TEXT_COLOR),
+                colorField('visualMutedColor','Texto secundário',EH.Config.VISUAL_MUTED_COLOR),
+                colorField('visualBorderColor','Bordas',EH.Config.VISUAL_BORDER_COLOR)
+            );
+            visualCard.append(visualGrid,colorGrid,checkField('visualAnimations','Usar animações leves',EH.Config.VISUAL_ANIMATIONS));
             sections.aparencia.pane.appendChild(visualCard);
 
             // PAINÉIS
@@ -21106,12 +21454,11 @@
                 ]),
                 numberField('managedWidth', 'Largura (px)', panelDrafts.main.width, { min:220, max:700, step:5 }),
                 numberField('managedHeight', 'Altura (px)', panelDrafts.main.height, { min:200, max:900, step:5 }),
-                numberField('managedZoom', 'Zoom do conteúdo (%)', panelDrafts.main.zoom, { min:75, max:150, step:5 }),
                 numberField('managedHandleY', 'Posição vertical da seta (%)', panelDrafts.main.handleY, { min:10, max:90, step:1 })
             );
             controlCard.append(
                 controlGrid,
-                checkField('managedDynamic','Tamanho dinâmico',panelDrafts.main.dynamic,'Quando ativo, largura/altura/zoom são ajustados dentro de limites seguros sem alterar o E-Pass.'),
+                checkField('managedDynamic','Tamanho dinâmico',panelDrafts.main.dynamic,'Quando ativo, largura e altura são ajustadas dentro de limites seguros sem alterar o E-Pass.'),
                 checkField('managedAllowDrag','Permitir arrastar pelo cabeçalho',panelDrafts.main.allowDrag),
                 checkField('managedAllowResize','Permitir redimensionar pela alça inferior',panelDrafts.main.allowResize)
             );
@@ -21121,11 +21468,11 @@
             const restoreAllPanels=document.createElement('button'); restoreAllPanels.type='button'; restoreAllPanels.className='eh-modal-btn'; restoreAllPanels.textContent='Restaurar todos';
             panelControlActions.append(fitPanel,restorePanel,restoreAllPanels); controlCard.append(panelControlActions,note('Arraste somente pelo cabeçalho. Botões e campos não iniciam movimento. O modo Livre é salvo após soltar.'));
             sections.paineis.pane.appendChild(controlCard);
-            const capturePanelDraft=()=>{ const key=fields.managedPanel.value; const rawHandleY=Number(fields.managedHandleY.value); panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,zoom:Number(fields.managedZoom.value)||100,handleY:Number.isFinite(rawHandleY)?Math.max(0,Math.min(100,rawHandleY)):50,dynamic:fields.managedDynamic.checked,allowDrag:fields.managedAllowDrag.checked,allowResize:fields.managedAllowResize.checked}; };
-            const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedZoom.value=String(cfg.zoom); fields.managedHandleY.value=String(cfg.handleY); fields.managedDynamic.checked=Boolean(cfg.dynamic); fields.managedAllowDrag.checked=Boolean(cfg.allowDrag); fields.managedAllowResize.checked=Boolean(cfg.allowResize); };
+            const capturePanelDraft=()=>{ const key=fields.managedPanel.value; const rawHandleY=Number(fields.managedHandleY.value); panelDrafts[key]={...panelDrafts[key],mode:fields.managedMode.value,width:Number(fields.managedWidth.value)||300,height:Number(fields.managedHeight.value)||400,handleY:Number.isFinite(rawHandleY)?Math.max(0,Math.min(100,rawHandleY)):50,dynamic:fields.managedDynamic.checked,allowDrag:fields.managedAllowDrag.checked,allowResize:fields.managedAllowResize.checked}; };
+            const loadPanelDraft=key=>{ const cfg=panelDrafts[key]||EH.PanelManager.defaults()[key]; fields.managedMode.value=cfg.mode; fields.managedWidth.value=String(cfg.width); fields.managedHeight.value=String(cfg.height); fields.managedHandleY.value=String(cfg.handleY); fields.managedDynamic.checked=Boolean(cfg.dynamic); fields.managedAllowDrag.checked=Boolean(cfg.allowDrag); fields.managedAllowResize.checked=Boolean(cfg.allowResize); };
             let previousManagedPanel='main'; fields.managedPanel.addEventListener('change',()=>{ const next=fields.managedPanel.value; fields.managedPanel.value=previousManagedPanel; capturePanelDraft(); fields.managedPanel.value=next; previousManagedPanel=next; loadPanelDraft(next); });
-            ['managedMode','managedWidth','managedHeight','managedZoom','managedHandleY','managedDynamic','managedAllowDrag','managedAllowResize'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
-            fitPanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; const rec=EH.PanelManager.recommended(key); fields.managedWidth.value=String(rec.width); fields.managedHeight.value=String(rec.height); fields.managedZoom.value=String(rec.zoom); fields.managedDynamic.checked=false; capturePanelDraft(); });
+            ['managedMode','managedWidth','managedHeight','managedHandleY','managedDynamic','managedAllowDrag','managedAllowResize'].forEach(k=>fields[k].addEventListener('change',capturePanelDraft));
+            fitPanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; const rec=EH.PanelManager.recommended(key); fields.managedWidth.value=String(rec.width); fields.managedHeight.value=String(rec.height); fields.managedDynamic.checked=false; capturePanelDraft(); });
             restorePanel.addEventListener('click',()=>{ const key=fields.managedPanel.value; panelDrafts[key]={...EH.PanelManager.defaults()[key]}; loadPanelDraft(key); });
             restoreAllPanels.addEventListener('click',()=>{ const defs=EH.PanelManager.defaults(); Object.keys(defs).forEach(k=>panelDrafts[k]={...defs[k]}); loadPanelDraft(fields.managedPanel.value); });
 
@@ -21306,7 +21653,8 @@
                 checkField('syncReminders','Sincronizar lembretes / impressão',EH.Config.SYNC_REMINDERS),
                 checkField('syncRequisitions','Sincronizar requisições e códigos',EH.Config.SYNC_REQUISITIONS),
                 checkField('syncEmissionData','Sincronizar memória de passageiros/emissão',EH.Config.SYNC_EMISSION_DATA),
-                checkField('syncSettings','Sincronizar taxas e horários operacionais',EH.Config.SYNC_SETTINGS,'Posições/tamanhos dos painéis continuam locais para não misturar monitores diferentes.'),
+                checkField('syncSettings','Sincronizar configurações compartilhadas',EH.Config.SYNC_SETTINGS,'Aparência, rotas, comissão, WhatsApp, atendimento, carros e lembretes são enviados por chave.'),
+                checkField('syncPanelLayout','Sincronizar também o layout dos painéis',EH.Config.SYNC_PANEL_LAYOUT,'Desativado por padrão. Inclui posições, dimensões e zoom específicos deste monitor.'),
                 syncGrid,
                 note('A sincronização real usa o mesmo projeto Supabase. O Helper salva primeiro localmente; se a internet cair, a alteração fica pendente e é enviada depois.'),
                 syncStatusLine,
@@ -21324,6 +21672,7 @@
                 EH.Config.SYNC_REQUISITIONS=Boolean(fields.syncRequisitions?.checked);
                 EH.Config.SYNC_EMISSION_DATA=Boolean(fields.syncEmissionData?.checked);
                 EH.Config.SYNC_SETTINGS=Boolean(fields.syncSettings?.checked);
+                EH.Config.SYNC_PANEL_LAYOUT=Boolean(fields.syncPanelLayout?.checked);
                 EH.Storage.set('syncProvider',EH.Config.SYNC_PROVIDER);
                 EH.Storage.set('syncEnabled',EH.Config.SYNC_ENABLED);
                 EH.Storage.set('syncSupabaseUrl',EH.Config.SYNC_SUPABASE_URL);
@@ -21333,6 +21682,7 @@
                 EH.Storage.set('syncRequisitions',EH.Config.SYNC_REQUISITIONS);
                 EH.Storage.set('syncEmissionData',EH.Config.SYNC_EMISSION_DATA);
                 EH.Storage.set('syncSettings',EH.Config.SYNC_SETTINGS);
+                EH.Storage.set('syncPanelLayout',EH.Config.SYNC_PANEL_LAYOUT);
             };
             syncLogin.addEventListener('click',async()=>{
                 try{
@@ -21386,20 +21736,64 @@
             });
             const importSettings=document.createElement('button');
             importSettings.type='button'; importSettings.className='eh-modal-btn'; importSettings.textContent='Importar configurações';
+            const restoreBackupSettings=document.createElement('button');
+            restoreBackupSettings.type='button';restoreBackupSettings.className='eh-modal-btn';restoreBackupSettings.textContent='Restaurar último backup';
+            restoreBackupSettings.addEventListener('click',()=>{
+                const backups=EH.Storage.get(EH.SettingsCatalog.BACKUP_KEY,[]);const backup=Array.isArray(backups)?backups[backups.length-1]:null;
+                if(!backup){EH.Toast.info('Nenhum backup de configurações disponível.');return;}
+                if(!window.confirm('Restaurar o último backup de configurações? Dados operacionais serão preservados.'))return;
+                EH.SettingsCatalog.restoreBackup(backup);EH.Storage.loadSettings();EH.Layout?.sync?.();setDirty(false);overlay.remove();EH.UI.showSettings();EH.Toast.success('Backup de configurações restaurado.');
+            });
             const importInput=document.createElement('input'); importInput.type='file'; importInput.accept='application/json,.json'; importInput.hidden=true;
             importSettings.addEventListener('click',()=>importInput.click());
+            const chooseImportMode=preview=>new Promise(resolve=>{
+                const layer=document.createElement('div');layer.className='eh-overlay';layer.style.zIndex='2147483600';
+                const box=document.createElement('div');box.className='eh-modal';box.style.width='min(600px,94vw)';
+                const hd=document.createElement('div');hd.className='eh-modal-head';
+                const tt=document.createElement('div');tt.className='eh-modal-title';tt.textContent='Prévia da importação';hd.appendChild(tt);
+                const body=document.createElement('div');body.className='eh-modal-content';
+                const summary=document.createElement('div');summary.className='eh-help-box';summary.textContent=`${preview.changes.length} alteração(ões) em ${preview.sections.length} seção(ões). ${preview.legacy?'O formato antigo será migrado durante a aplicação.':'Integridade validada.'}`;
+                const list=document.createElement('div');list.className='eh-import-preview-list';
+                preview.changes.slice(0,60).forEach(item=>{const row=document.createElement('div');row.textContent=`${item.section} • ${item.key}`;list.appendChild(row);});
+                if(preview.changes.length>60){const more=document.createElement('div');more.textContent=`… e mais ${preview.changes.length-60}`;list.appendChild(more);}
+                body.append(summary,list,note('Mesclar altera somente as chaves presentes. Substituir restaura as demais preferências exportáveis ao padrão. Credenciais e dados pessoais nunca são importados.'));
+                const actions=document.createElement('div');actions.className='eh-modal-actions';
+                const merge=document.createElement('button');merge.type='button';merge.className='eh-modal-btn primary';merge.textContent='Mesclar';
+                const replace=document.createElement('button');replace.type='button';replace.className='eh-modal-btn';replace.textContent='Substituir';
+                const cancel=document.createElement('button');cancel.type='button';cancel.className='eh-modal-btn';cancel.textContent='Cancelar';
+                const finish=mode=>{layer.remove();resolve(mode);};merge.onclick=()=>finish('merge');replace.onclick=()=>finish('replace');cancel.onclick=()=>finish('');layer.onclick=event=>{if(event.target===layer)finish('');};
+                actions.append(merge,replace,cancel);box.append(hd,body,actions);layer.appendChild(box);document.body.appendChild(layer);
+            });
             importInput.addEventListener('change',async()=>{
                 const file=importInput.files?.[0]; if(!file)return;
                 try{
                     const payload=JSON.parse(await file.text());
-                    EH.StorageSchema.importConfiguration(payload);
-                    EH.Toast.success('Configurações importadas. Recarregue a página para aplicar tudo.');
+                    const preview=EH.SettingsCatalog.previewImport(payload);
+                    if(!preview.changes.length){EH.Toast.info('O arquivo não possui alterações em relação às configurações atuais.');return;}
+                    const mode=await chooseImportMode(preview);if(!mode)return;
+                    EH.StorageSchema.importConfiguration(payload,{mode});
+                    EH.Storage.loadSettings();
+                    EH.Layout?.sync?.();EH.PanelManager?.bindAll?.();EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');
+                    setDirty(false);overlay.remove();
+                    EH.Toast.success(`Configurações importadas por ${mode==='merge'?'mesclagem':'substituição'}. Backup local criado.`);
                 }catch(error){EH.Toast.error(error.message||'Não foi possível importar as configurações.');}
                 finally{importInput.value='';}
             });
-            advancedActions.append(diagnostic, copyHtml, exportSettings, importSettings, importInput);
+            advancedActions.append(diagnostic, copyHtml, exportSettings, importSettings, restoreBackupSettings, importInput);
             advancedCard.append(debugWrap, note(`Armazenamento de dados: versão ${EH.Config.STORAGE_SCHEMA_VERSION}. Atualizações do script usam migração não destrutiva.`), advancedActions);
             sections.avancado.pane.appendChild(advancedCard);
+
+            Object.entries(sections).forEach(([id,section])=>{
+                if(id==='geral')return;
+                const row=document.createElement('div');row.className='eh-settings-inline-actions';
+                const restoreSection=document.createElement('button');restoreSection.type='button';restoreSection.className='eh-modal-btn';restoreSection.textContent='Restaurar somente esta seção';
+                restoreSection.addEventListener('click',()=>{
+                    if(!window.confirm(`Restaurar apenas as preferências de ${section.tab.textContent}? Dados operacionais não serão apagados.`))return;
+                    EH.SettingsCatalog.restoreSection(id);EH.Storage.loadSettings();EH.Storage.set('settingsTab',id);EH.Layout?.sync?.();
+                    setDirty(false);overlay.remove();EH.UI.showSettings();EH.Toast.success(`${section.tab.textContent}: padrões restaurados.`);
+                });
+                row.appendChild(restoreSection);section.pane.appendChild(row);
+            });
 
             const setActiveTab = id => {
                 Object.values(sections).forEach(section => {
@@ -21422,20 +21816,21 @@
             const applyPreset = key => {
                 selectedPreset = key;
                 const presets = {
-                    compacto: { density: 'compacto', panelZoom: 125, waZoom: 95, opacity: 98 },
-                    padrao: { density: 'padrao', panelZoom: 150, waZoom: 110, opacity: 100 },
-                    confortavel: { density: 'confortavel', panelZoom: 170, waZoom: 120, opacity: 100 }
+                    compacto: { density:'compacto',fontSize:11,spacing:.85,buttonHeight:34,opacity:98 },
+                    padrao: { density:'padrao',fontSize:12,spacing:1,buttonHeight:36,opacity:100 },
+                    confortavel: { density:'confortavel',fontSize:14,spacing:1.15,buttonHeight:42,opacity:100 }
                 };
                 const preset = presets[key];
                 if (!preset) return;
                 fields.density.value = preset.density;
-                fields.panelZoom.value = String(preset.panelZoom);
-                fields.waZoom.value = String(preset.waZoom);
+                fields.visualBaseFontSize.value=String(preset.fontSize);
+                fields.visualSpacing.value=String(preset.spacing);
+                fields.visualButtonHeight.value=String(preset.buttonHeight);
                 fields.opacity.value = String(preset.opacity);
                 Object.entries(presetButtons).forEach(([name, button]) => button.classList.toggle('active', name === key));
             };
             Object.entries(presetButtons).forEach(([key, button]) => button.addEventListener('click', () => applyPreset(key)));
-            ['density', 'panelZoom', 'waZoom', 'opacity'].forEach(key => fields[key]?.addEventListener('change', markCustomPreset));
+            ['density','visualBaseFontSize','visualSpacing','visualButtonHeight','opacity'].forEach(key => fields[key]?.addEventListener('change', markCustomPreset));
 
             const actions = document.createElement('div');
             actions.className = 'eh-modal-actions';
@@ -21458,6 +21853,20 @@
                 fields.mainOpen.checked = false;
                 fields.waVisible.checked = true;
                 fields.density.value = d.UI_DENSITY;
+                fields.visualTheme.value=d.VISUAL_THEME;
+                fields.visualPrimaryColor.value=d.VISUAL_PRIMARY_COLOR;
+                fields.visualPanelColor.value=d.VISUAL_PANEL_COLOR;
+                fields.visualSurfaceColor.value=d.VISUAL_SURFACE_COLOR;
+                fields.visualTextColor.value=d.VISUAL_TEXT_COLOR;
+                fields.visualMutedColor.value=d.VISUAL_MUTED_COLOR;
+                fields.visualBorderColor.value=d.VISUAL_BORDER_COLOR;
+                fields.visualFontFamily.value=d.VISUAL_FONT_FAMILY;
+                fields.visualBaseFontSize.value=String(d.VISUAL_BASE_FONT_SIZE);
+                fields.visualContrast.value=d.VISUAL_CONTRAST;
+                fields.visualSpacing.value=String(d.VISUAL_SPACING);
+                fields.visualBorderWidth.value=String(d.VISUAL_BORDER_WIDTH);
+                fields.visualButtonHeight.value=String(d.VISUAL_BUTTON_HEIGHT);
+                fields.visualAnimations.checked=Boolean(d.VISUAL_ANIMATIONS);
                 fields.opacity.value = String(Math.round(d.PANEL_OPACITY * 100));
                 fields.radius.value = String(d.PANEL_RADIUS);
                 fields.shadow.value = d.SHADOW_LEVEL;
@@ -21500,6 +21909,7 @@
                 fields.syncRequisitions.checked = Boolean(d.SYNC_REQUISITIONS);
                 fields.syncEmissionData.checked = Boolean(d.SYNC_EMISSION_DATA);
                 fields.syncSettings.checked = Boolean(d.SYNC_SETTINGS);
+                fields.syncPanelLayout.checked = Boolean(d.SYNC_PANEL_LAYOUT);
                 fields.contextButtonSize.value = d.CONTEXT_BUTTON_SIZE;
                 fields.contextButtonFontSize.value = String(d.CONTEXT_BUTTON_FONT_SIZE);
                 fields.contextButtonIconSize.value = String(d.CONTEXT_BUTTON_ICON_SIZE);
@@ -21522,6 +21932,7 @@
                 rebuildRoutineRows(d.OPERATION_ROUTINES || []);
                 fields.debug.checked = Boolean(d.DEBUG);
                 Object.entries(presetButtons).forEach(([name, button]) => button.classList.toggle('active', name === 'padrao'));
+                setDirty(true);
                 EH.Toast.info('Padrões carregados. Clique em “Salvar configurações” para aplicar.');
             });
 
@@ -21530,11 +21941,20 @@
             closeBottom.className = 'eh-modal-btn';
             closeBottom.textContent = 'Fechar';
 
-            const close = () => overlay.remove();
+            const close = () => {
+                if(dirty&&!window.confirm('Existem alterações não salvas. Deseja fechar e descartá-las?'))return;
+                overlay.remove();
+            };
             closeTop.addEventListener('click', close);
             closeBottom.addEventListener('click', close);
             overlay.addEventListener('click', event => {
                 if (event.target === overlay) close();
+            });
+            shell.addEventListener('input',event=>{if(event.target.matches('input,select,textarea'))setDirty(true);});
+            shell.addEventListener('change',event=>{if(event.target.matches('input,select,textarea'))setDirty(true);});
+            shell.addEventListener('click',event=>{
+                const button=event.target.closest('button');if(!button||button.classList.contains('eh-settings-tab'))return;
+                if(button.closest('.eh-preset-row')||button.closest('.eh-settings-list')||button.closest('.eh-operation-settings-list')||[fitPanel,restorePanel,restoreAllPanels,addFee,addRoutine,addQuickRoute].includes(button))setDirty(true);
             });
 
             save.addEventListener('click', () => {
@@ -21568,6 +21988,20 @@
                 const values = {
                     preset: selectedPreset,
                     density: ['compacto', 'padrao', 'confortavel'].includes(fields.density.value) ? fields.density.value : 'padrao',
+                    visualTheme:['claro','alto-contraste'].includes(fields.visualTheme.value)?fields.visualTheme.value:'claro',
+                    visualPrimaryColor:fields.visualPrimaryColor.value,
+                    visualPanelColor:fields.visualPanelColor.value,
+                    visualSurfaceColor:fields.visualSurfaceColor.value,
+                    visualTextColor:fields.visualTextColor.value,
+                    visualMutedColor:fields.visualMutedColor.value,
+                    visualBorderColor:fields.visualBorderColor.value,
+                    visualFontFamily:['sistema','arial','verdana'].includes(fields.visualFontFamily.value)?fields.visualFontFamily.value:'sistema',
+                    visualBaseFontSize:clamp(fields.visualBaseFontSize.value,11,18,12),
+                    visualContrast:['normal','forte'].includes(fields.visualContrast.value)?fields.visualContrast.value:'normal',
+                    visualSpacing:clamp(fields.visualSpacing.value,.8,1.35,1),
+                    visualBorderWidth:clamp(fields.visualBorderWidth.value,0,2,1),
+                    visualButtonHeight:clamp(fields.visualButtonHeight.value,34,48,36),
+                    visualAnimations:Boolean(fields.visualAnimations.checked),
                     opacity: clamp(Number(fields.opacity.value) / 100, 0.86, 1, 1),
                     radius: clamp(fields.radius.value, 8, 22, 15),
                     shadow: ['none', 'suave', 'normal'].includes(fields.shadow.value) ? fields.shadow.value : 'normal',
@@ -21585,6 +22019,20 @@
 
                 EH.Config.SETTINGS_PRESET = values.preset;
                 EH.Config.UI_DENSITY = values.density;
+                EH.Config.VISUAL_THEME=values.visualTheme;
+                EH.Config.VISUAL_PRIMARY_COLOR=values.visualPrimaryColor;
+                EH.Config.VISUAL_PANEL_COLOR=values.visualPanelColor;
+                EH.Config.VISUAL_SURFACE_COLOR=values.visualSurfaceColor;
+                EH.Config.VISUAL_TEXT_COLOR=values.visualTextColor;
+                EH.Config.VISUAL_MUTED_COLOR=values.visualMutedColor;
+                EH.Config.VISUAL_BORDER_COLOR=values.visualBorderColor;
+                EH.Config.VISUAL_FONT_FAMILY=values.visualFontFamily;
+                EH.Config.VISUAL_BASE_FONT_SIZE=values.visualBaseFontSize;
+                EH.Config.VISUAL_CONTRAST=values.visualContrast;
+                EH.Config.VISUAL_SPACING=values.visualSpacing;
+                EH.Config.VISUAL_BORDER_WIDTH=values.visualBorderWidth;
+                EH.Config.VISUAL_BUTTON_HEIGHT=values.visualButtonHeight;
+                EH.Config.VISUAL_ANIMATIONS=values.visualAnimations;
                 EH.Config.PANEL_OPACITY = values.opacity;
                 EH.Config.PANEL_RADIUS = values.radius;
                 EH.Config.SHADOW_LEVEL = values.shadow;
@@ -21623,6 +22071,7 @@
                 EH.Config.SYNC_REQUISITIONS = Boolean(fields.syncRequisitions?.checked);
                 EH.Config.SYNC_EMISSION_DATA = Boolean(fields.syncEmissionData?.checked);
                 EH.Config.SYNC_SETTINGS = Boolean(fields.syncSettings?.checked);
+                EH.Config.SYNC_PANEL_LAYOUT = Boolean(fields.syncPanelLayout?.checked);
                 EH.Config.CONTEXT_BUTTON_SIZE = fields.contextButtonSize.value;
                 EH.Config.CONTEXT_BUTTON_FONT_SIZE = clamp(fields.contextButtonFontSize.value,8,18,10);
                 EH.Config.CONTEXT_BUTTON_ICON_SIZE = clamp(fields.contextButtonIconSize.value,12,26,15);
@@ -21685,6 +22134,20 @@
                 const settingsToSave = {
                     settingsPreset: values.preset,
                     uiDensity: values.density,
+                    visualTheme:values.visualTheme,
+                    visualPrimaryColor:values.visualPrimaryColor,
+                    visualPanelColor:values.visualPanelColor,
+                    visualSurfaceColor:values.visualSurfaceColor,
+                    visualTextColor:values.visualTextColor,
+                    visualMutedColor:values.visualMutedColor,
+                    visualBorderColor:values.visualBorderColor,
+                    visualFontFamily:values.visualFontFamily,
+                    visualBaseFontSize:values.visualBaseFontSize,
+                    visualContrast:values.visualContrast,
+                    visualSpacing:values.visualSpacing,
+                    visualBorderWidth:values.visualBorderWidth,
+                    visualButtonHeight:values.visualButtonHeight,
+                    visualAnimations:values.visualAnimations,
                     panelOpacity: values.opacity,
                     panelRadius: values.radius,
                     shadowLevel: values.shadow,
@@ -21700,10 +22163,11 @@
                     ticketCaptureWidth: values.ticketWidth,
                     autoRouteCapture: fields.autoRoute.checked,
                     autoCopyImages: fields.autoCopy.checked,
+                    messages:{...EH.Config.MESSAGES},
                     aplicarTaxasOrigem: fields.autoFees.checked,
                     taxasOrigem: taxas,
                     taxaIpora: taxas.IPORA || 0,
-                    boardingFeesV2: feeEntries,
+                    'boardingFees.v2': feeEntries,
                     aplicarTaxaIpora: fields.autoFees.checked,
                     whatsappMode: 'web',
                     financeCommissionPercent: EH.Config.FINANCE_COMMISSION_PERCENT,
@@ -21731,6 +22195,7 @@
                     syncRequisitions: EH.Config.SYNC_REQUISITIONS,
                     syncEmissionData: EH.Config.SYNC_EMISSION_DATA,
                     syncSettings: EH.Config.SYNC_SETTINGS,
+                    syncPanelLayout: EH.Config.SYNC_PANEL_LAYOUT,
                     contextButtonSize: EH.Config.CONTEXT_BUTTON_SIZE,
                     contextButtonFontSize: EH.Config.CONTEXT_BUTTON_FONT_SIZE,
                     contextButtonIconSize: EH.Config.CONTEXT_BUTTON_ICON_SIZE,
@@ -21743,9 +22208,11 @@
                     quickRouteFullTemplate: EH.Config.QUICK_ROUTE_FULL_TEMPLATE,
                     quickRouteEmojiLevel: EH.Config.QUICK_ROUTE_EMOJI_LEVEL,
                     quickRouteCopyBeforeWhatsApp: EH.Config.QUICK_ROUTE_COPY_BEFORE_WHATSAPP,
+                    'quickRoutes.v1':quickRoutes,
+                    'panelManager.v1':panelDrafts,
                     debug: fields.debug.checked
                 };
-                Object.entries(settingsToSave).forEach(([key, value]) => EH.Storage.set(key, value));
+                EH.SettingsCatalog.setMany(settingsToSave,{timestamp:Date.now(),markSync:true,allowSecrets:true});
                 EH.QuickRoutes.save(quickRoutes);
                 EH.PanelManager.save(panelDrafts);
                 EH.Sync?.start?.();
@@ -21756,24 +22223,16 @@
                 EH.OperationCars?.render?.();
                 EH.ContextualShortcuts?.render?.(EH.Pages?.detect?.()||'desconhecida');
 
-                const verification = {
-                    preset: EH.Storage.get('settingsPreset', ''),
-                    density: EH.Storage.get('uiDensity', ''),
-                    side: EH.Storage.get('overlaySide', ''),
-                    panelZoom: Number(EH.Storage.get('panelZoom', 0)),
-                    waZoom: Number(EH.Storage.get('whatsappDockZoom', 0))
-                };
-                const ok = verification.preset === values.preset
-                    && verification.density === values.density
-                    && verification.side === values.side
-                    && Math.abs(verification.panelZoom - values.panelZoom) < 0.001
-                    && Math.abs(verification.waZoom - values.waZoom) < 0.001;
+                const normalizedByManager=new Set(['boardingFees.v2','quickRoutes.v1','panelManager.v1']);
+                const failedKeys=Object.entries(settingsToSave).filter(([key])=>EH.SettingsCatalog.entries[key]&&!normalizedByManager.has(key)).filter(([key,value])=>JSON.stringify(EH.Storage.get(key,undefined))!==JSON.stringify(value)).map(([key])=>key);
+                const ok=failedKeys.length===0;
 
                 if (!ok) {
-                    EH.Toast.error('Não foi possível confirmar o salvamento. Tente novamente.');
+                    EH.Toast.error(`Não foi possível confirmar o salvamento de ${failedKeys.length} preferência(s). Tente novamente.`);
                     return;
                 }
                 EH.Toast.success('Configurações salvas neste navegador.');
+                setDirty(false);
                 close();
             });
 
@@ -21814,7 +22273,7 @@
             }).filter(item => item.time && item.origin && item.destination);
             EH.Storage.set(this.KEY, clean);
             EH.Storage.set('quickRoutes.updatedAt', Date.now());
-            if (markPending) EH.Sync?.markPendingRecord?.('config', 'quick-routes');
+            if(markPending){EH.SettingsCatalog?.touch?.(this.KEY);EH.Sync?.markPendingRecord?.('setting',this.KEY);}
             EH.ContextualPanels?.refresh?.('routes');
             return clean;
         },
@@ -21925,6 +22384,8 @@
                 #eh-root[hidden],#eh-launcher[hidden],#eh-wa-dock[hidden],#eh-operation-dock[hidden],#eh-operation-launcher[hidden]{display:none!important}#eh-general-settings{position:fixed;z-index:2147482960;right:8px;top:96px;width:38px;height:38px;border:1px solid #cbd5e1;border-radius:11px;background:rgba(255,255,255,.97);color:#315b88;box-shadow:0 5px 16px rgba(31,48,70,.13);cursor:pointer;font:900 17px/1 Inter,"Segoe UI",Arial,sans-serif}
                 html.eh-overlay-side-left #eh-general-settings{left:8px;right:auto}.eh-context-panel{position:fixed;z-index:2147482945;display:flex;flex-direction:column;width:min(390px,calc(100vw - 24px));height:min(520px,calc(100vh - 34px));min-width:270px;min-height:190px;overflow:hidden;resize:both;border:1px solid #d8e0e8;border-radius:14px;background:rgba(255,255,255,.985);color:#263548;box-shadow:0 16px 42px rgba(24,42,66,.18);font-family:Inter,"Segoe UI",Arial,sans-serif}
                 .eh-context-panel-head{min-height:43px;display:flex;align-items:center;justify-content:space-between;gap:8px;padding:7px 8px 7px 12px;border-bottom:1px solid #e3e8ee;background:#f7f9fb;cursor:grab;touch-action:none}.eh-context-panel-head strong{font-size:12px}.eh-context-panel-head button{width:29px;height:29px;border:0;border-radius:7px;background:transparent;cursor:pointer}.eh-context-panel-body{display:grid;gap:8px;min-height:0;overflow:auto;padding:10px;zoom:var(--eh-context-panel-zoom,1)}.eh-context-panel.is-dragging{transition:none!important;will-change:transform}.eh-context-panel-grid{display:grid;gap:7px}.eh-context-route{display:grid;gap:7px}.eh-context-route-choice{width:100%;min-height:40px!important;justify-content:center;padding:9px 12px!important;border:1px solid #d9e2ea!important;border-radius:9px;background:#fff!important;color:#263e58!important;text-align:center;font-size:10px!important;font-weight:850;line-height:1.25;cursor:pointer;transition:background-color .12s ease,border-color .12s ease,color .12s ease,transform .08s ease}.eh-context-route-choice:hover{border-color:#91b4d6!important;background:#f6faff!important}.eh-context-route-choice:active{transform:translateY(1px)}.eh-context-route-choice:focus-visible{outline:2px solid rgba(37,99,235,.32);outline-offset:2px}.eh-context-route-choice.is-selected{border-color:#6d9fce!important;background:#edf6ff!important;color:#245d8f!important}.eh-context-route-choice:disabled{cursor:wait;opacity:.65}.eh-route-size-small .eh-context-route-choice{min-height:34px!important;padding:7px 9px!important;font-size:9px!important}.eh-route-size-large .eh-context-route-choice{min-height:47px!important;padding:11px 13px!important;font-size:11px!important}.eh-route-size-xlarge .eh-context-route-choice{min-height:56px!important;padding:13px 15px!important;font-size:12px!important}.eh-context-actions{display:flex;flex-wrap:wrap;gap:5px}.eh-context-actions button{min-height:30px;padding:6px 8px;border:1px solid #d3dce6;border-radius:7px;background:#f8fafc;color:#30445a;cursor:pointer;font-size:9px;font-weight:800}.eh-context-actions button.primary{border-color:#8fb6db;background:#edf6ff;color:#245d8f}.eh-context-actions button.success{border-color:#8dc9ae;background:#eefaf4;color:#266d4e}.eh-context-data{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px}.eh-context-data div{display:grid;gap:2px;padding:7px;border:1px solid #e4e9ee;border-radius:8px;background:#fafbfd;font-size:8px;color:#6e7b8a}.eh-context-data b{font-size:10px;color:#27384b;overflow-wrap:anywhere}.eh-context-empty{padding:18px;text-align:center;color:#6e7b8a;font-size:10px}.eh-requisition-context{display:grid;gap:8px;padding:9px;border:1px solid #dce6ef;border-radius:10px;background:#fbfdff}.eh-requisition-context>strong{font-size:11px;color:#27435f}.eh-requisition-context details{border-top:1px solid #e5ebf1;padding-top:6px}.eh-requisition-context summary{cursor:pointer;color:#607286;font-size:9px;font-weight:800;margin-bottom:6px}.eh-request-context-selector{display:grid;gap:4px;color:#607286;font-size:8px;font-weight:800}.eh-request-context-selector select,.eh-share-queue>select{width:100%;min-height:32px;padding:5px 7px;border:1px solid #d3dce6;border-radius:7px;background:#fff;color:#30445a;font-size:9px}.eh-share-queue .eh-context-empty,.eh-request-route-hint .eh-context-empty{padding:6px;text-align:left}
+                #eh-general-settings,.eh-context-panel,.eh-context-panel-head,.eh-context-panel-body,.eh-context-route-choice,.eh-context-actions button,.eh-context-data div,.eh-requisition-context,.eh-request-context-selector select,.eh-share-queue>select{font-family:var(--eh-font-family,Inter,"Segoe UI",Arial,sans-serif);color:var(--eh-text,#1f2937);border-color:var(--eh-border,#dbe3ec);background:var(--eh-panel-color,#fff)}
+                .eh-context-panel-head,.eh-context-data div,.eh-requisition-context{background:var(--eh-surface-color,#f8fafc)}.eh-context-empty,.eh-context-data div,.eh-request-context-selector{color:var(--eh-muted,#64748b)}.eh-context-route-choice.is-selected,.eh-context-actions button.primary{border-color:var(--eh-primary,#2563eb)!important;color:var(--eh-primary,#2563eb)!important}.eh-context-panel{border-radius:var(--eh-panel-radius,15px)}
                 @media(max-width:620px){.eh-context-panel{left:8px!important;right:8px!important;top:58px!important;width:auto!important;height:min(72vh,560px)!important;resize:none}.eh-context-data{grid-template-columns:1fr}}
             `);
         },
@@ -21932,6 +22393,8 @@
         persist(id, panel) {
             const rect=panel.getBoundingClientRect(),all=this.saved();
             all[id]={x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height),updatedAt:Date.now()};EH.Storage.set(this.KEY,all);
+            EH.SettingsCatalog?.touch?.(this.KEY);
+            if(EH.Config.SYNC_PANEL_LAYOUT)EH.Sync?.markPendingRecord?.('setting',this.KEY);
         },
         position(id,panel) {
             const cfg=this.saved()[id]||{};const defaultHeight=id==='operation'?430:520;const width=Math.min(window.innerWidth-24,Math.max(270,Number(cfg.width)||390));const height=Math.min(window.innerHeight-34,Math.max(190,Number(cfg.height)||defaultHeight));
